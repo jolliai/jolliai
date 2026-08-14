@@ -1748,6 +1748,10 @@ describe("wiki freshness + rebuild endpoints", () => {
 			behindRepoNames: ["acme-api"],
 			pending: { summary: 3, total: 3 },
 		});
+		// A per-process nonce the page keys its banner-dismiss on (restart → new
+		// nonce → dismissed banner reappears). Just needs to be a non-empty string.
+		expect(typeof body.nonce).toBe("string");
+		expect((body.nonce as string).length).toBeGreaterThan(0);
 	});
 
 	it("GET /api/wiki/freshness reports available:false when no Memory Bank folder is configured", async () => {

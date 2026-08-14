@@ -1023,6 +1023,29 @@ export type SidebarOutboundMsg =
 			 * "Generate Missing Summaries" control lives under its Memory Bank area.
 			 */
 			readonly type: "backfill:openSettings";
+	  }
+	| {
+			/**
+			 * User clicked the wiki banner's × (close). The host remembers this
+			 * dismissal in PROCESS memory (no persistence) and gates the next
+			 * `pushWikiFreshness` on it: the banner stays hidden until the backlog
+			 * GROWS (`total` up) or gets more urgent (severity up), or the host
+			 * process restarts (Reload Window). Once the wiki is caught up (fresh)
+			 * the host forgets the dismissal, so the next behind episode shows again.
+			 *
+			 * The host is the web dashboard's `wikiBannerNonce` analog: its lifetime
+			 * IS the reset boundary, so unlike the dashboard we need neither a nonce
+			 * nor localStorage. The webview snapshots the visible `{total, severity}`
+			 * so the host can compare a later freshness against exactly what the user
+			 * was looking at when they dismissed it.
+			 */
+			readonly type: "wiki:dismiss";
+			readonly total: number;
+			/** Headline "N new memories" count at dismiss time — re-show if it grows even when `total` is flat. */
+			readonly summary: number;
+			readonly severity: "never" | "fresh" | "info" | "warn";
+			/** Repos behind at dismiss time — re-show if a repo NOT in this set later falls behind. */
+			readonly repos: ReadonlyArray<string>;
 	  };
 
 export type SidebarInboundMsg =

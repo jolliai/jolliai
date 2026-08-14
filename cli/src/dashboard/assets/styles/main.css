@@ -1689,3 +1689,11 @@ body {
 	display: flex; gap: 10px; align-items: center; border-radius: 0; border-width: 0 0 1px;
 }
 .jd .wiki-freshness .cta.sm { margin-left: auto; white-space: nowrap; }
+/* Close (×): sits just right of the Update button (which carries margin-left:auto,
+   so both are pushed to the far end). Subtle by default, full-opacity on hover. */
+.jd .wiki-freshness .wiki-dismiss {
+	flex: none; border: 0; background: transparent; color: inherit; cursor: pointer;
+	opacity: .55; font-size: 18px; line-height: 1; padding: 0 2px; margin-left: 2px;
+}
+.jd .wiki-freshness .wiki-dismiss:hover { opacity: 1; }
+.jd .wiki-freshness .wiki-dismiss:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }

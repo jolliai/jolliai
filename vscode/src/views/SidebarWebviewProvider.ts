@@ -107,6 +107,15 @@ const ALLOWED_BUILTIN_WEBVIEW_COMMANDS = new Set<string>(["vscode.open", "vscode
  */
 const MAX_COPY_TEXT_LENGTH = 256;
 
+/**
+ * Ordering for the wiki banner's severity, so a dismiss can be re-shown when the
+ * state escalates (info → warn) even if the backlog count didn't grow — e.g. a
+ * repo crossing the 3-day staleness threshold. `never` folds to `info`'s rank
+ * (it never reaches the aggregate severity, which is only fresh/info/warn).
+ */
+type WikiSeverity = "never" | "fresh" | "info" | "warn";
+const WIKI_SEVERITY_RANK: Readonly<Record<WikiSeverity, number>> = { fresh: 0, never: 1, info: 1, warn: 2 };
+
 /** True when the webview may ask the host to run `command` (see the set above). */
 function isAllowedWebviewCommand(command: string): boolean {
 	return command.startsWith("jollimemory.") || ALLOWED_BUILTIN_WEBVIEW_COMMANDS.has(command);
@@ -618,6 +627,22 @@ export class SidebarWebviewProvider
 	// the repoDir-prefixed relPath all paths use, so signals for one row never
 	// suppress another's.
 	private readonly divergenceCheckSeq = new Map<string, number>();
+	/**
+	 * The wiki banner's "dismiss" (× click), held in PROCESS memory only — the
+	 * host process's lifetime is the reset boundary (Reload Window forgets it),
+	 * which is this surface's analog of the dashboard restarting. `null` = not
+	 * dismissed. `pushWikiFreshness` gates on it: a later freshness whose backlog
+	 * grew (`total`) or got more urgent (`severity`) clears it and shows the
+	 * banner again, and catching up (fresh) clears it so the next behind episode
+	 * shows. Snapshots exactly what the user saw at dismiss time so the compare is
+	 * against that, not against a stale recompute.
+	 */
+	private wikiDismissed: {
+		readonly total: number;
+		readonly summary: number;
+		readonly severity: WikiSeverity;
+		readonly repos: ReadonlyArray<string>;
+	} | null = null;
 
 	constructor(private readonly deps: SidebarWebviewDeps) {}
 
@@ -1363,6 +1388,16 @@ export class SidebarWebviewProvider
 			}
 			case "backfill:dismiss":
 				this.deps.backfill?.dismiss();
+				return;
+			case "wiki:dismiss":
+				// Snapshot what the user was looking at; pushWikiFreshness compares a
+				// later freshness against it. Process-memory only (see the field doc).
+				this.wikiDismissed = {
+					total: msg.total,
+					summary: msg.summary,
+					severity: msg.severity,
+					repos: msg.repos,
+				};
 				return;
 			case "backfill:openSettings":
 				void this.deps.executeCommand("jollimemory.openSettings");
@@ -2188,7 +2223,7 @@ export class SidebarWebviewProvider
 		if (!this.deps.getWikiFreshness) return;
 		try {
 			const freshness = await this.deps.getWikiFreshness();
-			this.postMessage({ type: "wiki:freshness", freshness });
+			this.postMessage({ type: "wiki:freshness", freshness: this.gateWikiFreshnessByDismiss(freshness) });
 		} catch (err) {
 			log.warn(
 				"SidebarWebviewProvider",
@@ -2196,6 +2231,49 @@ export class SidebarWebviewProvider
 			);
 			this.postMessage({ type: "wiki:freshness", freshness: null });
 		}
+	}
+
+	/**
+	 * Apply the user's banner dismissal (× click) to a freshness before it is
+	 * pushed. Returns `null` (banner hidden) while a live dismissal holds and the
+	 * state has not escalated; otherwise returns the freshness unchanged and, when
+	 * appropriate, clears the dismissal. See the {@link wikiDismissed} field doc
+	 * for the full rule. Kept separate from `pushWikiFreshness` so it can be unit
+	 * tested without a live webview.
+	 */
+	private gateWikiFreshnessByDismiss(
+		freshness: {
+			readonly severity: "never" | "fresh" | "info" | "warn";
+			readonly behindRepoNames: ReadonlyArray<string>;
+			readonly summary: number;
+			readonly total: number;
+			readonly lastRebuiltAt: string | null;
+		} | null,
+	): typeof freshness {
+		const d = this.wikiDismissed;
+		if (!d) return freshness;
+		// Probe failed (null): keep the banner hidden but DON'T forget the dismissal
+		// — a transient failure must not silently un-dismiss.
+		if (!freshness) return null;
+		const behind = freshness.severity !== "fresh" && freshness.behindRepoNames.length > 0;
+		if (!behind) {
+			// Caught up — scope the dismissal to this one behind episode.
+			this.wikiDismissed = null;
+			return freshness;
+		}
+		// Re-show if the backlog grew — by `total` OR by the headline `summary` count
+		// (summary can rise while total stays flat when other pending types drain) —
+		// got more urgent, or a repo the dismissal never saw is now behind (a partial
+		// multi-repo hand-off never reaches `fresh`, so this is the only signal a
+		// brand-new repo's backlog produces).
+		const grew = freshness.total > d.total || freshness.summary > d.summary;
+		const moreUrgent = WIKI_SEVERITY_RANK[freshness.severity] > WIKI_SEVERITY_RANK[d.severity];
+		const newRepo = freshness.behindRepoNames.some((r) => !d.repos.includes(r));
+		if (grew || moreUrgent || newRepo) {
+			this.wikiDismissed = null;
+			return freshness;
+		}
+		return null; // still behind, nothing new to say → stay dismissed
 	}
 
 	/**

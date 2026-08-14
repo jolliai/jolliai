@@ -1200,22 +1200,96 @@ window.JD = window.JD || {};
 	// re-render) the new chain replaces the old rather than stacking a second one.
 	var wikiPollTimer = null;
 
+	/* Banner "dismiss" (×) persistence. The user can collapse the reminder; it comes
+	   back only when there is genuinely something new to say. State lives in
+	   localStorage as {nonce, total, severity}:
+	   - `nonce` is the server's per-process id (see DashboardServer `wikiBannerNonce`).
+	     A restart mints a new one, so a dismissed banner reappears after a restart —
+	     the web analog of VSCode's host-process memory.
+	   - re-show when the backlog GREW (`total` up) or got more urgent (severity up),
+	     so a dismiss can never permanently mute a growing debt.
+	   - clearing on `fresh` (nothing behind) scopes a dismiss to ONE behind episode:
+	     once caught up, the next time it falls behind it shows again. */
+	var WIKI_DISMISS_KEY = "jolli.wikiBannerDismiss";
+	// `never` folds to info's rank (it never reaches the aggregate severity, which is
+	// only fresh/info/warn) — kept identical to the VS Code side (WIKI_SEVERITY_RANK
+	// in SidebarWebviewProvider.ts) so both surfaces order urgency the same way.
+	var WIKI_SEVERITY_RANK = { fresh: 0, never: 1, info: 1, warn: 2 };
+	// Cache of the freshness last rendered, so the × click handler (which has no `f`
+	// in scope) can snapshot the state at dismiss time.
+	var lastWikiFreshness = null;
+	function wikiSeverityRank(s) { return WIKI_SEVERITY_RANK[s] || 0; }
+	function wikiDismissRead() {
+		try {
+			var raw = window.localStorage.getItem(WIKI_DISMISS_KEY);
+			return raw ? JSON.parse(raw) : null;
+		} catch (_e) { return null; }
+	}
+	function wikiDismissWrite(f) {
+		try {
+			window.localStorage.setItem(WIKI_DISMISS_KEY, JSON.stringify({
+				nonce: f && f.nonce,
+				total: (f && f.pending && f.pending.total) || 0,
+				summary: (f && f.pending && f.pending.summary) || 0,
+				severity: f && f.severity,
+				repos: (f && f.behindRepoNames) || []
+			}));
+		} catch (_e) { /* storage blocked — dismiss simply won't persist */ }
+	}
+	function wikiDismissClear() {
+		try { window.localStorage.removeItem(WIKI_DISMISS_KEY); } catch (_e) { /* ignore */ }
+	}
+	// True when a currently-behind `f` should stay HIDDEN because the user dismissed
+	// it and nothing new has happened since. If anything HAS (backlog grew — by total
+	// OR by the headline `summary` count — got more urgent, or a repo the dismissal
+	// never saw is now behind), the dismissal is spent: clear it and return false so
+	// the banner shows again and stays shown. This clear-on-re-show mirrors the VS
+	// Code host gate (SidebarWebviewProvider.gateWikiFreshnessByDismiss) so both
+	// surfaces behave identically — without it a later drop below the frozen baseline
+	// would silently re-hide a banner the user had already seen re-appear.
+	function wikiDismissBlocks(f) {
+		var d = wikiDismissRead();
+		if (!d || d.nonce !== (f && f.nonce)) return false; // no record, or server restarted
+		var total = (f && f.pending && f.pending.total) || 0;
+		var summary = (f && f.pending && f.pending.summary) || 0;
+		var names = (f && f.behindRepoNames) || [];
+		var grew = total > (d.total || 0) || summary > (d.summary || 0);
+		var moreUrgent = wikiSeverityRank(f && f.severity) > wikiSeverityRank(d.severity);
+		var newRepo = names.some(function (n) { return (d.repos || []).indexOf(n) === -1; });
+		if (grew || moreUrgent || newRepo) {
+			wikiDismissClear();
+			return false;
+		}
+		return true;
+	}
+
 	function wikiBannerHtml(f) {
 		var esc = JD.esc;
+		lastWikiFreshness = f || null;
 		if (!f || f.available === false) return "";
 		if (f.inFlight) {
 			// Keep the warn tint while rebuilding if the wiki was warn-behind — the
-			// banner shouldn't lose its severity color mid-rebuild.
+			// banner shouldn't lose its severity color mid-rebuild. No × while a
+			// rebuild is running (nothing to dismiss; it clears itself when fresh).
 			var inCls = f.severity === "warn" ? "warning-banner" : "callout";
 			return (
 				'<div class="' + inCls + '"><span class="spin" aria-hidden="true"></span>' +
-				"<span>Rebuilding the wiki/graph…</span></div>"
+				"<span>Updating the wiki/graph…</span></div>"
 			);
 		}
 		// Aggregate across the whole Memory Bank folder. Up to date (nothing behind):
 		// show nothing — the empty container collapses via `.wiki-freshness:empty`.
 		var names = (f.behindRepoNames || []).slice();
-		if (!names.length) return "";
+		if (!names.length) {
+			// Caught up: forget any prior dismiss so the next behind episode shows.
+			// Opportunistic — these pages have no idle poll, so the clear happens the
+			// next time a render observes `fresh` (page mount, or the end of a rebuild
+			// poll), not the instant the folder catches up. Acceptable: the freshness
+			// is a deliberately slow probe, and every page mount re-evaluates it.
+			wikiDismissClear();
+			return "";
+		}
+		if (wikiDismissBlocks(f)) return "";
 		var repo =
 			names.length === 1
 				? "for <strong>" + esc(names[0]) + "</strong>"
@@ -1228,9 +1302,10 @@ window.JD = window.JD || {};
 				: extra + " " + (extra === 1 ? "item" : "items") + " pending";
 		var cls = f.severity === "warn" ? "warning-banner" : "callout";
 		return (
-			'<div class="' + cls + '"><span>Wiki is behind ' + repo + " — " + esc(String(label)) +
-			". Rebuilding uses your LLM.</span> " +
-			'<button type="button" class="cta sm" data-wiki-rebuild="1">Rebuild wiki</button></div>'
+			'<div class="' + cls + '"><span>Wiki &amp; graph are behind ' + repo + " — " + esc(String(label)) +
+			".</span> " +
+			'<button type="button" class="cta sm" data-wiki-rebuild="1">Update</button>' +
+			'<button type="button" class="wiki-dismiss" data-wiki-dismiss="1" aria-label="Dismiss" title="Dismiss">×</button></div>'
 		);
 	}
 
@@ -1263,11 +1338,20 @@ window.JD = window.JD || {};
 	}
 
 	function wireWikiRebuild(container) {
+		// The × (present only on a behind banner, never on the in-flight/error state).
+		// Snapshot the freshness shown at dismiss time so re-show can compare against it.
+		var dismissBtn = container.querySelector("[data-wiki-dismiss]");
+		if (dismissBtn) {
+			dismissBtn.onclick = function () {
+				wikiDismissWrite(lastWikiFreshness);
+				container.innerHTML = ""; // collapses via `.wiki-freshness:empty`
+			};
+		}
 		var btn = container.querySelector("[data-wiki-rebuild]");
 		if (!btn) return;
 		btn.onclick = function () {
 			btn.disabled = true;
-			btn.textContent = "Rebuilding…";
+			btn.textContent = "Updating…";
 			JD.post("/api/wiki/rebuild", {})
 				.then(function () {
 					pollWikiUntilDone(container, WIKI_POLL_MAX);
@@ -1281,7 +1365,7 @@ window.JD = window.JD || {};
 					// Any other failure: surface it BUT keep a wired retry button — these
 					// pages have no auto-refresh poll, so a buttonless error callout would
 					// leave the feature dead until a full reload.
-					container.innerHTML = '<div class="callout err"><span>Could not start the rebuild: ' +
+					container.innerHTML = '<div class="callout err"><span>Could not start the update: ' +
 						JD.esc(String((e && e.message) || "error")) + "</span> " +
 						'<button type="button" class="cta sm" data-wiki-rebuild="1">Retry</button></div>';
 					wireWikiRebuild(container);

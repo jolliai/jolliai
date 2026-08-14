@@ -6844,4 +6844,118 @@ describe("SidebarWebviewProvider.pushWikiFreshness", () => {
 		await p.pushWikiFreshness();
 		expect(freshnessMessages(view)).toEqual([]);
 	});
+
+	describe("banner dismiss (× → wiki:dismiss) gating", () => {
+		type F = {
+			severity: "never" | "fresh" | "info" | "warn";
+			behindRepoNames: ReadonlyArray<string>;
+			summary: number;
+			total: number;
+			lastRebuiltAt: string | null;
+		} | null;
+		const behind = (over: Partial<NonNullable<F>> = {}): NonNullable<F> => ({
+			severity: "info",
+			behindRepoNames: ["acme"],
+			summary: 2,
+			total: 3,
+			lastRebuiltAt: null,
+			...over,
+		});
+		function setup(): { view: MockWebviewView; p: SidebarWebviewProvider; setFreshness: (f: F) => void } {
+			const view = makeMockView();
+			let current: F = behind();
+			const gwf = vi.fn(() => Promise.resolve(current));
+			const p = providerWith(gwf);
+			p.resolveWebviewView(view as unknown as never);
+			return { view, p, setFreshness: (f) => { current = f; } };
+		}
+		function lastFreshness(view: MockWebviewView): F | undefined {
+			const msgs = freshnessMessages(view);
+			const last = msgs[msgs.length - 1];
+			return last ? (last as { freshness: F }).freshness : undefined;
+		}
+
+		// The full snapshot the × click sends, matching `behind()`'s defaults.
+		const dismiss = { type: "wiki:dismiss" as const, total: 3, summary: 2, severity: "info" as const, repos: ["acme"] };
+
+		it("hides the banner while dismissed and nothing has escalated", async () => {
+			const { view, p } = setup();
+			p.handleOutbound(dismiss);
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toBeNull();
+		});
+
+		it("re-shows when the backlog grows (total up)", async () => {
+			const { view, p, setFreshness } = setup();
+			p.handleOutbound(dismiss);
+			setFreshness(behind({ total: 5 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ total: 5 }));
+			// dismissal was cleared, so the same state keeps showing afterwards
+			setFreshness(behind({ total: 5 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ total: 5 }));
+		});
+
+		it("re-shows when the headline summary count grows even if total is flat", async () => {
+			const { view, p, setFreshness } = setup();
+			// Dismiss at total=10, summary=3 (7 non-summary pending).
+			p.handleOutbound({ type: "wiki:dismiss", total: 10, summary: 3, severity: "info", repos: ["acme"] });
+			// Non-summary items drain, new memories arrive: total flat at 10, summary 3→8.
+			setFreshness(behind({ total: 10, summary: 8 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ total: 10, summary: 8 }));
+		});
+
+		it("re-shows when a repo the dismissal never saw falls behind", async () => {
+			const { view, p, setFreshness } = setup();
+			p.handleOutbound(dismiss); // repos: ["acme"]
+			// A partial hand-off: totals/severity unchanged, but a new repo is behind.
+			setFreshness(behind({ behindRepoNames: ["acme", "beta"] }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ behindRepoNames: ["acme", "beta"] }));
+		});
+
+		it("re-shows when severity escalates even if the count did not grow", async () => {
+			const { view, p, setFreshness } = setup();
+			p.handleOutbound(dismiss);
+			setFreshness(behind({ severity: "warn", total: 3 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ severity: "warn", total: 3 }));
+		});
+
+		it("forgets the dismissal once caught up (fresh), so the next behind episode shows", async () => {
+			const { view, p, setFreshness } = setup();
+			p.handleOutbound(dismiss);
+			setFreshness({ severity: "fresh", behindRepoNames: [], summary: 0, total: 0, lastRebuiltAt: null });
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual({ severity: "fresh", behindRepoNames: [], summary: 0, total: 0, lastRebuiltAt: null });
+			// A brand-new behind episode (smaller than the old dismiss total) still shows.
+			setFreshness(behind({ total: 1, summary: 1 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toEqual(behind({ total: 1, summary: 1 }));
+		});
+
+		it("keeps hidden but does NOT forget the dismissal on a probe failure (null)", async () => {
+			const { view, p, setFreshness } = setup();
+			p.handleOutbound(dismiss);
+			setFreshness(null);
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toBeNull();
+			// A later non-escalated behind is still suppressed — the null didn't clear it.
+			setFreshness(behind({ total: 2, summary: 1 }));
+			view.webview.postMessage.mockClear();
+			await p.pushWikiFreshness();
+			expect(lastFreshness(view)).toBeNull();
+		});
+	});
 });

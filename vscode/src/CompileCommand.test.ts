@@ -96,7 +96,7 @@ describe("registerCompileCommand", () => {
 
 		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("AI provider"));
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
-		// Resets the kb-tab banner's optimistic "Rebuilding…" button — nothing ran.
+		// Resets the kb-tab banner's optimistic "Updating…" button — nothing ran.
 		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
 	});
 
@@ -110,7 +110,7 @@ describe("registerCompileCommand", () => {
 		expect(mockCompileAllRepos).toHaveBeenCalled();
 		expect(opts.sidebarProvider.refreshKnowledgeBaseFolders).toHaveBeenCalled();
 		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
-		// Banner "Rebuilding…" state driven across the whole sweep: on at start, off at end.
+		// Banner "Updating…" state driven across the whole sweep: on at start, off at end.
 		expect(opts.sidebarProvider.setWikiRebuilding).toHaveBeenCalledWith(true);
 		expect(opts.sidebarProvider.setWikiRebuilding).toHaveBeenCalledWith(false);
 	});
@@ -136,7 +136,7 @@ describe("registerCompileCommand", () => {
 
 		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("Memory Bank folder"));
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
-		// Resets the banner's optimistic "Rebuilding…" button — nothing ran.
+		// Resets the banner's optimistic "Updating…" button — nothing ran.
 		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
 	});
 

@@ -1000,6 +1000,13 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	// polls it to completion. (The old per-repo detached-worker rebuild needed the
 	// real lock/queue state; a folder sweep in-process does not.)
 	let wikiRebuildInFlight = false;
+	// A per-server-process identity handed to the browser with every freshness
+	// response. The page stores a banner "dismiss" in localStorage keyed by this
+	// value, so restarting the dashboard (a new process → a new nonce) makes a
+	// dismissed banner reappear — the web analog of "restart the server to see it
+	// again". It only needs to differ across restarts, so process start time is
+	// enough; it is captured once here (server-creation) and never changes.
+	const wikiBannerNonce = String(Date.now());
 	const buildModel =
 		options.buildModel ??
 		((request: ModelRequest) =>
@@ -1455,7 +1462,12 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 					return;
 				}
 				const freshness = await getAggregateWikiFreshness(config.localFolder, config);
-				sendJson(res, 200, { available: true, inFlight: wikiRebuildInFlight, ...freshness });
+				sendJson(res, 200, {
+					available: true,
+					inFlight: wikiRebuildInFlight,
+					nonce: wikiBannerNonce,
+					...freshness,
+				});
 			} catch (err) {
 				log.warn("wiki freshness failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not compute wiki freshness" });

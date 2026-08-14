@@ -376,6 +376,23 @@ export function buildSidebarCss(): string {
     opacity: 0.6;
     cursor: default;
   }
+  .kb-wiki-banner-dismiss {
+    flex: none;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+    opacity: 0.6;
+    font-size: 16px;
+    line-height: 1;
+    padding: 0 2px;
+  }
+  .kb-wiki-banner-dismiss:hover { opacity: 1; }
+  .kb-wiki-banner-dismiss:focus-visible {
+    opacity: 1;
+    outline: 1px solid var(--vscode-focusBorder);
+    outline-offset: 1px;
+  }
   .iconbtn {
     width: 24px;
     height: 22px;
