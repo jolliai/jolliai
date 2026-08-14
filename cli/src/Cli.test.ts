@@ -73,6 +73,9 @@ describe("serveMcpInProcess (the fast path's fallback)", () => {
 			bootstrapTelemetry: vi.fn(async () => void order.push("bootstrap")),
 			flushTelemetryNow: vi.fn(async () => {}),
 			maybeShowCliTelemetryNotice: vi.fn(async () => {}),
+			// The exit flush reads this off the module handle, so the mock has to
+			// carry it: an ESM namespace throws on an export the factory omitted.
+			BOUNDED_FLUSH_BUDGET_MS: 2_000,
 		}));
 		vi.doMock("./mcp/McpServer.js", () => ({
 			startMcpServer: vi.fn(async () => void order.push("serve")),
@@ -95,6 +98,7 @@ describe("serveMcpInProcess (the fast path's fallback)", () => {
 			}),
 			flushTelemetryNow: vi.fn(async () => {}),
 			maybeShowCliTelemetryNotice: vi.fn(async () => {}),
+			BOUNDED_FLUSH_BUDGET_MS: 2_000,
 		}));
 		const startMcpServer = vi.fn(async () => {});
 		vi.doMock("./mcp/McpServer.js", () => ({ startMcpServer }));

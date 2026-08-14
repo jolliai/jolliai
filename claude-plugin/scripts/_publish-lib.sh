@@ -416,6 +416,24 @@ publish_git_repo() {
 		last_version="${last_msg#"$release_subject"}"
 		if [ -z "$last_msg" ]; then
 			echo "==> No previous release commit on the target — version guard has no baseline."
+		elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] && [ "$last_version" = "$last_msg" ]; then
+			# `--grep` matches the whole MESSAGE and its `^` anchors per LINE, so a commit
+			# whose BODY carries a release-looking line is selected while its SUBJECT is
+			# something else — the prefix then does not strip and `last_version` is not a
+			# version at all. Fail CLOSED rather than treating it as "no baseline": the
+			# real last release may be further back in history, so an unparseable
+			# candidate is not evidence that this version is higher than it. (Reaching
+			# `publish_version_gt` with the garbage also stops the publish, since a
+			# non-semver answers "not greater" — but it does so while printing that
+			# subject as though it were the last published version.)
+			echo "error: a commit matching the release pattern has a non-release subject:" >&2
+			echo "         ${last_msg}" >&2
+			echo "       Cannot establish a version baseline, so the downgrade guard cannot run." >&2
+			echo "       Re-run with JOLLI_PUBLISH_FORCE=1 if this is intentional." >&2
+			git reset -q --hard HEAD
+			git -c core.excludesFile=/dev/null clean -fdq
+			echo "       (The synced changes were reverted — the checkout is back at HEAD.)" >&2
+			return 1
 		elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
 			! publish_version_gt "$version" "$last_version"; then
 			# `publish_sync` already ran `rsync --delete` + `git add -A`, so the checkout is

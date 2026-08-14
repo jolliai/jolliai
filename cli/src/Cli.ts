@@ -114,12 +114,20 @@ export function isDetachedDaemonInvocation(argv: ReadonlyArray<string>): boolean
  * reads while marking itself shown forever. It stays owed to the next ordinary
  * `jolli` invocation.
  *
- * Priming is best-effort: telemetry must never cost a session its MCP server.
+ * Priming is best-effort: telemetry must never cost a session its MCP server. That
+ * is why the module IMPORT is inside the guard too, and why the flush is reached
+ * through a nullable module handle: an import that fails outside it would reject
+ * before `startMcpServer` is ever called, which is the one outcome this whole
+ * function is not allowed to produce. With the handle null, the session simply
+ * runs untelemetered — the pre-existing behaviour this priming replaced.
  */
 export async function serveMcpInProcess(dir: string): Promise<void> {
-	const { bootstrapTelemetry, flushTelemetryNow } = await import("./core/TelemetryStartup.js");
+	// Held across the try so the `finally` can still flush what the session
+	// buffered; null only when the module itself could not be loaded.
+	let telemetry: typeof import("./core/TelemetryStartup.js") | null = null;
 	try {
-		await bootstrapTelemetry({ cwd: dir });
+		telemetry = await import("./core/TelemetryStartup.js");
+		await telemetry.bootstrapTelemetry({ cwd: dir });
 	} catch (error: unknown) {
 		// stderr, never stdout — stdout is this session's JSON-RPC stream.
 		console.error("telemetry unavailable for this MCP session:", error);
@@ -129,8 +137,25 @@ export async function serveMcpInProcess(dir: string): Promise<void> {
 		await startMcpServer(dir);
 	} finally {
 		// The session is over, so this is the only chance to upload what it buffered.
-		// Bounded and best-effort, like the command path's exit flush.
-		await flushTelemetryNow(dir, { timeoutMs: 2_000 });
+		// Both bounds come from the shared budget, not a local literal: `timeoutMs`
+		// caps one POST, and a session that filled its buffer flushes as SEVERAL
+		// sequential POSTs — so without `deadlineMs` this `finally` could hold up
+		// process exit for a multiple of the budget.
+		//
+		// Wrapped because a `finally` that throws REPLACES the exception the server
+		// was reporting. `flushTelemetryNow` swallows its own failures, so what is
+		// left is the namespace read above it — which would throw if that export were
+		// ever renamed, turning a real MCP fault into a telemetry stack trace.
+		try {
+			if (telemetry !== null) {
+				await telemetry.flushTelemetryNow(dir, {
+					timeoutMs: telemetry.BOUNDED_FLUSH_BUDGET_MS,
+					deadlineMs: telemetry.BOUNDED_FLUSH_BUDGET_MS,
+				});
+			}
+		} catch (error: unknown) {
+			console.error("telemetry flush failed for this MCP session:", error);
+		}
 	}
 }
 

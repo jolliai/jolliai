@@ -5761,12 +5761,12 @@ export function buildSidebarScript(): string {
     }
     var footerDashboard = e.target.closest('.cmd-btn[data-action="footer-dashboard"]');
     if (footerDashboard) {
-      // Starts the local dashboard and opens the browser. NOTE: no backticks in
-      // this comment -- the whole script is a template literal, so one would end
-      // it. The jolli dashboard command is a foreground command now, so the host
-      // runs it as a child process it owns rather than calling into the CLI
-      // in-process, and there is no reuse of an existing server -- see
-      // services/DashboardLauncher.ts.
+      // Runs the dashboard command in an integrated terminal, which starts the
+      // local server and opens the browser itself -- so its output, including
+      // the history import that runs after the page is up, is visible. NOTE: no
+      // backticks in this comment -- the whole script is a template literal, so
+      // one would end it. See services/DashboardLauncher.ts for which CLI entry
+      // gets invoked.
       vscode.postMessage({ type: 'command', command: 'jollimemory.openDashboard' });
       e.stopPropagation(); return;
     }

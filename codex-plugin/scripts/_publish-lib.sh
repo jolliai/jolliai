@@ -426,6 +426,29 @@ publish_git_repo() {
 				# No release commit on the target: a first publish has no baseline to be
 				# higher than. Said out loud, because "guard skipped" must never be silent.
 				echo "==> No previous release commit on the target — version guard has no baseline."
+			elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] && [ "$last_version" = "$last_msg" ]; then
+				# `--grep` matches the whole MESSAGE and its `^` anchors per LINE, so a
+				# commit whose BODY carries a release-looking line is selected while its
+				# SUBJECT is something else — the prefix then does not strip and
+				# `last_version` is not a version at all. Fail CLOSED rather than treating
+				# it as "no baseline": the real last release may be further back in
+				# history, so an unparseable candidate is not evidence that this version is
+				# higher than it. (Reaching `publish_version_gt` with the garbage also
+				# stops the publish, since a non-semver answers "not greater" — but it does
+				# so while printing that subject as though it were the last version.)
+				echo "error: a commit matching the release pattern has a non-release subject:" >&2
+				echo "         ${last_msg}" >&2
+				echo "       Cannot establish a version baseline, so the guard cannot run." >&2
+				echo "       Re-run with JOLLI_PUBLISH_FORCE=1 if this is intentional." >&2
+				# Same state the version-guard branch below leaves behind, so say the same
+				# thing: the mirror ran BEFORE this guard, so the destination now holds this
+				# build uncommitted. Left in place rather than auto-reverted (it may hold
+				# deliberate local edits, and the safe-dest guard cannot tell those from
+				# mirror output) — but silence here makes the next run's diff read as a real
+				# change.
+				echo "note: '${dest}' already holds this build, uncommitted. Discard it with:" >&2
+				echo "        git -C '${dest}' checkout . && git -C '${dest}' clean -fd" >&2
+				exit 1
 			elif [ "${JOLLI_PUBLISH_FORCE:-0}" != "1" ] &&
 				! publish_version_gt "$version" "$last_version"; then
 				echo "error: content changed but plugin version ${version} is not higher than" >&2

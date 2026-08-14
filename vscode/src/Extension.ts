@@ -125,7 +125,7 @@ import { StatusTreeProvider } from "./providers/StatusTreeProvider.js";
 import { ActiveSessionsProvider } from "./services/ActiveSessionsProvider.js";
 import { AuthService } from "./services/AuthService.js";
 import { readBackfillDismissFlag, writeBackfillDismissFlag } from "./services/BackfillDismissFlag.js";
-import { launchDashboard, stopDashboard } from "./services/DashboardLauncher.js";
+import { launchDashboard } from "./services/DashboardLauncher.js";
 import { KbFoldersService } from "./services/KbFoldersService.js";
 import {
 	readManualDisableFlag,
@@ -4250,27 +4250,24 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
-		// Dashboard — the branch footer button. Everything about starting the
-		// server lives in the CLI's `jolli dashboard`, which DashboardLauncher runs
-		// as a child process — it is a foreground command now, so it cannot be
-		// called in-process here without never returning. The launcher supplies the
-		// editor-shaped plugs (output channel, Electron-as-node spawn, host URL
-		// opener), the remote-window gate, and the child's lifetime.
+		// Dashboard — the branch footer button. Runs `jolli dashboard` in an
+		// integrated terminal rather than in this process, so the command's own
+		// output (including the history import, which runs after the page is up and
+		// can take minutes) is in front of the user. DashboardLauncher decides only
+		// which CLI entry to invoke, and keeps the remote-window gate.
+		//
+		// No stop command rides beside this one: the command is a FOREGROUND server
+		// and the terminal is what owns it, so Ctrl+C is the stop — the thing an
+		// extension-owned child process had to reinvent.
 		vscode.commands.registerCommand("jollimemory.openDashboard", () => {
 			log.info("cmd", "openDashboard invoked");
-			// Not awaited: launchDashboard resolves when the startup phase settles
-			// and reports its own failures, so there is nothing here to wait for.
+			// Not awaited: launchDashboard resolves once the line has been sent to
+			// the terminal and reports its own failures, so there is nothing to wait
+			// for here.
 			void launchDashboard({
 				cwd: workspaceRoot,
 				distDir: join(context.extensionPath, "dist"),
 			});
-		}),
-
-		// The Ctrl+C a button has no way to offer. `deactivate` calls the same
-		// function, so closing the window is the other way to stop it.
-		vscode.commands.registerCommand("jollimemory.stopDashboard", () => {
-			log.info("cmd", "stopDashboard invoked");
-			stopDashboard();
 		}),
 
 		// Settings — accessible via the gear icon in the STATUS panel title bar.
@@ -4805,12 +4802,11 @@ export function activate(context: vscode.ExtensionContext): void {
 
 export function deactivate(): void {
 	log.info("deactivate", "Jolli Memory extension deactivating");
-	// `jolli dashboard` is a foreground server running as OUR child, so this
-	// window owns its lifetime the way a terminal would. Skipping this would
-	// leave a listener nobody can see, reach or stop — the background process the
-	// command was rewritten to stop being. Before `log.dispose()`, so the stop is
-	// still recorded in the channel.
-	stopDashboard();
+	// Nothing to stop here: `jolli dashboard` runs in an integrated terminal, not
+	// as a child of this process, so the window closing takes its terminals — and
+	// therefore the server — with it. That is also what makes the running server
+	// reachable while the window is open, which is the whole reason it is not ours
+	// to own.
 	log.dispose();
 	// VSCode disposes context.subscriptions automatically
 }
