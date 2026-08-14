@@ -48,7 +48,7 @@ import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import * as installer from "../install/Installer.js";
 import { withDashboardDb } from "./DashboardDb.js";
-import type { DashboardModel, DashboardScope, DashboardView } from "./DashboardModel.js";
+import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
 	assembleDashboardHtml,
 	clearDashboardState,
@@ -1454,6 +1454,70 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((await get(port, "/api/tool-usage?list=server&offset=abc")).status).toBe(400);
 		// Absent means the first page, which is the one case a default is right.
 		expect((await get(port, "/api/tool-usage?list=skill")).status).toBe(200);
+	});
+
+	// The poll path's shape: re-reading a list the reader has already expanded takes
+	// as many rows as are on screen, which is a number only the client knows.
+	it("serves a caller-supplied tool-usage limit, clamped, and rejects one it cannot read", async () => {
+		const dbPath = join(dir, "tool-usage-limit.db");
+		const configDir = join(dir, "config-tool-limit");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "s1",
+						updatedAtMs: Date.now() - 3_600_000,
+						tools: Array.from({ length: 12 }, (_, i) => ({
+							name: `srv${String(i).padStart(2, "0")}.run`,
+							kind: "mcp" as const,
+							server: `srv${String(i).padStart(2, "0")}`,
+							calls: 12 - i,
+						})),
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		// Absent is still one page — the shape a Show more click asks for.
+		const onePage = await get(port, "/api/tool-usage?list=server");
+		expect(((await onePage.json()) as { rows: unknown[] }).rows).toHaveLength(TOOL_ROWS_LIMIT);
+
+		// A wider one answers the poll's question: all 12 rows in one read, so the
+		// client can compare them against the 12 it is displaying.
+		const wide = await get(port, "/api/tool-usage?list=server&limit=12");
+		expect(((await wide.json()) as { rows: unknown[] }).rows).toHaveLength(12);
+
+		// Clamped, not rejected: past the cap the client receives fewer rows than it
+		// asked for, reads that as "the card changed", and collapses to the first page.
+		// Turning an unbounded read into a 400 instead would break that degradation.
+		const past = await get(port, "/api/tool-usage?list=server&limit=1000000");
+		expect(past.status).toBe(200);
+		expect(((await past.json()) as { rows: unknown[] }).rows).toHaveLength(12);
+
+		// Floored to at least one row rather than answering an empty page.
+		const zero = await get(port, "/api/tool-usage?list=server&limit=0");
+		expect(((await zero.json()) as { rows: unknown[] }).rows).toHaveLength(1);
+
+		// Same rule as `offset`: a value this route cannot read is the caller's bug,
+		// and silently answering a different question is what hides it.
+		expect((await get(port, "/api/tool-usage?list=server&limit=abc")).status).toBe(400);
 	});
 
 	// The Context dialog's fetch. A read like every other GET here — no token —

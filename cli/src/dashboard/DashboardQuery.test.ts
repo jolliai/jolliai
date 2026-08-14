@@ -1503,6 +1503,39 @@ describe("buildDashboardModel — tool usage", () => {
 		expect(page.rows).toHaveLength(1);
 	});
 
+	it("floors a fractional or negative limit onto a whole page of at least one row", async () => {
+		await applySummaryEvents(manySkillEvents(), { producerKind: "cli", dbPath });
+		const width = async (limit: number) =>
+			(
+				await withDashboardDb(
+					(db) =>
+						buildToolUsagePage(db, {
+							scope: { kind: "all" },
+							list: "skill",
+							offset: 0,
+							limit,
+							timeZone: "UTC",
+							nowMs,
+						}),
+					{ dbPath },
+				)
+			).rows.length;
+		// Same rule as `offset` one test up, and for the same reason: a width is a row
+		// count, so a bad one has a nearest sane answer. The route already truncates
+		// and clamps every HTTP-borne limit, so this is about the OTHER caller of an
+		// exported function — nothing today, which is exactly when the guard is free.
+		expect(await width(2.7)).toBe(2);
+		expect(await width(-5)).toBe(1);
+		// The two values a falsy `|| TOOL_ROWS_LIMIT` cannot tell from NaN, and so the
+		// two this test has to name: both floor below one row, and one row is the answer
+		// the route already gives them. Getting the default 8 here instead is the shape
+		// of the bug, because 8 is a plausible page rather than a visible mistake.
+		expect(await width(0)).toBe(1);
+		expect(await width(0.5)).toBe(1);
+		// Absent — and only absent — means one page, the size a Show more click asks for.
+		expect(await width(Number.NaN)).toBe(TOOL_ROWS_LIMIT);
+	});
+
 	it("honours the page's repo scope and window, so an appended page matches the card", async () => {
 		await applySummaryEvents(
 			[

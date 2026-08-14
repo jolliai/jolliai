@@ -118,6 +118,7 @@ import {
 	type DashboardScope,
 	type DashboardView,
 	type SeriesDimension,
+	TOOL_ROWS_LIMIT,
 	type ToolUsageList,
 } from "./DashboardModel.js";
 import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
@@ -992,6 +993,29 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 const TOOL_USAGE_LISTS: ReadonlyArray<ToolUsageList> = ["skill", "server", "tool"];
 
 /**
+ * Widest `?limit=` this route will serve — 25 pages of {@link TOOL_ROWS_LIMIT}.
+ *
+ * The limit used to be ours alone, because the only caller was a "Show more"
+ * click and one click means one page. The 30 s poll needs the other shape: to
+ * decide whether a list the reader has already expanded still looks the same, it
+ * has to re-read exactly as many rows as are on screen, which is a number only
+ * the client knows (see `carryForwardToolLists` in `assets/js/stats.js`).
+ *
+ * Clamped rather than rejected, so a caller asking past the cap still gets a
+ * readable page. On the poll path that degrades in the safe direction: a client
+ * holding more rows than the cap receives fewer than it asked for, reads that as
+ * "the card changed", and collapses back to the first page — the pre-existing
+ * behaviour — rather than trusting rows it could not verify. It takes 25 clicks
+ * on one list to get there.
+ *
+ * A cap at all because this is an unauthenticated-shaped GET on a local server:
+ * without one, `?limit=1e9` turns a card's paging endpoint into an unbounded
+ * whole-table read, and the SQL behind it groups and folds per-agent shares for
+ * every row it returns.
+ */
+const TOOL_USAGE_MAX_LIMIT = TOOL_ROWS_LIMIT * 25;
+
+/**
  * Creates (but does not start) the server. Exported separately from
  * {@link startDashboardServer} so tests can drive it on port 0 with an
  * injected model builder and no real database.
@@ -1309,9 +1333,12 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		// rendered under would append rows counted from a different set. The client
 		// sends them from the same `JD.query` builder every other fetch uses.
 		//
-		// `limit` is deliberately NOT a parameter. The page size is the height the
-		// card is laid out for, so it is ours to pick; accepting one would let a
-		// browser-reachable route ask for an unbounded scan.
+		// `limit` IS a parameter, and used to deliberately not be — the page size was
+		// the height the card is laid out for, so it was ours to pick. The 30 s poll
+		// added the other caller: re-reading an already-expanded list to compare it
+		// against what is on screen needs a width only the client knows. The reason
+		// it was refused survives as the CLAMP rather than as the absence of the
+		// parameter — see TOOL_USAGE_MAX_LIMIT for why clamped and not rejected.
 		if (url.pathname === "/api/tool-usage") {
 			const requested = url.searchParams.get("list") ?? "";
 			const list = TOOL_USAGE_LISTS.find((known) => known === requested);
@@ -1330,6 +1357,21 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				sendJson(res, 400, { error: "offset must be a number" });
 				return;
 			}
+			// Absent means "one page", the shape a Show more click asks for. A
+			// non-numeric one is a 400 for the same reason `offset` is: the caller
+			// asked a question this route cannot answer, and silently answering a
+			// different one is what makes a client-side bug invisible. In range it is
+			// clamped, never rejected — see TOOL_USAGE_MAX_LIMIT.
+			const rawLimit = url.searchParams.get("limit");
+			let limit: number | undefined;
+			if (rawLimit !== null) {
+				const parsed = Number(rawLimit);
+				if (!Number.isFinite(parsed)) {
+					sendJson(res, 400, { error: "limit must be a number" });
+					return;
+				}
+				limit = Math.min(Math.max(1, Math.trunc(parsed)), TOOL_USAGE_MAX_LIMIT);
+			}
 			// Spelled out rather than spread from `parseWindow`: that helper also
 			// carries the series axis and the Memories view's `hash`/`detailRepo`,
 			// none of which this route has any business receiving.
@@ -1341,6 +1383,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 							scope: parseScope(url),
 							list,
 							offset,
+							...(limit !== undefined ? { limit } : {}),
 							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
 							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
 							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),

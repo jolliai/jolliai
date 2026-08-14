@@ -930,6 +930,31 @@ window.JD = window.JD || {};
 			},
 		);
 
+	/**
+	 * Seam for state a view holds ON the model rather than beside it, so a refresh
+	 * does not silently throw it away.
+	 *
+	 * Pushed to by a page module (Stats, for its expanded Skills / MCPs lists) and
+	 * empty everywhere else. Each hook is called with the incoming payload and the
+	 * outgoing one, BEFORE the swap and the repaint — carrying something forward has
+	 * to happen while both models are in hand and before the reader sees the new one,
+	 * or the card visibly resets and then un-resets. Every page module loads on every
+	 * view, so a hook's own `fresh.view` test is what scopes it.
+	 *
+	 * A hook may return a function, which runs AFTER the fresh model is adopted and
+	 * rendered. That is where asynchronous follow-up belongs: anything checking
+	 * whether the carried-over state is still correct has to run against a model
+	 * that is already `window.__JOLLI_DASHBOARD__`, because that identity is how
+	 * every in-flight response on this page recognises it has been superseded.
+	 *
+	 * A LIST rather than one slot, even though Stats is the only registrant today: a
+	 * second module assigning a single slot would silently displace the first, and
+	 * each hook's `view` guard makes both look correctly inert. Defensive `||` for
+	 * the same reason `window.JD` has one — it removes the load-order dependency
+	 * rather than relying on shell.js being evaluated first.
+	 */
+	JD.carryForwardHooks = JD.carryForwardHooks || [];
+
 	/* One model re-fetch (same params the page was rendered with).
 
 	   Carries the token like JD.getJson does, even though /api/model answers
@@ -956,8 +981,37 @@ window.JD = window.JD || {};
 					window.location.reload();
 					return;
 				}
+				/* Guarded per hook because this runs BEFORE the swap, and the catch below
+				   repaints the CURRENT model: an unguarded throw would leave
+				   `window.__JOLLI_DASHBOARD__` on the outgoing payload and repaint it, so
+				   the page would sit one poll behind for good — every later tick failing
+				   the same way. Carrying state forward is an optimisation over "repaint
+				   from the fresh model", so dropping it is the pre-existing behaviour and
+				   the right thing to degrade to.
+
+				   And REPORTED, or that degradation is indistinguishable from the feature
+				   never having been built: it would fail every 30 s, forever, with the page
+				   looking exactly as it did before any of this existed. This is a
+				   localhost developer dashboard, so the console is where a maintainer with
+				   devtools open will actually see it. */
+				var afterAdopt = [];
+				JD.carryForwardHooks.forEach((hook) => {
+					try {
+						var after = hook(fresh, model);
+						if (after) afterAdopt.push(after);
+					} catch (e) {
+						console.warn("jolli dashboard: a carry-forward hook threw; refreshing without it", e);
+					}
+				});
 				window.__JOLLI_DASHBOARD__ = fresh;
 				render(fresh);
+				afterAdopt.forEach((run) => {
+					try {
+						run();
+					} catch (e) {
+						console.warn("jolli dashboard: a carry-forward follow-up threw", e);
+					}
+				});
 			})
 			.catch(() => {
 				/* Transient — keep the last data, but still REPAINT it. Callers clear

@@ -482,10 +482,16 @@ window.JD = window.JD || {};
 	}
 
 	/* Page size for every ranked tool list — mirrors TOOL_ROWS_LIMIT in
-	   DashboardModel.ts. Used for the SCROLL CAP only: how many rows exist and
-	   whether another page can be fetched are the server's `*Total` counts, never
-	   this number, so the two going out of step costs a slightly wrong cap height
-	   and nothing else. */
+	   DashboardModel.ts. How many rows exist and whether another page can be fetched
+	   are still the server's `*Total` counts, never this number.
+
+	   It has TWO readers now, and only the first is cosmetic. The scroll cap measures
+	   this many rendered rows, so a drift there costs a slightly wrong cap height and
+	   nothing else. But `verifyToolList` also slices a collapsed list back to it —
+	   the width it claims is "exactly what a freshly opened card shows" — and that
+	   card's rows came from the server at TOOL_ROWS_LIMIT. Drift makes the two
+	   disagree: the collapse says "start again from the first page" while showing a
+	   different first page. Keep them equal. */
 	var TOOL_PAGE_SIZE = 8;
 
 	/* The three pageable ranked lists, and everything that differs between them:
@@ -495,18 +501,22 @@ window.JD = window.JD || {};
 	   otherwise each spell the same four decisions out, and only one of them would
 	   get fixed. */
 	var TOOL_LISTS = {
-		skill: { rows: "skills", total: "skillsTotal", key: (r) => r.name, noun: "skills" },
-		server: { rows: "servers", total: "serversTotal", key: (r) => r.server, noun: "servers" },
-		tool: { rows: "mcpTools", total: "mcpToolsTotal", key: (r) => r.name, noun: "tools" },
+		skill: { rows: "skills", total: "skillsTotal", key: (r) => r.name, noun: "skills", card: "skills" },
+		server: { rows: "servers", total: "serversTotal", key: (r) => r.server, noun: "servers", card: "mcps" },
+		tool: { rows: "mcpTools", total: "mcpToolsTotal", key: (r) => r.name, noun: "tools", card: "mcps" },
 	};
 
-	/* Per-list paging state — in flight, failed, and which row index a click just
-	   grew the list from.
+	/* Per-list paging state — in flight, failed, which row index a click just grew
+	   the list from, and where a carried-over list was scrolled to.
 
 	   Kept ON `toolUsage`, never on JD: the 30 s `/api/model` poll replaces that
-	   object with a fresh FIRST page, and the paging state has to reset with it. A
-	   module-level flag would survive the swap and either strand the new payload
-	   at page 1 or scroll it to a row index the new list does not have. */
+	   object, and every one of those facts is about the payload beside it. A
+	   module-level flag would survive the swap and either strand the new payload at
+	   page 1 or scroll it to a row index the new list does not have.
+
+	   What DOES survive a poll is decided per list, once, by
+	   `carryForwardToolLists` — which writes a deliberately minimal entry rather
+	   than moving this object across. */
 	function toolPaging(usage, list) {
 		usage.paging = usage.paging || {};
 		usage.paging[list] = usage.paging[list] || {};
@@ -582,13 +592,29 @@ window.JD = window.JD || {};
 			// The name truncates with an ellipsis (see .rl-name), so the full text
 			// has to survive somewhere the reader can get at it.
 			var label = labelOf(row);
+			/* `{ text, title }`, not a bare string: the meta slot folds a long agent
+			   list into `+N` and has to carry the full one somewhere reachable.
+
+			   Tested on `.text`, not on the object: `withAgents` returns one
+			   unconditionally, so a row with nothing to put in the slot would otherwise
+			   get an EMPTY `.rl-kind` — and an empty flex item is not free, it spends
+			   one of `.rl-top`'s 8px gaps and takes those pixels off the only thing
+			   that gives (the name, which truncates). A bare string was falsy here and
+			   so emitted no slot at all; this keeps that. */
+			var kind = kindOf ? kindOf(row) : null;
 			html +=
 				'<li><div class="rl-top"><span class="rl-name mono" title="' +
 				JD.esc(label) +
 				'">' +
 				JD.esc(label) +
 				"</span>" +
-				(kindOf ? '<span class="rl-kind">' + JD.esc(kindOf(row)) + "</span>" : "") +
+				(kind && kind.text
+					? '<span class="rl-kind"' +
+						(kind.title ? ' title="' + JD.esc(kind.title) + '"' : "") +
+						">" +
+						JD.esc(kind.text) +
+						"</span>"
+					: "") +
 				'<span class="rl-val num">' +
 				value +
 				" " +
@@ -611,31 +637,73 @@ window.JD = window.JD || {};
 
 	   Counts are deliberately left OFF the per-row tag: the row already prints
 	   its own total beside the name, and a second set of numbers at that size
-	   reads as noise. The split WITH volume lives on the card's header line. */
+	   reads as noise. This is now the ONLY per-agent signal on either card — the
+	   `by agent · 12 claude` header line that carried the same split with volume
+	   was removed, so nothing states a whole-window per-agent total any more. */
+	/**
+	 * How many agent names ride on a row before the rest fold into `+N`.
+	 *
+	 * `.rl-kind` is `flex: none` — it neither shrinks nor truncates, and only
+	 * `.rl-name` gives. So an unbounded list of names does not ellipsis, it pushes:
+	 * measured in a real browser with eight agents on one row, the tool NAME was
+	 * squeezed to 0px wide (gone, with no ellipsis to show for it) and the row still
+	 * overflowed its card, arming a horizontal scrollbar on both the list and the
+	 * page. Two names plus a count is a bounded width that leaves the name room.
+	 *
+	 * Not solved with `min-width: 0` + ellipsis on `.rl-kind` instead: that makes
+	 * the name and the agents compete for the same pixels, so a busy row loses both
+	 * halves at once — every truncating label on this page keeps exactly one thing
+	 * that gives, and here that is the name.
+	 */
+	var ROW_AGENT_LIMIT = 2;
+
 	function agentTag(agents) {
+		if (!agents || agents.length === 0) return "";
+		var names = agents.map((a) => a.source);
+		if (names.length <= ROW_AGENT_LIMIT) return names.join(" · ");
+		return names.slice(0, ROW_AGENT_LIMIT).join(" · ") + " +" + (names.length - ROW_AGENT_LIMIT);
+	}
+
+	/** Every agent on the row, for the `title` the folded tag hides them behind. */
+	function agentTagFull(agents) {
 		if (!agents || agents.length === 0) return "";
 		return agents.map((a) => a.source).join(" · ");
 	}
 
-	/* Append the agent tag to a row's existing meta slot without losing it —
-	   the MCP lists already spend that slot on tool/session counts. */
+	/* Append the agent tag to a row's existing meta slot without losing it — the MCP
+	   lists already spend that slot on tool/session counts.
+
+	   Returns the visible text AND the untruncated one, because `+3` is only honest
+	   if the three are reachable. `title` is left empty when nothing was folded, so
+	   a row with one agent does not carry a tooltip repeating what it already says.
+	   A native `title`, like `.rl-name`'s: same kind of information (the label you
+	   are already looking at, in full) and so the same affordance. */
 	function withAgents(metaOf) {
 		return (row) => {
-			var tag = agentTag(row.agents);
 			var meta = metaOf ? metaOf(row) : "";
-			return meta && tag ? meta + " · " + tag : meta || tag;
+			var join = (tag) => (meta && tag ? meta + " · " + tag : meta || tag);
+			var text = join(agentTag(row.agents));
+			var full = join(agentTagFull(row.agents));
+			return { text: text, title: full === text ? "" : full };
 		};
 	}
 
-	/* The card's per-agent header line: who produced everything below, with
-	   volume. Built from the server's own untruncated grouping (`skillAgents` /
-	   `mcpAgents`), never from the visible rows — those are cut to 8, so summing
-	   them would quietly under-report an agent whose tools all rank lower. */
-	function agentLine(agents) {
-		if (!agents || agents.length === 0) return "";
-		var parts = agents.map((a) => '<b class="num">' + a.calls + "</b> " + JD.esc(a.source));
-		return '<div class="sub" style="margin-top:2px">by agent · ' + parts.join(" · ") + "</div>";
-	}
+	/*
+	 * `agentLine` used to render the per-agent header line on both cards —
+	 * `by agent · 12 claude`, one `<b>calls</b> source` part per agent, from the
+	 * server's own untruncated `skillAgents` / `mcpAgents` grouping rather than
+	 * from the visible rows (those are cut to a page, so summing them
+	 * under-reports an agent whose tools all rank lower).
+	 *
+	 * Removed: it restated at card level what every row beneath it already names
+	 * through `agentTag`, and on a single-agent machine — the common case — it was
+	 * one line saying the same word as every row below it.
+	 *
+	 * `skillAgents` / `mcpAgents` are still in the payload and still computed by
+	 * `agentTotals` in DashboardQuery, so restoring the line is a render change
+	 * only. They now have NO reader on this page; the whole-window per-agent split
+	 * with volume is not stated anywhere.
+	 */
 
 	/* The "…so this list is not everything" caveat, shared by both cards.
 	   `uncoveredSources` is a PARSER capability the server computed, not "these
@@ -703,7 +771,6 @@ window.JD = window.JD || {};
 			(totalRuns === 1 ? " run · " : " runs · ") +
 			totalSkills +
 			(totalSkills === 1 ? " skill</div>" : " skills</div>");
-		html += agentLine(usage.skillAgents);
 
 		html += rankedList(
 			usage.skills,
@@ -828,7 +895,6 @@ window.JD = window.JD || {};
 			(totalServers === 1 ? " server · " : " servers · ") +
 			totalCalls +
 			(totalCalls === 1 ? " call</div>" : " calls</div>");
-		html += agentLine(usage.mcpAgents);
 
 		if (usage.recallCalls) {
 			html +=
@@ -928,6 +994,49 @@ window.JD = window.JD || {};
 	}
 
 	/**
+	 * Where each ranked list is scrolled to, read BEFORE a repaint replaces them.
+	 *
+	 * Every repaint on this page rewrites the whole of `#app`, so a grown list's
+	 * `<ul>` is destroyed and its replacement starts at row 1. That makes an
+	 * expanded list look collapsed rather than scrolled — the cap shows exactly one
+	 * page of rows, so row 1 at the top is indistinguishable from never having
+	 * clicked. And because a repaint is what EVERY control on the page ends in, one
+	 * card's Show more reset the reader's position in the other two: measured on a
+	 * real page, expanding MCPs to 11 rows, scrolling to 120, then clicking Skills'
+	 * Show more left MCPs' rows, cap and footer untouched with `scrollTop` back at 0.
+	 *
+	 * Snapshotting here, in the renderer, rather than at each control: the paging
+	 * state used to carry a per-list `restoreScroll` (since removed) that the 30 s
+	 * poll set on the one list it carried, and extending THAT would mean every
+	 * future caller of `renderPage` remembering to fill it in for the lists it is
+	 * NOT touching — forget one and the position is silently lost again. The poll
+	 * needs no special case now: `carryForwardHooks` run before the swap, so by the
+	 * time the repaint reads these offsets the old rows are still on screen.
+	 */
+	function snapshotToolScroll() {
+		var offsets = {};
+		Object.keys(TOOL_LISTS).forEach((list) => {
+			var el = document.querySelector('[data-toollist="' + list + '"]');
+			if (el && el.scrollTop) offsets[list] = el.scrollTop;
+		});
+		return offsets;
+	}
+
+	/* Puts every list back where the reader had it. Runs after `capToolLists`, which
+	   is what arms the scroll container: assigning `scrollTop` to a list with no
+	   `max-height` yet is silently a no-op — and so is assigning it to a list this
+	   repaint collapsed, which is what makes a collapse still land at row 1.
+
+	   Before `revealToolRows`, so the one list a click just grew wins: its reveal is
+	   a deliberate jump to the new rows, where this is only "do not move". */
+	function restoreToolScroll(offsets) {
+		Object.keys(offsets).forEach((list) => {
+			var el = document.querySelector('[data-toollist="' + list + '"]');
+			if (el) el.scrollTop = offsets[list];
+		});
+	}
+
+	/**
 	 * Fetches ONE more page of a ranked tool list and appends it.
 	 *
 	 * The paging is SQL-side (`/api/tool-usage` → `buildToolUsagePage`), so this
@@ -1005,6 +1114,249 @@ window.JD = window.JD || {};
 				state.error = true;
 				JD.renderPage(model);
 			});
+	}
+
+	/* Which renderer paints each pageable list. Both cards read
+	   `model.stats.toolUsage` and nothing else, which is what lets a comparison
+	   below run them against a stub model. */
+	var TOOL_CARDS = { skills: (usage) => skillsCard({ stats: { toolUsage: usage } }), mcps: mcpCardFor };
+
+	/* The MCPs card renders ONE of its two lists — whichever chip is pressed — so a
+	   comparison about `tool` while the reader is looking at `server` would compare
+	   HTML that does not contain the rows in question, and call every change
+	   invisible forever. The view is forced to the list being asked about and put
+	   straight back; nothing on screen is re-rendered in between. */
+	function mcpCardFor(usage, list) {
+		var previous = JD.mcpSplitView;
+		JD.mcpSplitView = list;
+		try {
+			return mcpCard({ stats: { toolUsage: usage } });
+		} finally {
+			JD.mcpSplitView = previous;
+		}
+	}
+
+	/**
+	 * One card's HTML, as the card that owns `list` would paint it.
+	 *
+	 * Rendering is the comparison: "has this card changed" is answered by the real
+	 * renderer rather than by a hand-kept list of the fields it prints, so a stat
+	 * line added to either card joins the check by existing. A field list would
+	 * have gone stale the first time someone added one, and it would have gone
+	 * stale SILENTLY — the failure is a card that stops noticing it is out of date.
+	 */
+	function toolCardHtml(usage, list) {
+		return TOOL_CARDS[TOOL_LISTS[list].card](usage, list);
+	}
+
+	/**
+	 * A `toolUsage` reduced to what a comparison should see: one payload's
+	 * aggregates, another's rows, and a paging state that is identical on both
+	 * sides.
+	 *
+	 * Normalising the paging is what keeps the check about DATA. `loading` and
+	 * `error` describe one request, not the card's contents, and `grown` is kept
+	 * because it is not decoration either: it is what holds the footer row in place
+	 * once a list has reached its end, and so part of the card's height.
+	 */
+	function comparableUsage(aggregatesFrom, rowsFrom) {
+		var merged = Object.assign({}, aggregatesFrom);
+		var paging = {};
+		Object.keys(TOOL_LISTS).forEach((list) => {
+			merged[TOOL_LISTS[list].rows] = rowsFrom[TOOL_LISTS[list].rows] || [];
+			paging[list] = { grown: !!((rowsFrom.paging || {})[list] || {}).grown };
+		});
+		merged.paging = paging;
+		return merged;
+	}
+
+	/**
+	 * Re-reads ONE expanded list at the width it is displayed at, and collapses it
+	 * back to the first page if anything about its card would now paint differently.
+	 *
+	 * Resolves `true` when it changed something (so the caller repaints once for all
+	 * three lists rather than up to three times).
+	 *
+	 * A failed read keeps the expanded rows and says nothing: the aggregates beside
+	 * them were already checked and matched, the next poll asks again 30 s later, and
+	 * a card that empties itself over a transient fetch failure is a worse answer
+	 * than one that is briefly a poll behind.
+	 */
+	function verifyToolList(model, list, width) {
+		var spec = TOOL_LISTS[list];
+		var usage = model.stats.toolUsage;
+		return JD.getJson(
+			JD.withParams("/api/tool-usage" + JD.query(model, {}), { list: list, offset: "0", limit: String(width) }),
+		)
+			.then((page) => {
+				/* Superseded — a later poll already replaced the model this answer was
+				   about. Same identity test, same reason, as `loadMoreToolRows`. */
+				if (window.__JOLLI_DASHBOARD__ !== model) return false;
+				/* A body that parsed but carries no total cannot be compared: the footer
+				   would read "of 0", so every field-for-field identical list would look
+				   changed. Unverifiable is the failed-read case, not the changed one. */
+				if (!page || typeof page.totalCount !== "number") return false;
+				var state = (usage.paging || {})[list] || {};
+				/* A Show more click overlapped this read, in either order, and both orders
+				   are only resolvable by waiting: its response rewrites these rows from the
+				   array it captured BEFORE the collapse (so collapsing now is undone a
+				   moment later), and if it has already landed, this read is narrower than
+				   what is on screen — which can only ever say "changed" and would throw
+				   away a click that just succeeded. The next poll asks again. */
+				if (state.loading) return false;
+				if ((usage[spec.rows] || []).length !== width) return false;
+				var rows = page.rows || [];
+				var candidate = Object.assign({}, usage);
+				candidate[spec.rows] = rows;
+				candidate[spec.total] = page.totalCount;
+				candidate.paging = usage.paging;
+				/* Wrapped separately from the read below, because the two failures are not
+				   the same answer wearing different clothes. A failed READ is expected and
+				   documented (keep the rows, say nothing); a renderer that THROWS is a bug,
+				   and letting it fall into that same silent `.catch` would spend this
+				   feature's whole lifetime looking like an offline blip. */
+				var cardChanged;
+				try {
+					var before = toolCardHtml(comparableUsage(usage, usage), list);
+					cardChanged = toolCardHtml(comparableUsage(candidate, candidate), list) !== before;
+				} catch (e) {
+					console.warn("jolli dashboard: could not compare the re-read " + list + " list", e);
+					return false;
+				}
+				if (!cardChanged) return false;
+				/* Changed — back to exactly the state a freshly opened card is in: the
+				   first page, no scroll cap, no sticky footer. The rows come from THIS
+				   response rather than from the poll's own first page, so the count in the
+				   footer and the rows above it are answers to the same question at the
+				   same moment.
+
+				   Collapsing is the asked-for behaviour, not a shortcut around
+				   re-expanding: a reader watching row 30 has no way to tell a re-fetched
+				   page 4 from the one they were already reading, whereas a card that
+				   visibly returns to 8 rows says "this changed, start again". */
+				usage[spec.rows] = rows.slice(0, TOOL_PAGE_SIZE);
+				usage[spec.total] = page.totalCount;
+				/* Reset rather than deleted, which is the same thing to `toolPaging` and
+				   one fewer shape for the rest of this module to consider. */
+				if (usage.paging) usage.paging[list] = {};
+				return true;
+			})
+			.catch(() => false);
+	}
+
+	/**
+	 * Keeps the Skills / MCPs lists a reader has expanded across the 30 s poll,
+	 * instead of silently dropping them back to 8 rows.
+	 *
+	 * The poll re-reads `/api/model`, whose tool lists are always the FIRST page —
+	 * so before this, three clicks' worth of rows lasted at most 30 s, and the card
+	 * shrank under whoever was reading it for no reason they could see.
+	 *
+	 * Two checks, in cost order, and a list has to pass both to stay expanded:
+	 *
+	 *   1. Everything on the card OTHER than its rows, compared synchronously. Both
+	 *      sides are handed the outgoing rows, which leaves the aggregates as the
+	 *      only thing that can differ. A change here needs no round trip to act on —
+	 *      the card is repainting whatever the rows say.
+	 *   2. The rows themselves, re-read at the width they are displayed at
+	 *      (`/api/tool-usage?limit=<rows on screen>`) and compared against them.
+	 *      This is the only asynchronous part, and it runs AFTER the fresh model is
+	 *      adopted, because that identity is how its response knows whether it is
+	 *      still relevant.
+	 *
+	 * The width is taken from `rows.length`, never from a click counter. They agree
+	 * until a page comes back holding a row already on screen (which the append
+	 * dedupes, see `loadMoreToolRows`), and from then on a counter asks for more
+	 * rows than are displayed — so every later comparison would be N fresh rows
+	 * against N-1 rendered ones, i.e. "changed" forever.
+	 *
+	 * Nothing is persisted: this is one browser tab's reading position. A reload or
+	 * a range/repo click is a full navigation, which is exactly the point where an
+	 * expansion should not follow the reader.
+	 *
+	 * COST, since only correctness is argued above: an expansion is a standing charge
+	 * for as long as the tab stays open, not a one-off. Every 30 s each expanded list
+	 * costs one `/api/tool-usage` read — up to three concurrent, each up to
+	 * `TOOL_USAGE_MAX_LIMIT` (200) rows, and that SQL folds per-agent shares for every
+	 * row it returns. Unmeasurable against a local database today, which is why the
+	 * cap is the thing holding it down rather than a fetch budget here; a reader who
+	 * clicks Show more is asking for it, and the collapse on any change is what stops
+	 * a stale expansion from being paid for indefinitely.
+	 */
+	function carryForwardToolLists(fresh, previous) {
+		/* Every page loads this module, so the hook has to be what knows it only
+		   applies to Stats. */
+		if (!fresh || fresh.view !== "stats") return null;
+		var freshUsage = fresh.stats && fresh.stats.toolUsage;
+		var prevUsage = previous && previous.stats && previous.stats.toolUsage;
+		if (!freshUsage || !prevUsage) return null;
+		var pending = [];
+		Object.keys(TOOL_LISTS).forEach((list) => {
+			var spec = TOOL_LISTS[list];
+			var prevRows = prevUsage[spec.rows] || [];
+			/* Never expanded: the fresh payload already carries this list's whole first
+			   page, so there is nothing to keep and nothing to ask about. */
+			if (prevRows.length <= TOOL_PAGE_SIZE) return;
+			/* Check 1: the card apart from its rows. Both sides are handed the outgoing
+			   rows, so the aggregates are the only thing left that can differ.
+
+			   Wrapped per list, and BEFORE the first write below, so a renderer that
+			   throws on one card costs that card its expansion and nothing else. The
+			   alternative is a half-carried payload: rows moved across with no entry in
+			   `pending`, so check 2 never runs and the list keeps rows nothing verified
+			   for as long as the tab stays open. Skipping is the pre-existing behaviour;
+			   the seam's own guard in shell.js is what stops a throw from stranding the
+			   whole poll on the outgoing model. */
+			var matches;
+			try {
+				var onScreen = toolCardHtml(comparableUsage(prevUsage, prevUsage), list);
+				matches = toolCardHtml(comparableUsage(freshUsage, prevUsage), list) === onScreen;
+			} catch (e) {
+				/* Reported, not just swallowed: a renderer that throws here degrades to the
+				   pre-existing collapse, which looks exactly like this feature not existing
+				   — so it would fail every 30 s forever with no signal anywhere. */
+				console.warn("jolli dashboard: could not compare the " + list + " card; not carrying it over", e);
+				return;
+			}
+			if (!matches) return;
+			var prevState = (prevUsage.paging || {})[list] || {};
+			freshUsage[spec.rows] = prevRows;
+			freshUsage.paging = freshUsage.paging || {};
+			/* Rebuilt, not moved: `loading` and `error` belong to a request that this
+			   swap has just orphaned (its own identity guard will drop the response), so
+			   carrying `loading` would leave the button disabled with nothing left to
+			   finish it, and carrying `error` would keep reporting a failure whose
+			   subject is gone. `revealFrom` is dropped for the same kind of reason — it
+			   describes one click's scroll, and re-applying it here would yank the reader
+			   to a row boundary on a repaint that changed nothing.
+
+			   No scroll offset either: `snapshotToolScroll` reads it off the live DOM at
+			   the top of every repaint, and this runs before the swap, so the rows the
+			   reader is looking at are still on screen when it does. */
+			freshUsage.paging[list] = { grown: !!prevState.grown };
+			pending.push(list);
+		});
+		if (pending.length === 0) return null;
+		/* Check 2, once the fresh model is the current one — see JD.carryForwardHooks. */
+		return () => {
+			var model = window.__JOLLI_DASHBOARD__;
+			if (model !== fresh) return;
+			var usage = model.stats.toolUsage;
+			var reads = pending.map((list) => verifyToolList(model, list, usage[TOOL_LISTS[list].rows].length));
+			Promise.all(reads).then((changed) => {
+				if (window.__JOLLI_DASHBOARD__ !== model) return;
+				/* One repaint for all three, and only if something actually moved.
+
+				   That repaint replaces every <ul>, including the lists that PASSED and are
+				   still showing the reader's rows — they keep their position because
+				   `renderStats` snapshots and restores every list's offset, not because
+				   anything is re-armed here. A list that DID collapse lands at row 1 out of
+				   the same mechanism: its <ul> is no longer scrollable, so the restore is a
+				   no-op on it. */
+				if (!changed.some(Boolean)) return;
+				JD.renderPage(model);
+			});
+		};
 	}
 
 	/* Tokens (span4) — input/output/cache, day-bucketed. Reuses
@@ -1288,6 +1640,10 @@ window.JD = window.JD || {};
 
 	JD.renderStats = (model) => {
 		var stats = model.stats;
+		/* Read before anything writes to #app — see `snapshotToolScroll`. Taken even
+		   on the no-repos path below, which is cheap and keeps the one rule ("read
+		   first, always") rather than a second thing to remember. */
+		var toolScroll = snapshotToolScroll();
 		if ((model.repos || []).length === 0) {
 			document.getElementById("app").innerHTML = noReposCard();
 			return;
@@ -1378,9 +1734,14 @@ window.JD = window.JD || {};
 		   height and its scrollbar), then the reveal, which needs the cap in place
 		   to have anything to scroll. */
 		capToolLists();
+		restoreToolScroll(toolScroll);
 		revealToolRows(stats.toolUsage);
 		document.querySelectorAll("[data-toolmore]").forEach((button) => {
 			button.onclick = () => loadMoreToolRows(model, button.getAttribute("data-toolmore"));
 		});
 	};
+
+	/* Registered unconditionally — every view loads this module, and the hook's own
+	   `view !== "stats"` guard is what scopes it. See `JD.carryForwardHooks`. */
+	JD.carryForwardHooks.push(carryForwardToolLists);
 })(window.JD);

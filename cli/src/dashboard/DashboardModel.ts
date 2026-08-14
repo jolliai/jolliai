@@ -1286,8 +1286,11 @@ export interface McpServerRow {
  * number of rows visible without scrolling.
  *
  * The client has a copy of this number (`TOOL_PAGE_SIZE` in `assets/js/stats.js`)
- * for the scroll cap alone; the paging itself is driven by the server's
- * `*Total` counts below, never by the client re-deriving the page size.
+ * and it must stay equal to this one. The paging itself is still driven by the
+ * `*Total` counts below rather than by the client re-deriving the page size — but
+ * the copy is no longer cosmetic: past its scroll cap, the 30 s poll's
+ * carry-forward slices a list it decided to COLLAPSE back to that width, claiming
+ * it is what a freshly opened card shows. A freshly opened card shows this many.
  */
 export const TOOL_ROWS_LIMIT = 8;
 
@@ -1463,9 +1466,17 @@ export interface ToolUsage {
 	 * deriving this client-side would under-report every agent whose skills all
 	 * rank outside the loaded pages, and would have to re-sum session counts (see
 	 * {@link ToolUsageAgentShare}).
+	 *
+	 * NO READER TODAY. It fed the Skills card's `by agent · 12 claude` header line,
+	 * which was removed for restating at card level what every row already names
+	 * through its own `agents` — so the whole-window per-agent split with volume is
+	 * currently computed and shipped and stated nowhere. Kept because that makes
+	 * restoring the line a render change and nothing else (see the note where
+	 * `agentLine` was, in `assets/js/stats.js`); recorded here because a payload
+	 * field with no reader is otherwise a contract that drifts unnoticed.
 	 */
 	readonly skillAgents: ReadonlyArray<ToolUsageAgentTotal>;
-	/** Agents that called an MCP tool in the window, most calls first — same rule as {@link skillAgents}. */
+	/** Agents that called an MCP tool in the window, most calls first — same rule as {@link skillAgents}, and unread for the same reason. */
 	readonly mcpAgents: ReadonlyArray<ToolUsageAgentTotal>;
 	/** Sessions with at least one recorded tool call. */
 	readonly sessionsWithTools: number;

@@ -55,6 +55,16 @@ interface Harness {
 	readonly fetched: string[];
 	/** Replaces the browser's current model, as `JD.refreshNow` does after a poll. */
 	setCurrentModel: (model: unknown) => void;
+	/**
+	 * Drives the REAL `JD.refreshNow` with `fresh` as the polled payload, so the
+	 * carry-forward seam is exercised through shell.js's own ordering rather than
+	 * through a copy of it in this file. `fetch` is injected into the asset scripts'
+	 * scope, which is what makes that possible without touching a global.
+	 */
+	poll: (fresh: unknown) => Promise<void>;
+	/** The model the page is currently rendered from — the poll replaces it. */
+	// biome-ignore lint/suspicious/noExplicitAny: as JD above.
+	current: () => any;
 }
 
 /**
@@ -85,17 +95,31 @@ function loadHarness(rowCounts: Record<string, number> = {}): Harness {
 	}
 	let buttons = new Map<string, FakeButton>();
 
-	const element = () => ({
-		innerHTML: "",
-		style: {} as Record<string, string>,
-		querySelectorAll: () => [] as ReadonlyArray<never>,
-		querySelector: () => null,
-		addEventListener: () => undefined,
-	});
+	const element = (id?: string) => {
+		let html = "";
+		return {
+			get innerHTML() {
+				return html;
+			},
+			set innerHTML(next: string) {
+				html = next;
+				// In the browser, rewriting #app destroys every ranked <ul>, and each
+				// replacement starts at row 1. These stubs are reused across renders, so
+				// that has to be modelled at the ASSIGNMENT — the renderer snapshots the
+				// offsets just before it, and resetting any earlier would make the
+				// snapshot read zeroes and hide a broken restore.
+				if (id === "app") for (const stub of lists.values()) stub.scrollTop = 0;
+			},
+			style: {} as Record<string, string>,
+			querySelectorAll: () => [] as ReadonlyArray<never>,
+			querySelector: () => null,
+			addEventListener: () => undefined,
+		};
+	};
 	const elements = new Map<string, ReturnType<typeof element>>();
 	const doc = {
 		getElementById: (id: string) => {
-			if (!elements.has(id)) elements.set(id, element());
+			if (!elements.has(id)) elements.set(id, element(id));
 			return elements.get(id);
 		},
 		// Only the two selectors this test is about are answered; every other
@@ -127,9 +151,14 @@ function loadHarness(rowCounts: Record<string, number> = {}): Harness {
 		string,
 		unknown
 	>;
+	/** The payload the next `JD.refreshNow` will receive from `/api/model`. */
+	let polled: unknown = null;
+	const fakeFetch = () => Promise.resolve({ ok: true, json: () => Promise.resolve(polled) });
 	for (const file of ["format.js", "shell.js", "charts.js", "stats.js"]) {
 		const src = readFileSync(new URL(`./assets/js/${file}`, import.meta.url), "utf8");
-		new Function("window", "document", src)(win, doc);
+		// `fetch` is a free variable in shell.js, so passing it here shadows the real
+		// global for these modules alone — no process-wide stub to undo.
+		new Function("window", "document", "fetch", src)(win, doc, fakeFetch);
 	}
 	// biome-ignore lint/suspicious/noExplicitAny: see the Harness comment.
 	const JD = win.JD as any;
@@ -141,8 +170,10 @@ function loadHarness(rowCounts: Record<string, number> = {}): Harness {
 		// `main.js` seeds this once at boot. Local re-renders keep the same object;
 		// only refreshNow replaces it, which the paging code detects by identity.
 		if (!("__JOLLI_DASHBOARD__" in win)) win.__JOLLI_DASHBOARD__ = model;
-		const app = doc.getElementById("app");
-		if (app) app.innerHTML = "";
+		// Deliberately NOT clearing #app first: `renderStats` assigns it on every
+		// path, and that assignment is what resets the list stubs' scroll (see the
+		// innerHTML setter). Clearing here would fire the reset BEFORE the renderer
+		// reads the offsets it is meant to restore.
 		JD.renderStats(model);
 		// `renderPage` is main.js's job in the browser; here it is the real
 		// re-render, which is what every paging handler ends in.
@@ -163,6 +194,12 @@ function loadHarness(rowCounts: Record<string, number> = {}): Harness {
 		setCurrentModel: (model: unknown) => {
 			win.__JOLLI_DASHBOARD__ = model;
 		},
+		poll: async (fresh: unknown) => {
+			polled = fresh;
+			JD.refreshNow(render);
+			await settle();
+		},
+		current: () => win.__JOLLI_DASHBOARD__,
 	};
 }
 
@@ -239,6 +276,78 @@ function model(toolUsageOver: Record<string, unknown> = {}): unknown {
 
 /** One microtask hop past the stubbed fetch, plus the render it ends in. */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+
+describe("ranked rows — the per-agent tag", () => {
+	const FIVE_AGENTS = ["claude", "codex", "cursor-agent", "opencode", "kimi"].map((source) => ({ source, calls: 5 }));
+
+	it("folds past two agents into a +N, with the full list behind a tooltip", () => {
+		const h = loadHarness();
+		h.render(
+			model({
+				servers: [{ ...serverRow(0), agents: FIVE_AGENTS }],
+				serversTotal: 1,
+				serverCallsTotal: 20,
+			}),
+		);
+		// `.rl-kind` is `flex: none` — it never shrinks and never ellipsises, so an
+		// unbounded name list does not truncate, it PUSHES. Measured in a real browser
+		// at 1200px with eight agents: the slot wanted 402px of a 261px row, which left
+		// the tool name -203px, i.e. rendered at 0 wide with no ellipsis to show for it,
+		// and armed a horizontal scrollbar on the list and the page. Folded: 131px.
+		expect(h.html()).toContain("1 tool · claude · codex +3");
+		// `+3` is only honest if the three are reachable.
+		expect(h.html()).toContain('title="1 tool · claude · codex · cursor-agent · opencode · kimi"');
+	});
+
+	it("leaves two or fewer agents whole, and gives them no tooltip", () => {
+		const h = loadHarness();
+		h.render(
+			model({
+				servers: [
+					{
+						...serverRow(0),
+						agents: [
+							{ source: "claude", calls: 5 },
+							{ source: "codex", calls: 3 },
+						],
+					},
+				],
+				serversTotal: 1,
+				serverCallsTotal: 8,
+			}),
+		);
+		// No `title` at all: a tooltip repeating the text under the pointer is noise,
+		// and it would claim there is more to see when there is not.
+		expect(h.html()).toContain('<span class="rl-kind">1 tool · claude · codex</span>');
+		expect(h.html()).not.toContain("+0");
+	});
+
+	it("emits no meta slot at all for a row with nothing to put in it", () => {
+		const h = loadHarness();
+		// `agents: []` is the shape `DashboardQuery`'s defensive `?? []` can hand a
+		// Skills row, and Skills is the one list whose meta slot is the agent tag
+		// ALONE — the MCP lists always spend it on a tool/session count first.
+		h.render(model({ skills: [{ ...skillRow(0), agents: [] }], skillsTotal: 1, skillCallsTotal: 20 }));
+		// An empty `.rl-kind` is not free: it is still a flex item, so it spends one of
+		// `.rl-top`'s 8px gaps and takes those pixels off the name, which is the only
+		// thing in the row that truncates. `withAgents` returns its object
+		// unconditionally, so the emptiness has to be tested on `.text`.
+		//
+		// Asserted as name-then-value with nothing between, rather than as "no
+		// `rl-kind` anywhere": `html()` is the whole page, and the MCPs card below
+		// carries a populated slot on every one of its rows.
+		expect(h.html()).toContain('title="/skill00">/skill00</span><span class="rl-val num">20 runs</span>');
+	});
+
+	it("folds a Skills row too, where the tag is the whole meta slot", () => {
+		const h = loadHarness();
+		h.render(model({ skills: [{ ...skillRow(0), agents: FIVE_AGENTS }], skillsTotal: 1, skillCallsTotal: 20 }));
+		// Skills rows carry no tool/session count, so there is no leading `N tools ·`
+		// for the names to hang off — the join has to hold with an empty meta.
+		expect(h.html()).toContain('<span class="rl-kind" title="claude · codex · cursor-agent · opencode · kimi">');
+		expect(h.html()).toContain("claude · codex +3</span>");
+	});
+});
 
 describe("tool-usage lists — header totals", () => {
 	it("prints the window's totals, not a sum of the page on screen", () => {
@@ -493,9 +602,333 @@ describe("tool-usage lists — the scroll cap", () => {
 		expect(h.list("skill").scrollTop).toBe(TOOL_ROWS_LIMIT * ROW_PITCH);
 
 		// And not again on the next repaint — a sticky reveal would yank the reader
-		// back to that row on every 30 s model poll.
+		// back to that row on every 30 s model poll. The repaint replaces the <ul>, so
+		// what puts the list back at 120 is `restoreToolScroll`, whose whole job is "do
+		// not move". A second reveal would land on TOOL_ROWS_LIMIT * ROW_PITCH instead,
+		// which is a different number precisely so the two cannot be confused: 0 is not
+		// available as the assertion here, because every repaint now restores.
 		h.list("skill").scrollTop = 120;
 		h.render(model({ skills: Array.from({ length: TOOL_ROWS_LIMIT + 1 }, (_, i) => skillRow(i)) }));
 		expect(h.list("skill").scrollTop).toBe(120);
+	});
+});
+
+/** Skills in the window — the model's own `skillsTotal`, so a poll can reuse it. */
+const SKILLS_TOTAL = TOOL_ROWS_LIMIT + 4;
+/** Rows on screen after the one Show more click these tests make. */
+const GROWN = TOOL_ROWS_LIMIT + 2;
+
+/**
+ * One Show more click on the Skills list, leaving it displaying {@link GROWN} of
+ * {@link SKILLS_TOTAL}. Returns the rows a verification read hands back for
+ * "nothing changed" — the first page plus what the click appended.
+ */
+async function expandSkills(h: Harness): Promise<Array<Record<string, unknown>>> {
+	const appended = [skillRow(TOOL_ROWS_LIMIT), skillRow(TOOL_ROWS_LIMIT + 1)];
+	h.JD.getJson = (path: string) => {
+		h.fetched.push(path);
+		return Promise.resolve({ list: "skill", offset: TOOL_ROWS_LIMIT, rows: appended, totalCount: SKILLS_TOTAL });
+	};
+	const buttons = h.render(model());
+	buttons.get("skill")?.onclick?.();
+	await settle();
+	return [...Array.from({ length: TOOL_ROWS_LIMIT }, (_, i) => skillRow(i)), ...appended];
+}
+
+/** Answers the poll's verification read, and records the URL it asked for. */
+function verifyWith(h: Harness, answer: unknown): void {
+	h.JD.getJson = (path: string) => {
+		h.fetched.push(path);
+		return Promise.resolve(answer);
+	};
+}
+
+describe("tool-usage lists — carrying an expansion across the 30 s poll", () => {
+	it("keeps the rows, re-reading the list at the width on screen", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+
+		h.fetched.length = 0;
+		verifyWith(h, { list: "skill", offset: 0, rows: onScreen, totalCount: SKILLS_TOTAL });
+		await h.poll(model());
+
+		// From the top, as wide as the list is displayed. The width is the rows on
+		// screen and never a click count: a page that came back holding a row already
+		// loaded is deduped, and from then on a counter asks for more rows than are
+		// displayed, which reads as "changed" forever.
+		expect(h.fetched).toEqual([`/api/tool-usage?range=month&dimension=model&list=skill&offset=0&limit=${GROWN}`]);
+		// Nothing moved, so the poll left the card exactly as the reader had it. Before
+		// this, `/api/model`'s first page silently replaced it every 30 s.
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+		expect(h.html()).toContain("skill09");
+	});
+
+	it("collapses to the first page when a re-read row disagrees with the one on screen", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		// One row busier than the copy on screen: its run count and every bar width
+		// beside it move, so the card is out of date.
+		const changed = onScreen.map((row, i) => (i === 0 ? { ...row, calls: 999 } : row));
+		verifyWith(h, { list: "skill", offset: 0, rows: changed, totalCount: SKILLS_TOTAL });
+		await h.poll(model());
+
+		expect(h.html()).toContain(`Showing ${TOOL_ROWS_LIMIT} of ${SKILLS_TOTAL} skills`);
+		expect(h.html()).toContain("999 runs");
+		// Back to eight rows: a reader watching row 10 has no way to tell a re-fetched
+		// page from the one they were already reading, whereas a card that visibly
+		// returns to its first page says "this changed, start again".
+		expect(h.html()).not.toContain("skill09");
+	});
+
+	it("collapses without a re-read when anything else on the card moved", async () => {
+		const h = loadHarness({ skill: GROWN });
+		await expandSkills(h);
+		h.fetched.length = 0;
+		verifyWith(h, { list: "skill", offset: 0, rows: [], totalCount: 0 });
+		// One more skill run landed in the window. The card repaints whatever the rows
+		// turn out to be, so confirming them would only delay it.
+		await h.poll(model({ skillCallsTotal: 201 }));
+
+		expect(h.fetched).toEqual([]);
+		expect(h.html()).toContain(`201 runs · ${SKILLS_TOTAL} skills`);
+		expect(h.html()).toContain(`Showing ${TOOL_ROWS_LIMIT} of ${SKILLS_TOTAL} skills`);
+	});
+
+	it("asks nothing about a list still on its first page", async () => {
+		const h = loadHarness();
+		h.render(model());
+		h.fetched.length = 0;
+		await h.poll(model());
+		// The polled payload already carries the whole first page of all three lists,
+		// so there is nothing to keep and nothing to ask about.
+		expect(h.fetched).toEqual([]);
+	});
+
+	it("leaves the other cards' rows and scroll alone when one card pages", async () => {
+		const SERVERS_TOTAL = TOOL_ROWS_LIMIT + 7;
+		const h = loadHarness({ skill: GROWN, server: GROWN });
+		const moreServers = [serverRow(TOOL_ROWS_LIMIT), serverRow(TOOL_ROWS_LIMIT + 1)];
+		h.JD.getJson = (path: string) => {
+			h.fetched.push(path);
+			return Promise.resolve(
+				path.includes("list=server")
+					? { list: "server", offset: TOOL_ROWS_LIMIT, rows: moreServers, totalCount: SERVERS_TOTAL }
+					: {
+							list: "skill",
+							offset: TOOL_ROWS_LIMIT,
+							rows: [skillRow(8), skillRow(9)],
+							totalCount: SKILLS_TOTAL,
+						},
+			);
+		};
+		h.render(model()).get("server")?.onclick?.();
+		await settle();
+		// The reader is part-way down the MCPs list and then pages the SKILLS card.
+		h.list("server").scrollTop = 300;
+		h.fetched.length = 0;
+		h.render(h.current()).get("skill")?.onclick?.();
+		await settle();
+
+		// One request, for the clicked list only. The three lists are independent in
+		// the payload, so paging one must not re-read — or reset — another.
+		expect(h.fetched).toEqual([`/api/tool-usage?range=month&dimension=model&list=skill&offset=${TOOL_ROWS_LIMIT}`]);
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SERVERS_TOTAL} servers`);
+		// And the untouched card does not move. A Show more ends in a whole-page
+		// repaint, so before the offsets were snapshotted this reset the reader's
+		// position in the other two cards — and because the cap shows exactly one page
+		// of rows, row 1 at the top made an expanded list look collapsed.
+		expect(h.list("server").scrollTop).toBe(300);
+	});
+
+	it("puts a carried list back where the reader had scrolled it", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		h.list("skill").scrollTop = 260;
+		verifyWith(h, { list: "skill", offset: 0, rows: onScreen, totalCount: SKILLS_TOTAL });
+		await h.poll(model());
+		// Without this the card is unchanged and still interrupts the reader: the
+		// repaint replaces the <ul>, so a list scrolled to row 10 restarts at row 1.
+		expect(h.list("skill").scrollTop).toBe(260);
+	});
+
+	it("keeps a sibling list's scroll when another list collapses", async () => {
+		const h = loadHarness({ skill: GROWN, server: GROWN });
+		const moreSkills = [skillRow(TOOL_ROWS_LIMIT), skillRow(TOOL_ROWS_LIMIT + 1)];
+		const moreServers = [serverRow(TOOL_ROWS_LIMIT), serverRow(TOOL_ROWS_LIMIT + 1)];
+		const SERVERS_TOTAL = TOOL_ROWS_LIMIT + 7;
+		// Both cards grown, so the poll has one list to collapse and one to keep.
+		h.JD.getJson = (path: string) =>
+			Promise.resolve(
+				path.includes("list=skill")
+					? { list: "skill", offset: TOOL_ROWS_LIMIT, rows: moreSkills, totalCount: SKILLS_TOTAL }
+					: { list: "server", offset: TOOL_ROWS_LIMIT, rows: moreServers, totalCount: SERVERS_TOTAL },
+			);
+		h.render(model()).get("skill")?.onclick?.();
+		await settle();
+		h.render(h.current()).get("server")?.onclick?.();
+		await settle();
+
+		const skillsShown = [...Array.from({ length: TOOL_ROWS_LIMIT }, (_, i) => skillRow(i)), ...moreSkills];
+		const serversShown = [...Array.from({ length: TOOL_ROWS_LIMIT }, (_, i) => serverRow(i)), ...moreServers];
+		// The reader is part-way down the MCPs list when the poll fires.
+		h.list("server").scrollTop = 300;
+		h.JD.getJson = (path: string) =>
+			Promise.resolve(
+				path.includes("list=skill")
+					? {
+							list: "skill",
+							offset: 0,
+							rows: skillsShown.map((row, i) => (i === 0 ? { ...row, calls: 999 } : row)),
+							totalCount: SKILLS_TOTAL,
+						}
+					: { list: "server", offset: 0, rows: serversShown, totalCount: SERVERS_TOTAL },
+			);
+		await h.poll(model());
+
+		// Skills moved and collapsed; MCP servers passed and kept the reader's rows.
+		expect(h.html()).toContain(`Showing ${TOOL_ROWS_LIMIT} of ${SKILLS_TOTAL} skills`);
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SERVERS_TOTAL} servers`);
+		// One list collapsing repaints the whole page, which replaces the MCPs <ul> too.
+		// The untouched card keeps the reader's position because every repaint snapshots
+		// and restores each list's offset — otherwise it snaps back to row 1 on a repaint
+		// it had no part in: the same interruption this carry-over exists to prevent, one
+		// repaint later.
+		expect(h.list("server").scrollTop).toBe(300);
+	});
+
+	it("verifies the MCPs split the reader has switched away from", async () => {
+		const h = loadHarness({ tool: GROWN });
+		const appended = [
+			{ ...skillRow(TOOL_ROWS_LIMIT), kind: "mcp" },
+			{ ...skillRow(TOOL_ROWS_LIMIT + 1), kind: "mcp" },
+		];
+		h.JD.mcpSplitView = "tool";
+		h.JD.getJson = () => Promise.resolve({ list: "tool", offset: TOOL_ROWS_LIMIT, rows: appended, totalCount: 42 });
+		const buttons = h.render(model());
+		buttons.get("tool")?.onclick?.();
+		await settle();
+		expect(h.html()).toContain(`Showing ${GROWN} of 42 tools`);
+
+		// The reader switches to By server, so the expanded `tool` list is off screen.
+		h.JD.mcpSplitView = "server";
+		h.render(h.current());
+
+		const onScreen = [
+			...Array.from({ length: TOOL_ROWS_LIMIT }, (_, i) => ({ ...skillRow(i), kind: "mcp" })),
+			...appended,
+		];
+		verifyWith(h, {
+			list: "tool",
+			offset: 0,
+			rows: onScreen.map((row, i) => (i === 0 ? { ...row, calls: 999 } : row)),
+			totalCount: 42,
+		});
+		await h.poll(model());
+
+		// It collapsed even though nothing about it was painted. The comparison forces
+		// the split to the list it is asking about — without that, a change to the list
+		// the reader switched away from is invisible for as long as the tab stays open.
+		h.JD.mcpSplitView = "tool";
+		h.render(h.current());
+		expect(h.html()).toContain(`Showing ${TOOL_ROWS_LIMIT} of 42 tools`);
+	});
+
+	it("keeps the expanded rows when the re-read fails, and says nothing about it", async () => {
+		const h = loadHarness({ skill: GROWN });
+		await expandSkills(h);
+		h.JD.getJson = () => Promise.reject(new Error("offline"));
+		await h.poll(model());
+		// The aggregates beside them were already checked and matched, and the next
+		// poll asks again in 30 s — a card that empties itself over a transient failure
+		// is the worse answer.
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+		// Not the Show more failure state: the reader never asked for this read.
+		expect(h.html()).not.toContain("could not load more");
+	});
+
+	it("treats a body carrying no total as unverifiable rather than as a change", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		verifyWith(h, { list: "skill", offset: 0, rows: onScreen });
+		await h.poll(model());
+		// An absent total renders "of 0", which would make even a field-for-field
+		// identical list look changed — the same collapse for a reason that is not the
+		// reader's.
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+	});
+
+	it("leaves every other view alone", () => {
+		const h = loadHarness({ skill: GROWN });
+		h.render(model());
+		// Every view loads stats.js, so the hook itself is what has to know its scope.
+		expect(h.JD.carryForwardHooks).toHaveLength(1);
+		expect(h.JD.carryForwardHooks[0]({ view: "memories" }, h.current())).toBeNull();
+		expect(h.JD.carryForwardHooks[0]({ view: "stats" }, {})).toBeNull();
+	});
+
+	it("does not collapse a list a Show more click is still growing", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		let resolveVerify: ((page: unknown) => void) | undefined;
+		h.JD.getJson = (path: string) =>
+			path.includes("offset=0")
+				? new Promise((resolve) => {
+						resolveVerify = resolve;
+					})
+				: new Promise(() => undefined);
+		await h.poll(model());
+
+		// The reader clicks Show more while the verification read is in flight. That
+		// click's response rewrites these rows from the array it captured a moment ago,
+		// so a collapse now would be silently undone by it.
+		h.render(h.current()).get("skill")?.onclick?.();
+		resolveVerify?.({
+			list: "skill",
+			offset: 0,
+			rows: onScreen.map((row, i) => (i === 0 ? { ...row, calls: 999 } : row)),
+			totalCount: SKILLS_TOTAL,
+		});
+		await settle();
+
+		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
+		expect(h.html()).not.toContain("999 runs");
+	});
+
+	it("does not collapse over a read narrower than the list it is comparing", async () => {
+		const h = loadHarness({ skill: GROWN });
+		const onScreen = await expandSkills(h);
+		let resolveVerify: ((page: unknown) => void) | undefined;
+		h.JD.getJson = (path: string) => {
+			if (path.includes("offset=0")) {
+				return new Promise((resolve) => {
+					resolveVerify = resolve;
+				});
+			}
+			return Promise.resolve({
+				list: "skill",
+				offset: GROWN,
+				rows: [skillRow(GROWN), skillRow(GROWN + 1)],
+				totalCount: SKILLS_TOTAL + 2,
+			});
+		};
+		await h.poll(model());
+
+		// This time the click LANDS first, so the list is wider than the read in flight.
+		h.render(h.current()).get("skill")?.onclick?.();
+		await settle();
+		expect(h.html()).toContain(`Showing ${GROWN + 2} of ${SKILLS_TOTAL + 2} skills`);
+
+		resolveVerify?.({
+			list: "skill",
+			offset: 0,
+			rows: onScreen.map((row, i) => (i === 0 ? { ...row, calls: 999 } : row)),
+			totalCount: SKILLS_TOTAL,
+		});
+		await settle();
+		// Comparing a 10-row read against 12 rendered rows can only ever say
+		// "changed", and collapsing would throw away the click that just succeeded.
+		expect(h.html()).toContain(`Showing ${GROWN + 2} of ${SKILLS_TOTAL + 2} skills`);
 	});
 });

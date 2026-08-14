@@ -1794,7 +1794,15 @@ export interface ToolUsagePageOptions {
 	readonly list: ToolUsageList;
 	/** Row index to start at. Negative or fractional input is floored to a valid one. */
 	readonly offset: number;
-	/** Rows per page. Defaults to {@link TOOL_ROWS_LIMIT}, the size the first page rode in at. */
+	/**
+	 * Rows per page. Defaults to {@link TOOL_ROWS_LIMIT}, the size the first page
+	 * rode in at — which is also what a "Show more" click asks for.
+	 *
+	 * A bigger one is the poll path: re-reading a list the reader has already
+	 * expanded takes as many rows as are on screen, so it can be compared against
+	 * them. That number comes from the client, so the route caps it before this
+	 * ever sees it (`TOOL_USAGE_MAX_LIMIT` in DashboardServer).
+	 */
 	readonly limit?: number;
 	readonly range?: DashboardRange;
 	readonly customFrom?: string;
@@ -1825,11 +1833,29 @@ export function buildToolUsagePage(db: DashboardDbHandle, opts: ToolUsagePageOpt
 	const timeZone = opts.timeZone ?? machineTimeZone();
 	const window = resolveWindow(opts.range, opts.customFrom, opts.customTo, opts.nowMs ?? Date.now(), timeZone);
 	const where = toolUsageWhere(db, opts.scope, window);
-	// Floored, not rejected: an offset is a position in a list, and a bad one has
-	// a nearest sane answer (the first page). The LIMIT is ours, never the
-	// caller's — see DashboardServer's route.
+	// Floored, not rejected — for both, and for the same reason: an offset is a
+	// position in a list and a width is a row count, so a bad one has a nearest sane
+	// answer rather than an error. The floor is all this does to the limit; its
+	// MAGNITUDE is bounded one layer out, where the route clamps a caller-supplied
+	// one to TOOL_USAGE_MAX_LIMIT, so nothing here has to defend the SQL against an
+	// unbounded read. Kept symmetric with `offset` anyway because this is the only
+	// exported entry point: a second caller would otherwise be the first thing
+	// standing between a fractional or negative width and the SQL.
 	const offset = Math.max(0, Math.trunc(opts.offset) || 0);
-	const limit = opts.limit ?? TOOL_ROWS_LIMIT;
+	// `Number.isFinite` rather than `|| TOOL_ROWS_LIMIT`, which cannot tell NaN from
+	// a zero: the falsy test sent `0` and `0.5` to the DEFAULT page of 8, so the one
+	// caller this guard exists for would have received 8 rows where both this comment
+	// and the route's own clamp say 1. Absent still means one page; a number that
+	// floors below one row means one row.
+	//
+	// `Infinity` lands on the default page too, and that is the honest answer rather
+	// than an oversight: clamping needs a width to clamp TO, and this layer
+	// deliberately has no upper bound (the route holds it, see TOOL_USAGE_MAX_LIMIT).
+	// So an unbounded request has no nearest sane width the way a fractional one has
+	// a nearest sane row count, and one page is the only answer left that is not a
+	// whole-table read.
+	const requestedLimit = Math.trunc(opts.limit ?? TOOL_ROWS_LIMIT);
+	const limit = Number.isFinite(requestedLimit) ? Math.max(1, requestedLimit) : TOOL_ROWS_LIMIT;
 	const { totalCount } = toolListTotals(db, where, opts.list);
 	if (opts.list === "server") {
 		return { list: "server", offset, rows: serverRowsPage(db, where, offset, limit), totalCount };

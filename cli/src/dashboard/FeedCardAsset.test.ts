@@ -49,6 +49,13 @@ function loadJD(): { JD: JDNamespace; app: FakeElement } {
 			return elements.get(id);
 		},
 		querySelectorAll: () => [],
+		// Answered because `renderStats` snapshots and restores each ranked list's
+		// scroll offset by looking its <ul> up on the DOCUMENT (see
+		// `snapshotToolScroll` in stats.js), and unlike `revealToolRows` it does so
+		// unconditionally — there is no paging state to short-circuit on. `null` is
+		// the honest answer: this harness renders to a string and has no lists to
+		// scroll, so every offset is absent and every restore a no-op.
+		querySelector: () => null,
 		addEventListener: () => undefined,
 		createElement: element,
 		body: element(),
