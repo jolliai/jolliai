@@ -261,7 +261,7 @@ describe("withDashboardDb", () => {
 		).rejects.toThrow(/FOREIGN KEY/i);
 	});
 
-	it("never deletes repo rows — the v7 policy trigger blocks it, disable is an UPDATE", async () => {
+	it("refuses to delete a repo that owns rows — now on the foreign key, not the retired trigger", async () => {
 		const result = await withDashboardDb(
 			(db) => {
 				db.prepare(
@@ -270,8 +270,13 @@ describe("withDashboardDb", () => {
 				db.prepare(
 					"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms) VALUES ('e', (SELECT id FROM repos WHERE repo_identity = 'r'), 'claude', 's', 1)",
 				).run();
-				expect(() => db.prepare("DELETE FROM repos WHERE repo_identity = 'r'").run()).toThrow(/never deleted/i);
-				// The sanctioned path: soft-disable in place, children untouched.
+				// `repos_no_delete` used to abort this with "never deleted". With the
+				// trigger dropped (REPOS_DELETE_ALLOWED_DDL) the guarantee that matters
+				// — a repo's memories cannot be silently wiped — is carried by the NO
+				// ACTION foreign keys, which hold because `foreign_keys` is ON in both
+				// WRITE_PRAGMAS and READ_PRAGMAS.
+				expect(() => db.prepare("DELETE FROM repos WHERE repo_identity = 'r'").run()).toThrow(/FOREIGN KEY/i);
+				// The sanctioned path is still soft-disable in place, children untouched.
 				db.prepare("UPDATE repos SET disabled_at = 'now' WHERE repo_identity = 'r'").run();
 				return {
 					sessions: (db.prepare("SELECT COUNT(*) AS n FROM sessions").get() as { n: number }).n,
@@ -286,6 +291,22 @@ describe("withDashboardDb", () => {
 		);
 		expect(result.sessions).toBe(1);
 		expect(result.disabled).toBe("now");
+	});
+
+	it("allows deleting a repo that owns nothing — the case the trigger used to block", async () => {
+		const remaining = await withDashboardDb(
+			(db) => {
+				db.prepare(
+					"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES ('empty', 'e', '/e', 't')",
+				).run();
+				db.prepare("DELETE FROM repos WHERE repo_identity = 'empty'").run();
+				return (
+					db.prepare("SELECT COUNT(*) AS n FROM repos WHERE repo_identity = 'empty'").get() as { n: number }
+				).n;
+			},
+			{ dbPath },
+		);
+		expect(remaining).toBe(0);
 	});
 
 	it("still cascades intra-repo deletes — removing a commit clears its branch rows", async () => {
@@ -726,11 +747,34 @@ describe("the migration log — identity is the name, not the slot", () => {
 		// which is a guess, and says so in the outcome rather than posing as an
 		// observation.
 		expect(seeded?.map((r) => r.name)).toEqual(MIGRATIONS.slice(0, 5).map((m) => m.name));
-		// The entry that created the table is the only observed one, and its row
-		// comes after the seeds so `seq` order still reads as history.
+		// Everything from the version stamp onward really ran — starting with the
+		// entry that created the table — and those rows come after the seeds, so
+		// `seq` order still reads as history. Derived from MIGRATIONS rather than
+		// spelled out: a hardcoded tail breaks on the next append for no reason.
 		const observed = rows?.filter((r) => r.outcome === "applied");
-		expect(observed?.map((r) => r.name)).toEqual(["SCHEMA_MIGRATIONS_DDL"]);
+		expect(observed?.map((r) => r.name)).toEqual(MIGRATIONS.slice(5).map((m) => m.name));
 		expect(observed?.[0]?.seq).toBeGreaterThan(seeded?.[4]?.seq ?? 0);
+	});
+
+	it("drops repos_no_delete when upgrading a database that predates the entry", async () => {
+		// The behaviour REPOS_DELETE_ALLOWED_DDL exists for, on the path that
+		// matters: an existing install, not a fresh one. `BASELINE_DDL` is frozen
+		// and still creates the trigger, so every database ever made has it and
+		// only this entry takes it away.
+		await buildLegacyDb(dbPath, 5);
+		const before = await rawDb(dbPath);
+		try {
+			expect(before.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all()).toEqual([
+				{ name: "repos_no_delete" },
+			]);
+		} finally {
+			before.close();
+		}
+		const after = await withDashboardDb(
+			(db) => db.prepare("SELECT name FROM sqlite_master WHERE type = 'trigger'").all(),
+			{ dbPath },
+		);
+		expect(after).toEqual([]);
 	});
 
 	it("re-applies a MISSING name on a database that is already past it — the self-heal", async () => {

@@ -16,6 +16,118 @@ window.JD = window.JD || {};
 		return month && parts[2] ? month + " " + Number(parts[2]) : String(key);
 	};
 
+	/* The series palette holds FIVE colours and `JD.seriesColor` cycles them, so a
+	   sixth series is drawn in the first one's colour and the stack stops being
+	   readable back to a legend. Measured: `category` produces 10 series and
+	   `branch` 23, i.e. every colour reused ~5x.
+
+	   Extending the palette is not the fix. `--s1..--s5` reproduces a validated
+	   categorical order chosen for colour-vision separation (see the comment on
+	   `--s1` in main.css: the adjacent cat-1/cat-2 pair scores ΔE 2.3 under
+	   deuteranopia against a floor of 15), and there is no supply of 23 colours
+	   that stays distinguishable. Ranking and rolling up the tail is.
+
+	   `limit` is therefore FOUR, not five: the roll-up bucket is itself a series
+	   and needs the fifth colour. Five plus "Other" would wrap again — the exact
+	   bug this removes.
+
+	   It MERGES rather than truncates, and that is load-bearing: the Spend card's
+	   headline is the sum of the bars it draws, so dropping the tail would make
+	   the headline smaller than its own chart. The bucket keeps the total exact.
+
+	   Returns the per-key totals too, so a legend never recomputes them from the
+	   pre-roll-up keys — which would print an amount for a series that is no
+	   longer drawn, and none for the bucket that replaced it. */
+	var OTHER_KEY = "Other";
+	/* The bucket's key is a display label that also has to be UNIQUE, and series
+	   keys are user-controlled strings — a branch, a ticket or a repo really can
+	   be named `Other`. Colliding is not a cosmetic tie: `byKey[OTHER_KEY] = 0`
+	   overwrites that series' own total, the per-point `bySeries[OTHER_KEY]`
+	   overwrites its daily value, and `kept.concat` then lists one key TWICE — so
+	   the legend prints two identical swatches and `stackedBars`' `keys.forEach`
+	   sums that segment twice, inflating every bar and the axis bound with it.
+	   The Spend headline is computed before the roll-up, so the card would be back
+	   to disagreeing with its own chart.
+
+	   Suffixing until free is the whole fix. The loop runs zero times on every
+	   real dataset, and in the case it does fire a legend reading `Other` and
+	   `Other ` is strictly better than one series silently absorbing another. */
+	var otherKeyFor = (totals) => {
+		var key = OTHER_KEY;
+		while (key in totals) key += " ";
+		return key;
+	};
+	JD.topSeries = (series, keys, limit) => {
+		var totals = Object.create(null);
+		var read = (point, key) => (typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0);
+		keys.forEach((key) => {
+			totals[key] = 0;
+		});
+		series.forEach((point) => {
+			keys.forEach((key) => {
+				totals[key] += read(point, key);
+			});
+		});
+		if (keys.length <= limit) return { keys: keys, series: series, byKey: totals };
+		/* Sorted by total, so the colours track magnitude rather than the server's
+		   alphabetical key order — and the tie-break is the key itself, so two
+		   equal series cannot swap places between renders of the same data. */
+		var kept = keys
+			.slice()
+			.sort((a, b) => totals[b] - totals[a] || (a < b ? -1 : a > b ? 1 : 0))
+			.slice(0, limit);
+		var isKept = Object.create(null);
+		kept.forEach((key) => {
+			isKept[key] = true;
+		});
+		var otherKey = otherKeyFor(totals);
+		var byKey = Object.create(null);
+		kept.forEach((key) => {
+			byKey[key] = totals[key];
+		});
+		byKey[otherKey] = 0;
+		var rolled = series.map((point) => {
+			var bySeries = Object.create(null);
+			var other = 0;
+			keys.forEach((key) => {
+				var value = read(point, key);
+				if (isKept[key]) bySeries[key] = value;
+				else other += value;
+			});
+			bySeries[otherKey] = other;
+			byKey[otherKey] += other;
+			return { ...point, bySeries: bySeries };
+		});
+		return { keys: kept.concat([otherKey]), series: rolled, byKey: byKey };
+	};
+
+	/* An axis bound that divides into four ROUND ticks.
+	 *
+	 * The bound was the data maximum itself, quartered — so a token axis read
+	 * `0 / 2.2M / 4.3M / 6.5M / 8.7M`, four arbitrary numbers whose only property
+	 * was summing back to the tallest bar.
+	 *
+	 * The step comes off a 1/2/2.5/5/10 ladder and the bound is four of them, so
+	 * the bound is always >= the data (a step is never smaller than max/4) and no
+	 * bar can overflow the top gridline. That containment is why the ticks cannot
+	 * simply be the issue's `0 / 2M / … / 8M` for a maximum of 8.7M: 8M would clip
+	 * the tallest bar. The honest equivalent is `0 / 2.5M / 5M / 7.5M / 10M`.
+	 *
+	 * Scale-free by construction, because the same axis draws dollars: a $0.37 day
+	 * gets a $0.10 step, not a $1 one that would flatten the whole chart. The bar
+	 * loop used to seed `max = 1`, which defeated exactly that — a floor of "one
+	 * token" means nothing in dollars, and every sub-$1 window was drawn against a
+	 * $1 axis. The no-data case is seeded HERE instead, at 4, so its four ticks
+	 * stay integers on the token axis rather than reading `0 / 0.25 / 0.5 / …`. */
+	var niceAxisMax = (max) => {
+		if (!(max > 0)) return 4;
+		var raw = max / 4;
+		var magnitude = Math.pow(10, Math.floor(Math.log10(raw)));
+		var frac = raw / magnitude;
+		var step = (frac <= 1 ? 1 : frac <= 2 ? 2 : frac <= 2.5 ? 2.5 : frac <= 5 ? 5 : 10) * magnitude;
+		return step * 4;
+	};
+
 	/* Tokens' and Spend's daily chart.
 	 *
 	 * **The date axis is the two ENDPOINTS, not a tick per bar.** It used to label
@@ -28,8 +140,15 @@ window.JD = window.JD || {};
 	 * Between the ends, per-bar identification is the same affordance
 	 * `JD.recallBars` relies on: every segment carries a `<title>` with its full
 	 * date, series key and value.
+	 *
+	 * **`fmt` formats the axis ticks AND that tooltip**, defaulting to
+	 * `JD.fmtTokens` because this began as the token chart and Spend was later
+	 * drawn with the same function — so a money axis read `0 / 17 / 34 / 50` with
+	 * no `$`, cents rounded away, and a $1,200 day labelled `1.2k`: a token suffix
+	 * on a currency. The caller owns the unit; this function never did.
 	 */
-	JD.stackedBars = (series, keys, valueLabel) => {
+	JD.stackedBars = (series, keys, valueLabel, fmt) => {
+		var format = fmt || JD.fmtTokens;
 		var W = 660;
 		var bottom = 214;
 		/* Baseline + room for the endpoint labels + the same 8px margin the right
@@ -39,14 +158,25 @@ window.JD = window.JD || {};
 		var plotW = W - left - 8;
 		var slot = plotW / Math.max(1, series.length);
 		var barW = slot * 0.58;
-		var max = 1;
+		/* Seeded at 0, not 1 — `niceAxisMax` owns the no-data case. */
+		var max = 0;
+		/* Typed read, not `|| 0`: `topSeries` hands its INPUT series straight back
+		   when the key count is within the limit, so `bySeries` here can still be
+		   the JSON.parse'd object with a prototype. A series named `constructor`
+		   then yields the inherited function on any day it is absent — `|| 0`
+		   treats it as a value, and the bar geometry below becomes NaN. */
+		var read = (point, key) => (typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0);
 		series.forEach((point) => {
 			var total = 0;
 			keys.forEach((key) => {
-				total += point.bySeries[key] || 0;
+				total += read(point, key);
 			});
 			if (total > max) max = total;
 		});
+		/* The bars are scaled by this same bound, deliberately. Rounding only the
+		   LABELS would leave a tallest bar that touches the top gridline while the
+		   gridline claims a larger number. */
+		max = niceAxisMax(max);
 		var svg =
 			'<svg viewBox="0 0 ' +
 			W +
@@ -72,14 +202,14 @@ window.JD = window.JD || {};
 				'" y="' +
 				(y + 4) +
 				'" text-anchor="end" font-size="11" fill="var(--muted)" class="num">' +
-				JD.fmtTokens(Math.round((max * g) / 4)) +
+				format((max * g) / 4) +
 				"</text>";
 		}
 		series.forEach((point, dayIndex) => {
 			var x = left + dayIndex * slot + (slot - barW) / 2;
 			var yCursor = bottom;
 			keys.forEach((key, keyIndex) => {
-				var value = point.bySeries[key] || 0;
+				var value = read(point, key);
 				if (value <= 0) return;
 				var h = ((bottom - 10) * value) / max;
 				yCursor -= h;
@@ -95,7 +225,7 @@ window.JD = window.JD || {};
 					'" fill="' +
 					JD.seriesColor(keyIndex) +
 					'"><title>' +
-					JD.esc(point.date + " · " + key + " · " + JD.fmtTokens(value)) +
+					JD.esc(point.date + " · " + key + " · " + format(value)) +
 					"</title></rect>";
 			});
 		});
@@ -235,35 +365,14 @@ window.JD = window.JD || {};
 		return svg + "</svg>";
 	};
 
-	/* Ranked horizontal bars — the mockup's rendering for every non-model axis
-	   (agent / project / branch / ticket / category), where a stacked-by-day
-	   chart would be noise: what matters is the ordering of totals. */
-	JD.rankedBars = (rows) => {
-		var max = 1;
-		rows.forEach((r) => {
-			if (r.tokens > max) max = r.tokens;
-		});
-		var html = '<div class="ranked">';
-		rows.forEach((row, index) => {
-			html +=
-				'<div class="rrow">' +
-				'<span class="lbl mono">' +
-				JD.esc(row.key) +
-				"</span>" +
-				'<span class="track"><span class="bar" style="width:' +
-				((row.tokens / max) * 100).toFixed(1) +
-				"%;background:" +
-				JD.seriesColor(index) +
-				'"></span></span>' +
-				'<span class="val num">' +
-				JD.fmtTokens(row.tokens) +
-				'<span class="meta">' +
-				(row.cost > 0 ? JD.fmtUsd(row.cost) + " est" : "—") +
-				"</span></span>" +
-				"</div>";
-		});
-		return html + "</div>";
-	};
+	/* No `JD.rankedBars` here, deliberately. It rendered `{key, tokens, cost}`
+	   rows produced by a `rankRows` helper in stats.js, and nothing on any page
+	   ever called it — so when the Spend card moved to per-day apportionment and
+	   `rankRows` went away with it, the last thing that could ever fill `cost`
+	   went too. What was left was a function whose every row would have printed
+	   "—" for the estimate: an unwired renderer for a shape no code produces,
+	   which is worse than no renderer at all. Every axis now draws through
+	   `JD.stackedBars` + `JD.topSeries`. */
 
 	/* Per-day cost table — the mockup's `table view` toggle. One column per
 	   series key plus a total, so the chart's numbers are readable exactly. */

@@ -26,6 +26,11 @@ window.JD = window.JD || {};
 	   reads. So we scroll only when the selected hash CHANGES. Reset to null on
 	   each page load (a fresh module), which is exactly when we DO want to scroll. */
 	JD.memLastScrolledHash = JD.memLastScrolledHash || null;
+	/* Same one-shot rule as the hash above, for the `#what-changed` anchor the
+	   Memory Activity card links at. The browser cannot honour it itself: the
+	   detail pane is written into the DOM after navigation, so by the time the
+	   element exists the automatic scroll has already happened and been lost. */
+	JD.memLastScrolledAnchor = JD.memLastScrolledAnchor || null;
 
 	const MEMORY_ICONS = {
 		database: '<ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v14c0 1.7 3.6 3 8 3s8-1.3 8-3V5"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/>',
@@ -315,6 +320,24 @@ window.JD = window.JD || {};
 		if (row && row.scrollIntoView) row.scrollIntoView({ block: "center" });
 	}
 
+	/* Scrolls to `location.hash` once the element it names actually exists.
+	   NOT recorded when the element is missing — the detail pane may still be
+	   rendering, or this tick may be showing a different memory, and recording it
+	   would burn the one chance to honour the anchor. Recorded on success, so the
+	   30s tick cannot keep yanking a reader back to it. */
+	function scrollToAnchor() {
+		/* `window` is whatever the host injected into this IIFE, so `location` is
+		   read defensively — the same reason every DOM touch below is guarded. It
+		   always exists in a browser; a host without it must not take the whole
+		   page down on the way to an optional scroll. */
+		var anchor = ((window.location && window.location.hash) || "").slice(1);
+		if (!anchor || anchor === JD.memLastScrolledAnchor) return;
+		var target = document.getElementById(anchor);
+		if (!target) return;
+		JD.memLastScrolledAnchor = anchor;
+		if (target.scrollIntoView) target.scrollIntoView({ block: "start" });
+	}
+
 	function renderToolbar(model) {
 		var memories = model.memories || {};
 		if (!(memories.items || []).length) return "";
@@ -407,8 +430,8 @@ window.JD = window.JD || {};
 			(c) =>
 				/* The session id is this row's tooltip, and that is what it is in the
 				   payload FOR — see MemoryConversationRow. Two conversations from the
-				   same source render identically otherwise (same glyph, same `claude`
-				   meta, and titles that a first-user-message fallback can make near
+				   same source render identically otherwise (same agent mark, and
+				   titles that a first-user-message fallback can make near
 				   duplicates), so a memory fed by three Claude sessions gave the user no
 				   way to tell which row is which, nor to match one against
 				   `sessions.json` or a log line. The whole attribute is omitted rather
@@ -417,11 +440,19 @@ window.JD = window.JD || {};
 				   false about the session. */
 				'<div class="gd-row"' +
 				(c.sessionId ? ' title="Session ' + esc(c.sessionId) + '"' : "") +
-				'><span class="mem-row-icon">' +
-				memoryIcon("message") +
-				'</span><span class="mem-row-title">' +
+				">" +
+				/* The row leads with the AGENT's brand mark rather than a generic
+				   speech bubble — the same row VS Code's memory detail renders and
+				   the same mark IntelliJ's Working Memory panel uses, so one
+				   conversation looks like itself on all three surfaces. It also
+				   replaces the `c.source` text that used to sit in the meta slot:
+				   the mark says the same thing in space the title wants, and the
+				   name survives as the mark's tooltip and accessible name. An agent
+				   with no mark shipped falls back to its initial there. */
+				JD.sourceBadge(c.source, "mem-row-icon") +
+				'<span class="mem-row-title">' +
 				esc(c.title || "(untitled)") +
-				'</span><span class="mem-row-meta">' + esc(c.source) + '</span><span class="mem-row-meta">' + c.messageCount + " msgs</span></div>",
+				'</span><span class="mem-row-meta">' + c.messageCount + " msgs</span></div>",
 			"No conversations linked yet.",
 		);
 		return (
@@ -530,10 +561,24 @@ window.JD = window.JD || {};
 	function topicsSection(detail) {
 		var esc = JD.esc;
 		if (!detail.topics.length) return "";
+		/* The deep-link target for both cards that point into a memory's topics —
+		   Memory Activity's "N decisions" chip and the Decisions card's Latest title.
+		   It sits on the SECTION, so the reader lands on the "What changed and why"
+		   header with the first topic below it.
+
+		   It used to be a per-topic id on the first `.decide` block that carried a
+		   decision, which put the reader mid-topic: `.decide` renders BELOW the
+		   topic's own <h3> and its trigger prose, so aligning it to the top of the
+		   pane scrolled past the heading naming the topic the decision belongs to.
+		   Landing one level up costs a short scroll and keeps that context.
+
+		   One fixed id rather than a per-topic one, because Memory Activity carries
+		   a decision COUNT (`MemoryCard.decisionCount`) and no topic list at all —
+		   it could never name a topic to aim at. */
 		return (
-			'<section class="mem-section mem-topics"><div class="gd-sec">What changed and why</div><div class="mem-topic-list">' +
+			'<section class="mem-section mem-topics" id="what-changed"><div class="gd-sec">What changed and why</div><div class="mem-topic-list">' +
 			detail.topics
-				.map((t) => {
+				.map((t, index) => {
 					var decisions = t.decisions.length
 						? '<div class="decide"><div class="decide-title">' +
 							memoryIcon("bulb") +
@@ -554,7 +599,9 @@ window.JD = window.JD || {};
 							"</div></div>"
 						: "";
 					return (
-						'<article class="topic"><div class="topic-head"><h3>' +
+						'<article class="topic" id="topic-' +
+						index +
+						'"><div class="topic-head"><h3>' +
 						esc(t.title) +
 						"</h3>" +
 						(t.category ? '<span class="tag">' + esc(t.category) + "</span>" : "") +
@@ -940,6 +987,7 @@ window.JD = window.JD || {};
 			wireTree(model);
 			wireDetail(model);
 			scrollSelectedIntoView(model);
+			scrollToAnchor();
 			return;
 		}
 		document.getElementById("app").innerHTML =
@@ -954,5 +1002,6 @@ window.JD = window.JD || {};
 		wireTree(model);
 		wireDetail(model);
 		scrollSelectedIntoView(model);
+		scrollToAnchor();
 	};
 })(window.JD);

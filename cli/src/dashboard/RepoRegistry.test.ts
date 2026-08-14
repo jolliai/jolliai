@@ -31,6 +31,7 @@ import {
 	readRepoRegistry,
 	registerRepo,
 	resolveRepoIdentity,
+	sameRecordedRoot,
 	stampRegistryInstanceId,
 } from "./RepoRegistry.js";
 
@@ -178,6 +179,34 @@ describe("multiple checkouts of one project (§10.2)", () => {
 		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
 		const again = await registerRepo({ cwd: "/home/dev/jolli/sub", configDir, now: () => new Date(1) });
 		expect(again.worktrees).toEqual(["/home/dev/jolli"]);
+	});
+
+	it("replaces a differently-spelled repeat instead of listing it twice", async () => {
+		// The spelling is whatever the calling surface passed; a trailing slash
+		// folds on every platform, so this asserts the fix without depending on
+		// the host's case sensitivity (see `sameRecordedRoot` below for that half).
+		vi.mocked(getProjectRootDir).mockResolvedValueOnce("/home/dev/jolli/");
+		await registerRepo({ cwd: "/home/dev/jolli/", configDir, now: () => new Date(0) });
+		vi.mocked(getProjectRootDir).mockResolvedValueOnce("/home/dev/jolli");
+		const again = await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(1) });
+		// One entry, and the freshest spelling won.
+		expect(again.worktrees).toEqual(["/home/dev/jolli"]);
+	});
+
+	it("ensureWorktreeListed no-ops on a checkout already listed under another spelling", async () => {
+		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
+		vi.mocked(getProjectRootDir).mockResolvedValueOnce("/home/dev/jolli/");
+		const entry = await ensureWorktreeListed({ cwd: "/home/dev/jolli/", configDir });
+		// Adds nothing AND rewrites nothing — the stored spelling is untouched.
+		expect(entry?.worktrees).toEqual(["/home/dev/jolli"]);
+	});
+
+	it("sameRecordedRoot folds drive-letter case on win32 but not on linux", () => {
+		expect(sameRecordedRoot("C:\\Users\\dev\\repo", "c:\\Users\\dev\\repo", "win32")).toBe(true);
+		expect(sameRecordedRoot("C:\\Users\\dev\\repo", "c:\\Users\\dev\\repo", "linux")).toBe(false);
+		// Separator and trailing slash fold everywhere; distinct paths never do.
+		expect(sameRecordedRoot("/home/dev/repo/", "/home/dev/repo", "linux")).toBe(true);
+		expect(sameRecordedRoot("/home/dev/repo", "/home/dev/other", "win32")).toBe(false);
 	});
 
 	it("existingWorktrees drops paths that no longer exist, newest first", () => {

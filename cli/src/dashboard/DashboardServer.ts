@@ -100,6 +100,7 @@ import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDra
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
+import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import { install } from "../install/Installer.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
@@ -275,6 +276,14 @@ export function resolveDashboardAssetsDir(baseDir: string = HERE): string {
  * the mutation-only credential `JD.post` attaches to every POST it makes
  * (see the module header for why GET stays token-free). Optional so the
  * many existing tests that call this with two arguments are unaffected.
+ *
+ * `window.__JOLLI_SOURCE_LABELS__` carries `TRANSCRIPT_SOURCE_LABELS` verbatim,
+ * so `JD.sourceLabel` names an agent without the page holding a copy of that
+ * map. The icons beside those labels DO live in `shell.js` and cannot come from
+ * here — they are markup, not a constant — but the names are one `JSON.stringify`
+ * away, and a label map that drifts is the cheap half of the same bug. Always
+ * inlined (unlike the token): it is a fixed, non-secret table, and a page that
+ * skipped it would silently print raw transcript tags.
  */
 export function assembleDashboardHtml(assetsDir: string, modelJson: string, token?: string): string {
 	const read = (...p: string[]) => readFileSync(join(assetsDir, ...p), "utf8");
@@ -287,6 +296,7 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
 		: "";
 	const scripts =
 		tokenScript +
+		`<script>window.__JOLLI_SOURCE_LABELS__ = ${escapeForInlineScript(JSON.stringify(TRANSCRIPT_SOURCE_LABELS))};</script>\n` +
 		`<script>window.__JOLLI_DASHBOARD__ = ${escapeForInlineScript(modelJson)};</script>\n` +
 		DASHBOARD_SCRIPT_FILES.map((f) => `<script>\n${read("js", f)}\n</script>`).join("\n");
 	const marker = /<!-- scripts:start -->[\s\S]*?<!-- scripts:end -->/;

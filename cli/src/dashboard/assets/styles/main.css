@@ -381,10 +381,13 @@ body {
   }
   @media (min-width: 900px) {
     .span7 { grid-column: span 7; } .span5 { grid-column: span 5; }
+    /* Half-and-half band — Tokens beside Spend: one question in two units
+       (tokens vs dollars, which a rising cached share moves in opposite
+       directions), so the comparison needs them on one row. */
     .span6 { grid-column: span 6; }
-    /* Equal-third band — Skills / MCP servers / Tokens, matching
-       jolli-design's own three-up row: three widgets of the same weight, so
-       none of them leads. */
+    /* Equal-third band — Skills / MCPs / Decisions, matching jolli-design's own
+       three-up row: three widgets of the same weight, so none of them leads.
+       Tokens held the third seat until it paired off with Spend above. */
     .span4 { grid-column: span 4; }
   }
   .card h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
@@ -489,15 +492,6 @@ body {
      content rather than as the absence of it. */
   .empty-note { font-size: 12.5px; color: var(--muted); margin-top: 12px; line-height: 1.55; }
 
-  /* ---------- ranked bars ---------- */
-  .ranked { display: flex; flex-direction: column; gap: 10px; margin-top: 6px; }
-  .rrow { display: grid; grid-template-columns: 190px 1fr 92px; gap: 10px; align-items: center; }
-  .rrow .lbl { font-size: 12.5px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .rrow .bar { height: 18px; border-radius: 0 4px 4px 0; background: var(--s1); min-width: 2px; position: relative; }
-  .rrow .track { background: transparent; border-left: 2px solid var(--baseline); padding-left: 0; height: 18px; display:flex; align-items:center; }
-  .rrow .val { font-size: 12.5px; text-align: right; color: var(--ink); }
-  .rrow .meta { font-size: 11px; color: var(--muted); display: block; }
-
   /* ---------- table view ---------- */
   .ttable { width: 100%; border-collapse: collapse; margin-top: 6px; font-size: 12.5px; }
   .ttable th { text-align: left; font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--grid); }
@@ -529,6 +523,27 @@ body {
   .tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--border); color: var(--ink-2); display: inline-flex; align-items: center; gap: 5px; }
   .tag i { width: 7px; height: 7px; border-radius: 50%; display: inline-block; }
   .tag.metric { border-color: transparent; background: var(--lock-bg); }
+  /* A metric chip that is also a link (Memory Activity's decision count jumps to
+     `#what-changed`). It keeps the chip's own colour rather than the link
+     accent — it reads as a count first and a link second — and states its
+     affordance on hover, where the rest of the row's chips have none. */
+  a.tag.metric { text-decoration: none; color: var(--ink-2); }
+  a.tag.metric:hover { background: var(--accent-soft); color: var(--accent); }
+  /* The AI agent's brand mark (JD.sourceBadge) — Skills rows and the memory
+     detail's conversation rows. Sized here rather than on each <svg> so the two
+     call sites cannot drift, and `color` is inherited on purpose: the neutral
+     marks (Cursor / Copilot / OpenCode / Cline / Devin) draw with
+     `currentColor`, so they take the surrounding slot's colour and stay legible
+     on both themes, while the brand-coloured ones ignore it. */
+  .src-mark { display: inline-flex; align-items: center; justify-content: center; flex: none; }
+  .src-mark svg { display: block; width: 14px; height: 14px; }
+  /* The same 14px box as an <svg>, not a bare glyph: measured at 7x10 without
+     it, which left a row of marks visibly ragged wherever one agent ships no
+     brand mark (Kimi today). */
+  .src-letter {
+    display: inline-flex; align-items: center; justify-content: center; width: 14px; height: 14px;
+    font-size: 10px; font-weight: 650; line-height: 1;
+  }
   .tag.reuse { display: none; border-color: transparent; background: var(--accent-soft); color: var(--accent); font-weight: 600; }
   .jd[data-tier="2"] .tag.reuse { display: inline-flex; }
   .sess-row { display: flex; gap: 12px; align-items: center; border: 1px solid var(--grid); border-radius: 8px; padding: 10px 14px; font-size: 12.5px; color: var(--ink-2); }
@@ -556,13 +571,16 @@ body {
   .jd[data-tier="2"] .t2hide { display: none; }
 
   /* ---------- decisions ----------
-     A span12 card: it was a span6 paired with the Recall card, and that one is
-     gone (JOLLI-2193), so it took the whole row rather than leaving six empty
-     columns. Carries no "recalled" figure of its own — see DecisionsCard's doc
-     comment. */
-  .hdr-stat { margin-left: auto; text-align: right; }
-  .hdr-stat b { display: block; font-size: 19px; font-weight: 650; letter-spacing: -.01em; }
-  .hdr-stat span { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+     A span4 card, third seat in the equal-third band. It was span12 (span6 until
+     the Recall card beside it was removed, JOLLI-2193) and gave the width back:
+     the step chart below scales to any column, so nothing on the card was using
+     it. Carries no "recalled" figure of its own — see DecisionsCard's doc
+     comment.
+
+     The `.hdr-stat` rules that used to head this section went with that move —
+     a right-aligned headline beside a two-line title needs more than a third of
+     the row — and this card was their only user. The count is now a `.bignum`
+     under the title, styled inline exactly like Tokens' own. */
   .stepchart { margin-top: 10px; }
   .stepchart svg { display: block; width: 100%; height: 60px; }
   .dec-quote {
@@ -727,6 +745,18 @@ body {
      breathing room for the reading pane; a left inset reads as an accidental
      gap between the app navigation and this second-level navigator. */
   .wrap:has(.memories-page) { max-width: none; padding: 0 56px 0 0; }
+  /* `.main`'s 48px bottom padding is for pages that end; this one is sized to the
+     viewport (topbar + `calc(100vh - 58px)`), so the padding only makes the
+     DOCUMENT 48px taller than the window. That is not just dead scroll: the
+     topbar is `position: sticky`, so those 48px of root scrolling slide the
+     reading pane up UNDER it. `#what-changed` landed there — `scrollIntoView`
+     scrolls the pane and then the root, and the root's alignment runs out of
+     travel and clamps, so the section header the anchor exists to show finished
+     behind an opaque bar. Removing the overflow leaves the pane as the page's
+     only scroller, which is what the anchor's `scroll-margin-top` assumes.
+     Not applied at the ≤899px breakpoint below: there the pane goes
+     `height: auto` and the window is SUPPOSED to scroll. */
+  .main:has(.memories-page) { padding-bottom: 0; }
   .grid:has(.memories-page) { display: block; }
   .memories-page {
     display: grid; grid-template-columns: 344px minmax(0, 1fr);
@@ -880,6 +910,14 @@ body {
   .mem-row-icon .mem-icon { width: 14px; height: 14px; }
   .mem-row-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--ink); }
   .mem-row-meta { color: var(--muted); white-space: nowrap; font-size: 11px; }
+  /* The deep-link target from Memory Activity and the Decisions card. The scroll
+     lands the section's own header at the top edge of whatever is scrolling, so
+     this margin is the only thing keeping "What changed and why" off that edge.
+     Two values, because WHICH element scrolls changes: on desktop it is
+     `.mem-detail`, which has nothing overlapping it, so 18px is breathing room
+     alone; below 899px the pane goes `height: auto` and the WINDOW scrolls under
+     the 58px sticky topbar, so the same 16px of room needs 74. */
+  #what-changed { scroll-margin-top: 18px; }
   .mem-topic-list { display: flex; flex-direction: column; gap: 16px; }
   .mem-topics .topic {
     margin: 0; padding: 20px; border: 1px solid var(--border); border-radius: 10px;
@@ -929,6 +967,7 @@ body {
     .mem-tree { flex: none; height: min(42vh, 360px); }
     .mem-detail { height: auto; overflow: visible; border-radius: 0; border-inline: 0; }
     .mem-read-inner { padding: 28px 4px 48px; }
+    #what-changed { scroll-margin-top: 74px; }
   }
   .tok-bar { margin-top: 6px; display: flex; height: 8px; border-radius: 999px; overflow: hidden; background: var(--heat-track); }
   .tok-bar i { display: block; height: 100%; }
@@ -1061,6 +1100,27 @@ body {
      siblings are flex:none so the name is the only thing that gives. Every
      truncating label in this file carries its full text in a `title`. */
   .ranklist .rl-name { color: var(--ink); font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+  /* The Skills row's agent marks, ahead of the name.
+
+     The width is FIXED at two 14px marks plus their gap, and the contents are
+     right-aligned into it. That is what keeps every skill name starting at the
+     same x — a lead sized to its contents put a one-agent row's name 18px left
+     of a two-agent row's, and the names are the column a reader scans down.
+     `agentBadges` caps itself at the same two so nothing overflows the box.
+     Right-aligned rather than left so a single mark sits against the name it
+     belongs to instead of floating a slot away from it.
+
+     `align-self: center` overrides `.rl-top`'s baseline alignment — a 14px icon
+     on a text baseline hangs below the line. `--muted` is inherited by the
+     neutral marks' `currentColor` (Cursor / Copilot / OpenCode / Cline / Devin),
+     which keeps them a row attribute rather than a second focal point beside
+     the name. */
+  .ranklist .rl-lead {
+    display: inline-flex; align-items: center; justify-content: flex-end; gap: 4px;
+    flex: none; align-self: center; width: 32px; color: var(--muted);
+  }
+  /* The overflow counter, in the second mark's slot and on its baseline. */
+  .src-more { display: inline-flex; align-items: center; justify-content: center; min-width: 14px; height: 14px; font-size: 10px; font-weight: 650; line-height: 1; }
   .ranklist .rl-kind { color: var(--muted); font-size: 11px; flex: none; }
   .ranklist .rl-val { margin-left: auto; color: var(--ink-2); white-space: nowrap; flex: none; }
   .ranklist .rl-bar { height: 10px; margin-top: 10px; border-radius: 5px; background: var(--heat-track); overflow: hidden; }
@@ -1102,12 +1162,16 @@ body {
     border-left: 3px solid var(--memory-color); border-bottom: 1px solid var(--grid);
   }
   .mem-activity-copy { min-width: 0; }
-  .mem-activity-title { font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.4; }
+  /* The title IS the link, so it keeps the ink colour a heading has and picks
+     up the accent only on hover — a row of blue titles would read as a list of
+     links rather than a list of memories. `display: block` so the hit area is
+     the whole line, not just the glyphs. */
+  .mem-activity-title { display: block; font-size: 13px; font-weight: 600; color: var(--ink); line-height: 1.4; text-decoration: none; }
+  a.mem-activity-title:hover { color: var(--accent); text-decoration: underline; }
   .mem-activity-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
   .mem-activity-category { color: var(--memory-color); font-size: 11.5px; font-weight: 600; }
   .mem-activity-action { display: flex; align-items: center; gap: 14px; margin-left: auto; flex: none; white-space: nowrap; }
   .mem-activity-action time { font-size: 11.5px; color: var(--muted); }
-  .mem-activity-action a { color: var(--accent); font-size: 12.5px; font-weight: 600; }
   @media (max-width: 620px) {
     .mem-activity-row { align-items: flex-start; flex-direction: column; gap: 8px; }
     .mem-activity-action { margin-left: 0; }
@@ -1172,11 +1236,28 @@ body {
 
   .overlay { position: fixed; inset: 0; background: rgba(0,0,0,.4); display: none; align-items: center; justify-content: center; z-index: 80; padding: 20px; }
   .overlay.open { display: flex; }
-  .sheet { background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 12px; width: min(640px, 100%); padding: 18px; }
+  /* The Context viewer is this class's only user, and what it holds is a whole
+     plan or note — agent-written markdown with no hard wrap, rendered as 12px
+     monospace. At the 640px this used to be, the body measured ~85 characters
+     (measured in Chrome, not derived), so nearly every line of a real plan
+     folded; 960px gives ~133 and leaves the wrapping to lines that are genuinely
+     long. `min(…, 100%)` still yields to a narrow window — 100% of the overlay's
+     content box, so its own 20px padding is already subtracted.
+
+     Height is the same argument one axis over: a fixed `60vh` on the body left a
+     tall window mostly empty while still scrolling. The sheet is a flex column
+     capped at the overlay's height instead, so a short document keeps a small
+     dialog and a long one gets every pixel there is. `min-height: 0` on the body
+     is what actually lets it scroll — a flex item's default `min-height: auto`
+     refuses to shrink below its content, so the sheet would grow past the cap. */
+  .sheet {
+    background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 12px;
+    width: min(960px, 100%); max-height: 100%; padding: 18px; display: flex; flex-direction: column;
+  }
   .sheet h3 { margin: 0 0 2px; font-size: 14px; }
   .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
   .ctx-body {
-    max-height: 60vh; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
+    flex: 0 1 auto; min-height: 0; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
     font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6;
     color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
   }

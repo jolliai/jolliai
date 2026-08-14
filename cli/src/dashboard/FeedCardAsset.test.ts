@@ -13,10 +13,27 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { MEMORY_CARD_MAJOR_LINES } from "./DashboardModel.js";
 
+interface SeriesPoint {
+	readonly date: string;
+	readonly bySeries: Record<string, number>;
+}
+
 interface JDNamespace {
 	renderStats: (model: unknown) => void;
 	repoToken: (model: unknown, identity: string) => string;
 	withParams: (query: string, params: Record<string, string | undefined>) => string;
+	stackedBars: (
+		series: ReadonlyArray<SeriesPoint>,
+		keys: ReadonlyArray<string>,
+		valueLabel: string,
+		fmt?: (n: number) => string,
+	) => string;
+	topSeries: (
+		series: ReadonlyArray<SeriesPoint>,
+		keys: ReadonlyArray<string>,
+		limit: number,
+	) => { keys: ReadonlyArray<string>; series: ReadonlyArray<SeriesPoint>; byKey: Record<string, number> };
+	fmtUsd: (n: number) => string;
 }
 
 /** Minimal element stub: enough for the renderer to write into and be read back. */
@@ -109,7 +126,6 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 		],
 		usage: { available: false },
 		stats: {
-			kpis: [],
 			series: [],
 			seriesKeys: [],
 			seriesDimension: "model",
@@ -173,11 +189,14 @@ describe("Memory Activity — memory tier", () => {
 		expect(html).toContain("bugfix");
 		expect(html).toContain("3 turns");
 		expect(html).toContain("fix-auth-refresh");
-		expect(html).toContain("Open memory →");
+		// The TITLE is the link — there is no separate "Open memory →" action.
+		expect(html).not.toContain("Open memory");
 		// `detailRepo`, not `repo`: the link names which repo owns the memory
 		// without scoping the Memories tree to it (see wireTree in memories.js).
 		expect(html).toContain("&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai");
-		expect(html).toContain('" target="_blank" rel="noopener">Open memory →');
+		expect(html).toContain(
+			'<a class="mem-activity-title" href="/memories?repo=jolliai&range=month&dimension=model&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai" target="_blank" rel="noopener">fix: token refresh race in gateway retries</a>',
+		);
 		// The whole point of the runtime test: a renamed model field would show up here.
 		expect(html).not.toContain("undefined");
 		expect(html).not.toContain("NaN");
@@ -243,16 +262,29 @@ describe("Memory Activity — memory tier", () => {
 	});
 
 	it("shows the decisions this commit recorded, singular when there is one", () => {
-		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 3 }] }))).toContain("3 decisions</span>");
-		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 1 }] }))).toContain("1 decision</span>");
+		// The chip is an <a>, not a <span>: it jumps to `#what-changed` on the
+		// detail page rather than making the reader find the decisions themselves.
+		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 3 }] }))).toContain("3 decisions</a>");
+		expect(feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 1 }] }))).toContain("1 decision</a>");
+	});
+
+	it("links the decision count at the topics section, not the top of the memory", () => {
+		const html = feedHtml(model({}, { memoryCards: [{ ...CARD, decisionCount: 3 }] }));
+		expect(html).toContain(
+			'<a class="tag metric num" href="/memories?repo=jolliai&range=month&dimension=model&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai#what-changed" target="_blank" rel="noopener">3 decisions</a>',
+		);
+		// The title link is the same memory WITHOUT the anchor — the two chips
+		// lead to different places in one page on purpose.
+		expect(html).toContain('rel="noopener">fix: token refresh race in gateway retries</a>');
 	});
 
 	// Absent, not zero: the server omits the field when the commit recorded none,
 	// and a row of zeros is noise beside the chips that are already conditional.
 	it("prints no decision chip when the commit recorded none", () => {
 		const html = feedHtml(model());
-		expect(html).not.toContain("decisions</span>");
-		expect(html).not.toContain("decision</span>");
+		expect(html).not.toContain("decisions</a>");
+		expect(html).not.toContain("decision</a>");
+		expect(html).not.toContain("#what-changed");
 	});
 
 	it("labels the two nearest days Today/Yesterday, and leaves older groups as a bare date", () => {
@@ -397,7 +429,15 @@ describe("Decisions card footer", () => {
 	});
 });
 
-describe("equal-third card subtitles", () => {
+/**
+ * Every card built on `widgetHead` — the three in the equal-third band plus
+ * Tokens, which kept the head when it moved down to share a row with Spend. The
+ * shape is what they have in common (one-line title, explanation in a `title=`
+ * hint, no visible sub), not the column count.
+ */
+const WIDGET_HEAD_CARDS = ["Skills", "MCPs", "Decisions", "Tokens"];
+
+describe("widget card heads", () => {
 	/** A card's tooltip text with the hard wraps taken back out. */
 	const hintOf = (label: string): string => {
 		const title = /title="([^"]*)"/.exec(headOf(label));
@@ -447,7 +487,8 @@ describe("equal-third card subtitles", () => {
 		// `Last 30 days` came off the card: the topbar range control is the one
 		// place the window is set, and it says so there. What the tooltip carries
 		// instead is the thing the bars cannot show — why this card counts tokens
-		// while Spend counts dollars.
+		// while Spend counts dollars. Tokens has since moved out of the band and
+		// onto the row it shares with Spend, but the head shape came with it.
 		const head = headOf("Tokens");
 		expect(head).toContain('class="has-hint"');
 		expect(hintOf("Tokens")).toContain("Cache reads bill at 10% of input");
@@ -456,10 +497,25 @@ describe("equal-third card subtitles", () => {
 		expect(head).not.toContain('<div class="sub">');
 	});
 
+	it("puts the Decisions explanation in the title's tooltip", () => {
+		// Took Tokens' seat in the band, and with it the band's head: what was a
+		// visible sub is now a one-line title carrying its sentence as a hint.
+		// The window went the same way `Last 30 days` did on Tokens.
+		const head = headOf("Decisions");
+		expect(head).toContain('class="has-hint"');
+		expect(hintOf("Decisions")).toContain("Decisions your sessions made, accumulating across the range");
+		expect(hintOf("Decisions")).toContain("the knowledge Jolli banked, with the receipts behind it");
+		// "What Jolli decided to keep" is gone: it described the store rather than
+		// the reader's work.
+		expect(hintOf("Decisions")).not.toContain("What Jolli decided to keep");
+		expect(head).not.toContain("Last 30 days");
+		expect(head).not.toContain('<div class="sub">');
+	});
+
 	it("hard-wraps every tooltip — a native one does not wrap itself", () => {
 		// Unwrapped, a two-sentence hint renders as one line that runs past the
 		// card and off the viewport.
-		for (const label of ["Skills", "MCPs", "Tokens"]) {
+		for (const label of WIDGET_HEAD_CARDS) {
 			const lines = hintLines(label);
 			expect(lines.length, label).toBeGreaterThan(1);
 			for (const line of lines) expect(line.length, `${label}: ${line}`).toBeLessThanOrEqual(70);
@@ -469,7 +525,7 @@ describe("equal-third card subtitles", () => {
 	it("breaks only between words", () => {
 		// The wrap is by character count against a font the page cannot measure,
 		// so word boundaries are what keep it acceptable.
-		for (const label of ["Skills", "MCPs", "Tokens"]) {
+		for (const label of WIDGET_HEAD_CARDS) {
 			for (const line of hintLines(label)) {
 				expect(line.startsWith(" "), label).toBe(false);
 				expect(line.endsWith(" "), label).toBe(false);
@@ -478,7 +534,7 @@ describe("equal-third card subtitles", () => {
 	});
 
 	it("leaves no visible subtitle on any card in the band", () => {
-		for (const label of ["Skills", "MCPs", "Tokens"]) {
+		for (const label of WIDGET_HEAD_CARDS) {
 			expect(headOf(label), label).not.toContain('<div class="sub">');
 		}
 	});
@@ -516,7 +572,10 @@ describe("Memory Activity", () => {
 		expect(app.innerHTML).toContain('data-memory-activity-view="branch"');
 		expect(app.innerHTML).toContain('data-memory-activity-view="time"');
 		expect(app.innerHTML).toContain("&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai");
-		expect(app.innerHTML).toContain("Open memory →");
+		// One link per row, and it is the title: an action column of identical
+		// "Open memory →" links was the same word repeated down the card.
+		expect(app.innerHTML).toContain('<a class="mem-activity-title"');
+		expect(app.innerHTML).not.toContain("Open memory");
 	});
 });
 
@@ -617,6 +676,17 @@ describe("Decisions card", () => {
 		expect(html).toContain('target="_blank" rel="noopener"');
 	});
 
+	it("lands on the memory's topics, at the same anchor the feed's count uses", () => {
+		// `#what-changed` is the topics section's own header in `memories.js`. One
+		// anchor serves both callers, and neither can address anything finer: the
+		// feed's chip knows a decision COUNT, and `DecisionRecord` carries no topic
+		// index — `buildDecisionsCard`'s ordering settles which topic it MEANS, not
+		// where the link goes.
+		expect(decisionsHtml(DECISIONS)).toContain(
+			'href="/memories?repo=jolliai&range=month&dimension=model&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai#what-changed"',
+		);
+	});
+
 	// The card used to render the whole decisions block through an inline-only
 	// markdown renderer — measured at ~1,900 characters on a real memory.
 	it("renders no decision prose and no quote marks", () => {
@@ -639,6 +709,118 @@ describe("Decisions card", () => {
 	});
 });
 
+/**
+ * The per-row agent marks. Skills leads its rows with them; the two MCP lists
+ * keep text in the trailing slot they already spend on counts. Those are two
+ * different slots on opposite sides of the label, which is what `rankedList`'s
+ * `leadHtmlOf` / `kindHtmlOf` pair is for — the marks are ahead of the name in
+ * the DOM, not flipped there by CSS, so these cases assert real source order.
+ */
+describe("agent marks on ranked rows", () => {
+	const skillRow = (agents: ReadonlyArray<{ source: string; calls: number }>) => ({
+		skills: [{ name: "code-review", kind: "skill", sessions: 3, calls: 4, agents }],
+		skillsTotal: 1,
+		skillCallsTotal: 4,
+	});
+
+	it("puts one brand mark per agent on a skill row, naming each", () => {
+		const html = usageHtml("Skills", skillRow([{ source: "claude", calls: 3 }]));
+		// Claude's mark is its own hex on both themes, so the hue is part of the
+		// contract, not a token.
+		expect(html).toContain('stroke="#D97757"');
+		// The name is not lost with the text — it is the mark's tooltip and its
+		// accessible name.
+		expect(html).toContain('role="img" title="claude" aria-label="claude"');
+		// And the bare source name no longer sits in the row as text.
+		expect(html).not.toContain('<span class="rl-kind">claude</span>');
+	});
+
+	it("emits the mark ahead of the skill name in the markup, not just on screen", () => {
+		const html = usageHtml("Skills", skillRow([{ source: "claude", calls: 3 }]));
+		expect(html).toContain('<div class="rl-top"><span class="rl-lead">');
+		// A CSS `order` flip would pass a screenshot and fail this: what a screen
+		// reader announces and what a copy-paste yields is the source order.
+		expect(html.indexOf("rl-lead")).toBeLessThan(html.indexOf("rl-name"));
+	});
+
+	// The lead is a fixed-width COLUMN, so a row with no agents still reserves it
+	// — dropping the span would put that row's name 40px left of its neighbours'.
+	it("reserves the lead column on a row with no agents", () => {
+		const html = usageHtml("Skills", skillRow([]));
+		expect(html).toContain('<div class="rl-top"><span class="rl-lead"></span>');
+		expect(html).not.toContain("src-mark");
+	});
+
+	// Past two agents the lead collapses, because a lead that grows with the
+	// agent count is what makes the name column ragged.
+	it("collapses past two agents into the leader's mark plus a counter", () => {
+		const html = usageHtml(
+			"Skills",
+			skillRow([
+				{ source: "claude", calls: 30 },
+				{ source: "codex", calls: 8 },
+				{ source: "cursor", calls: 2 },
+			]),
+		);
+		// The leader keeps its mark; the other two become "+2".
+		expect(html).toContain('stroke="#D97757"');
+		expect(html).toContain(">+2</span>");
+		expect(html).not.toContain('stroke="#10A37F"');
+		// Their names are the counter's tooltip rather than being dropped.
+		expect(html).toContain('title="codex, cursor"');
+	});
+
+	it("shows both marks at exactly two agents, with no counter", () => {
+		const html = usageHtml(
+			"Skills",
+			skillRow([
+				{ source: "claude", calls: 30 },
+				{ source: "codex", calls: 8 },
+			]),
+		);
+		expect(html).toContain('stroke="#D97757"');
+		expect(html).toContain('stroke="#10A37F"');
+		expect(html).not.toContain("src-more");
+	});
+
+	it("keeps the server's order when two agents ran one skill", () => {
+		const html = usageHtml(
+			"Skills",
+			skillRow([
+				{ source: "codex", calls: 30 },
+				{ source: "claude", calls: 4 },
+			]),
+		);
+		// `sortAgents` ranks by volume, so codex leads — the marks must not resort.
+		expect(html.indexOf('stroke="#10A37F"')).toBeLessThan(html.indexOf('stroke="#D97757"'));
+	});
+
+	// Kimi ships no mark on any surface yet. The row must still say who ran it.
+	it("falls back to the agent's initial when no mark ships for it", () => {
+		const html = usageHtml("Skills", skillRow([{ source: "kimi", calls: 2 }]));
+		expect(html).toContain('<span class="src-letter" aria-hidden="true">K</span>');
+		expect(html).toContain('aria-label="kimi"');
+	});
+
+	// The MCP lists keep TEXT in the trailing slot, and it still goes through
+	// JD.esc — that slot stopped escaping for them when it started taking markup.
+	it("leaves the MCP lists on escaped text after the name", () => {
+		const html = usageHtml("MCPs", {
+			servers: [
+				{ server: "<img src=x>", sessions: 2, calls: 30, tools: 3, agents: [{ source: "codex", calls: 30 }] },
+			],
+			serversTotal: 1,
+			serverCallsTotal: 30,
+		});
+		expect(html).toContain('<span class="rl-kind">3 tools · codex</span>');
+		expect(html).not.toContain("<img src=x>");
+		// And no lead: an MCP row's agent stays inside that text, so the lead slot
+		// is Skills-only rather than something every list grew.
+		expect(html).not.toContain("rl-lead");
+		expect(html.indexOf("rl-name")).toBeLessThan(html.indexOf("rl-kind"));
+	});
+});
+
 describe("MCPs card footer", () => {
 	const withServers = (over: Record<string, unknown> = {}) =>
 		usageHtml("MCPs", {
@@ -658,8 +840,8 @@ describe("MCPs card footer", () => {
 		);
 	});
 
-	// The three caveats JOLLI-2191 removed. Each is asserted separately because
-	// they came from three different branches of the old note.
+	// The caveats removed from these cards. Each is asserted separately because
+	// they came from different branches of the old note.
 	it("drops the uncovered-sources, recall-scope and reconstructed-history caveats", () => {
 		const html = withServers({
 			uncoveredSources: ["copilot-chat"],
@@ -672,23 +854,41 @@ describe("MCPs card footer", () => {
 		expect(html).toContain("recall calls");
 	});
 
-	// The empty state is a different element with no session count to trim to,
-	// so it keeps the caveat that says why the list may be short.
-	it("keeps the coverage caveat in the empty state", () => {
-		const html = usageHtml("MCPs", { servers: [], uncoveredSources: ["copilot-chat"] });
-		expect(html).toContain("No MCP calls recorded in this window.");
-		expect(html).toContain("record no tool calls");
-	});
-
-	// Same helper, still printed by the other card that has one.
-	it("leaves the Skills card's own caveat alone", () => {
-		const html = usageHtml("Skills", {
+	// The uncovered-sources caveat is gone from EVERY branch now, empty states
+	// included — it named a parser capability where a reader expects data, in a
+	// footer that already states its own denominator. The server still computes
+	// `uncoveredSources`; nothing prints it.
+	it.each(["Skills", "MCPs"] as const)("prints no uncovered-sources caveat on the %s card", (label) => {
+		const populated = usageHtml(label, {
 			skills: [{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 2, agents: [] }],
 			skillsTotal: 1,
 			skillCallsTotal: 2,
 			uncoveredSources: ["copilot-chat"],
 		});
-		expect(html).toContain("record no tool calls");
+		const empty = usageHtml(label, { skills: [], servers: [], uncoveredSources: ["copilot-chat"] });
+		for (const html of [populated, empty]) {
+			expect(html).not.toContain("record no tool calls");
+			expect(html).not.toContain("will not appear here");
+			expect(html).not.toContain("copilot-chat");
+		}
+		expect(empty).toContain("recorded in this window.");
+	});
+
+	// `<b>` is opened before the numerator and closed by "</b> of ", so the
+	// singular branch used to emit a second, unpaired `</b>`. Browsers swallow
+	// it, which is why it survived — assert the tags balance rather than the
+	// prose.
+	it("balances its bold tags on the singular session count", () => {
+		const html = usageHtml("Skills", {
+			skills: [{ name: "jolli-recall", kind: "skill", sessions: 1, calls: 2, agents: [] }],
+			skillsTotal: 1,
+			skillCallsTotal: 2,
+			sessionsWithTools: 1,
+			sessionsInWindow: 1,
+		});
+		const foot = html.slice(html.indexOf("w-foot"));
+		expect(foot).toContain("of 1 session in this window");
+		expect((foot.match(/<b>/g) ?? []).length).toBe((foot.match(/<\/b>/g) ?? []).length);
 	});
 });
 
@@ -746,5 +946,298 @@ describe("JD.withParams (shell.js)", () => {
 			"?hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai",
 		);
 		expect(JD.withParams("?repo=x", { hash: "", detailRepo: undefined })).toBe("?repo=x");
+	});
+});
+
+/** The Spend card, sliced out of the rendered stats page. */
+function spendHtml(statsOver: Record<string, unknown>): string {
+	app.innerHTML = "";
+	JD.renderStats(model({}, statsOver));
+	const html = app.innerHTML;
+	const start = html.indexOf('aria-label="Spend"');
+	expect(start).toBeGreaterThan(-1);
+	return html.slice(start, html.indexOf("</section>", start));
+}
+
+/**
+ * One ordinary day plus the day that used to break the card: real cost, but
+ * every series key at zero tokens. Cost is apportioned by token share, so that
+ * day draws no bar at all — and the headline must not claim it either.
+ */
+const SPEND_SERIES = {
+	seriesKeys: ["alpha", "beta"],
+	series: [
+		{ date: "2026-07-29", tokens: 100, estCostUsd: 4, bySeries: { alpha: 60, beta: 40 } },
+		{ date: "2026-07-30", tokens: 0, estCostUsd: 5, bySeries: { alpha: 0, beta: 0 } },
+	],
+};
+
+describe("Spend card — headline, legend and footer read one source", () => {
+	it("totals what the bars draw, not `estCostUsd`, so an undrawable day cannot inflate it", () => {
+		const html = spendHtml(SPEND_SERIES);
+		// 4.00 is the drawn total; 9.00 would be the sum of estCostUsd.
+		expect(html).toContain("$4.00");
+		expect(html).not.toContain("$9.00");
+	});
+
+	it("splits the headline across the legend exactly", () => {
+		const html = spendHtml(SPEND_SERIES);
+		expect(html).toContain("$2.40"); // alpha: 60/100 of the drawn $4.00
+		expect(html).toContain("$1.60"); // beta:  40/100
+	});
+
+	it("names a busiest day that cannot exceed the headline", () => {
+		const html = spendHtml(SPEND_SERIES);
+		// Asserted POSITIVELY on purpose. The undrawable day carries the larger
+		// `estCostUsd` ($5.00), so a footer reading that field would name a
+		// busiest day worth more than the whole window — but it would also read
+		// `estCostUsd` off the apportioned series, where the field does not
+		// exist, and render no footer at all. A `not.toContain` passes on that.
+		expect(html).toContain("busiest day");
+		expect(html).toContain("2026-07-29 · $4.00");
+	});
+
+	it("states which clock the series is on", () => {
+		expect(spendHtml({ ...SPEND_SERIES, seriesDimension: "branch" })).toContain("by commit date");
+		expect(spendHtml({ ...SPEND_SERIES, seriesDimension: "category" })).toContain("by commit date");
+		// Not the requested dimension — the effective one. Below the memory tier a
+		// memory axis falls back to `model`, and the label has to follow it.
+		expect(spendHtml({ ...SPEND_SERIES, seriesDimension: "model" })).toContain("by session activity");
+		expect(spendHtml({ ...SPEND_SERIES, seriesDimension: "agent" })).toContain("by session activity");
+	});
+
+	it("names the axis it actually drew, in both places it says one", () => {
+		// Both the chart's aria-label and the "largest …" figure said "model" on
+		// every axis, so `?dimension=branch` announced a branch name as a model.
+		const branch = spendHtml({ ...SPEND_SERIES, seriesDimension: "branch" });
+		expect(branch).toContain("estimated spend by branch");
+		expect(branch).toContain("largest branch");
+		expect(branch).not.toContain("model");
+		const project = spendHtml({ ...SPEND_SERIES, seriesDimension: "project" });
+		expect(project).toContain("estimated spend by project");
+		expect(project).toContain("largest project");
+		// The effective dimension, not the requested one — same rule as the clock
+		// note above, and the case that has to keep saying "model".
+		const model = spendHtml({ ...SPEND_SERIES, seriesDimension: "model" });
+		expect(model).toContain("estimated spend by model");
+		expect(model).toContain("largest model");
+	});
+
+	it("degrades an unknown dimension to a neutral noun rather than a wrong one", () => {
+		// An older page against a newer server. Naming the axis wrongly is worse
+		// than not naming it, and `constructor` is the shape that would hand back
+		// an inherited value from a plain-object lookup table.
+		for (const dim of ["quantum", "constructor"]) {
+			const html = spendHtml({ ...SPEND_SERIES, seriesDimension: dim });
+			expect(html).toContain("estimated spend by series");
+			expect(html).toContain("largest series");
+			expect(html).not.toContain("function Object");
+		}
+	});
+
+	it("renders no stray undefined or NaN", () => {
+		const html = spendHtml(SPEND_SERIES);
+		expect(html).not.toContain("undefined");
+		expect(html).not.toContain("NaN");
+	});
+});
+
+describe("Memory Activity — subtitle counts the page, and says so", () => {
+	const twoCards = [CARD, { ...CARD, commitHash: "h2" }];
+
+	it("counts the window when the list is NOT capped", () => {
+		const html = feedHtml(model({}, { memoryCards: twoCards, memoryCardsCapped: false }));
+		expect(html).toContain("2 memories in this window");
+		// Claiming a truncation that did not happen is its own inaccuracy.
+		expect(html).not.toContain("showing the");
+	});
+
+	it("says 'showing the N most recent' only when the server capped the list", () => {
+		const html = feedHtml(model({}, { memoryCards: twoCards, memoryCardsCapped: true }));
+		expect(html).toContain("showing the 2 most recent");
+		// The original wording printed the page size as though it were the window
+		// total, directly above the coverage line that prints the real one.
+		expect(html).not.toContain("memories in this window");
+	});
+
+	it("keeps the uncapped singular readable", () => {
+		const html = feedHtml(model({}, { memoryCards: [CARD], memoryCardsCapped: false }));
+		expect(html).toContain("1 memory in this window");
+		expect(html).not.toContain("1 memories");
+	});
+});
+
+/** Axis tick labels, in draw order (bottom gridline first). */
+function axisTicks(svg: string): ReadonlyArray<string> {
+	return [...svg.matchAll(/class="num">([^<]*)<\/text>/g)].map((m) => m[1]);
+}
+
+/** Every `var(--sN)` fill in the legend, in render order. */
+function legendColors(html: string): ReadonlyArray<string> {
+	const legend = html.slice(
+		html.indexOf('<div class="legend'),
+		html.indexOf("</div>", html.indexOf('<div class="legend')),
+	);
+	return [...legend.matchAll(/background:(var\(--s\d\))/g)].map((m) => m[1]);
+}
+
+const DAY = (date: string, bySeries: Record<string, number>) => ({ date, bySeries });
+
+describe("JD.stackedBars — the caller owns the unit", () => {
+	it("formats the axis and the tooltip with the supplied formatter", () => {
+		const svg = JD.stackedBars([DAY("2026-07-29", { a: 2.4 })], ["a"], "spend", JD.fmtUsd);
+		// The defect: one chart function served both cards and hardcoded the token
+		// formatter, so money lost its `$` and its cents.
+		expect(axisTicks(svg).every((t) => t.startsWith("$"))).toBe(true);
+		expect(svg).toContain("· a · $2.40");
+		expect(svg).not.toContain("· a · 2.4<");
+	});
+
+	it("still formats tokens when no formatter is passed", () => {
+		const svg = JD.stackedBars([DAY("2026-07-29", { a: 1_200_000 })], ["a"], "tokens");
+		expect(svg).toContain("· a · 1.2M");
+		expect(axisTicks(svg).some((t) => t.endsWith("M"))).toBe(true);
+		expect(svg).not.toContain("$");
+	});
+
+	it("lands the axis on round ticks and never clips the tallest bar", () => {
+		// 8.7M used to read 0 / 2.2M / 4.3M / 6.5M / 8.7M — four arbitrary numbers.
+		const svg = JD.stackedBars([DAY("2026-07-29", { a: 8_700_000 })], ["a"], "tokens");
+		expect(axisTicks(svg)).toEqual(["0", "2.5M", "5.0M", "7.5M", "10.0M"]);
+	});
+
+	it("scales the step to the data, so a sub-dollar window is not flattened", () => {
+		// Regression on the seed, not just the ladder: the bar loop started `max`
+		// at 1, a "one token" floor that drew every sub-$1 window against a $1
+		// axis — four ticks of headroom above a $0.37 chart.
+		const svg = JD.stackedBars([DAY("2026-07-29", { a: 0.37 })], ["a"], "spend", JD.fmtUsd);
+		expect(axisTicks(svg)).toEqual(["$0.00", "$0.10", "$0.20", "$0.30", "$0.40"]);
+	});
+
+	it("survives a series key that shadows Object.prototype", () => {
+		// `topSeries` was hardened for this and hands a SHORT series straight back,
+		// so the raw JSON.parse'd object — prototype and all — reaches this function
+		// unchanged. `|| 0` then treats the inherited `constructor` function as a
+		// value on the day it is absent: it clears the `<= 0` guard, and every
+		// geometry expression downstream of it becomes NaN.
+		const svg = JD.stackedBars(
+			[DAY("2026-07-29", { constructor: 40 }), DAY("2026-07-30", { a: 60 })],
+			["constructor", "a"],
+			"tokens",
+		);
+		expect(svg).not.toContain("NaN");
+		expect(svg).toContain("· constructor · 40");
+		expect(axisTicks(svg)).toEqual(["0", "20", "40", "60", "80"]);
+	});
+
+	it("keeps the no-data axis on integers", () => {
+		// The seed moved into `niceAxisMax`, so this is the case that would
+		// otherwise read 0 / 0.25 / 0.5 / 0.75 / 1 tokens.
+		expect(axisTicks(JD.stackedBars([DAY("2026-07-29", { a: 0 })], ["a"], "tokens"))).toEqual([
+			"0",
+			"1",
+			"2",
+			"3",
+			"4",
+		]);
+	});
+});
+
+describe("JD.topSeries — ranked head plus a conserving Other bucket", () => {
+	const wide = {
+		keys: Array.from({ length: 23 }, (_, i) => `branch-${i}`),
+		series: [DAY("2026-07-29", Object.fromEntries(Array.from({ length: 23 }, (_, i) => [`branch-${i}`, i + 1])))],
+	};
+
+	it("caps the visible series at limit + Other", () => {
+		const top = JD.topSeries(wide.series, wide.keys, 4);
+		expect(top.keys).toHaveLength(5);
+		expect(top.keys[top.keys.length - 1]).toBe("Other");
+		// Ranked by total, so the largest series keeps the first colour.
+		expect(top.keys.slice(0, 4)).toEqual(["branch-22", "branch-21", "branch-20", "branch-19"]);
+	});
+
+	it("conserves the total — the tail is merged, never dropped", () => {
+		const top = JD.topSeries(wide.series, wide.keys, 4);
+		const before = wide.keys.reduce((sum, k) => sum + wide.series[0].bySeries[k], 0);
+		const after = top.keys.reduce((sum, k) => sum + top.series[0].bySeries[k], 0);
+		// 1..23. Dropping the tail instead of merging would lose 190 of 276 —
+		// and make the Spend headline smaller than its own chart.
+		expect(before).toBe(276);
+		expect(after).toBe(276);
+		expect(top.byKey.Other).toBe(190);
+	});
+
+	it("passes a short series through untouched, with no Other bucket", () => {
+		const short = [DAY("2026-07-29", { a: 1, b: 2 })];
+		const top = JD.topSeries(short, ["a", "b"], 4);
+		expect(top.keys).toEqual(["a", "b"]);
+		expect(top.series).toBe(short);
+		expect(top.byKey).toEqual({ a: 1, b: 2 });
+	});
+
+	it("survives a series key that shadows Object.prototype", () => {
+		// A branch really can be called `constructor`. Against a plain object the
+		// lookup hands back an inherited function, `+=` writes NaN, and the series
+		// silently vanishes from the chart.
+		const nasty = [DAY("2026-07-29", { constructor: 5, toString: 3, a: 1 })];
+		const top = JD.topSeries(nasty, ["constructor", "toString", "a"], 2);
+		expect(top.keys).toEqual(["constructor", "toString", "Other"]);
+		expect(top.byKey.constructor).toBe(5);
+		expect(top.byKey.Other).toBe(1);
+	});
+
+	it("does not let a series named Other collide with the roll-up bucket", () => {
+		// Series keys are user-controlled — a branch or a repo really can be named
+		// `Other`. Reusing the literal destroyed it in three places at once: its
+		// total was overwritten by the bucket's, its daily value was overwritten
+		// per point, and `keys` listed one string twice — so the legend drew two
+		// identical swatches and `stackedBars` summed that segment twice, lifting
+		// every bar and the axis above a headline computed before the roll-up.
+		const clash = [DAY("2026-07-29", { Other: 10, b: 4, c: 3, d: 2, e: 1 })];
+		const top = JD.topSeries(clash, ["Other", "b", "c", "d", "e"], 4);
+		expect(new Set(top.keys).size).toBe(top.keys.length);
+		// The real series keeps rank, colour and its own total.
+		expect(top.keys[0]).toBe("Other");
+		expect(top.byKey.Other).toBe(10);
+		// The bucket lands beside it under a free name, holding only the tail.
+		const bucket = top.keys[top.keys.length - 1];
+		expect(bucket).not.toBe("Other");
+		expect(top.byKey[bucket]).toBe(1);
+		// Conservation still holds, which is the property the whole roll-up exists for.
+		expect(top.keys.reduce((sum, k) => sum + top.series[0].bySeries[k], 0)).toBe(20);
+	});
+});
+
+describe("Spend card — the chart is readable back to its legend", () => {
+	const wideSpend = {
+		seriesKeys: Array.from({ length: 23 }, (_, i) => `branch-${i}`),
+		series: [
+			{
+				date: "2026-07-29",
+				tokens: 276,
+				estCostUsd: 27.6,
+				bySeries: Object.fromEntries(Array.from({ length: 23 }, (_, i) => [`branch-${i}`, i + 1])),
+			},
+		],
+	};
+
+	it("shows at most five series and never reuses a colour", () => {
+		const colors = legendColors(spendHtml(wideSpend));
+		expect(colors).toHaveLength(5);
+		// The bug: seriesColor cycles a five-colour palette, so 23 series reused
+		// every colour ~5x and the stack could not be read back.
+		expect(new Set(colors).size).toBe(5);
+	});
+
+	it("keeps the headline equal to the bars after the roll-up", () => {
+		const html = spendHtml(wideSpend);
+		// Rolling up must not change the total: $27.60 is the whole window.
+		expect(html).toContain("$27.60");
+		expect(html).toContain("Other");
+	});
+
+	it("renders the axis in dollars", () => {
+		expect(axisTicks(spendHtml(SPEND_SERIES)).every((t) => t.startsWith("$"))).toBe(true);
 	});
 });

@@ -28,7 +28,7 @@ import { writeFileAtomic } from "../core/AtomicJsonFile.js";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import { withRepoRegistryLock } from "../core/Locks.js";
-import { toForwardSlash } from "../core/PathUtils.js";
+import { normalizePathForCompareOn, toForwardSlash } from "../core/PathUtils.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 
@@ -62,6 +62,30 @@ export interface RegisteredRepo {
 	readonly enabledAt: string;
 	/** Set when the repo is disabled. Rows are kept so history stays queryable. */
 	readonly disabledAt?: string;
+}
+
+/**
+ * Whether two recorded paths name the same checkout.
+ *
+ * The spelling of a recorded path is inherited from whatever `cwd` the caller
+ * passed: `getProjectRootDir` ends in `resolve(cwd, …)`, which preserves the
+ * caller's drive-letter case. The callers are different surfaces — a
+ * PowerShell `jolli`, the ide-bridge, a git hook launched by a GUI client —
+ * and they do not agree on it. So a raw `!==` recorded `C:\…` and `c:\…` as
+ * two checkouts of one clone, and every {@link existingWorktrees} consumer
+ * then did the same idempotent work twice (the hook sync in
+ * `SettingsMutations`, the backfill sweep). The cutover is the one consumer
+ * already immune: `collectSources` keys on `realpath` of the common dir.
+ *
+ * Comparison ONLY — the stored value keeps the spelling git reported, so a
+ * path recorded here still matches what a later `git status` prints.
+ *
+ * The platform is a parameter for the same reason `normalizePathForCompareOn`
+ * takes one: case folds on win32/darwin and not on Linux, so a test asserting
+ * the drive-letter case cannot leave that to the host it runs on.
+ */
+export function sameRecordedRoot(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
+	return normalizePathForCompareOn(a, platform) === normalizePathForCompareOn(b, platform);
 }
 
 /**
@@ -335,8 +359,13 @@ export async function registerRepo(opts: RegisterRepoOptions): Promise<Registere
 			// overwriting would leave the other clone's commits uncollected with nothing to
 			// show that it had been dropped. Existing paths are preserved in order, the new
 			// one moves to the end (newest), and vanished paths are filtered on read.
+			//
+			// Matched with `sameRecordedRoot`, not `!==`: a re-registration that spells
+			// this checkout differently must REPLACE the old spelling rather than add a
+			// second entry for it. Appending the new one last is what makes the freshest
+			// spelling win.
 			const previous = existing?.worktrees ?? (existing ? [existing.worktreeRoot] : []);
-			const worktrees = [...previous.filter((path) => path !== worktreeRoot), worktreeRoot];
+			const worktrees = [...previous.filter((path) => !sameRecordedRoot(path, worktreeRoot)), worktreeRoot];
 			const entry: RegisteredRepo = {
 				repoIdentity: identity,
 				repoName: deriveRepoName(worktreeRoot, remoteUrl),
@@ -377,7 +406,11 @@ export async function ensureWorktreeListed(opts: RegisterRepoOptions): Promise<R
 			if (!existing) return null;
 			const previous =
 				existing.worktrees && existing.worktrees.length > 0 ? existing.worktrees : [existing.worktreeRoot];
-			if (previous.includes(worktreeRoot)) return existing;
+			// `sameRecordedRoot`, not `includes`: a checkout already listed under a
+			// different spelling is already listed. Returning `existing` unchanged is
+			// also what keeps this function's "adds, never rewrites" contract — the
+			// freshest spelling is `registerRepo`'s business, not a stray hook's.
+			if (previous.some((path) => sameRecordedRoot(path, worktreeRoot))) return existing;
 			const entry: RegisteredRepo = { ...existing, worktrees: [...previous, worktreeRoot] };
 			const repos = [...registry.repos.filter((r) => r.repoIdentity !== identity), entry];
 			await writeRepoRegistry({ ...registry, version: 1, repos }, opts.configDir);

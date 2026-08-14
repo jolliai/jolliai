@@ -46,6 +46,7 @@ import { unlink } from "node:fs/promises";
 import * as gitOps from "../core/GitOps.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
+import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import * as installer from "../install/Installer.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
@@ -190,8 +191,9 @@ afterEach(async () => {
    wrote its own fixture into the developer's live database — a repo named
    `acme-api` at `/tmp/acme-api`, `enabled_at: "t"`, `disabled_at` NULL, which
    every read surface then showed as a real repo in the picker. It is also not
-   removable by the obvious means: `repos_no_delete` (DashboardDb.ts) aborts any
-   DELETE on `repos`, by design, so the only cleanup is stamping `disabled_at`.
+   removable while it owns any row: the NO ACTION foreign keys reject the
+   DELETE (`repos_no_delete` used to reject it outright, and was dropped by
+   REPOS_DELETE_ALLOWED_DDL), so the cleanup is stamping `disabled_at`.
    Nothing failed — the enable tests assert an exact `{ok, repoIdentity}` body,
    which is what a SUCCESSFUL projection returns — so this was silent both ways.
    `over` still spreads last: a test wanting a specific path passes one. */
@@ -814,6 +816,24 @@ describe("assembleDashboardHtml", () => {
 		// The model block still closes: the app scripts after it stay real tags.
 		expect(html).toContain("/* main.js */");
 		expect(html.indexOf("window.__JOLLI_DASHBOARD__")).toBeLessThan(html.indexOf("/* main.js */"));
+	});
+
+	// The agent-name half of `JD.sourceBadge`. Inlined from the CLI's own map so
+	// the page holds no copy of it — asserted against the constant rather than
+	// against literals, which is the whole point: a label added there must reach
+	// the dashboard without anyone editing an asset file.
+	it("inlines the transcript source labels ahead of the app scripts", () => {
+		const html = assembleDashboardHtml(assetsDir, "{}");
+		expect(html).toContain(`window.__JOLLI_SOURCE_LABELS__ = ${JSON.stringify(TRANSCRIPT_SOURCE_LABELS)}`);
+		expect(html.indexOf("__JOLLI_SOURCE_LABELS__")).toBeLessThan(html.indexOf("/* main.js */"));
+	});
+
+	// Unlike the token, which is omitted when absent: a page without the labels
+	// silently prints raw transcript tags (`cursor-cli`), and there is no caller
+	// that would want that.
+	it("inlines the labels even with no mutation token", () => {
+		expect(assembleDashboardHtml(assetsDir, "{}")).toContain("__JOLLI_SOURCE_LABELS__");
+		expect(assembleDashboardHtml(assetsDir, "{}")).not.toContain("__JOLLI_DASHBOARD_TOKEN__");
 	});
 });
 

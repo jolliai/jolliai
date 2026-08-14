@@ -1,6 +1,11 @@
 window.JD = window.JD || {};
 
 ((JD) => {
+	/* Four ranked series plus an "Other" bucket — exactly the five colours the
+	   palette has. See `JD.topSeries` in charts.js for why it is four and not
+	   five, and why extending the palette is not an option. */
+	var SERIES_LIMIT = 4;
+
 	var RANGE_SUB = { today: "Today", week: "Last 7 days", "2w": "Last 14 days", month: "Last 30 days", "3m": "Last 90 days" };
 
 	/* Prose name for the window a model was built over. A custom range has no
@@ -10,36 +15,79 @@ window.JD = window.JD || {};
 		return RANGE_SUB[stats.range] || stats.rangeFrom + " → " + stats.rangeTo;
 	}
 
-	/* Totals per series key, for the ranked-bar axes. */
-	function rankRows(stats) {
-		/* Prototype-less, same reason as memoryActivityCard's grouping: series keys
-		   are user-controlled strings (branch, ticket, model, repo). A branch named
-		   `constructor` makes `totals[key] || {…}` hand back an inherited function,
-		   so the row is never created — `+=` writes NaN onto Object.prototype and
-		   Object.keys() never lists it, silently dropping that series from the chart. */
-		var totals = Object.create(null);
-		stats.series.forEach((point) => {
+	/* The Spend card's SINGLE source of cost. Each day's measured total is spread
+	   across that day's series keys by token share — an estimate, stated as one in
+	   the card — and the bars, the legend, the headline and the footer all read
+	   this one result. That is the point: the card used to take its headline from
+	   `kpis.cost`, which windows `sessions` on their update time, while the bars
+	   below it came from memories/commits windowed on committer date. Two clocks,
+	   two populations, one card claiming both numbers answered the same question.
+
+	   It deliberately does NOT total `estCostUsd`, close as that is. `bySeries`
+	   carries TOKENS, so a day with real cost but zero tokens — the category axis
+	   apportions a commit across its topics and rounds — spreads to nothing and
+	   draws no bar. Money that is not drawn must not be in the headline either,
+	   or the card is back to disagreeing with itself, just by less. */
+	function apportionedCost(stats) {
+		/* Prototype-less throughout, same reason as memoryActivityCard's grouping:
+		   series keys are user-controlled strings (branch, ticket, model, repo). A
+		   branch named `constructor` makes a plain object hand back an inherited
+		   function, so `+=` writes NaN onto Object.prototype and Object.keys() never
+		   lists it — silently dropping that series from the chart. And `bySeries`
+		   comes off JSON.parse, so it has a prototype: read it with a typeof test
+		   rather than trusting `|| 0` to catch a function. */
+		var byKey = Object.create(null);
+		var total = 0;
+		var series = stats.series.map((point) => {
+			var read = (key) => (typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0);
+			var tokenTotal = stats.seriesKeys.reduce((sum, key) => sum + read(key), 0);
+			var bySeries = Object.create(null);
+			var dayCost = 0;
 			stats.seriesKeys.forEach((key) => {
-				totals[key] = totals[key] || { key: key, tokens: 0, cost: 0 };
-				/* bySeries comes off JSON.parse, so it has a prototype — read it the
-				   same defensive way rather than trusting `|| 0` to catch a function. */
-				var value = point.bySeries[key];
-				totals[key].tokens += typeof value === "number" ? value : 0;
+				var cost = tokenTotal > 0 ? (point.estCostUsd * read(key)) / tokenTotal : 0;
+				bySeries[key] = cost;
+				byKey[key] = (byKey[key] || 0) + cost;
+				dayCost += cost;
 			});
+			total += dayCost;
+			return { date: point.date, bySeries: bySeries, cost: dayCost };
 		});
-		// Cost is only known per day, not per key, so spread it by token share —
-		// stated in the axis note rather than presented as an exact per-key cost.
-		var grandTokens = 0;
-		var grandCost = 0;
-		stats.series.forEach((p) => {
-			grandTokens += p.tokens;
-			grandCost += p.estCostUsd;
-		});
-		var rows = Object.keys(totals).map((key) => totals[key]);
-		rows.forEach((row) => {
-			row.cost = grandTokens > 0 ? (grandCost * row.tokens) / grandTokens : 0;
-		});
-		return rows.sort((a, b) => b.tokens - a.tokens);
+		var ranked = stats.seriesKeys
+			.map((key) => ({ key: key, cost: byKey[key] || 0 }))
+			.sort((a, b) => b.cost - a.cost);
+		return { series: series, byKey: byKey, ranked: ranked, total: total };
+	}
+
+	/* Which clock the series is on. The memory-driven axes window on committer
+	   date; the session-driven ones on session activity. Reading `seriesDimension`
+	   rather than the requested dimension is what keeps this honest — below the
+	   memory tier a memory axis falls back to `model`, and the label follows. */
+	function seriesClockNote(stats) {
+		var byCommit =
+			stats.seriesDimension === "branch" ||
+			stats.seriesDimension === "ticket" ||
+			stats.seriesDimension === "category";
+		return byCommit ? "by commit date" : "by session activity";
+	}
+
+	/* What the series is split BY, as a word. The Spend card names it twice — the
+	   chart's `aria-label` and the "largest …" figure — and both said "model" on
+	   every axis, so on `?dimension=branch` a screen reader announced a branch
+	   name as a model and the sighted label read "largest model: fix-auth-refresh".
+
+	   Reads `seriesDimension` rather than the requested dimension, for the same
+	   reason `seriesClockNote` above does: below the memory tier a memory axis
+	   falls back to `model` server-side, and the word has to follow the data that
+	   was actually drawn, not the one that was asked for.
+
+	   An unrecognised dimension degrades to the neutral "series" instead of
+	   asserting a wrong noun — the server owns this vocabulary and can extend it,
+	   and an older page reading a newer server must not mislabel the axis. The
+	   whitelist is an ARRAY, so a dimension colliding with an Object.prototype
+	   member cannot hand back an inherited value the way a plain-object map would. */
+	var AXIS_NOUNS = ["model", "agent", "project", "branch", "ticket", "category"];
+	function axisNoun(stats) {
+		return AXIS_NOUNS.indexOf(stats.seriesDimension) >= 0 ? stats.seriesDimension : "series";
 	}
 
 	/* Spend is the cost-only companion to Tokens. It never reuses the token
@@ -48,52 +96,59 @@ window.JD = window.JD || {};
 	function costCard(model) {
 		var esc = JD.esc;
 		var stats = model.stats;
-		var sub =
-			esc(rangeSub(stats)) +
-			" · estimated from local transcripts" +
-			(stats.pricesAsOf ? ' · prices as of <span class="mono">' + esc(stats.pricesAsOf) + "</span>" : "");
-		var costKpi = stats.kpis.find((k) => k.key === "cost");
-		var ranked = rankRows(stats);
-		var costSeries = stats.series.map((point) => {
-			var tokenTotal = stats.seriesKeys.reduce((sum, key) => sum + (point.bySeries[key] || 0), 0);
-			/* Prototype-less: keys are user-controlled series names — see rankRows. */
-			var bySeries = Object.create(null);
-			stats.seriesKeys.forEach((key) => {
-				bySeries[key] = tokenTotal > 0 ? (point.estCostUsd * (point.bySeries[key] || 0)) / tokenTotal : 0;
-			});
-			return { date: point.date, bySeries: bySeries };
-		});
+		var spend = apportionedCost(stats);
+		/* WHICH WINDOW and WHICH CLOCK — the two things that change what these
+		   numbers mean — ride in the head's `title=` hint rather than as a visible
+		   sub, the move every other card in the band already made. Each head on
+		   the page is then one line.
+
+		   RAW text, not `esc`aped: `hintAttr` wraps first and escapes per line, so
+		   pre-escaping would double-encode.
+
+		   It used to append `prices as of <date>`; that is a property of the price
+		   table, constant across every window and every card, so it read as noise
+		   on the line a user scans to orient themselves. `stats.pricesAsOf` is
+		   still sent, for a surface that wants to state it once. */
+		var hint = rangeSub(stats) + " · " + seriesClockNote(stats) + " · estimated from local transcripts";
 
 		/* Dollar in a circle — Lucide `circle-dollar-sign`. It was an axes-plus-
 		   trend-line glyph, which is the same "it's a chart" statement Tokens'
 		   bar chart already makes one card up; the only thing that distinguishes
 		   these two widgets is that this one is denominated in money, so that is
 		   what the icon has to say. */
+		/* span6, paired with Tokens rather than a full row of its own. The two ask
+		   one question in two units — the hint on Tokens' head is about the
+		   difference between them — and side by side is where that comparison can
+		   actually be made. What the halved width costs is chart resolution: the
+		   bars are a 660-wide viewBox drawn at `width="100%"`, so they scale rather
+		   than clip, and half a row is still wider than the third of a row Tokens
+		   drew them in before this. */
 		var html =
-			'<section class="card span12" aria-label="Spend"><div class="card-head">' +
-			widgetIcon(
-				"--s4",
-				'<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/>' +
-					'<path d="M12 18V6"/>',
-			) +
-			'<div style="flex:1 1 300px;min-width:0">' +
-			"<h2>Spend</h2>" +
-			'<div class="sub" style="margin-top:5px">' +
-			sub +
-			"</div></div>" +
-			'<div class="spacer"></div>' +
-			'<div style="text-align:right"><div class="num" style="font-size:18px;font-weight:650;color:var(--good-text)">' +
-			(costKpi ? costKpi.value : "$0.00") +
-			'</div><div class="sub">estimated spend<br>this window</div></div>' +
-			"</div>";
+			'<section class="card span6" aria-label="Spend">' +
+			widgetHead(
+				widgetIcon(
+					"--s4",
+					'<circle cx="12" cy="12" r="10"/><path d="M16 8h-6a2 2 0 1 0 0 4h4a2 2 0 1 1 0 4H8"/>' +
+						'<path d="M12 18V6"/>',
+				),
+				"Spend",
+				null,
+				hint,
+				'<div class="num" style="font-size:18px;font-weight:650;color:var(--good-text)">' +
+					JD.fmtUsd(spend.total) +
+					'</div><div class="sub">estimated spend<br>this window</div>',
+			);
 
 		html += '<div class="chart-box" style="margin-top:12px">';
 		if (stats.seriesKeys.length === 0) {
 			html += '<div class="empty-note">No estimated spend data yet.</div>';
 		} else {
+			/* Legend and bars read the SAME rolled-up keys, in the same order — the
+			   colour of a legend swatch is its index in this array and nothing else,
+			   so two arrays here would mislabel every series after the first. */
+			var top = JD.topSeries(spend.series, stats.seriesKeys, SERIES_LIMIT);
 			html += '<div class="legend">';
-			stats.seriesKeys.forEach((key, index) => {
-				var row = ranked.find((r) => r.key === key);
+			top.keys.forEach((key, index) => {
 				html +=
 					'<span><i style="background:' +
 					JD.seriesColor(index) +
@@ -102,20 +157,36 @@ window.JD = window.JD || {};
 					'">' +
 					esc(key) +
 					'</span> <b class="num">' +
-					(row ? JD.fmtUsd(row.cost) : "") +
+					JD.fmtUsd(top.byKey[key] || 0) +
 					"</b></span>";
 			});
-			html += "</div>" + JD.stackedBars(costSeries, stats.seriesKeys, "estimated spend by model");
+			html += "</div>" + JD.stackedBars(top.series, top.keys, "estimated spend by " + axisNoun(stats), JD.fmtUsd);
 		}
 		html += "</div>";
 
-		/* Comparison row — vs the prior window (server-computed, self-trend only),
-		   the largest key this window, and the single busiest day by cost. */
+		/* Comparison row — vs the prior window, the largest key this window, and
+		   the single busiest day by cost.
+
+		   `costTrendPct` is server-computed and self-trend only, but it is now the
+		   SAME population as the headline it sits under: the server sums the prior
+		   window's series along this same dimension, by the rule `apportionedCost`
+		   uses here (`drawnCost` in DashboardQuery.ts). It used to trend
+		   `sessions.est_cost_usd` instead — a different clock on the memory axes —
+		   so a "$0.00" headline could carry a "↑ 200%" beside it. */
 		if (stats.seriesKeys.length > 0) {
-			var top = ranked[0];
-			var totalCost = ranked.reduce((sum, r) => sum + r.cost, 0);
-			var busiest = stats.series.reduce(
-				(best, p) => (p.estCostUsd > best.v ? { date: p.date, v: p.estCostUsd } : best),
+			/* `largest`, not `top` — `var` is FUNCTION-scoped, so reusing the name
+			   the roll-up above bound would put two different shapes on one binding
+			   and leave this block working only because it runs second. Reordering
+			   the chart and comparison blocks would then read `.key`/`.cost` off a
+			   `topSeries` result and print "largest model: undefined, NaN%".
+			   Biome cannot catch it: `cli/biome.json` excludes `src/dashboard/assets`. */
+			var largest = spend.ranked[0];
+			var totalCost = spend.total;
+			/* From the apportioned series, not `estCostUsd`: the busiest day is
+			   printed as a share of the headline, so a day counted one way against
+			   a total counted the other can read as more than 100%. */
+			var busiest = spend.series.reduce(
+				(best, p) => (p.cost > best.v ? { date: p.date, v: p.cost } : best),
 				{ date: undefined, v: 0 },
 			);
 			html += '<div class="cmpline" style="display:flex;gap:20px;flex-wrap:wrap;margin-top:10px;font-size:11.5px;color:var(--muted)">';
@@ -125,13 +196,14 @@ window.JD = window.JD || {};
 					? "no prior window to compare"
 					: (stats.costTrendPct < 0 ? "↓ " : "↑ ") + Math.abs(stats.costTrendPct) + "%") +
 				"</b></span>";
-			if (top && totalCost > 0) {
+			if (largest && totalCost > 0) {
 				html +=
-					"<span>largest model" +
+					"<span>largest " +
+					axisNoun(stats) +
 					'<b style="display:block;font-size:12.5px;color:var(--ink);font-weight:650">' +
-					esc(top.key) +
+					esc(largest.key) +
 					", " +
-					Math.round((top.cost / totalCost) * 100) +
+					Math.round((largest.cost / totalCost) * 100) +
 					"%</b></span>";
 			}
 			if (busiest.v > 0) {
@@ -145,11 +217,15 @@ window.JD = window.JD || {};
 			html += "</div>";
 		}
 
-		return (
-			html +
-			'<div class="w-foot"><span class="w-chip">estimated, not a bill</span>' +
-			'<span class="w-measure">ⓘ model splits are apportioned by token share</span></div></section>'
-		);
+		/* No footer. Two notes used to sit here — "estimated, not a bill" and
+		   "model splits are apportioned by token share" — and the card states
+		   both of them earlier, where they are read rather than scrolled past:
+		   the subtitle already says "estimated from local transcripts", which
+		   carries the not-a-bill point in the same breath as where the numbers
+		   came from, and the legend presents the per-key figures as a split of
+		   one measured daily total. A caveat printed below the chart corrects a
+		   reading the reader has already made. */
+		return html + "</section>";
 	}
 
 	/* Time view's group header: "Today · Jul 31" / "Yesterday · Jul 30" for the
@@ -167,15 +243,52 @@ window.JD = window.JD || {};
 	}
 
 	/* The deep link into one memory's detail pane. Shared by the Memory Activity
-	   row's "Open memory →" and by the Decisions card's title, so a decision and
-	   the row it came from lead to the same place.
+	   row's TITLE and by the Decisions card's title, so a decision and the row it
+	   came from lead to the same place. Both are the thing being named rather
+	   than a separate "Open memory →" affordance beside it: the title is what a
+	   reader aims at, and a per-row action column of identical links is a column
+	   of the same word repeated.
 
 	   `detailRepo` names the memory's owning repo without scoping the page it
 	   lands on — see wireTree in memories.js. Whatever scope THIS page carries
 	   rides along through JD.query, so a repo-filtered dashboard still opens a
 	   repo-filtered tree. */
-	function memoryHref(model, commitHash, repoIdentity) {
-		return "/memories" + JD.withParams(JD.query(model, {}), { hash: commitHash, detailRepo: repoIdentity });
+	function memoryHref(model, commitHash, repoIdentity, anchor) {
+		return (
+			"/memories" +
+			JD.withParams(JD.query(model, {}), { hash: commitHash, detailRepo: repoIdentity }) +
+			(anchor ? "#" + anchor : "")
+		);
+	}
+
+	/* The id `memories.js` puts on the detail pane's topics section — the one whose
+	   header reads "What changed and why". One fixed anchor serves both callers,
+	   and neither could address anything finer: Memory Activity's "N decisions"
+	   knows only HOW MANY a memory recorded (`MemoryCard.decisionCount`), never
+	   which topic they sit under, and the Decisions card's Latest title names a
+	   topic that carries no index on the wire.
+
+	   It used to land on the decision block itself. That was one level too deep —
+	   `.decide` renders below its topic's own heading and trigger prose, so the
+	   scroll left the reader mid-topic with nothing above the fold saying which
+	   topic the decision belongs to. */
+	var TOPICS_ANCHOR = "what-changed";
+
+	/* What the list is: the window's memories, or the most recent slice of them.
+	   The distinction is `memoryCardsCapped`, and it has to come from the server —
+	   the feed is cut at MEMORY_CARDS_LIMIT before it is serialised, so a count of
+	   20 here means "20 in the window" and "the 20 most recent of 300" equally.
+
+	   Both wordings have shipped wrong. "N memories in this window" claimed the
+	   page size was the window total, directly above the coverage line that prints
+	   the real one; the fix for that then said "showing the N most recent"
+	   unconditionally, which asserts a truncation that usually has not happened —
+	   and reads "showing the 1 most recent" at N=1. Neither is "N of M": the
+	   coverage line's `memoriesCreated` counts COMMITS carrying a memory while
+	   this list counts memory rows, so that framing would be a third inaccuracy. */
+	function memoryActivitySub(count, capped) {
+		if (capped) return "showing the " + count + " most recent";
+		return count === 1 ? "1 memory in this window" : count + " memories in this window";
 	}
 
 	/* Memory Activity: Branch answers "what landed on this line of work?" while
@@ -210,9 +323,11 @@ window.JD = window.JD || {};
 			   other item here is conditional, and a row of zeros is noise. */
 			if (card.decisionCount)
 				meta.push(
-					'<span class="tag metric num">' +
+					'<a class="tag metric num" href="' +
+						memoryHref(model, card.commitHash, card.repoIdentity, TOPICS_ANCHOR) +
+						'" target="_blank" rel="noopener">' +
 						esc(card.decisionCount) +
-						(card.decisionCount === 1 ? " decision</span>" : " decisions</span>"),
+						(card.decisionCount === 1 ? " decision</a>" : " decisions</a>"),
 				);
 			if (card.branch && view === "time") meta.push('<span class="tag mono">' + esc(card.branch) + "</span>");
 			/* The repo tag earns its space only when the page is showing more than
@@ -223,15 +338,15 @@ window.JD = window.JD || {};
 			return (
 				'<article class="mem-activity-row" style="--memory-color:' +
 				(catColor(card.category || "feature")) +
-				'"><div class="mem-activity-copy"><div class="mem-activity-title">' +
+				'"><div class="mem-activity-copy"><a class="mem-activity-title" href="' +
+				openHref(card) +
+				'" target="_blank" rel="noopener">' +
 				esc(card.title) +
-				'</div><div class="mem-activity-meta">' +
+				'</a><div class="mem-activity-meta">' +
 				meta.join("") +
 				"</div></div><div class=\"mem-activity-action\"><time>" +
 				esc(cardWhen(card.committedAtMs, model.timeZone)) +
-				'</time><a href="' +
-				openHref(card) +
-				'" target="_blank" rel="noopener">Open memory →</a></div></article>'
+				"</time></div></article>"
 			);
 		};
 		var body = groups.map((group) => '<section class="mem-activity-group"><h3>' + esc(group.label) + "</h3>" + group.cards.map(row).join("") + "</section>").join("");
@@ -239,8 +354,8 @@ window.JD = window.JD || {};
 			'<section class="card span12 mem-activity" aria-label="Memory Activity"><div class="card-head">' +
 			widgetIcon("--s4", '<path d="M7 3h10v18H7z"/><path d="M9 7h6M9 11h6M9 15h4"/>') +
 			'<div><h2>Memory Activity</h2><div class="sub">' +
-			cards.length +
-			" memories in this window</div></div><div class=\"spacer\"></div>" +
+			memoryActivitySub(cards.length, model.stats.memoryCardsCapped) +
+			"</div></div><div class=\"spacer\"></div>" +
 			'<div class="seg seg-sm" role="group" aria-label="Memory Activity view"><button type="button" data-memory-activity-view="branch" aria-pressed="' +
 			String(view === "branch") +
 			'">Branch</button><button type="button" data-memory-activity-view="time" aria-pressed="' +
@@ -322,17 +437,39 @@ window.JD = window.JD || {};
 	   positioned at the pointer for chart readouts and needs listeners rebound on
 	   every 30 s refresh tick, and this needs no such thing. `esc` is what makes
 	   it safe in an attribute — it escapes both quote characters. */
-	function widgetHead(icon, title, sub, hint) {
+	/* `aside` is the card's headline figure, right-aligned on the head's own row —
+	   the shape Spend built inline, now shared so Tokens reads the same way.
+
+	   Two numbers in it are MEASURED, not chosen, and both come from Spend at
+	   `span6`. `flex:1 1 220px` (not 300) is what decides whether the figure sits
+	   beside the title or wraps under it: half a row on a ~1200px viewport is
+	   ~410px of head, enough for icon + 220 + the figure and not for icon + 300 +
+	   the figure. `margin-left:auto` is the other half — a WRAPPED flex line
+	   places its one item at the START, so without it a figure that did wrap
+	   lands left-aligned under a sub still styled to sit at the right edge.
+
+	   Both apply ONLY when there is an aside; a head without one keeps its plain
+	   `<div>` so the `span4` cards are untouched. That narrowness is the reason
+	   `.hdr-stat` — the rule this generalises — was dropped in the first place: a
+	   right-aligned headline does not fit a third of the row beside a two-line
+	   title (see the decisions section in main.css). Pass an aside from a
+	   `span6`-or-wider card with a single-line title, and from nowhere else. */
+	function widgetHead(icon, title, sub, hint, aside) {
 		return (
 			'<div class="card-head">' +
 			icon +
-			"<div><h2" +
+			(aside ? '<div style="flex:1 1 220px;min-width:0">' : "<div>") +
+			"<h2" +
 			(hint ? ' class="has-hint" title="' + hintAttr(hint) + '"' : "") +
 			">" +
 			title +
 			"</h2>" +
 			(sub ? '<div class="sub">' + sub + "</div>" : "") +
-			"</div></div>"
+			"</div>" +
+			(aside
+				? '<div class="spacer"></div><div style="text-align:right;margin-left:auto">' + aside + "</div>"
+				: "") +
+			"</div>"
 		);
 	}
 
@@ -371,17 +508,31 @@ window.JD = window.JD || {};
 		return lines.map((each) => JD.esc(each)).join("&#10;");
 	}
 
-	/* Decisions (span12) — the corpus of decisions itself: kept count, a
+	/* What this card counts and why it is worth looking at.
+	   "What Jolli decided to keep" is gone: it described the STORE rather than
+	   the reader's own work, and the card's subject is the decisions the reader's
+	   sessions made — Jolli is what banked them, not what made them. */
+	var DECISIONS_HINT =
+		"Decisions your sessions made, accumulating across the range — the knowledge Jolli banked, " +
+		"with the receipts behind it.";
+
+	/* Decisions (span4) — the corpus of decisions itself: kept count, a
 	   cumulative step chart, and the latest one as a single TITLE line.
 	   Distinct from the KPI sub-line (gone with the KPI strip) and from the
 	   feed's per-commit `decision` line — this is the standalone widget those
 	   always implied but never had. Carries no "recalled" figure — see
 	   DecisionsCard's doc comment in DashboardModel.ts.
 
-	   Full width because it is now alone on its row: it was a span6 paired with
-	   the Recall card, and removing that one (JOLLI-2193) left six empty columns
-	   beside it. The step chart stretches to fill them, which is also the only
-	   part of this card that gains anything from the width. */
+	   Third seat in the equal-third band, where Tokens used to sit. It was
+	   span12 — alone on its row after the Recall card beside it was removed
+	   (JOLLI-2193) — and the width bought nothing: the step chart draws with
+	   `preserveAspectRatio="none"`, so it fills whatever column it is given.
+	   Joining the band means adopting the band's head, which is why the
+	   description became a hint and the kept count moved below the title the way
+	   Tokens states its own: the old head hung a right-aligned `hdr-stat` off a
+	   two-line title, which needs more than a third of the row to sit on one
+	   line. The window went with it — the topbar range control is where that is
+	   set and stated, the same reason Tokens dropped its own `Last 30 days`. */
 	function decisionsCard(model) {
 		var esc = JD.esc;
 		var decisions = model.stats.decisions;
@@ -390,16 +541,11 @@ window.JD = window.JD || {};
 			'<path d="M9 18h6M10 22h4M12 2a6 6 0 0 0-4 10.4c.6.5 1 1.3 1 2.1V16h6v-1.5c0-.8.4-1.6 1-2.1A6 6 0 0 0 12 2Z"/>',
 		);
 		var head =
-			'<section class="card span12" aria-label="Decisions"><div class="card-head">' + icon + "<div><h2>Decisions</h2>" +
-			/* "…and whether it came back" until JOLLI-2193: the second half was the
-			   Recall card beside it, and the payload no longer carries a reuse
-			   signal of any kind, so the promise had nothing behind it. */
-			'<div class="sub">What Jolli decided to keep</div></div>';
+			'<section class="card span4" aria-label="Decisions">' + widgetHead(icon, "Decisions", null, DECISIONS_HINT);
 
 		if (!decisions) {
 			return (
 				head +
-				'<div class="spacer"></div></div>' +
 				'<div class="locked-panel"><p><b>Decisions need a summarized commit.</b></p>' +
 				"<p class=\"why\">Each decision is mined from a commit's memory — enable Jolli Memory to start " +
 				"recording them.</p>" +
@@ -409,12 +555,9 @@ window.JD = window.JD || {};
 
 		var html =
 			head +
-			'<div class="hdr-stat"><b class="num">' +
+			'<div class="bignum num" style="font-size:22px;font-weight:650;margin-top:2px">' +
 			decisions.keptCount +
-			' kept</b><span>decisions · ' +
-			esc(rangeSub(model.stats)) +
-			"</span></div>" +
-			'<div class="spacer"></div></div>';
+			' kept<div class="sub" style="font-weight:400;margin-top:2px">decisions in this window</div></div>';
 
 		/* Cumulative step chart over `perDay` — an empty window still draws a
 		   flat baseline rather than an empty box. */
@@ -454,6 +597,17 @@ window.JD = window.JD || {};
 		   no-op: the newest decision's commit is usually the newest memory, so the
 		   scroll lands on the row already at the top of the list.
 
+		   It lands on the memory's topics rather than the top of the page, which is
+		   where the decision it names actually lives — `buildDecisionsCard` takes
+		   `rows[0]` of `ORDER BY committed_at_ms DESC, i.ord`, and `ord` is `t.key *
+		   2` over the topics carrying a non-empty decisions block, so this title is
+		   the first decision-carrying topic of that memory. The section anchor makes
+		   that ordering argument load-bearing for the WORDING only, never for the
+		   destination: both callers land on the same header whatever the topic list
+		   turns out to hold, so a decisions block that survives the query's TRIM but
+		   that `splitDecisionBullets` empties can no longer send a reader somewhere
+		   the card did not mean.
+
 		   Skipped entirely when the title came back empty, which needs a payload
 		   carrying neither a topic title nor a parseable decision line. */
 		if (decisions.latest && decisions.latest.title) {
@@ -461,7 +615,7 @@ window.JD = window.JD || {};
 				'<div class="dec-quote"><span class="qlab">Latest · ' +
 				esc(decisions.latest.repoName) +
 				'</span><a class="dec-jump" href="' +
-				memoryHref(model, decisions.latest.commitHash, decisions.latest.repoIdentity) +
+				memoryHref(model, decisions.latest.commitHash, decisions.latest.repoIdentity, TOPICS_ANCHOR) +
 				'" target="_blank" rel="noopener"><strong>' +
 				esc(decisions.latest.title) +
 				"</strong></a></div>";
@@ -570,11 +724,30 @@ window.JD = window.JD || {};
 		);
 	}
 
-	/* Ranked rows shared by Skills and MCP servers: label (+ optional kind),
-	   value, a bare colour bar underneath sized against the top row. `list` names
-	   which pageable list this is, so `capToolLists` can find the <ul> again after
-	   the render. */
-	function rankedList(rows, colorVar, valueOf, labelOf, kindOf, unit, list) {
+	/* Ranked rows shared by Skills and MCP servers: an optional lead mark, the
+	   label, an optional kind, the value, and a bare colour bar underneath sized
+	   against the top row. `list` names which pageable list this is, so
+	   `capToolLists` can find the <ul> again after the render.
+
+	   The two optional slots are on OPPOSITE sides of the label and are not
+	   interchangeable. Skills puts its agent marks in the LEAD, where an icon
+	   reads as an attribute of the name it precedes; the MCP lists put a count in
+	   the trailing kind, where it reads as a qualifier. A single slot with a CSS
+	   `order` flip was the cheaper version of this and is the wrong one — it
+	   leaves the DOM saying the opposite of the screen, which is what a screen
+	   reader and a copy-paste both get.
+
+	   The two slots return different things, and each has exactly ONE contract —
+	   a parameter that is raw for some callers and escaped for others is the trap
+	   this avoids. The LEAD returns HTML, because it carries markup: its only
+	   producer is `agentBadges`, which escapes the names inside its own marks.
+	   The KIND returns `{ text, title }` and is escaped here, because its only
+	   producer is `withAgents` and that text is transcript-derived. The row LABEL
+	   is escaped here for the same reason.
+
+	   Arguments run in the row's own left-to-right order (lead, label, kind,
+	   value) so a call site reads like the row it builds. */
+	function rankedList(rows, colorVar, valueOf, leadHtmlOf, labelOf, kindOf, unit, list) {
 		if (rows.length === 0) return "";
 		// The real maximum, not `rows[0]` — that is only the biggest value when the
 		// list's rank order happens to be the metric the bars measure, and Skills
@@ -603,7 +776,14 @@ window.JD = window.JD || {};
 			   so emitted no slot at all; this keeps that. */
 			var kind = kindOf ? kindOf(row) : null;
 			html +=
-				'<li><div class="rl-top"><span class="rl-name mono" title="' +
+				'<li><div class="rl-top">' +
+				// Emitted for every row of a list that HAS a lead, including rows whose
+				// own lead comes back empty. The span is a fixed-width column (see
+				// .rl-lead), so skipping it on a row with no agents would put that row's
+				// name 40px left of its neighbours' — the raggedness the fixed width
+				// exists to remove, reintroduced by the empty case.
+				(leadHtmlOf ? '<span class="rl-lead">' + leadHtmlOf(row) + "</span>" : "") +
+				'<span class="rl-name mono" title="' +
 				JD.esc(label) +
 				'">' +
 				JD.esc(label) +
@@ -635,11 +815,16 @@ window.JD = window.JD || {};
 	   same tag the Tokens chart's Agent axis prints, so the two panels can be
 	   read against each other without a mapping in the reader's head.
 
+	   This is the MCP lists' form of that signal, in the trailing kind slot;
+	   Skills states the same thing as brand marks in the row's LEAD instead (see
+	   `agentBadges`). Between them they are the only per-agent signal on either
+	   card — the `by agent · 12 claude` header line that carried the same split
+	   with volume was removed, so nothing states a whole-window per-agent total
+	   any more.
+
 	   Counts are deliberately left OFF the per-row tag: the row already prints
 	   its own total beside the name, and a second set of numbers at that size
-	   reads as noise. This is now the ONLY per-agent signal on either card — the
-	   `by agent · 12 claude` header line that carried the same split with volume
-	   was removed, so nothing states a whole-window per-agent total any more. */
+	   reads as noise. */
 	/**
 	 * How many agent names ride on a row before the rest fold into `+N`.
 	 *
@@ -688,6 +873,46 @@ window.JD = window.JD || {};
 		};
 	}
 
+	/* The Skills row's LEAD: one brand mark per agent that ran the skill, in
+	   place of the name list `agentTag` writes. It sits ahead of the skill name
+	   rather than after it, which is where an icon belongs — the mark qualifies
+	   the name, and reading it first means the eye picks up "who" before "what"
+	   without scanning to the end of a truncating label. "Who ran this" is also a
+	   question a logo answers faster than a word at 11px. The name is not lost:
+	   it is each mark's tooltip and its accessible name, via `JD.sourceBadge`.
+
+	   Ordered as the server sent them, which is `sortAgents` — by volume, so the
+	   agent that ran the skill most leads. */
+	/* How many marks the lead shows before it collapses the rest into `+N`.
+
+	   The cap exists for ALIGNMENT, not for width: a lead that grows with the
+	   agent count puts every skill name at a different x, and the names are the
+	   column a reader scans. Two marks plus the row's 4px gap is exactly the
+	   fixed width `.rl-lead` reserves, and `+N` occupies the second slot when it
+	   is needed — so the name starts in the same place whether a skill was run by
+	   one agent or five. Two rather than one because a skill shared between
+	   Claude and Codex is a real and interesting case, where "+1" would hide the
+	   more informative half of it. */
+	var LEAD_AGENT_MARKS = 2;
+
+	function agentBadges(row) {
+		var agents = row.agents || [];
+		if (agents.length === 0) return "";
+		if (agents.length <= LEAD_AGENT_MARKS) return agents.map((a) => JD.sourceBadge(a.source)).join("");
+		/* Past the cap the leading (highest-volume) agent keeps its mark and the
+		   remainder becomes a count. The names are not dropped — they are the
+		   counter's tooltip, which is the same bargain every mark makes. */
+		var rest = agents.slice(1);
+		return (
+			JD.sourceBadge(agents[0].source) +
+			'<span class="src-more" title="' +
+			JD.esc(rest.map((a) => JD.sourceLabel(a.source)).join(", ")) +
+			'">+' +
+			rest.length +
+			"</span>"
+		);
+	}
+
 	/*
 	 * `agentLine` used to render the per-agent header line on both cards —
 	 * `by agent · 12 claude`, one `<b>calls</b> source` part per agent, from the
@@ -705,25 +930,14 @@ window.JD = window.JD || {};
 	 * with volume is not stated anywhere.
 	 */
 
-	/* The "…so this list is not everything" caveat, shared by both cards.
-	   `uncoveredSources` is a PARSER capability the server computed, not "these
-	   agents happened to call nothing" — see ToolUsage in DashboardModel. */
-	function uncoveredNote(usage, noun) {
-		if (usage.uncoveredSources.length === 0) return "";
-		return (
-			" · <b>" +
-			JD.esc(usage.uncoveredSources.join(", ")) +
-			"</b> record no tool calls, so " +
-			noun +
-			" used only from those agents will not appear here"
-		);
-	}
-
 	/* Skills (span6) — split out of the old combined "Skills & tools" card so
 	   each half gets its own icon, stat line and footer, matching jolli-design's
-	   per-card anatomy. Every row names the agents that ran it; which agents can
-	   be read at all is the footer's `uncoveredSources` caveat, not a fixed list
-	   here (it was hard-coded to Claude and went stale the day Codex landed). */
+	   per-card anatomy. Every row names the agents that ran it, rather than the
+	   fixed list this used to carry (hard-coded to Claude, stale the day Codex
+	   landed). The server still computes `ToolUsage.uncoveredSources` — the
+	   agents whose transcripts cannot record a tool call at all — but no card
+	   prints it: it was a second sentence in a footer that already states its own
+	   denominator, and it named parser capability where a reader expects data. */
 	/* Skill invocations only — NOT commands or subagents. `parseToolUse` promotes
 	   a call to a skill row exactly when the tool is `Skill` and carries an
 	   `input.skill` (TranscriptParser.ts); a subagent is the `Task` tool and
@@ -754,7 +968,6 @@ window.JD = window.JD || {};
 			return (
 				html +
 				'<div class="empty-note">No skill invocations recorded in this window.' +
-				uncoveredNote(usage, "a skill") +
 				"</div></section>"
 			);
 		}
@@ -776,8 +989,9 @@ window.JD = window.JD || {};
 			usage.skills,
 			"--s2",
 			(r) => r.calls,
+			agentBadges,
 			(r) => "/" + r.name,
-			withAgents(null),
+			null,
 			"run",
 			"skill",
 		);
@@ -789,9 +1003,8 @@ window.JD = window.JD || {};
 			usage.sessionsWithTools +
 			"</b> of " +
 			usage.sessionsInWindow +
-			(usage.sessionsInWindow === 1 ? " session</b>" : " sessions") +
+			(usage.sessionsInWindow === 1 ? " session" : " sessions") +
 			" in this window" +
-			uncoveredNote(usage, "a skill") +
 			"</span></div></section>"
 		);
 	}
@@ -822,6 +1035,7 @@ window.JD = window.JD || {};
 					usage.mcpTools,
 					"--s1",
 					(r) => r.calls,
+					null,
 					(r) => r.name,
 					withAgents((r) => r.sessions + (r.sessions === 1 ? " session" : " sessions")),
 					"call",
@@ -834,6 +1048,7 @@ window.JD = window.JD || {};
 				usage.servers,
 				"--s1",
 				(r) => r.calls,
+				null,
 				(r) => r.server,
 				withAgents((r) => r.tools + (r.tools === 1 ? " tool" : " tools")),
 				"call",
@@ -878,7 +1093,6 @@ window.JD = window.JD || {};
 			return (
 				html +
 				'<div class="empty-note">No MCP calls recorded in this window.' +
-				uncoveredNote(usage, "a server") +
 				"</div></section>"
 			);
 		}
@@ -924,7 +1138,8 @@ window.JD = window.JD || {};
 		   If a caveat matters enough to say, it goes in the head's ⓘ (which
 		   EXPLAINS the card) or on the face; if it does not, it is not written.
 		   Two that used to hang here are now unwritten: the `uncoveredSources`
-		   list, and "the recall count is MCP-tool calls only".
+		   list (since removed from the card face too), and "the recall count is
+		   MCP-tool calls only".
 
 		   Never held the page-wide clause either ("older activity is reconstructed
 		   from commits and stored summaries") — that described the activity
@@ -1359,7 +1574,7 @@ window.JD = window.JD || {};
 		};
 	}
 
-	/* Tokens (span4) — input/output/cache, day-bucketed. Reuses
+	/* Tokens (span6) — input/output/cache, day-bucketed. Reuses
 	   `JD.stackedBars` (the same chart Cost & tokens draws) rather than a
 	   one-off SVG, so the two cards read as the same chart language. `cached`
 	   is one combined figure, not a cache-write/cache-read split — the database
@@ -1427,10 +1642,9 @@ window.JD = window.JD || {};
 		}
 		if (stats.seriesKeys.length === 0) return '<div class="empty-note">No token data yet in this window.</div>';
 
-		var ranked = rankRows(stats);
+		var top = JD.topSeries(stats.series, stats.seriesKeys, SERIES_LIMIT);
 		var html = '<div class="legend" style="margin-top:8px">';
-		stats.seriesKeys.forEach((key, index) => {
-			var row = ranked.find((r) => r.key === key);
+		top.keys.forEach((key, index) => {
 			html +=
 				'<span><i style="background:' +
 				JD.seriesColor(index) +
@@ -1439,11 +1653,11 @@ window.JD = window.JD || {};
 				'">' +
 				JD.esc(key) +
 				'</span> <b class="num">' +
-				JD.fmtTokens(row ? row.tokens : 0) +
+				JD.fmtTokens(top.byKey[key] || 0) +
 				"</b></span>";
 		});
 		html += "</div>";
-		return html + '<div class="chart-box" style="margin-top:16px">' + JD.stackedBars(stats.series, stats.seriesKeys, "tokens by " + wantDim) + "</div>";
+		return html + '<div class="chart-box" style="margin-top:16px">' + JD.stackedBars(top.series, top.keys, "tokens by " + wantDim) + "</div>";
 	}
 
 	/* Why this card counts tokens while Spend counts dollars — the one thing a
@@ -1462,35 +1676,50 @@ window.JD = window.JD || {};
 		   volume; the clock is still correct on the session feed below, which is
 		   the card it was presumably copied from. */
 		var icon = widgetIcon("--s3", '<path d="M3 3v16a2 2 0 0 0 2 2h16"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/>');
-		var html =
-			'<section class="card span4" aria-label="Tokens">' +
-			widgetHead(icon, "Tokens", null, TOKENS_HINT);
-
+		/* The empty state keeps a bare head: there is no figure to right-align,
+		   and an aside reading "0" beside "No token data yet" says the same
+		   nothing twice. */
 		if (total === 0) {
 			return (
-				html +
+				'<section class="card span6" aria-label="Tokens">' +
+				widgetHead(icon, "Tokens", null, TOKENS_HINT) +
 				'<div class="empty-note">No token data yet — Claude sessions report tokens; other agents count ' +
 				"sessions only.</div></section>"
 			);
 		}
 
-		html +=
-			'<div class="bignum num" style="font-size:22px;font-weight:650;margin-top:2px">' +
-			JD.fmtTokens(total) +
-			'<div class="sub" style="font-weight:400;margin-top:2px">captured tokens, ' +
-			Math.round((tb.cached / total) * 100) +
-			"% of them cache</div></div>";
+		/* Right-aligned in the head, matching Spend beside it. `span6` with a
+		   one-word title is exactly the case `widgetHead`'s aside was measured
+		   for. 18px, not the 22px it used at full width, so the two cards' figures
+		   are the same size. */
+		var html =
+			'<section class="card span6" aria-label="Tokens">' +
+			widgetHead(
+				icon,
+				"Tokens",
+				null,
+				TOKENS_HINT,
+				'<div class="num" style="font-size:18px;font-weight:650">' +
+					JD.fmtTokens(total) +
+					'</div><div class="sub">captured tokens<br>' +
+					Math.round((tb.cached / total) * 100) +
+					"% of them cache</div>",
+			);
 
 		var view = JD.tokSplitView || "type";
 		html += tokensViewChips(view);
 		html += tokensViewBody(stats, view);
 
-		return (
-			html +
-			'<div class="w-foot"><span class="w-chip">Claude only</span>' +
-			'<span class="w-chip">cache is one combined figure</span>' +
-			'<span class="w-measure">ⓘ volume, not spend</span></div></section>'
-		);
+		/* No footer. The three chips that were here — "Claude only", "cache is one
+		   combined figure", "volume, not spend" — were caveats about how the
+		   figures are SOURCED, not facts about this window, and the card already
+		   answers each of them where a reader is looking: the legend names Input /
+		   Output / Cache as three separate series, so the combined-cache point is
+		   made by the chart rather than asserted under it; the headline says
+		   "captured tokens"; and the ⓘ on the card head explains the rest. A
+		   caveat that has to be read after the chart to correct it belongs in the
+		   head, not in a strip below the fold. */
+		return html + "</section>";
 	}
 
 	/* Shared label/value stat list — same `.records` markup activityCard already
@@ -1648,20 +1877,22 @@ window.JD = window.JD || {};
 			document.getElementById("app").innerHTML = noReposCard();
 			return;
 		}
-		/* Order follows jolli-design's own Dashboard route (confirmed against a
-		   real screenshot of it): the equal-third band (what runs, what's
-		   called, what it cost in tokens) leads, then spend over time, then
-		   decisions, then the feed, then the two lower-priority cards. Decisions
-		   used to be paired with a Recall card beside it; that card was removed
-		   (JOLLI-2193) along with its whole query path, so Decisions took the
-		   whole row rather than leaving six empty columns. */
+		/* Two bands over the feed. The equal-third band leads with the three
+		   summary widgets — what ran, what was called, what was decided — and the
+		   half-and-half band under it carries the two cost views, which are one
+		   question in two units (see Tokens' hint) and so belong beside each other
+		   rather than stacked a scroll apart.
+
+		   Both are moves off the original jolli-design order, where Tokens held the
+		   third seat and Spend and Decisions each took a full row: Decisions was
+		   span12 only because the Recall card beside it was removed (JOLLI-2193),
+		   and neither it nor Spend draws anything that needs twelve columns. */
 		var html = skillsCard(model);
 		html += mcpCard(model);
-		html += tokensCard(model);
-
-		html += costCard(model);
-
 		html += decisionsCard(model);
+
+		html += tokensCard(model);
+		html += costCard(model);
 
 		/* The session-activity card (heatmap, hour histogram, records, share card)
 		   was removed — `stats.heatmap` / `stats.hours` / `stats.fun` stay in the

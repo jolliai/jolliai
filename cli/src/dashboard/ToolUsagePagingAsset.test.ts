@@ -241,7 +241,6 @@ function model(toolUsageOver: Record<string, unknown> = {}): unknown {
 		],
 		usage: { available: false },
 		stats: {
-			kpis: [],
 			series: [],
 			seriesKeys: [],
 			seriesDimension: "model",
@@ -325,8 +324,9 @@ describe("ranked rows — the per-agent tag", () => {
 	it("emits no meta slot at all for a row with nothing to put in it", () => {
 		const h = loadHarness();
 		// `agents: []` is the shape `DashboardQuery`'s defensive `?? []` can hand a
-		// Skills row, and Skills is the one list whose meta slot is the agent tag
-		// ALONE — the MCP lists always spend it on a tool/session count first.
+		// row. Read on a Skills row because Skills passes NO kind at all, so this is
+		// the list where an accidental empty slot would show up first; the MCP lists
+		// always spend theirs on a tool/session count.
 		h.render(model({ skills: [{ ...skillRow(0), agents: [] }], skillsTotal: 1, skillCallsTotal: 20 }));
 		// An empty `.rl-kind` is not free: it is still a flex item, so it spends one of
 		// `.rl-top`'s 8px gaps and takes those pixels off the name, which is the only
@@ -339,13 +339,23 @@ describe("ranked rows — the per-agent tag", () => {
 		expect(h.html()).toContain('title="/skill00">/skill00</span><span class="rl-val num">20 runs</span>');
 	});
 
-	it("folds a Skills row too, where the tag is the whole meta slot", () => {
+	it("folds a Skills row too, in the LEAD rather than the meta slot", () => {
 		const h = loadHarness();
 		h.render(model({ skills: [{ ...skillRow(0), agents: FIVE_AGENTS }], skillsTotal: 1, skillCallsTotal: 20 }));
-		// Skills rows carry no tool/session count, so there is no leading `N tools ·`
-		// for the names to hang off — the join has to hold with an empty meta.
-		expect(h.html()).toContain('<span class="rl-kind" title="claude · codex · cursor-agent · opencode · kimi">');
-		expect(h.html()).toContain("claude · codex +3</span>");
+		// Skills states its agents as brand marks AHEAD of the name (`agentBadges`),
+		// not as the name list the MCP lists put in the trailing slot. So the fold
+		// that keeps a five-agent row from pushing the name to 0 wide happens in
+		// `.rl-lead`, past `LEAD_AGENT_MARKS` — and it folds harder, to one mark plus
+		// a count, because that slot's width is what holds every skill name at the
+		// same x.
+		expect(h.html()).toContain('<span class="src-more" title="codex, cursor-agent, opencode, kimi">+4</span>');
+		// `+4` is only honest if the four are reachable, which is what that title is
+		// for — the same bargain `.rl-kind`'s tooltip makes on an MCP row.
+		//
+		// And nothing lands in the trailing slot: asserted as name-then-value with
+		// nothing between, rather than as "no `rl-kind` anywhere", because `html()`
+		// is the whole page and the MCPs card below carries a populated one.
+		expect(h.html()).toContain('title="/skill00">/skill00</span><span class="rl-val num">20 runs</span>');
 	});
 });
 

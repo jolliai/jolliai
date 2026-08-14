@@ -44,6 +44,7 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	["EVENT_FAILED_KIND_DDL", "a7cdc1abee65"],
 	["TOOL_CALL_TIME_DDL", "6393ea338cd8"],
 	["SCHEMA_MIGRATIONS_DDL", "151c9e7a7af7"],
+	["REPOS_DELETE_ALLOWED_DDL", "52561786c1b7"],
 ];
 
 describe("migration fingerprints", () => {

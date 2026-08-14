@@ -35,6 +35,7 @@ import {
 	EVENT_FAILED_KIND_DDL,
 	MEMORY_SOT_DDL,
 	RECALL_RECEIPTS_DDL,
+	REPOS_DELETE_ALLOWED_DDL,
 	SCHEMA_MIGRATIONS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
 	TOOL_CALL_TIME_DDL,
@@ -81,7 +82,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 6;
+export const DASHBOARD_SCHEMA_VERSION = 7;
 
 /**
  * NOTE ON COMPATIBILITY, because its absence here is a decision.
@@ -326,6 +327,7 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 	{ name: "EVENT_FAILED_KIND_DDL", ddl: EVENT_FAILED_KIND_DDL },
 	{ name: "TOOL_CALL_TIME_DDL", ddl: TOOL_CALL_TIME_DDL },
 	{ name: "SCHEMA_MIGRATIONS_DDL", ddl: SCHEMA_MIGRATIONS_DDL },
+	{ name: "REPOS_DELETE_ALLOWED_DDL", ddl: REPOS_DELETE_ALLOWED_DDL },
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

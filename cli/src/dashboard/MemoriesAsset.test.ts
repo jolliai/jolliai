@@ -42,6 +42,7 @@ const PLAN_ROW = { kind: "plan", key: "plan-key", contextKey: "plan-key", title:
 function render(
 	context: ReadonlyArray<Record<string, unknown>>,
 	conversations: ReadonlyArray<Record<string, unknown>> = [],
+	topics: ReadonlyArray<Record<string, unknown>> = [],
 ): { rows: FakeRow[]; html: string } {
 	const rows: FakeRow[] = [
 		{
@@ -98,7 +99,7 @@ function render(
 				excluded: [],
 				activity: [],
 				activityUncoveredSources: [],
-				topics: [],
+				topics,
 				files: [],
 				e2e: [],
 			},
@@ -224,5 +225,82 @@ describe("memories.js — conversation rows", () => {
 		const { html } = render([], [conversation({ sessionId: undefined })]);
 		expect(html).toContain('<div class="gd-row">');
 		expect(html).not.toContain('title="Session');
+	});
+
+	// The row leads with the agent that produced the conversation, the same way
+	// VS Code's memory detail and IntelliJ's Working Memory panel do.
+	it("leads with the producing agent's brand mark instead of a generic glyph", () => {
+		const { html } = render([], [conversation({ source: "codex" })]);
+		expect(html).toContain('<span class="src-mark mem-row-icon" role="img" title="codex" aria-label="codex">');
+		expect(html).toContain('stroke="#10A37F"');
+	});
+
+	// The name moved into the mark rather than being dropped: it used to sit in
+	// the meta slot as raw text, competing with the title for width.
+	it("no longer prints the source tag as row text", () => {
+		const { html } = render([], [conversation({ source: "cursor" })]);
+		expect(html).not.toContain('<span class="mem-row-meta">cursor</span>');
+		expect(html).toContain('aria-label="cursor"');
+		expect(html).toContain("12 msgs");
+	});
+
+	// cursor-agent and the Cursor IDE are one brand — the same pairing the other
+	// three surfaces make, so the CLI does not render as an unknown agent.
+	it("rides the sibling brand for cursor-cli", () => {
+		const cli = render([], [conversation({ source: "cursor-cli" })]).html;
+		expect(cli).toContain('aria-label="cursor-cli"');
+		expect(cli).toContain("M8 1.5 14 5v6L8 14.5 2 11V5L8 1.5Z");
+	});
+});
+
+/**
+ * The anchor the Memory Activity card's "N decisions" chip links at.
+ *
+ * It is a FIXED id on the topics SECTION — the "What changed and why" header —
+ * not a per-topic index, because the card that links here knows only how many
+ * decisions a memory has (`MemoryCard.decisionCount`) and carries no topic list.
+ * It sat on the first `.decide` block before, which landed the reader below the
+ * topic heading that says what the decision is about.
+ */
+describe("topic anchors", () => {
+	const topic = (title: string, decisions: ReadonlyArray<string>) => ({
+		title,
+		category: "bugfix",
+		trigger: "t",
+		response: "r",
+		decisions,
+		files: [],
+		todo: "",
+	});
+
+	it("gives every topic an index anchor", () => {
+		const { html } = render([], [], [topic("T0", []), topic("T1", ["picked sqlite"])]);
+		expect(html).toContain('id="topic-0"');
+		expect(html).toContain('id="topic-1"');
+	});
+
+	it("puts #what-changed on the section header, above every topic", () => {
+		const { html } = render([], [], [topic("T0", []), topic("T1", ["picked sqlite"]), topic("T2", ["again"])]);
+		// Exactly once — a second copy would make the anchor ambiguous and send
+		// the reader to whichever the browser happened to find first.
+		expect(html.match(/id="what-changed"/g)).toHaveLength(1);
+		// On the section that carries the header, so the scroll lands on "What
+		// changed and why" with the first topic below it — not inside a topic.
+		expect(html).toContain('<section class="mem-section mem-topics" id="what-changed">');
+		expect(html.indexOf('id="what-changed"')).toBeLessThan(html.indexOf('id="topic-0"'));
+	});
+
+	// The section is the whole memory's topics, so it is there whenever any topic
+	// is — the decision count is what the LINK is gated on, not the target.
+	it("emits #what-changed even when no topic recorded a decision", () => {
+		const { html } = render([], [], [topic("T0", []), topic("T1", [])]);
+		expect(html).toContain('id="topic-1"');
+		expect(html).toContain('id="what-changed"');
+		expect(html).not.toContain("decide-title");
+	});
+
+	it("emits no #what-changed when the memory has no topics at all", () => {
+		const { html } = render([], [], []);
+		expect(html).not.toContain('id="what-changed"');
 	});
 });

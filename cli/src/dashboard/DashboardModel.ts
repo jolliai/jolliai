@@ -829,8 +829,9 @@ export interface RepoOption {
 	readonly sessionsThisWeek: number;
 	/**
 	 * Present and `true` only for a PAUSED repo (`repos.disabled_at` set). The list
-	 * carries paused repos rather than dropping them: their rows are never deleted
-	 * and they keep counting in the aggregate KPIs, so hiding them made an
+	 * carries paused repos rather than dropping them: pausing is an UPDATE that
+	 * stamps `disabled_at`, never a delete, and they keep counting in the
+	 * aggregate figures, so hiding them made an
 	 * all-paused dashboard read as "No repositories yet". Absent on an active repo,
 	 * so an active row's shape is unchanged.
 	 */
@@ -850,14 +851,6 @@ export interface RepoOption {
 /** `today` and `2w` remain accepted for older deep links; the dashboard picker
  * intentionally presents the clearer 7d / 30d / 90d choices. */
 export type DashboardRange = "today" | "week" | "2w" | "month" | "3m" | "custom";
-
-/** One KPI card on the Stats page. */
-export interface KpiCard {
-	readonly key: string;
-	readonly label: string;
-	readonly value: string;
-	readonly hint?: string;
-}
 
 /** One local calendar day in the cost/token series. `date` is `YYYY-MM-DD` local. */
 export interface DaySeriesPoint {
@@ -1059,7 +1052,6 @@ export interface DecisionsCard {
 
 /** The Stats page payload. */
 export interface StatsModel {
-	readonly kpis: ReadonlyArray<KpiCard>;
 	readonly series: ReadonlyArray<DaySeriesPoint>;
 	/** Series keys present in `series[].bySeries`, in render order. */
 	readonly seriesKeys: ReadonlyArray<string>;
@@ -1067,12 +1059,16 @@ export interface StatsModel {
 	readonly seriesDimension: SeriesDimension;
 	readonly heatmap: ReadonlyArray<HeatmapCell>;
 	readonly hours: ReadonlyArray<HourBucket>;
-	/** Token volume by type, over the range — available at every tier, like `kpis`. */
+	/** Token volume by type, over the range — available at every tier. */
 	readonly tokenBreakdown: TokenBreakdown;
 	/**
-	 * Est. cost vs the immediately preceding window of equal length — Cost &
-	 * tokens' own self-trend. Absent when the previous window has no priced
-	 * sessions to compare against.
+	 * Est. cost vs the immediately preceding window of equal length — the Spend
+	 * card's own self-trend.
+	 *
+	 * Both ends are summed over {@link series}, along the SAME dimension, by the
+	 * same rule the card's headline uses — so the arrow trends the number it is
+	 * printed beside. Absent when the previous window drew no cost to compare
+	 * against.
 	 */
 	readonly costTrendPct?: number;
 	readonly fun: FunStats;
@@ -1084,6 +1080,16 @@ export interface StatsModel {
 	readonly recentSessions: ReadonlyArray<RecentSession>;
 	/** The tier-1+ feed. Empty at the local tier (no summaries to draw from). */
 	readonly memoryCards: ReadonlyArray<MemoryCard>;
+	/**
+	 * {@link memoryCards} hit {@link MEMORY_CARDS_LIMIT} — i.e. the window holds
+	 * more memories than the feed is showing.
+	 *
+	 * The card's subtitle is the whole reason this travels: `memoryCards.length`
+	 * alone cannot tell "20 memories in this window" from "the 20 most recent of
+	 * 300", and the page has no other way to know the cap. Absent (not `false`)
+	 * when the feed is complete, matching the other optional fields here.
+	 */
+	readonly memoryCardsCapped?: boolean;
 	/**
 	 * Commits in the window, memory tier or not — the denominator behind Memory
 	 * Activity's "X of Y captured" line and the source of its gap count

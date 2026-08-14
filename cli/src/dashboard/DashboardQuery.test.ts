@@ -11,12 +11,11 @@ import type {
 	StatsModel,
 	ToolUsageRow,
 } from "./DashboardModel.js";
-import { TOOL_ROWS_LIMIT } from "./DashboardModel.js";
+import { MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
 	addLocalDays,
 	buildDashboardModel,
 	buildToolUsagePage,
-	computeStreak,
 	localDayKey,
 	localHour,
 	machineTimeZone,
@@ -55,6 +54,71 @@ async function seedTopicRows(
 					"INSERT INTO memory_topics (repo_id, commit_hash, pos, category, title) VALUES (?, ?, ?, ?, ?)",
 				).run(id, hash, pos, category, `topic ${pos}`);
 			});
+		},
+		{ dbPath },
+	);
+}
+
+/**
+ * Adds one SUPERSEDED predecessor of `rootHash` — the row an amend or a squash
+ * leaves behind. It carries the same tokens/cost as the memory it precedes
+ * (production copies them forward), gets its own `commits` row on the same
+ * branch, and is marked as a non-root generation via `parent_hash`.
+ *
+ * The `commits` row is the point: an INNER JOIN on `commits` looks like it
+ * filters these out and does not — `commits` keeps rows that git can no longer
+ * reach, which is why `memoriesCreated` carries a separate `isReachable` pass.
+ */
+async function seedSupersededPredecessor(
+	dbPath: string,
+	rootHash: string,
+	predHash: string,
+	opts: {
+		branch: string;
+		childPos: number;
+		tokens: number;
+		estCostUsd: number;
+		committedAtMs: number;
+		/** Topics the predecessor recorded — a superseded generation keeps its own. */
+		topics?: ReadonlyArray<Record<string, unknown>>;
+	},
+): Promise<void> {
+	await withDashboardDb(
+		(db) => {
+			const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+				id: number;
+			};
+			db.prepare(
+				`INSERT INTO commits (event_id, repo_id, hash, branch, message, committed_at_ms)
+				 VALUES (?, ?, ?, ?, 'superseded', ?)`,
+			).run(`ev-${predHash}`, repoId, predHash, opts.branch, opts.committedAtMs);
+			const { id: commitId } = db
+				.prepare("SELECT id FROM commits WHERE repo_id = ? AND hash = ?")
+				.get(repoId, predHash) as { id: number };
+			db.prepare("INSERT OR IGNORE INTO branches (name) VALUES (?)").run(opts.branch);
+			const { id: branchId } = db.prepare("SELECT id FROM branches WHERE name = ?").get(opts.branch) as {
+				id: number;
+			};
+			db.prepare("INSERT INTO commit_branches (commit_id, branch_id) VALUES (?, ?)").run(commitId, branchId);
+			db.prepare(
+				`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+				                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+				 VALUES (?, ?, ?, ?, ?, 1, ?, 1, 1, ?)`,
+			).run(
+				repoId,
+				predHash,
+				rootHash,
+				opts.childPos,
+				rootHash,
+				JSON.stringify({
+					commitHash: predHash,
+					conversationTokens: opts.tokens,
+					estimatedCostUsd: opts.estCostUsd,
+					ticketId: "JOLLI-2069",
+					...(opts.topics ? { topics: opts.topics } : {}),
+				}),
+				opts.committedAtMs,
+			);
 		},
 		{ dbPath },
 	);
@@ -160,25 +224,6 @@ describe("time-zone engine", () => {
 
 	it("machineTimeZone returns a resolvable IANA name", () => {
 		expect(() => new Intl.DateTimeFormat("en", { timeZone: machineTimeZone() })).not.toThrow();
-	});
-});
-
-describe("computeStreak", () => {
-	const now = Date.parse("2026-07-30T12:00:00Z");
-	const day = (offset: number) => addLocalDays(now, offset, "UTC") + 3_600_000;
-
-	it("counts consecutive days ending today", () => {
-		expect(computeStreak([day(0), day(-1), day(-2)], "UTC", now)).toBe(3);
-	});
-
-	it("tolerates an inactive morning — a streak ending yesterday still counts", () => {
-		expect(computeStreak([day(-1), day(-2)], "UTC", now)).toBe(2);
-	});
-
-	it("breaks on a gap and is 0 with no recent activity", () => {
-		expect(computeStreak([day(0), day(-2)], "UTC", now)).toBe(1);
-		expect(computeStreak([day(-5)], "UTC", now)).toBe(0);
-		expect(computeStreak([], "UTC", now)).toBe(0);
 	});
 });
 
@@ -319,7 +364,7 @@ describe("buildDashboardModel", () => {
 		expect(model.stats?.pricesAsOf).toBeUndefined();
 	});
 
-	it("scopes KPIs and the series to the requested range, and labels them with it", async () => {
+	it("scopes the session feed and the series to the requested range", async () => {
 		await seed();
 		const forRange = async (range: "today" | "week" | "2w" | "month") =>
 			withDashboardDb(
@@ -330,18 +375,15 @@ describe("buildDashboardModel", () => {
 
 		// today-1 is an hour ago; yesterday-1 is 26 h back; old-1 is 10 days back.
 		const today = await forRange("today");
-		expect(today.stats?.kpis.find((k) => k.key === "sessions")).toMatchObject({
-			value: "1",
-			label: "sessions today",
-		});
+		expect(today.stats?.recentSessions).toHaveLength(1);
 		expect(today.stats?.series).toHaveLength(1); // one day bucket
 
 		const week = await forRange("week");
-		expect(week.stats?.kpis.find((k) => k.key === "sessions")?.value).toBe("2"); // old-1 excluded
+		expect(week.stats?.recentSessions).toHaveLength(2); // old-1 excluded
 		expect(week.stats?.series).toHaveLength(7);
 
 		const month = await forRange("month");
-		expect(month.stats?.kpis.find((k) => k.key === "sessions")?.value).toBe("3");
+		expect(month.stats?.recentSessions).toHaveLength(3);
 		expect(month.stats?.series).toHaveLength(30);
 
 		// The heatmap is deliberately NOT range-scoped — it is the 12-week long view.
@@ -349,7 +391,7 @@ describe("buildDashboardModel", () => {
 		expect(month.stats?.heatmap).toHaveLength(84);
 	});
 
-	it("assembles the stats view with KPIs, heatmap, hours and recent sessions", async () => {
+	it("assembles the stats view with the series, heatmap, hours and recent sessions", async () => {
 		await seed();
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -367,16 +409,11 @@ describe("buildDashboardModel", () => {
 
 		const stats = model.stats;
 		if (!stats) throw new Error("stats missing");
-		// KPIs cover the SELECTED RANGE, default 30 days, and
-		// the labels carry that window so a figure can't be misread as today's.
+		// Everything below covers the SELECTED RANGE, default 30 days.
 		expect(stats.range).toBe("month");
 		// today-1 + yesterday-1 + old-1 (10 days back) all fall inside 30 days;
 		// only the two Claude ones carry tokens (cursor is sessions-only).
-		expect(stats.kpis.find((k) => k.key === "sessions")).toMatchObject({ value: "3", label: "sessions · 30d" });
-		expect(stats.kpis.find((k) => k.key === "tokens")?.value).toBe("3.2k");
-		expect(stats.kpis.find((k) => k.key === "cost")?.value).toBe("$3.00");
-		// cached share = 200 cached / (2000 input + 200 cached)
-		expect(stats.kpis.find((k) => k.key === "cached")?.value).toBe("9%");
+		expect(stats.recentSessions).toHaveLength(3);
 		// Tokens: today-1 + old-1 carry the default model tokens;
 		// yesterday-1 is sessions-only (cursor) and contributes nothing.
 		expect(stats.tokenBreakdown).toMatchObject({ input: 2000, output: 1000, cached: 200 });
@@ -422,7 +459,7 @@ describe("buildDashboardModel", () => {
 	it("reports a cost trend once the preceding window has priced sessions", async () => {
 		await seed();
 		// 40 days back: inside the prior 30-day window (days 30–60 back), outside
-		// the current one — so it moves costTrendPct without touching stats.kpis.
+		// the current one — so it moves costTrendPct without touching the series.
 		await applySummaryEvents(
 			[
 				session({
@@ -447,7 +484,7 @@ describe("buildDashboardModel", () => {
 			{ dbPath },
 		);
 		// Current window's $3.00 (unchanged) vs the prior window's $2.00 → +50%.
-		expect(model.stats?.kpis.find((k) => k.key === "cost")?.value).toBe("$3.00");
+		expect(model.stats?.series.reduce((sum, p) => sum + p.estCostUsd, 0)).toBe(3);
 		expect(model.stats?.costTrendPct).toBe(50);
 	});
 
@@ -636,7 +673,7 @@ describe("buildDashboardModel", () => {
 		expect(scoped.stats?.recentSessions.map((s) => s.sessionId)).toEqual(["other-1"]);
 	});
 
-	it("renders sensibly from an empty database — zero KPIs, empty fun stats, no series keys", async () => {
+	it("renders sensibly from an empty database — empty fun stats, no series keys", async () => {
 		await applySummaryEvents([], { producerKind: "cli", dbPath }); // create schema only
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -644,8 +681,8 @@ describe("buildDashboardModel", () => {
 		);
 		const stats = model.stats;
 		if (!stats) throw new Error("stats missing");
-		expect(stats.kpis.find((k) => k.key === "sessions")?.value).toBe("0");
-		expect(stats.kpis.find((k) => k.key === "cached")?.value).toBe("—");
+		expect(stats.recentSessions).toEqual([]);
+		expect(stats.tokenBreakdown).toMatchObject({ input: 0, output: 0, cached: 0 });
 		expect(stats.seriesKeys).toEqual([]);
 		expect(stats.fun).toMatchObject({ legendarySessionMinutes: 0, biggestDayTokens: 0, nightOwlSharePct: 0 });
 		expect(stats.fun.legendarySessionTitle).toBeUndefined();
@@ -816,17 +853,18 @@ describe("buildDashboardModel", () => {
 			});
 		});
 
-		it("scopes the KPIs to an explicit window, inclusive at both ends", async () => {
+		it("scopes the window to an explicit range, inclusive at both ends", async () => {
 			await seed();
 			// Seeded sessions land on Jul 30 (×1), Jul 29 (×1) and Jul 20 (×1).
 			const july29 = await stats({ range: "custom", customFrom: "2026-07-29", customTo: "2026-07-29" });
 			expect(july29.range).toBe("custom");
-			expect(july29.kpis.find((k) => k.key === "sessions")?.value).toBe("1");
-			// The label carries the window so a KPI can never be misread as today's.
-			expect(july29.kpis.find((k) => k.key === "sessions")?.label).toBe("sessions · 07-29→07-29");
+			expect(july29.recentSessions).toHaveLength(1);
+			// The resolved bounds are echoed back, so a clamped request reads as
+			// the window it actually got.
+			expect(july29).toMatchObject({ rangeFrom: "2026-07-29", rangeTo: "2026-07-29" });
 
 			const spanning = await stats({ range: "custom", customFrom: "2026-07-29", customTo: "2026-07-30" });
-			expect(spanning.kpis.find((k) => k.key === "sessions")?.value).toBe("2");
+			expect(spanning.recentSessions).toHaveLength(2);
 		});
 
 		it("clamps a future `to` and an over-long `from` instead of rejecting them", async () => {
@@ -882,7 +920,6 @@ describe("buildDashboardModel", () => {
 				{ producerKind: "cli", dbPath },
 			);
 			const old = await stats({ range: "custom", customFrom: "2026-01-10", customTo: "2026-01-12" });
-			expect(old.kpis.find((k) => k.key === "sessions")?.value).toBe("1");
 			// The feed follows the range, so it shows the window's session — not
 			// whatever happens to be most recent overall.
 			expect(old.recentSessions.map((s) => s.title)).toEqual(["Old work"]);
@@ -1741,6 +1778,51 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(model.stats?.memoryCards?.[0]?.committedAtMs).toBe(nowMs - 3 * 3_600_000);
 	});
 
+	it("flags memoryCardsCapped only once the window holds more than one page", async () => {
+		const bulk = (from: number, count: number) =>
+			applySummaryEvents(
+				Array.from({ length: count }, (_, i) => ({
+					producerKind: "bootstrap" as const,
+					event: {
+						type: "commit.summary" as const,
+						repoIdentity: "repo-1",
+						hash: `bulk${from + i}`,
+						committedAtMs: nowMs - 2 * 3_600_000,
+						branch: "main",
+						message: `chore: bulk ${from + i}`,
+						turns: 1,
+						tokens: 10,
+						estCostUsd: 0.1,
+						insights: [],
+						references: [],
+						sessionLinks: [],
+					},
+				})),
+				{ producerKind: "cli", dbPath },
+			);
+		const readStats = async () =>
+			(
+				await withDashboardDb(
+					(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+					{ dbPath },
+				)
+			).stats;
+
+		await seedMemory();
+		await bulk(0, MEMORY_CARDS_LIMIT - 2);
+		const full = await readStats();
+		// Exactly one page with nothing behind it: the feed IS the window, so the
+		// subtitle must not claim a truncation that has not happened. `>= LIMIT`
+		// cannot tell this case from the next one — only the un-cut count can.
+		expect(full?.memoryCards).toHaveLength(MEMORY_CARDS_LIMIT);
+		expect(full?.memoryCardsCapped).toBeUndefined();
+
+		await bulk(100, 1);
+		const cut = await readStats();
+		expect(cut?.memoryCards).toHaveLength(MEMORY_CARDS_LIMIT);
+		expect(cut?.memoryCardsCapped).toBe(true);
+	});
+
 	it("credits a rewritten commit as captured through commit_aliases, decision included", async () => {
 		await seedMemory();
 		// Simulate mem1 getting rebased/amended after it was summarized: the live
@@ -1881,6 +1963,204 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(total).toBe(28000);
 	});
 
+	/**
+	 * The shape a rebase leaves behind. `commits` moves to the new hash — the ROW
+	 * survives, so its `commit_branches` links and its committer date come with it
+	 * — while the memory stays filed under the old hash, reachable only through
+	 * `commit_aliases`. Nothing is left carrying the memory's own hash, which is
+	 * what `pruneUnreachableCommits` guarantees and what makes the alias the only
+	 * path to it.
+	 */
+	async function rebaseMem1(authorDaysAgo?: number): Promise<void> {
+		await withDashboardDb(
+			(db) => {
+				const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				db.prepare("UPDATE commits SET hash = 'mem1-rebased' WHERE repo_id = ? AND hash = 'mem1'").run(repoId);
+				db.prepare(
+					"INSERT INTO commit_aliases (repo_id, old_hash, target_hash, created_ms) VALUES (?, ?, ?, ?)",
+				).run(repoId, "mem1-rebased", "mem1", 1);
+				if (authorDaysAgo != null) {
+					db.prepare("UPDATE memories SET commit_date_ms = ? WHERE repo_id = ? AND commit_hash = 'mem1'").run(
+						nowMs - authorDaysAgo * 24 * 3_600_000,
+						repoId,
+					);
+				}
+			},
+			{ dbPath },
+		);
+	}
+
+	it.each(["branch", "ticket"] as const)(
+		"keeps a rebased commit's spend on the %s axis, bucketed on its landed date",
+		async (dimension) => {
+			await seedMemory();
+			// Two ways to lose mem1's 20k here, and this fixture arms both: joining
+			// `m.commit_hash = c.hash` never reaches a memory whose hash was rewritten
+			// away, and its own `commit_date_ms` is an AUTHOR date 400 days back, which
+			// would fall outside the series even once the row is found.
+			await rebaseMem1(400);
+			const model = await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "stats",
+						scope: { kind: "all" },
+						dimension,
+						timeZone: "UTC",
+						nowMs,
+					}),
+				{ dbPath },
+			);
+			const stats = model.stats;
+			if (!stats) throw new Error("stats missing");
+			expect(stats.seriesDimension).toBe(dimension);
+			expect(stats.series.reduce((sum, p) => sum + p.tokens, 0)).toBe(28000);
+			// On TODAY — the rebased commit's committer date — and under the branch
+			// the surviving `commit_branches` row still carries.
+			const today = stats.series[stats.series.length - 1];
+			expect(today.bySeries[dimension === "branch" ? "feature/dash" : "JOLLI-2069"]).toBe(20000);
+		},
+	);
+
+	it("buckets a rebased memory's category spend on the landed committer date", async () => {
+		await seedMemory();
+		await seedTopicRows(dbPath, "mem1", ["bugfix", "feature", "bugfix", "security"], { tokens: 20000 });
+		await seedTopicRows(dbPath, "mem2", [], { tokens: 8000, commitDateMs: nowMs - 26 * 3_600_000 });
+		// The author date is stamped by the rebase helper, not by `seedTopicRows`:
+		// that one is an INSERT OR IGNORE, so on a memory `seedMemory` already wrote
+		// it silently changes nothing — and a fixture that cannot move the date
+		// cannot exercise the fallback this test is about.
+		await rebaseMem1(400);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					dimension: "category",
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		const stats = model.stats;
+		if (!stats) throw new Error("stats missing");
+		const today = stats.series[stats.series.length - 1];
+		expect(today.bySeries).toEqual({ bugfix: 10000, feature: 5000, security: 5000 });
+		expect(stats.series.reduce((sum, p) => sum + p.tokens, 0)).toBe(28000);
+	});
+
+	it("keeps a rebased memory in the feed when reachability is checked", async () => {
+		await seedMemory();
+		await rebaseMem1();
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					// What the server passes for this view: hashes reachable from a ref.
+					// The memory's own hash is not one of them any more — asking about it
+					// instead of the live one drops the very card the "N of M captured"
+					// line beside it has just counted through the alias.
+					reachableCommits: new Map([["repo-1", new Set(["mem1-rebased", "mem2"])]]),
+				}),
+			{ dbPath },
+		);
+		expect(model.stats?.memoriesCreated).toBe(2);
+		expect(model.stats?.memoryCards?.map((c) => c.commitHash)).toContain("mem1");
+	});
+
+	it("stamps a rebased memory's card with the landed date, not the author date", async () => {
+		await seedMemory();
+		// The half of the ordering rule the non-rebased fixture cannot reach. Once
+		// nothing carries the memory's own hash the payload query has no `commits`
+		// row to read, so a COALESCE that skips the alias hop falls all the way to
+		// `commit_date_ms` — an AUTHOR date, here 400 days outside the window the
+		// key query just selected this row FOR. Both queries read the same
+		// `memory_landing.at_ms` precisely so they cannot answer differently.
+		await rebaseMem1(400);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					reachableCommits: new Map([["repo-1", new Set(["mem1-rebased", "mem2"])]]),
+				}),
+			{ dbPath },
+		);
+		// The rebased commit's own committer date — mem1 landed today, so it also
+		// still leads the feed over yesterday's mem2.
+		expect(model.stats?.memoryCards?.map((c) => c.commitHash)).toEqual(["mem1", "mem2"]);
+		expect(model.stats?.memoryCards?.[0]?.committedAtMs).toBe(nowMs - 3 * 3_600_000);
+	});
+
+	it("keeps a day's cost in the trend when a series key shadows Object.prototype", async () => {
+		// A branch really can be named `constructor`, and `bySeries` is a plain
+		// object — so on a day that branch recorded nothing, the lookup hands back
+		// the INHERITED function. Read with `??` it reaches the arithmetic:
+		// `number + function` is a string, the `> 0` test deciding whether a day was
+		// drawn is then false, and that day's money leaves the headline the trend is
+		// computed against. Both windows here hold exactly one such day.
+		const summary = (hash: string, branch: string, committedAtMs: number, tokens: number, estCostUsd: number) => ({
+			producerKind: "bootstrap" as const,
+			event: {
+				type: "commit.summary" as const,
+				repoIdentity: "repo-1",
+				hash,
+				committedAtMs,
+				branch,
+				message: `chore: ${hash}`,
+				turns: 1,
+				tokens,
+				estCostUsd,
+				insights: [],
+				references: [],
+				sessionLinks: [],
+			},
+		});
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				summary("today-main", "main", nowMs - 3 * 3_600_000, 20_000, 2),
+				// The `constructor` series exists in this window but not on the day
+				// above — which is what makes the day above read its inherited value.
+				summary("yesterday-ctor", "constructor", nowMs - 27 * 3_600_000, 10_000, 1),
+				// The prior window, whose only series is `main` — so it is priced the
+				// same either way and the comparison isolates the current window.
+				summary("prior-main", "main", nowMs - 40 * 24 * 3_600_000, 10_000, 1),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					dimension: "branch",
+					timeZone: "UTC",
+					nowMs,
+				}),
+			{ dbPath },
+		);
+		expect(model.stats?.seriesKeys).toEqual(["constructor", "main"]);
+		// $3 drawn against the prior window's $1. Losing the shadowed days to the
+		// inherited value reads 0% here — a flat trend over a window that tripled.
+		expect(model.stats?.costTrendPct).toBe(200);
+	});
+
 	it("apportions a multi-branch commit so the day totals do not multiply", async () => {
 		await seedMemory();
 		// `commit_branches` is a per-branch `git rev-list` union, so a commit on
@@ -1955,6 +2235,81 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		// Sharing keeps the axis summing to the real total — the property the old
 		// per-commit mode existed to protect.
 		expect(stats.series.reduce((sum, p) => sum + p.tokens, 0)).toBe(28000);
+	});
+
+	it.each(["category", "branch", "ticket"] as const)(
+		"counts a memory once on the %s axis however many predecessors it was amended over",
+		async (dimension) => {
+			await seedMemory();
+			await seedTopicRows(dbPath, "mem1", ["feature"], { tokens: 20000, commitDateMs: nowMs - 3 * 3_600_000 });
+			const read = async () => {
+				const model = await withDashboardDb(
+					(db) =>
+						buildDashboardModel(db, {
+							view: "stats",
+							scope: { kind: "all" },
+							dimension,
+							timeZone: "UTC",
+							nowMs,
+						}),
+					{ dbPath },
+				);
+				const stats = model.stats;
+				if (!stats) throw new Error("stats missing");
+				return {
+					tokens: stats.series.reduce((sum, p) => sum + p.tokens, 0),
+					cost: stats.series.reduce((sum, p) => sum + p.estCostUsd, 0),
+				};
+			};
+			const before = await read();
+
+			// Three amends over the same piece of work. Each leaves a `memories`
+			// row AND a `commits` row behind, so an INNER JOIN on `commits` does
+			// not filter them — only `parent_hash IS NULL` does.
+			for (const n of [1, 2, 3]) {
+				await seedSupersededPredecessor(dbPath, "mem1", `mem1-old-${n}`, {
+					branch: "feature/dash",
+					childPos: n,
+					tokens: 20000,
+					estCostUsd: 3,
+					committedAtMs: nowMs - 3 * 3_600_000,
+				});
+			}
+
+			// Unchanged: superseded history is the same work, not new spend.
+			expect(await read()).toEqual(before);
+		},
+	);
+
+	it("counts a decision once however many predecessors recorded it", async () => {
+		await seedMemory();
+		const read = async () => {
+			const model = await withDashboardDb(
+				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+			return { captured: model.stats?.decisionsCaptured, kept: model.stats?.decisions?.keptCount };
+		};
+		const before = await read();
+		expect(before.captured).toBeGreaterThan(0);
+
+		// The same defect as the axis test above, one card over: a predecessor
+		// keeps its OWN topics, and every consumer of TOPIC_INSIGHTS_CTE joins
+		// `commits`, which keeps the predecessor's row. Unfiltered, the decision
+		// this branch reached once is counted once per amend — right beside
+		// `memoriesCreated`, which filters the same history out via isReachable.
+		for (const n of [1, 2]) {
+			await seedSupersededPredecessor(dbPath, "mem1", `mem1-dec-${n}`, {
+				branch: "feature/dash",
+				childPos: 10 + n,
+				tokens: 20000,
+				estCostUsd: 3,
+				committedAtMs: nowMs - 3 * 3_600_000,
+				topics: [{ title: "Retry policy", category: "bugfix", decisions: "- Keep jittered backoff." }],
+			});
+		}
+
+		expect(await read()).toEqual(before);
 	});
 
 	it("builds the ticket dimension with a (no ticket) bucket", async () => {

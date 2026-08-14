@@ -38,7 +38,6 @@ import type {
 	HeatmapCell,
 	HourBucket,
 	KnowledgeModel,
-	KpiCard,
 	McpServerRow,
 	MemoryCard,
 	RecentSession,
@@ -92,15 +91,6 @@ type PresetRange = Exclude<DashboardRange, "custom">;
 
 /** Local days each preset range covers, counting today. */
 const RANGE_DAYS: Readonly<Record<PresetRange, number>> = { today: 1, week: 7, "2w": 14, month: 30, "3m": 90 };
-
-/** KPI label suffix per range — "sessions today" vs "sessions · 30d". */
-const RANGE_LABEL: Readonly<Record<PresetRange, string>> = {
-	today: "today",
-	week: "· 7d",
-	"2w": "· 14d",
-	month: "· 30d",
-	"3m": "· 90d",
-};
 
 /** The range a malformed or empty custom request falls back to. */
 const DEFAULT_RANGE: PresetRange = "month";
@@ -244,7 +234,7 @@ export function addLocalDays(ms: number, days: number, timeZone: string): number
 
 // ── Range resolution ────────────────────────────────────────────────────────
 
-/** A range request resolved into concrete bounds, labels and day keys. */
+/** A range request resolved into concrete bounds and day keys. */
 interface ResolvedWindow {
 	/** What the page ended up showing — `custom` only if the request survived. */
 	readonly range: DashboardRange;
@@ -254,8 +244,6 @@ interface ResolvedWindow {
 	readonly endMs: number;
 	readonly from: string;
 	readonly to: string;
-	/** KPI label suffix ("today", "· 14d", "· 07-01→07-15"). */
-	readonly label: string;
 }
 
 /**
@@ -296,9 +284,6 @@ function resolveCustomWindow(
 		endMs: addLocalDays(lastDay, 1, timeZone),
 		from,
 		to,
-		// Year is dropped: the picker beside it always shows the full dates, and
-		// "· 2026-07-01→2026-07-15" does not fit a KPI label.
-		label: `· ${from.slice(5)}→${to.slice(5)}`,
 	};
 }
 
@@ -322,7 +307,6 @@ function resolveWindow(
 		endMs: addLocalDays(nowMs, 1, timeZone),
 		from: localDayKey(startMs, timeZone),
 		to: localDayKey(nowMs, timeZone),
-		label: RANGE_LABEL[preset],
 	};
 }
 
@@ -538,6 +522,14 @@ function commitsInRange(
  * decision row holds is the whole `decisions` block, which is prose and has no
  * title in it to recover. Both branches select it so the column exists whatever
  * `kind` a consumer filters to.
+ *
+ * **Both branches filter `m.parent_hash IS NULL`** — the same "current
+ * generation" rule {@link buildSeries} states at length, for the same reason and
+ * with the same trap. `memories` holds one row per GENERATION, so a branch
+ * amended or squashed four times keeps its predecessors' topics, and every
+ * consumer of this CTE joins `commits`, which retains the predecessors' rows.
+ * Unfiltered, one decision is counted once per rewrite — directly beside
+ * `memoriesCreated`, which filters the same history out via `isReachable`.
  */
 const TOPIC_INSIGHTS_CTE = `WITH topic_insights AS (
 	SELECT m.repo_id, m.commit_hash, 'decision' AS kind,
@@ -545,25 +537,130 @@ const TOPIC_INSIGHTS_CTE = `WITH topic_insights AS (
 	       TRIM(COALESCE(json_extract(t.value, '$.title'), '')) AS topic_title,
 	       NULL AS addressed_to, t.key * 2 AS ord
 	  FROM memories m, json_each(m.summary_json, '$.topics') t
-	 WHERE TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
+	 WHERE m.parent_hash IS NULL
+	   AND TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
 	UNION ALL
 	SELECT m.repo_id, m.commit_hash, 'todo' AS kind,
 	       TRIM(json_extract(t.value, '$.todo')) AS text,
 	       TRIM(COALESCE(json_extract(t.value, '$.title'), '')) AS topic_title,
 	       NULL AS addressed_to, t.key * 2 + 1 AS ord
 	  FROM memories m, json_each(m.summary_json, '$.topics') t
-	 WHERE TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> ''
+	 WHERE m.parent_hash IS NULL
+	   AND TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> ''
 )`;
+
+/**
+ * Where a memory LANDED: the commit its work sits on today, and that commit's
+ * committer date.
+ *
+ * **One of TWO spellings of that rule.** This one is for callers that need the
+ * landing as DATA — the `category` axis windows on `at_ms`, and
+ * {@link buildMemoryCards} needs both `at_ms` and `live_hash`. Callers that only
+ * need to know which memory belongs to a commit they already have use
+ * {@link MEMORY_FOR_COMMIT} instead, and the choice between them is a measured
+ * performance fact, not a style preference — see that constant's note.
+ *
+ * The three queries here join it on `commit_hash`, a REAL column, which is what
+ * keeps it cheap (38 ms against the pre-alias query's 43 ms on a 165 MB
+ * database). `live_hash` is a COALESCE and therefore unindexable: joining on
+ * THAT is what cost 3,146 ms.
+ *
+ * A hash rewritten after it was summarized leaves the memory filed under the
+ * PRE-rewrite hash while `commits` moves on to the new one, so `m.commit_hash`
+ * alone answers neither question. `commit_aliases` maps the surviving hash back
+ * (`old_hash` -> the memory's `target_hash`), which is the direction
+ * {@link commitsInRange} and {@link buildDecisionsCard} enter from; this CTE
+ * walks it BACKWARDS, from the memory to whichever live commit points at it.
+ *
+ * Two consequences that are the whole reason it exists:
+ *
+ * - **`live_hash` is what a reachability check has to be asked about.** The
+ *   memory's own hash was rewritten away, so `isReachable` answers `false` for
+ *   it forever — dropping a memory from the feed that `memoriesCreated`, which
+ *   enters from the live commit, has just counted.
+ * - **`at_ms` is the LANDED committer date.** The old fallback went straight to
+ *   `m.commit_date_ms`, which is `CommitSummary.commitDate` — an AUTHOR date
+ *   (`%aI`), while every window in this file is a committer-date window. For a
+ *   rebase or a cherry-pick those are different days, and for a rewritten
+ *   commit the fallback was not an edge case but the permanent state: no
+ *   `commits` row will ever carry the memory's own hash again. `commit_date_ms`
+ *   survives as the third choice, for a memory whose commit this database has
+ *   not collected at all.
+ *
+ * **The alias sub-select is grouped, and the JOIN onto `commits` is what keeps
+ * that honest.** A memory rewritten more than once collects an alias row per
+ * rewrite, and `live_hash`/`at_ms` have to come from ONE of them — but only
+ * aliases whose commit still EXISTS survive that join, and
+ * `pruneUnreachableCommits` deletes every superseded link in the chain, so the
+ * group is normally a single row. `MAX(c.committed_at_ms)` picks the newest for
+ * the window before it converges, and `c.hash` rides along as a bare column,
+ * which SQLite documents as coming from that same max row. Two live commits
+ * aliasing one memory at the identical millisecond is the only case that would
+ * make the pair ambiguous, and it resolves to a real commit either way.
+ *
+ * **`cm` wins over `al` when both resolve.** A tree-hash alias is not proof the
+ * memory moved: cherry-picking a commit onto two branches gives it aliases while
+ * its own commit is still very much alive, and that memory belongs to its own
+ * commit. So the alias is consulted only when nothing carries the memory's own
+ * hash — the same order as `getSummary`'s direct-then-alias lookup.
+ *
+ * `parent_hash IS NULL` for the same reason every caller states it: `memories`
+ * holds one row per GENERATION.
+ */
+const MEMORY_LANDING_CTE = `WITH memory_landing AS (
+	SELECT m.repo_id, m.commit_hash,
+	       COALESCE(cm.hash, al.live_hash, m.commit_hash) AS live_hash,
+	       COALESCE(cm.committed_at_ms, al.at_ms, m.commit_date_ms) AS at_ms
+	  FROM memories m
+	  LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
+	  LEFT JOIN (
+	      SELECT a.repo_id, a.target_hash, c.hash AS live_hash, MAX(c.committed_at_ms) AS at_ms
+	        FROM commit_aliases a
+	        JOIN commits c ON c.repo_id = a.repo_id AND c.hash = a.old_hash
+	       GROUP BY a.repo_id, a.target_hash
+	  ) al ON al.repo_id = m.repo_id AND al.target_hash = m.commit_hash
+	 WHERE m.parent_hash IS NULL
+)`;
+
+/**
+ * The same landing rule as {@link MEMORY_LANDING_CTE}, read from the COMMIT end:
+ * "which memory belongs to this commit". Joins as
+ * `JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})`, with the
+ * commit aliased `c`.
+ *
+ * **Two spellings of one rule is a deliberate, measured exception**, so the
+ * numbers matter. The CTE exposes `live_hash` as a COALESCE — a computed column,
+ * which SQLite cannot index — so an axis that enters from `commits` and joins
+ * `ml.live_hash = c.hash` re-scans the whole materialised CTE per commit. On the
+ * author's 165 MB database (1,123 memories / 2,434 commits / 87 aliases), the
+ * branch axis measured:
+ *
+ * - joining the CTE on `live_hash`: **3,146 ms** (`MATERIALIZED` hint: 94 ms)
+ * - this predicate: **1.1 ms**, against 0.9 ms for the pre-alias query it replaces
+ *
+ * `buildSeries` runs twice per render (the window and its predecessor), so the
+ * CTE spelling was a ~6 s page. The axes that keep the CTE — `category` and
+ * `buildMemoryCards` — join it on `commit_hash`, a REAL column, and measured
+ * 38 ms against the old query's 43 ms.
+ *
+ * **`NOT EXISTS` is what makes this safe, and it is the `cm`-beats-`al`
+ * precedence written from the other side.** Without it the alias branch fires
+ * while the memory's own commit row is still present, so the pre-rewrite commit
+ * matches the memory directly AND the live one matches it through the alias —
+ * measured 2x on a synthetic prune-window fixture. With it, exactly one commit
+ * claims each memory in every state: the memory's own row while it survives, the
+ * aliasing commit once `pruneUnreachableCommits` has removed it. All four
+ * variants were verified to return byte-identical rows on the real database.
+ */
+const MEMORY_FOR_COMMIT = `m.commit_hash = c.hash
+	     OR (m.commit_hash = (SELECT a.target_hash FROM commit_aliases a
+	                           WHERE a.repo_id = c.repo_id AND a.old_hash = c.hash)
+	         AND NOT EXISTS (SELECT 1 FROM commits c2
+	                          WHERE c2.repo_id = c.repo_id AND c2.hash = m.commit_hash))`;
 
 const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_tokens + row.cached_tokens;
 
 // ── Stats page ──────────────────────────────────────────────────────────────
-
-function formatTokens(n: number): string {
-	if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
-	if (n >= 1_000) return `${(n / 1_000).toFixed(1)}k`;
-	return String(n);
-}
 
 /**
  * Detects the adoption tier from the data itself: the memory tier is "the
@@ -593,6 +690,41 @@ interface SeriesResult {
  * `branch`/`ticket` read the memory-enriched commit columns (and silently fall
  * back to `model` below the memory tier, so a stale URL cannot render an empty
  * chart pretending to be data).
+ *
+ * **Every memory-driven axis filters `m.parent_hash IS NULL`.** `memories` holds
+ * one row per GENERATION, not per memory: amending or squashing a commit leaves
+ * its predecessor behind as a child row carrying the same cost, so an unfiltered
+ * SUM bills one piece of work once per rewrite. `parent_hash IS NULL` is the
+ * repo-wide spelling of "current generation" (`MemoriesQuery.ts`,
+ * {@link TOPIC_INSIGHTS_CTE} above, `buildMemoryCards` below) — never "has no
+ * children", which is a different set.
+ *
+ * The INNER JOIN on `commits` is NOT a substitute, though it looks like one: it
+ * drops only predecessors whose commit row is gone, and `commits` deliberately
+ * retains unreachable rows (see the `isReachable` filter on `memoriesCreated`).
+ * Measured on a real database before this filter existed: the ticket axis read
+ * $150.97 against a true $92.93 (1.6x) and the LEFT-JOINed category axis read
+ * $3,490.47 against $366.03 (9.5x).
+ *
+ * **And every memory-driven axis resolves a rewritten commit, by one of the two
+ * spellings of the landing rule.** `category` windows on the landing DATE, so it
+ * carries {@link MEMORY_LANDING_CTE}; `branch` and `ticket` only need the memory
+ * that belongs to a commit they already have in hand, so they enter from
+ * `commits` with {@link MEMORY_FOR_COMMIT}. That split is a measured performance
+ * fact — the CTE spelling made the branch axis a 3,146 ms query — and NOT an
+ * invitation to unify them the other way.
+ *
+ * What neither spelling may become is the naive repair. Joining plain
+ * `m.commit_hash = c.hash` drops a rewritten commit's memory outright (its hash
+ * moved, the memory's did not) — that is the bug this PR fixes, where `branch`
+ * and `ticket` lost spend that Memory Activity and Decisions, both of which walk
+ * the alias, went on counting. But adding a bare `OR c.hash = al.target_hash`
+ * trades the hole for a double count: until `pruneUnreachableCommits` sweeps,
+ * the pre-rewrite commit row is still there and matches the memory directly
+ * while the live one matches it through the alias, so one piece of work bills
+ * twice (measured 2x). `MEMORY_FOR_COMMIT`'s `NOT EXISTS` is precisely what
+ * closes that, and it is why the predicate is longer than it looks like it
+ * needs to be.
  */
 function buildSeries(
 	db: DashboardDbHandle,
@@ -657,20 +789,25 @@ function buildSeries(
 		// figures are apportioned by design, not exact per-topic spend.
 		// The LEFT JOIN keeps memories with no topics on the axis: their window
 		// COUNT(*) is 1 and their whole spend lands in '(uncategorised)'.
+		//
+		// `parent_hash IS NULL` — see the note above `buildSeries`. This axis is
+		// where the double-count was worst (measured 9.5x) precisely because the
+		// LEFT JOIN keeps predecessors whose commit row is gone.
 		rows = db
 			.prepare(
-				`SELECT COALESCE(cm.committed_at_ms, m.commit_date_ms) AS at_ms,
+				`${MEMORY_LANDING_CTE}
+				 SELECT ml.at_ms AS at_ms,
 				        COALESCE(t.category, '(uncategorised)') AS key,
 				        COALESCE(m.tokens, 0) * 1.0
 				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS tokens,
 				        COALESCE(m.est_cost_usd, 0) * 1.0
 				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS cost
 				   FROM memories m
+				   JOIN memory_landing ml ON ml.repo_id = m.repo_id AND ml.commit_hash = m.commit_hash
 				   LEFT JOIN memory_topics t ON t.repo_id = m.repo_id AND t.commit_hash = m.commit_hash
-				   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
 				  WHERE m.tokens IS NOT NULL
-				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) >= ?
-				    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) < ?${filter.sql}`,
+				    AND m.parent_hash IS NULL
+				    AND ml.at_ms >= ? AND ml.at_ms < ?${filter.sql}`,
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else if (effective === "branch") {
@@ -696,10 +833,12 @@ function buildSeries(
 				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS tokens,
 				        COALESCE(m.est_cost_usd, 0) * 1.0
 				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS cost
-				   FROM commits c JOIN commit_branches b ON b.commit_id = c.id
-			                        JOIN branches br ON br.id = b.branch_id
-			                        JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
-				  WHERE m.tokens IS NOT NULL AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
+				   FROM commits c
+				   JOIN commit_branches b ON b.commit_id = c.id
+				   JOIN branches br ON br.id = b.branch_id
+				   JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})
+				  WHERE m.tokens IS NOT NULL AND m.parent_hash IS NULL
+				    AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	} else {
@@ -708,8 +847,10 @@ function buildSeries(
 			.prepare(
 				`SELECT c.committed_at_ms AS at_ms, COALESCE(m.ticket_id, '(no ticket)') AS key,
 				        COALESCE(m.tokens, 0) AS tokens, COALESCE(m.est_cost_usd, 0) AS cost
-				   FROM commits c JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
-				  WHERE m.tokens IS NOT NULL AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
+				   FROM commits c
+				   JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})
+				  WHERE m.tokens IS NOT NULL AND m.parent_hash IS NULL
+				    AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
 			)
 			.all(fromMs, toMs, ...filter.params) as UsageRow[];
 	}
@@ -741,6 +882,37 @@ function buildSeries(
 		seriesKeys: [...seriesKeys].sort(),
 		seriesDimension: effective,
 	};
+}
+
+/**
+ * The cost the Spend card actually DRAWS, which is not quite the sum of
+ * `estCostUsd`.
+ *
+ * `apportionedCost` in `stats.js` spreads each day's measured total across that
+ * day's series keys by token share, so a day whose per-key tokens all round to
+ * zero — the category axis apportions a commit across its topics and rounds —
+ * spreads to nothing and draws no bar. The headline is the sum of what is drawn,
+ * deliberately: money that is not drawn must not be in the total either.
+ *
+ * Anything compared AGAINST that headline has to sum the same way, or the two
+ * disagree by exactly those days. Hence this being one function rather than a
+ * `reduce` at each site.
+ */
+function drawnCost(result: SeriesResult): number {
+	// Read by TYPE, not with `??`. `bySeries` is a plain object here
+	// (`Object.fromEntries`) and in the browser (`JSON.parse`), so a series key
+	// colliding with an Object.prototype member — a branch really can be named
+	// `constructor` — hands back the INHERITED function on any day that key is
+	// absent, which is most days. `?? 0` passes it through: `number + function`
+	// is string concatenation, `> 0` on the result is false, and that day's cost
+	// leaves the headline silently. Same read as `apportionedCost` and
+	// `JD.topSeries`, which were hardened first.
+	const read = (point: DaySeriesPoint, key: string): number =>
+		typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0;
+	return result.series.reduce((sum, point) => {
+		const tokens = result.seriesKeys.reduce((n, key) => n + read(point, key), 0);
+		return tokens > 0 ? sum + point.estCostUsd : sum;
+	}, 0);
 }
 
 /** Price-table date behind the cost figures, from the newest priced session. */
@@ -909,16 +1081,11 @@ function buildStats(
 		? windowSessions.filter((s) => inWindow(s.updated_at_ms))
 		: sessionsInRange(db, scope, window.startMs, window.endMs);
 
-	// KPI row, scoped to the range. Labels carry the window so "6 sessions" can
-	// never be misread as today's when the user is looking at a month.
-	const rangeTokens = rangeSessions.reduce((sum, s) => sum + totalTokens(s), 0);
-	const rangeCost = rangeSessions.reduce((sum, s) => sum + (s.est_cost_usd ?? 0), 0);
 	const rangeCached = rangeSessions.reduce((sum, s) => sum + s.cached_tokens, 0);
-	const rangeInput = rangeSessions.reduce((sum, s) => sum + s.input_tokens + s.cached_tokens, 0);
 
-	// "Tokens" — input/output/cache over the range, day-bucketed
-	// for the card's chart. Reuses `rangeSessions`, already swept above for the
-	// KPI row, rather than a second query.
+	// "Tokens" — input/output/cache over the range, day-bucketed for the card's
+	// chart. Reuses `rangeSessions`, already swept above, rather than a second
+	// query.
 	const perDayTokens = new Map<string, { input: number; output: number; cached: number }>();
 	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
 		perDayTokens.set(localDayKey(dayStart, timeZone), { input: 0, output: 0, cached: 0 });
@@ -938,34 +1105,24 @@ function buildStats(
 		perDay: [...perDayTokens.entries()].map(([date, v]) => ({ date, ...v })),
 	};
 
-	// Cost vs the immediately preceding window of equal length — the Spend
-	// card's own self-trend.
-	const priorRangeFrom = window.startMs - (window.endMs - window.startMs);
-	const priorRangeCost = (
-		priorRangeFrom >= heatmapStart
-			? windowSessions.filter((s) => s.updated_at_ms >= priorRangeFrom && s.updated_at_ms < window.startMs)
-			: sessionsInRange(db, scope, priorRangeFrom, window.startMs)
-	).reduce((sum, s) => sum + (s.est_cost_usd ?? 0), 0);
-	const costTrendPct =
-		priorRangeCost > 0 ? Math.round(((rangeCost - priorRangeCost) / priorRangeCost) * 100) : undefined;
+	// Cost/token series along the requested dimension, over the range.
+	const seriesResult = buildSeries(db, scope, dimension, tier, window.startMs, window.endMs, timeZone);
 
-	const streakDays = computeStreak(
-		[...windowSessions.map((s) => s.updated_at_ms), ...windowCommits.map((c) => c.committed_at_ms)],
-		timeZone,
-		nowMs,
-	);
-	const suffix = window.label;
-	const kpis: KpiCard[] = [
-		{ key: "sessions", label: `sessions ${suffix}`, value: String(rangeSessions.length) },
-		{ key: "tokens", label: `tokens ${suffix}`, value: formatTokens(rangeTokens) },
-		{ key: "cost", label: `est. cost ${suffix}`, value: `$${rangeCost.toFixed(2)}` },
-		{
-			key: "cached",
-			label: "% cached",
-			value: rangeInput > 0 ? `${Math.round((rangeCached / rangeInput) * 100)}%` : "—",
-		},
-		{ key: "streak", label: "streak", value: `${streakDays}d 🔥` },
-	];
+	// Cost vs the immediately preceding window of equal length — the Spend card's
+	// own self-trend, and BOTH ends are the same series the card draws.
+	//
+	// It used to be a sum of `sessions.est_cost_usd` over each window, which is a
+	// different clock AND a different population from the headline directly above
+	// it: on `branch`/`ticket`/`category` the series is memory rows windowed on
+	// committer date, so a window with sessions but no summarized commits read
+	// "$0.00" with an arrow beside it claiming +200%. Even on `model` the two
+	// disagree — the series reads `session_model_usage`, not `sessions`. A
+	// self-trend is only worth printing if it trends the number it sits next to.
+	const priorRangeFrom = window.startMs - (window.endMs - window.startMs);
+	const priorSeries = buildSeries(db, scope, dimension, tier, priorRangeFrom, window.startMs, timeZone);
+	const priorDrawn = drawnCost(priorSeries);
+	const costTrendPct =
+		priorDrawn > 0 ? Math.round(((drawnCost(seriesResult) - priorDrawn) / priorDrawn) * 100) : undefined;
 
 	// Memory-tier KPI sub-lines. `undefined` below the tier so the card renders
 	// the mockup's "—" instead of asserting a real zero.
@@ -990,9 +1147,6 @@ function buildStats(
 		tier === "installed" ? undefined : buildDecisionsCard(db, scope, window.startMs, window.endMs, timeZone);
 
 	const pricesAsOf = readPricesAsOf(db, scope);
-
-	// Cost/token series along the requested dimension, over the same window.
-	const seriesResult = buildSeries(db, scope, dimension, tier, window.startMs, window.endMs, timeZone);
 
 	// Heatmap + hour histogram from the same window sweep. Commits count as
 	// their own dimension: sessions older than the live-log window survive only
@@ -1050,18 +1204,22 @@ function buildStats(
 	// The memory-tier feed. Built unconditionally: an installed-tier repo simply
 	// has no summarized commits, so this comes back empty and the renderer shows
 	// the session list instead.
-	const memoryCards = buildMemoryCards(db, scope, window, reachable);
+	const memoryFeed = buildMemoryCards(db, scope, window, reachable);
 
 	return {
-		kpis,
 		...seriesResult,
 		heatmap,
 		hours,
 		tokenBreakdown,
 		...(costTrendPct !== undefined ? { costTrendPct } : {}),
+		// Reported by the builder, not inferred from the page it returned: the feed
+		// is cut inside it, so `length === MEMORY_CARDS_LIMIT` is equally "the
+		// window holds exactly that many" and "the twenty most recent of three
+		// hundred" — and the page has no constant to compare against either way.
+		...(memoryFeed.capped ? { memoryCardsCapped: true } : {}),
 		fun,
 		recentSessions,
-		memoryCards,
+		memoryCards: memoryFeed.cards,
 		totalCommits: rangeCommits.length,
 		range: window.range,
 		rangeFrom: window.from,
@@ -1083,25 +1241,6 @@ function toRecentSession(s: SessionRow, nowMs: number): RecentSession {
 		repoName: s.repo_name,
 		isLive: nowMs - s.updated_at_ms < LIVE_WINDOW_MS,
 	};
-}
-
-/**
- * Consecutive active local days ending today (or yesterday — a streak is not
- * broken by a morning where you have not started yet).
- */
-export function computeStreak(activityMs: ReadonlyArray<number>, timeZone: string, nowMs: number): number {
-	const activeDays = new Set(activityMs.map((ms) => localDayKey(ms, timeZone)));
-	let cursor = startOfLocalDay(nowMs, timeZone);
-	if (!activeDays.has(localDayKey(cursor, timeZone))) {
-		cursor = addLocalDays(cursor, -1, timeZone);
-		if (!activeDays.has(localDayKey(cursor, timeZone))) return 0;
-	}
-	let streak = 0;
-	while (activeDays.has(localDayKey(cursor, timeZone))) {
-		streak += 1;
-		cursor = addLocalDays(cursor, -1, timeZone);
-	}
-	return streak;
 }
 
 // ── Standup page ────────────────────────────────────────────────────────────
@@ -1314,6 +1453,19 @@ function dominantWorkingModel(summary: CommitSummary): string | undefined {
 	return best?.model;
 }
 
+interface MemoryCardFeed {
+	readonly cards: MemoryCard[];
+	/**
+	 * More memories in the window than {@link cards} carries.
+	 *
+	 * Travels out of here rather than being inferred from `cards.length`,
+	 * because that length cannot tell a window holding exactly
+	 * {@link MEMORY_CARDS_LIMIT} memories (complete) from one holding three
+	 * hundred (cut). Only this function still holds the un-cut set.
+	 */
+	readonly capped: boolean;
+}
+
 /**
  * The "What my agents did" feed at the memory tier: commits paired with the
  * session summary that produced them.
@@ -1329,7 +1481,7 @@ function buildMemoryCards(
 	scope: DashboardScope,
 	window: ResolvedWindow,
 	reachable?: ReachableCommits,
-): MemoryCard[] {
+): MemoryCardFeed {
 	// `repo_id` belongs to the memory row (`c`), not the joined repo lookup
 	// (`r`).  Using `r.repo_id` only breaks the scoped form of the query; the
 	// catch below then intentionally degrades to an empty feed, which used to
@@ -1338,6 +1490,7 @@ function buildMemoryCards(
 	const filter = scopeFilter(repoScope, "c.repo_id");
 	let rows: ReadonlyArray<MemoryCardRow>;
 	let decisionCounts: ReadonlyMap<string, number> = new Map();
+	let capped = false;
 	try {
 		// Two steps, because the reachability filter can only run in JS (git, not
 		// the DB — see `ReachableCommits`) and a rewritten-away commit keeps its
@@ -1345,52 +1498,64 @@ function buildMemoryCards(
 		// showing the two survivors of the twenty most recent rows instead of the
 		// twenty most recent surviving memories. Step one is deliberately narrow —
 		// the payload blob is only read for the page that is actually rendered.
-		// Windowed on the COMMITTER date, falling back to the memory's own
-		// `commit_date_ms` only when no `commits` row exists yet. Those two are
-		// different clocks: `commit_date_ms` comes from `CommitSummary.commitDate`,
-		// which `GitOps.getHeadCommitInfo` reads with `%aI` (author date), while
-		// `commits.committed_at_ms` is collected with `%cI` — deliberately, since
-		// every other window in this file is a committer-date window. Filtering
-		// the cards on the author date put a rebased or cherry-picked commit in a
-		// different bucket from the "N of M captured" line directly above the
-		// list, so the header counted memories the feed did not show.
+		//
+		// Windowed, sorted and stamped on {@link MEMORY_LANDING_CTE}'s `at_ms` —
+		// the LANDED committer date — for the reason stated there: the memory's own
+		// `commit_date_ms` is an author date (`%aI` via `CommitSummary.commitDate`,
+		// against the `%cI` every other window in this file uses), so windowing on
+		// it put a rebased or cherry-picked commit in a different bucket from the
+		// "N of M captured" line directly above the list, and the header counted
+		// memories the feed did not show.
 		const keys = db
 			.prepare(
-				`SELECT c.commit_hash, r.repo_identity
+				`${MEMORY_LANDING_CTE}
+				 SELECT c.commit_hash, ml.live_hash, r.repo_identity
 				   FROM memories c
 				   JOIN repos r ON r.id = c.repo_id
-				   LEFT JOIN commits cm ON cm.repo_id = c.repo_id AND cm.hash = c.commit_hash
+				   JOIN memory_landing ml ON ml.repo_id = c.repo_id AND ml.commit_hash = c.commit_hash
 				  WHERE c.parent_hash IS NULL
-				    AND COALESCE(cm.committed_at_ms, c.commit_date_ms) >= ?
-				    AND COALESCE(cm.committed_at_ms, c.commit_date_ms) < ?${filter.sql}
-				  ORDER BY COALESCE(cm.committed_at_ms, c.commit_date_ms) DESC`,
+				    AND ml.at_ms >= ? AND ml.at_ms < ?${filter.sql}
+				  ORDER BY ml.at_ms DESC`,
 			)
 			.all(window.startMs, window.endMs, ...filter.params) as ReadonlyArray<{
 			commit_hash: string;
+			live_hash: string;
 			repo_identity: string;
 		}>;
-		const page = keys
-			.filter((k) => isReachable(reachable, k.repo_identity, k.commit_hash))
-			.slice(0, MEMORY_CARDS_LIMIT);
-		if (page.length === 0) return [];
+		// Reachability is asked about `live_hash`, never the memory's own hash: a
+		// rewritten commit's memory stays filed under a hash no ref reaches, so
+		// asking about that one drops from the feed exactly the memories
+		// `memoriesCreated` has just counted through the alias — the two figures
+		// sit in the same card.
+		const eligible = keys.filter((k) => isReachable(reachable, k.repo_identity, k.live_hash));
+		const page = eligible.slice(0, MEMORY_CARDS_LIMIT);
+		// Decided HERE, where the un-cut set is still in hand. `cards.length` cannot
+		// answer it: a window holding exactly the limit is complete, and reporting
+		// it as capped makes the card say "showing the 20 most recent" of 20.
+		capped = eligible.length > MEMORY_CARDS_LIMIT;
+		if (page.length === 0) return { cards: [], capped: false };
 		const holes = page.map(() => "?").join(",");
 		rows = db
 			.prepare(
-				// Same COALESCE as the key query above, for both the sort and the
-				// timestamp the card renders. Ordering on `c.commit_date_ms` alone
-				// re-sorted the page by AUTHOR date after it had been selected and
-				// windowed on the committer date, so a rebased or cherry-picked commit
-				// landed out of order and rendered a timestamp that could fall outside
-				// the window it was selected for.
-				`SELECT c.commit_hash, c.commit_message,
-				        COALESCE(cm.committed_at_ms, c.commit_date_ms) AS committed_at_ms,
+				// {@link MEMORY_LANDING_CTE}'s `at_ms` again — the SAME expression the
+				// key query selected and windowed on, not a restatement of it. Both the
+				// sort and the timestamp the card renders have to come from that one
+				// clock: ordering on `c.commit_date_ms` re-sorted the page by AUTHOR
+				// date after it had been selected on the committer date, and STAMPING a
+				// row with it rendered a date that can fall outside the window the row
+				// was selected for. A near-miss spelling is what this replaces —
+				// `COALESCE(cm.committed_at_ms, c.commit_date_ms)` agrees with `at_ms`
+				// only while the memory's own commit row survives, and skips the alias
+				// hop in exactly the rewritten case both queries exist to handle.
+				`${MEMORY_LANDING_CTE}
+				 SELECT c.commit_hash, c.commit_message, ml.at_ms AS committed_at_ms,
 				        c.recap, c.turns, c.est_cost_usd,
 				        c.branch, c.insertions, c.deletions, c.summary_json, r.repo_identity, r.repo_name
 				   FROM memories c
 				   JOIN repos r ON r.id = c.repo_id
-				   LEFT JOIN commits cm ON cm.repo_id = c.repo_id AND cm.hash = c.commit_hash
+				   JOIN memory_landing ml ON ml.repo_id = c.repo_id AND ml.commit_hash = c.commit_hash
 				  WHERE c.parent_hash IS NULL AND c.commit_hash IN (${holes})${filter.sql}
-				  ORDER BY COALESCE(cm.committed_at_ms, c.commit_date_ms) DESC`,
+				  ORDER BY ml.at_ms DESC`,
 			)
 			.all(...page.map((k) => k.commit_hash), ...filter.params) as ReadonlyArray<MemoryCardRow>;
 		// `IN (hashes)` is keyed on the hash alone, so an unscoped dashboard whose
@@ -1412,10 +1577,10 @@ function buildMemoryCards(
 		// The feed is one card on one page; a query failure degrades it to the
 		// tier-0 session list rather than taking the whole dashboard down.
 		log.warn("memory cards unavailable: %s", errMsg(err));
-		return [];
+		return { cards: [], capped: false };
 	}
 
-	return rows.map((row) => {
+	const cards = rows.map((row) => {
 		// Not guarded: `memories` computes STORED generated columns with
 		// `json_extract`, so SQLite rejects a malformed payload at INSERT
 		// ("malformed JSON") — no unparseable row can exist to read here. Pinned by
@@ -1448,6 +1613,7 @@ function buildMemoryCards(
 			repoName: row.repo_name,
 		};
 	});
+	return { cards, capped };
 }
 
 /**
@@ -2050,8 +2216,9 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	// `sessionsThisWeek` is the repo picker's per-repo meta figure, computed here so
 	// the shell needs no second round trip.
 	//
-	// PAUSED repos are listed too, not filtered out. Their rows are never deleted
-	// (`repos_no_delete`) and they keep counting in the aggregate KPIs, so a
+	// PAUSED repos are listed too, not filtered out. Pausing is an UPDATE that
+	// stamps `disabled_at`, never a delete, and they keep counting in the
+	// aggregate figures, so a
 	// `disabled_at IS NULL` filter here made an all-paused dashboard read as "No
 	// repositories yet" while its numbers still had the paused repo's activity in
 	// them. `disabled_at IS NOT NULL` sorts the paused ones to the bottom of the
