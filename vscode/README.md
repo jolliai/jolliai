@@ -209,9 +209,11 @@ Tab toolbar actions (when the Memory Bank tab is active):
 | **Reset** | Re-detect repo identities and rebuild the tree from disk. |
 | **Build Knowledge Wiki** | Compile every repo in the Memory Bank into a topic-organized knowledge wiki (see below). |
 
-**Knowledge wiki** — **Build Knowledge Wiki** gathers the memories scattered across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. A browsable `_wiki/` folder is written into your Memory Bank, and the same topic pages back the MCP server's search and decision-timeline tools. You rarely need to click it: after each commit the extension incrementally folds new memories into the wiki in the background; the button is for an immediate, repo-wide rebuild. Needs an API key (same as summary generation).
+**Knowledge wiki** — **Build Knowledge Wiki** gathers the memories scattered across your commits and folds work on the same theme into per-topic pages, so a feature touched by ten commits reads as one evolving page instead of ten disconnected entries. A browsable `_wiki/` folder is written into your Memory Bank, and the same topic pages back the MCP server's search and decision-timeline tools. Needs an API key (same as summary generation).
 
-**Knowledge graph** — each repo row in the Memory Bank tree has a **View knowledge graph** button (`$(type-hierarchy)`) that opens an interactive map of that wiki: categories, the knowledge units inside each (decisions, mechanisms, fixes), and the typed links between them (`extends`, `caused-by`, `supersedes`, `contradicts`, `related-to`). Click a unit to zoom in and reveal its related neighbors. The graph rebuilds incrementally in the background after each commit — if a repo doesn't have one yet, build the wiki first. The same visualization can be exported to a shareable HTML file from the CLI with `jolli graph`.
+**The wiki rebuilds when you ask, not after every commit.** Rebuilding costs an AI call per new memory, so the extension leaves the timing to you and tells you when it matters: once the wiki has fallen behind, a banner appears above the Memory Bank tree naming the repos and how far behind they are ("N updates behind · rebuilt X ago"), with a **Rebuild** action next to it. It reads "Updating the wiki/graph…" while a rebuild runs, and closing it keeps it closed until there is something new to report. If you would rather it keep up on its own after every commit, run `jolli configure --set wikiRebuild=auto`.
+
+**Knowledge graph** — each repo row in the Memory Bank tree has a **View knowledge graph** button (`$(type-hierarchy)`) that opens an interactive map of that wiki: categories, the knowledge units inside each (decisions, mechanisms, fixes), and the typed links between them (`extends`, `caused-by`, `supersedes`, `contradicts`, `related-to`). Click a unit to zoom in and reveal its related neighbors. The graph is rebuilt together with the wiki, so it refreshes whenever you rebuild — if a repo doesn't have one yet, build the wiki first. The same visualization can be exported to a shareable HTML file from the CLI with `jolli graph`.
 
 **Per-memory context menu** (right-click any memory file in the tree):
 
@@ -278,6 +280,12 @@ Jolli Memory opens a dedicated **Create PR** view where you can review and edit 
 
 Jolli won't overwrite commits that only exist on the remote. Requires the `gh` CLI to be installed and authenticated.
 
+### Open Dashboard
+
+The **Current Branch** view's footer bar carries a **Dashboard** button next to **Create PR** (**Share in Jolli** moved into the `…` overflow menu beside them). It opens Jolli's private local dashboard — your memories, per-repo stats, and a daily standup, all served from your own machine and never uploaded. The same action is available as **Jolli Memory: Open Dashboard** in the Command Palette.
+
+The dashboard runs in an **integrated terminal** rather than inside the editor, which means you see its output as it happens — including the history import, which keeps going for a while after your browser opens — and you stop it the way you stop any terminal command, with **Ctrl+C**. Each click opens a new terminal; a second dashboard takes the port from the first rather than running beside it, so you always land on a fresh one. The button works whether you have the CLI installed globally or only this extension: it uses the newest Jolli runtime registered on your machine, falling back to the copy bundled here.
+
 ### Memory Bank
 
 Every repo automatically gets a plain-Markdown copy of every memory on disk, alongside the canonical storage on the `jollimemory/summaries/v3` orphan branch. The Memory Bank folder is created the first time the extension activates on a repo, and any pre-existing memories on the orphan branch are migrated into it without any action on your part.
@@ -328,6 +336,7 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 | `kimiEnabled` | boolean | auto-detect | Enable Kimi Code CLI session discovery |
 | `mcpPlatformToolsEnabled` | boolean | `true` | When signed in, surface your Jolli tenant's own platform tools in the MCP server alongside the ten built-in tools. Set to `false` to expose only the built-ins. |
 | `localFolder` | string | — | Memory Bank folder root — every memory is dual-written here as Markdown alongside the orphan-branch copy. Set via Settings → Memory Bank → Browse…. |
+| `wikiRebuild` | enum | `manual` | When the knowledge wiki and graph rebuild. `manual` (the default) records what is pending on each commit and waits for you — use the banner's **Rebuild** action, the **Build Knowledge Wiki** toolbar button, or `jolli compile` — so a commit never spends AI credits on its own. `auto` rebuilds in the background after every commit and merge, the way earlier versions did. Set via `jolli configure`. |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes section in the Branch tab |
 | `syncTranscripts` | boolean | `false` | When syncing, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
 | `dcoSignoff` | boolean | `false` | Append `Signed-off-by: <user.name> <user.email>` to commits created by **AI Commit**. Off by default; turn on if your project's CI gates merges on a DCO sign-off. Set via Settings → Others. |

@@ -1,6 +1,13 @@
 # Changelog
 
-<!-- Last synced commit: 09554198 | 2026-08-13 -->
+<!-- Last synced commit: b2e68798 | 2026-08-15 -->
+
+## 0.99.13
+
+- **Open your dashboard from the sidebar** — a new toolbar button (also **Jolli Memory: Open Dashboard** in the Command Palette) runs the dashboard in an integrated terminal, so you see what it is doing while it works and stop it with **Ctrl+C** like any other command. The old separate "stop dashboard" command is gone along with the background server it used to stop.
+- **The knowledge wiki and graph rebuild when you ask** — they no longer rebuild in the background after every commit, so commits stay fast and nothing spends AI credits unprompted. A banner at the top of the sidebar shows how far behind they are and rebuilds them on one click; dismiss it and it returns once there is something new. To keep the old behaviour: `jolli configure --set wikiRebuild=auto`.
+- **Pushes stop promising memories that were never yours** — after a rebase, the pre-push check counted other people's commits that were already on the remote and then reported their memories as "still generating" on every push for a week. It now counts only what your push actually adds.
+- Bug fixes.
 
 ## 0.99.12
 

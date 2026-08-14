@@ -1,12 +1,17 @@
 # Changelog
 
-<!-- Last synced commit: 09554198 | 2026-08-13 -->
+<!-- Last synced commit: b2e68798 | 2026-08-15 -->
 
-## Unreleased
+## 0.99.13
 
-- **Breaking: `jolli dashboard` runs in the foreground** — it now serves the dashboard from its own terminal until you press **Ctrl+C**, instead of leaving a background server running. `jolli dashboard --stop` is gone with it: there is nothing left to stop but the command in front of you, and closing the terminal stops it too. If you are upgrading with a background server still running from the old version, the new command recognises it as a Jolli dashboard and takes port 1818 back from it, saying so — there is nothing you need to stop by hand first.
-- **Opening the dashboard replaces the one already running.** `jolli dashboard` (and the dashboard that first-time `jolli` setup opens) now stops a dashboard already on its port before taking it, so you always get a fresh one on the address you expect. Only a Jolli dashboard is ever stopped — an unrelated service on port 1818 is left alone, and the new one moves to 18118 as before.
-- **`jolli` ends by opening your dashboard** — after the closing "Next steps", so nothing is left unsaid, and it keeps serving until you press Ctrl+C. This is every `jolli` run at a terminal, not only first-time setup: the status line, the memory count and Next steps are all on screen before it starts serving, so nothing is withheld, and opening the dashboard whenever it can is what makes `jolli` the one command to remember. A piped or non-interactive `jolli` is unchanged — it prints the command list as before and never blocks.
+- **Breaking: `jolli dashboard` stays in your terminal** — it serves the dashboard until you press **Ctrl+C** instead of leaving a background server behind, so `jolli dashboard --stop` is gone with it. Run it again and it replaces the dashboard already running, so you always get a fresh one at the address you expect. A background server left over from the old version is taken over automatically; an unrelated service on port 1818 is still left alone.
+- **`jolli` finishes by opening your dashboard** — every run in a terminal now ends there, after the status line, your memory count and "Next steps" are on screen, and keeps serving until you press Ctrl+C. `jolli` in a script or pipe is unchanged.
+- **The knowledge wiki and graph rebuild when you ask** — they no longer rebuild in the background after every commit, so commits stay fast and nothing spends AI credits unprompted. The dashboard shows how far behind they are ("N updates behind · rebuilt X ago") and rebuilds them on one click. To keep the old behaviour: `jolli configure --set wikiRebuild=auto`.
+- **A clearer dashboard** — accurate spend figures and a tidier layout, decisions and MCP usage trimmed to what you can act on, a standup that covers committed work only, and a repo picker in place of the old Repositories page. A list you opened with **Show more** now survives the 30-second refresh instead of snapping shut.
+- **Your dashboard finds more conversations** — it now looks through your agents' own session history from the last 7 days, not just what was already recorded, and tells you in one line what it picked up.
+- **Pushes stop promising memories that were never yours** — after a rebase, the pre-push check counted other people's commits that were already on the remote and then reported their memories as "still generating" on every push for a week. It now counts only what your push actually adds.
+- **MCP tools answer for the right repository** — when the MCP server is started outside a project (some editors do this), the tools that need a repository are hidden from your agent instead of answering with an empty result that reads as "no memories here". Listing your Jolli Spaces and your workspace's own platform tools still work from anywhere, since they don't depend on which repo you are in.
+- Bug fixes.
 
 ## 0.99.12
 

@@ -65,7 +65,7 @@ Prefer an in-editor panel? The same memories show up in the [VS Code extension](
 - **Works with 11 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer IDE and the `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), Devin CLI, Antigravity, and Kimi Code. Sessions are detected automatically, no per-tool setup. Only Claude Code and Gemini install a hook; the other nine are discovered by scanning their own local session stores.
 - **Ask your agent about past work.** `jolli mcp` exposes your history over the Model Context Protocol (10 tools: search, recall a branch, trace a decision's timeline, list branches, draft a PR description, check installation health, and more), so your agent can answer "how did we handle X?" and draft PRs without leaving the chat. Registered automatically into the AI hosts Jolli detects when you enable, and when you are signed in your Jolli Space's own platform tools are surfaced alongside them.
 - **Catch up on history.** `jolli backfill` writes memories for commits you made before installing Jolli.
-- **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both build in the background.
+- **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both rebuild when you ask — a command, or one click in the dashboard or the editor sidebar, which also tell you how far behind they have fallen.
 - **Local-first, and explicit about what leaves.** Every memory is written to your own repo and to a plain-Markdown folder on disk you can read or `grep`. Two things do leave: at commit time the transcript slice and diff go to whichever AI provider you configured, because that is the summarization call itself (the Jolli LLM proxy holds them in memory only and never persists or logs them); and once you are signed in, `git push` syncs that branch's memories to your bound Jolli Space. Turn the second off per repo with `jolli push-control`, or globally with `syncOnPush`. Raw transcripts are never part of it.
 
 Free and open source (Apache-2.0). A hosted **Jolli Space** for team sharing is optional.
@@ -139,7 +139,7 @@ Two more optional plugins install the same way: `@jolli.ai/space-cli` (Jolli Spa
 
 ## Repository layout
 
-Monorepo with five deliverables that share one product model and storage:
+Monorepo with six deliverables that share one product model and storage:
 
 ```
 jolliai/
@@ -148,11 +148,12 @@ jolliai/
 ├── intellij/       IntelliJ plugin (Kotlin + Gradle)
 ├── claude-plugin/  Claude Code plugin (bundles the CLI, hooks, and MCP server)
 ├── codex-plugin/   Codex plugin (bundles the CLI, hooks, and MCP server)
+├── cursor-plugin/  Cursor plugin (bundles the CLI, hooks, and MCP server) — pre-release
 ├── package.json    Root workspace config (coordinates cli + vscode)
 └── .nvmrc          Pinned Node version for development
 ```
 
-`cli/` and `vscode/` are npm workspaces coordinated from the root `package.json`. `intellij/` is a separate Gradle project. `claude-plugin/` and `codex-plugin/` are built by `npm run build:claude-plugin` and `npm run build:codex-plugin`, and each is published to its own marketplace repo.
+`cli/` and `vscode/` are npm workspaces coordinated from the root `package.json`. `intellij/` is a separate Gradle project. The three plugin trees are built by `npm run build:claude-plugin`, `npm run build:codex-plugin` and `npm run build:cursor-plugin`, and each is published to its own marketplace repo. The Cursor plugin is not published yet — see [`cursor-plugin/DEVELOPMENT.md`](cursor-plugin/DEVELOPMENT.md) for the open questions still to be closed before its first release.
 
 ### Development quick start
 
@@ -160,7 +161,7 @@ Requires the Node version in `.nvmrc` (currently 24.10.0, which is the developme
 
 ```bash
 npm install
-npm run build        # builds the CLI, the Claude Code plugin, the Codex plugin, then VS Code
+npm run build        # builds the CLI, the Claude Code / Codex / Cursor plugins, then VS Code
 npm run all          # clean, build, lint, test (run this before committing)
 ```
 
