@@ -107,16 +107,34 @@ function branchFromRef(ref: string): string {
 }
 
 /**
- * Lists the commits this ref update introduces, oldest-first. For a brand-new
- * remote branch (`remote-sha` all-zero) there is no remote tip to diff against,
- * so we take everything reachable from the local tip that isn't already on any
- * remote (`--not --remotes`) — otherwise `rev-list <zero>..<local>` would error.
+ * Lists the commits this ref update introduces, oldest-first.
+ *
+ * BOTH arms end in `--not --remotes`, and that exclusion is load-bearing on the
+ * ranged one too. Git hands this hook the old tip of ONE ref; it does not hand it
+ * the set of objects the push will actually transfer, which git works out
+ * afterwards by negotiating against EVERY ref the remote advertises. The two
+ * answers diverge sharply after a rebase, because a rebased branch absorbs
+ * commits that its own remote tip predates: measured on a real force-push,
+ * `<remote-sha>..<local-sha>` reported 12 commits, 11 of which were already on
+ * `origin/main` and authored by other people. Git transferred none of those 11 —
+ * but each was enqueued into push-pending.json, and since a memory is generated
+ * on the machine that made the commit (the summaries branch is local-only, never
+ * fetched), none of them can ever gain one here. They rendered as "memory still
+ * generating — will sync later" on every subsequent push until they aged out.
+ *
+ * Dropping them cannot lose a memory: a commit reachable from a remote ref was
+ * already carried by whichever push put it there. A stale remote-tracking ref
+ * only makes this over-report, which is the pre-existing behaviour.
+ *
+ * The zero-remote-sha arm (a brand-new remote branch) has no tip to diff against
+ * and leans on the same exclusion for its whole answer — `rev-list <zero>..<local>`
+ * would error.
  */
 async function listCommitsForRef(cwd: string, ref: PushRef): Promise<string[]> {
 	const args =
 		ref.remoteSha === ZERO_SHA
 			? ["rev-list", "--reverse", ref.localSha, "--not", "--remotes"]
-			: ["rev-list", "--reverse", `${ref.remoteSha}..${ref.localSha}`];
+			: ["rev-list", "--reverse", `${ref.remoteSha}..${ref.localSha}`, "--not", "--remotes"];
 	try {
 		const { stdout } = await execFileAsyncHidden("git", args, { cwd });
 		return stdout

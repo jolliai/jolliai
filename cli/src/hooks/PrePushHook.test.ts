@@ -450,10 +450,15 @@ describe("prePushEntry", () => {
 		expect(args).toEqual(["rev-list", "--reverse", LOCAL, "--not", "--remotes"]);
 	});
 
-	it("uses the remote..local range for an existing remote branch", async () => {
+	it("excludes commits already on a remote from the remote..local range", async () => {
+		// The range alone is not "what this push introduces": a rebased branch
+		// absorbs commits from its updated base that its own remote tip predates,
+		// and git transfers none of them. Without --not --remotes they are enqueued
+		// and reported as "memory still generating" forever — no memory for another
+		// author's commit is ever generated on this machine.
 		await prePushEntry(CWD, `refs/heads/x ${LOCAL} refs/heads/x ${REMOTE}\n`, REMOTE_NAME);
 		const args = vi.mocked(execFileAsyncHidden).mock.calls[0][1];
-		expect(args).toEqual(["rev-list", "--reverse", `${REMOTE}..${LOCAL}`]);
+		expect(args).toEqual(["rev-list", "--reverse", `${REMOTE}..${LOCAL}`, "--not", "--remotes"]);
 	});
 
 	it("no-ops when rev-list yields no commits", async () => {
