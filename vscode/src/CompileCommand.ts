@@ -11,7 +11,21 @@ import * as vscode from "vscode";
 import { log } from "./util/Logger.js";
 
 export interface CompileCommandOpts {
-	readonly sidebarProvider: { refreshKnowledgeBaseFolders(): void };
+	readonly sidebarProvider: {
+		refreshKnowledgeBaseFolders(): void;
+		// Re-push the folder-wide freshness so the kb-tab banner re-renders. Its
+		// Rebuild button optimistically shows "Rebuilding…" on click and relies on
+		// the next push to reset; without this, an immediate-return compile (no
+		// provider) or a no-op sweep (nothing folded, so no ingest-phase event
+		// fires) would leave the button stuck until the user switches tabs. Optional
+		// so tests that stub a bare sidebarProvider keep compiling.
+		pushWikiFreshness?(): void;
+		// Drive the kb-tab banner's "Rebuilding the wiki/graph…" state across the
+		// WHOLE sweep (true at start, false at end), mirroring the dashboard's
+		// in-flight banner. Without this the banner would only change its button
+		// text, not the message. Optional for the same test-stub reason.
+		setWikiRebuilding?(active: boolean): void;
+	};
 }
 
 /**
@@ -39,12 +53,17 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 			await vscode.window.showInformationMessage(
 				"Building the knowledge wiki needs an AI provider. Open Settings → Memory Bank to sign in, configure a key, or select the Local Agent, then try again.",
 			);
+			// Reset the banner's optimistic "Rebuilding…" button — nothing ran.
+			sidebarProvider.pushWikiFreshness?.();
 			return;
 		}
 		if (!config.localFolder) {
 			await vscode.window.showInformationMessage(
 				"No Memory Bank folder configured. Open Settings → Memory Bank to set one, then try again.",
 			);
+			// Reset the banner's optimistic "Rebuilding…" button — nothing ran (matches
+			// the no-provider gate; this path never reaches the try/finally that clears it).
+			sidebarProvider.pushWikiFreshness?.();
 			return;
 		}
 
@@ -56,6 +75,9 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 			return;
 		}
 		compileInFlight = true;
+		// Mirror the dashboard: the banner shows "Rebuilding the wiki/graph…" for the
+		// whole sweep. Set at start (past the gates), cleared in the finally.
+		sidebarProvider.setWikiRebuilding?.(true);
 
 		const { compileAllRepos } = await import("../../cli/src/core/MultiRepoCompile.js");
 
@@ -91,8 +113,14 @@ export function registerCompileCommand(opts: CompileCommandOpts): vscode.Disposa
 			);
 		} finally {
 			compileInFlight = false;
+			// Clear the banner's "Rebuilding…" state; the freshness push below then
+			// re-renders it to the final state (fresh → hidden, or reduced backlog).
+			sidebarProvider.setWikiRebuilding?.(false);
 		}
 
 		sidebarProvider.refreshKnowledgeBaseFolders();
+		// Re-render the kb-tab freshness banner (fresh → hidden, or the reduced
+		// backlog) and reset its "Rebuilding…" button, regardless of sweep outcome.
+		sidebarProvider.pushWikiFreshness?.();
 	});
 }

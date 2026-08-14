@@ -56,7 +56,13 @@ vi.mock("../../cli/src/core/MultiRepoCompile.js", () => ({
 import { registerCompileCommand } from "./CompileCommand.js";
 
 function makeOpts() {
-	return { sidebarProvider: { refreshKnowledgeBaseFolders: vi.fn() } };
+	return {
+		sidebarProvider: {
+			refreshKnowledgeBaseFolders: vi.fn(),
+			pushWikiFreshness: vi.fn(),
+			setWikiRebuilding: vi.fn(),
+		},
+	};
 }
 
 beforeEach(() => {
@@ -83,12 +89,30 @@ describe("registerCompileCommand", () => {
 
 	it("shows info and skips compile when no usable provider", async () => {
 		mockLoadConfig.mockResolvedValue({ localFolder: "/mb" });
-		registerCompileCommand(makeOpts());
+		const opts = makeOpts();
+		registerCompileCommand(opts);
 
 		await registeredHandlers.get("jollimemory.compileNow")?.();
 
 		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("AI provider"));
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
+		// Resets the kb-tab banner's optimistic "Rebuilding…" button — nothing ran.
+		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
+	});
+
+	it("re-pushes wiki freshness after a completed sweep (resets the banner button)", async () => {
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", localFolder: "/mb" });
+		const opts = makeOpts();
+		registerCompileCommand(opts);
+
+		await registeredHandlers.get("jollimemory.compileNow")?.();
+
+		expect(mockCompileAllRepos).toHaveBeenCalled();
+		expect(opts.sidebarProvider.refreshKnowledgeBaseFolders).toHaveBeenCalled();
+		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
+		// Banner "Rebuilding…" state driven across the whole sweep: on at start, off at end.
+		expect(opts.sidebarProvider.setWikiRebuilding).toHaveBeenCalledWith(true);
+		expect(opts.sidebarProvider.setWikiRebuilding).toHaveBeenCalledWith(false);
 	});
 
 	it("compiles when the Local Agent provider is selected without any API key", async () => {
@@ -105,12 +129,15 @@ describe("registerCompileCommand", () => {
 
 	it("shows info and skips compile when no localFolder", async () => {
 		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
-		registerCompileCommand(makeOpts());
+		const opts = makeOpts();
+		registerCompileCommand(opts);
 
 		await registeredHandlers.get("jollimemory.compileNow")?.();
 
 		expect(showInformationMessage).toHaveBeenCalledWith(expect.stringContaining("Memory Bank folder"));
 		expect(mockCompileAllRepos).not.toHaveBeenCalled();
+		// Resets the banner's optimistic "Rebuilding…" button — nothing ran.
+		expect(opts.sidebarProvider.pushWikiFreshness).toHaveBeenCalled();
 	});
 
 	it("sweeps all repos and refreshes panel when API key + localFolder present", async () => {

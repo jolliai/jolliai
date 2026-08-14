@@ -34,11 +34,34 @@ vi.mock("./RepoRegistry.js", async (importOriginal) => ({
 	deregisterRepo: vi.fn().mockResolvedValue("r1"),
 	readRepoRegistry: vi.fn().mockResolvedValue({ version: 1, repos: [] }),
 }));
+// unlink is wrapped (not replaced) so every other state-file test keeps its
+// real filesystem behavior — only the non-ENOENT-unlink-error test below ever
+// overrides it, and only for its own call.
+vi.mock("node:fs/promises", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("node:fs/promises")>();
+	return { ...actual, unlink: vi.fn(actual.unlink) };
+});
+// wiki endpoints reach these directly (same no-injectable-seam pattern
+// as the other write handlers) — mocked so the server-layer tests stay hermetic.
+// Freshness is folder-wide aggregate; rebuild is the whole-folder compile sweep.
+vi.mock("../core/WikiFreshness.js", () => ({ getAggregateWikiFreshness: vi.fn() }));
+vi.mock("../core/MultiRepoCompile.js", () => ({
+	compileAllRepos: vi.fn(async () => ({ repos: [], totalIngested: 0, failed: 0 })),
+}));
+// Partial mock so the rebuild endpoint's up-front provider gate is controllable;
+// default = a usable provider so the happy-path rebuild tests proceed.
+vi.mock("../core/LlmClient.js", async (orig) => ({
+	...(await orig<typeof import("../core/LlmClient.js")>()),
+	resolveLlmCredentialSource: vi.fn(() => "local-agent"),
+}));
 
 import * as gitOps from "../core/GitOps.js";
+import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
+import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
 import * as installer from "../install/Installer.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
@@ -1679,5 +1702,153 @@ describe("telemetry beacon", () => {
 		const res = await post(port, { event: "range_changed", properties: { range: "7d" } });
 		expect(res.status).toBe(204);
 		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+});
+
+describe("wiki freshness + rebuild endpoints", () => {
+	const TOKEN = "wiki-token-0123456789abcdef";
+	const HEADERS = { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" };
+
+	const AGG = {
+		repos: [],
+		behindRepoNames: ["acme-api"],
+		pending: { summary: 3, total: 3 },
+		lastRebuiltAt: "2026-08-10T00:00:00.000Z",
+		everBuilt: true,
+		severity: "info" as const,
+	};
+
+	// A configDir whose config.json points `localFolder` at a real Memory Bank
+	// dir, so `loadConfigFromDir` returns a localFolder and the endpoints proceed.
+	// The aggregate freshness and the compile sweep are BOTH mocked, so the folder
+	// contents are irrelevant — only that `localFolder` is set.
+	function wikiServer(): Server {
+		const configDir = writeMemoryBank(dir, [{ dir: "acme-api" }]);
+		return testServer({ token: TOKEN, configDir });
+	}
+
+	// A configDir with a config.json that has NO localFolder (Memory Bank not set).
+	function noFolderServer(): Server {
+		const configDir = join(dir, "cfg-empty");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(join(configDir, "config.json"), "{}");
+		return testServer({ token: TOKEN, configDir });
+	}
+
+	it("GET /api/wiki/freshness returns the aggregate freshness + inFlight", async () => {
+		vi.mocked(getAggregateWikiFreshness).mockResolvedValue(AGG);
+		const port = await listen(wikiServer());
+		const res = await get(port, "/api/wiki/freshness");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as Record<string, unknown>;
+		expect(body).toMatchObject({
+			available: true,
+			inFlight: false,
+			severity: "info",
+			behindRepoNames: ["acme-api"],
+			pending: { summary: 3, total: 3 },
+		});
+	});
+
+	it("GET /api/wiki/freshness reports available:false when no Memory Bank folder is configured", async () => {
+		const port = await listen(noFolderServer());
+		const res = await get(port, "/api/wiki/freshness");
+		expect(res.status).toBe(200);
+		expect((await res.json()) as { available: boolean }).toEqual({ available: false });
+	});
+
+	it("GET /api/wiki/freshness 500s when freshness computation throws", async () => {
+		vi.mocked(getAggregateWikiFreshness).mockRejectedValueOnce(new Error("boom"));
+		const port = await listen(wikiServer());
+		const res = await get(port, "/api/wiki/freshness");
+		expect(res.status).toBe(500);
+	});
+
+	it("POST /api/wiki/rebuild launches the folder-wide compile and returns 202", async () => {
+		vi.mocked(compileAllRepos).mockResolvedValue({ repos: [], totalIngested: 0, failed: 0 });
+		const port = await listen(wikiServer());
+		const res = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(res.status).toBe(202);
+		// Fire-and-forget: the sweep is kicked off after the 202 is sent.
+		await vi.waitFor(() => expect(compileAllRepos).toHaveBeenCalled());
+		expect(vi.mocked(compileAllRepos).mock.calls[0][0]).toMatch(/[\\/]mb$/);
+	});
+
+	it("POST /api/wiki/rebuild 409s when a rebuild is already in flight (no second sweep)", async () => {
+		// Hold the first sweep pending so the in-flight flag stays set for POST #2.
+		let release: (() => void) | undefined;
+		vi.mocked(compileAllRepos).mockImplementationOnce(
+			() =>
+				new Promise((r) => {
+					release = () => r({ repos: [], totalIngested: 0, failed: 0 });
+				}),
+		);
+		const port = await listen(wikiServer());
+		const first = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(first.status).toBe(202);
+		await vi.waitFor(() => expect(compileAllRepos).toHaveBeenCalledTimes(1));
+		const second = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(second.status).toBe(409);
+		expect(compileAllRepos).toHaveBeenCalledTimes(1);
+		release?.(); // let the first sweep finish so no promise dangles
+	});
+
+	it("POST /api/wiki/rebuild clears the in-flight flag when the sweep throws (a later rebuild still starts)", async () => {
+		// The fire-and-forget sweep rejects; the handler's catch + finally must
+		// still clear the flag, so a subsequent rebuild is accepted (202, not 409).
+		vi.mocked(compileAllRepos).mockRejectedValueOnce(new Error("boom"));
+		const port = await listen(wikiServer());
+		const first = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(first.status).toBe(202);
+		await vi.waitFor(() => expect(compileAllRepos).toHaveBeenCalledTimes(1));
+		// Flag cleared by the finally → a fresh rebuild starts again.
+		await vi.waitFor(async () => {
+			const again = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+				method: "POST",
+				headers: HEADERS,
+				body: "{}",
+			});
+			expect(again.status).toBe(202);
+		});
+	});
+
+	it("POST /api/wiki/rebuild 400s when no Memory Bank folder is configured", async () => {
+		const port = await listen(noFolderServer());
+		const res = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(res.status).toBe(400);
+		expect(compileAllRepos).not.toHaveBeenCalled();
+	});
+
+	it("POST /api/wiki/rebuild 400s (no silent no-op) when no usable LLM provider is configured", async () => {
+		vi.mocked(resolveLlmCredentialSource).mockReturnValueOnce(null);
+		const port = await listen(wikiServer());
+		const res = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+			method: "POST",
+			headers: HEADERS,
+			body: "{}",
+		});
+		expect(res.status).toBe(400);
+		expect(((await res.json()) as { error: string }).error).toMatch(/AI provider/);
+		expect(compileAllRepos).not.toHaveBeenCalled();
 	});
 });

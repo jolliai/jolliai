@@ -39,6 +39,9 @@ const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["gl
 	"disabled",
 ];
 
+/** Valid values for the `wikiRebuild` config key. */
+const VALID_WIKI_REBUILD: ReadonlyArray<NonNullable<JolliMemoryConfig["wikiRebuild"]>> = ["manual", "auto"];
+
 /**
  * Valid config keys exposed via `jolli configure --set/--remove`.
  * Must stay in sync with {@link JolliMemoryConfig} in Types.ts.
@@ -78,6 +81,7 @@ const VALID_CONFIG_KEYS = [
 	"localAgentPath",
 	"backupFolder",
 	"backupRetentionDays",
+	"wikiRebuild",
 	"slack.workspaceUrl",
 ] as const satisfies ReadonlyArray<keyof JolliMemoryConfig | "slack.workspaceUrl">;
 
@@ -183,6 +187,12 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 	if (key === "globalInstructions") {
 		if (!(VALID_GLOBAL_INSTRUCTIONS as ReadonlyArray<string>).includes(raw)) {
 			throw new Error(`${key} must be one of: ${VALID_GLOBAL_INSTRUCTIONS.join(", ")} (got: ${raw})`);
+		}
+		return raw;
+	}
+	if (key === "wikiRebuild") {
+		if (!(VALID_WIKI_REBUILD as ReadonlyArray<string>).includes(raw)) {
+			throw new Error(`${key} must be one of: ${VALID_WIKI_REBUILD.join(", ")} (got: ${raw})`);
 		}
 		return raw;
 	}
@@ -307,6 +317,12 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "syncPollIntervalSec",
 		type: "number",
 		description: "Sync poll interval in seconds (5400-86400; default + floor = 90 min, ceiling = 24h; plugin only)",
+	},
+	{
+		key: "wikiRebuild",
+		type: "enum",
+		description:
+			"When the wiki/graph rebuilds: manual (default — rebuild on demand from dashboard/sidebar) | auto (every commit/merge/backfill)",
 	},
 	{
 		key: "slack.workspaceUrl",

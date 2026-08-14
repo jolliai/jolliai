@@ -173,6 +173,8 @@ window.JD = window.JD || {};
 		};
 		wireList(model);
 		wireWikiNav(model);
+		// wiki/graph freshness + on-demand Rebuild (folder-wide aggregate).
+		if (JD.mountWikiFreshness) JD.mountWikiFreshness();
 	}
 
 	// A source-commit link clicked inside the wiki iframe posts up its commit hash

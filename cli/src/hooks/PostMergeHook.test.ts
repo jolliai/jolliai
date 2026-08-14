@@ -127,7 +127,7 @@ describe("handlePostMerge", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent" });
+		mockLoadConfig.mockResolvedValue({ aiProvider: "local-agent", wikiRebuild: "auto" });
 		const origKey = process.env.ANTHROPIC_API_KEY;
 		delete process.env.ANTHROPIC_API_KEY;
 
@@ -144,7 +144,7 @@ describe("handlePostMerge", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "auto" });
 
 		await handlePostMerge("/test");
 
@@ -161,7 +161,7 @@ describe("handlePostMerge", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "auto" });
 
 		await handlePostMerge("/test");
 
@@ -179,7 +179,7 @@ describe("handlePostMerge", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "auto" });
 
 		await handlePostMerge("/test");
 
@@ -203,7 +203,7 @@ describe("handlePostMerge", () => {
 			}
 			return { stdout: "", stderr: "", exitCode: 0 };
 		});
-		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "auto" });
 
 		await handlePostMerge("/test");
 
@@ -251,12 +251,42 @@ describe("handlePostMerge", () => {
 			stderr: "",
 			exitCode: 0,
 		});
-		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "auto" });
 		mockEnqueueIngest.mockResolvedValue(false);
 
 		await handlePostMerge("/test");
 
 		expect(mockEnqueueIngest).toHaveBeenCalledOnce();
+		expect(mockLaunchWorker).not.toHaveBeenCalled();
+	});
+
+	it("does NOT enqueue in the default MANUAL mode — absent wikiRebuild means manual", async () => {
+		mockExecGit.mockResolvedValue({
+			stdout: "Merge branch 'feature/x' into main",
+			stderr: "",
+			exitCode: 0,
+		});
+		// wikiRebuild absent → manual: the merged commits are summarized by the
+		// per-commit path, but folding them into the wiki waits for a user rebuild.
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test" });
+
+		await handlePostMerge("/test");
+
+		expect(mockEnqueueIngest).not.toHaveBeenCalled();
+		expect(mockLaunchWorker).not.toHaveBeenCalled();
+	});
+
+	it("does NOT enqueue when wikiRebuild is explicitly manual", async () => {
+		mockExecGit.mockResolvedValue({
+			stdout: "Merge branch 'feature/x' into main",
+			stderr: "",
+			exitCode: 0,
+		});
+		mockLoadConfig.mockResolvedValue({ apiKey: "sk-test", wikiRebuild: "manual" });
+
+		await handlePostMerge("/test");
+
+		expect(mockEnqueueIngest).not.toHaveBeenCalled();
 		expect(mockLaunchWorker).not.toHaveBeenCalled();
 	});
 });

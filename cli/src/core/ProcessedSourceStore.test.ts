@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import type { FileWrite } from "../Types.js";
 import {
 	addProcessed,
+	carryProcessedSummaryHash,
 	emptyProcessedSet,
 	hasProcessed,
 	readProcessedSet,
@@ -73,5 +74,46 @@ describe("ProcessedSourceStore", () => {
 		const storage = makeFakeStorage({ "topics/processed.json": JSON.stringify({ schemaVersion: 1 }) });
 		const set = await readProcessedSet("/tmp/x", storage);
 		expect(set).toEqual(emptyProcessedSet());
+	});
+
+	describe("carryProcessedSummaryHash (rebase 1:1 migration)", () => {
+		it("carries the old hash's mark onto the new hash AND prunes the dead old hash", async () => {
+			const storage = makeFakeStorage();
+			await saveProcessedSet(addProcessed(emptyProcessedSet(), [ref("summary", "OLD")]), "/tmp/x", storage);
+			await carryProcessedSummaryHash("/tmp/x", "OLD", "NEW", storage);
+			const set = await readProcessedSet("/tmp/x", storage);
+			expect(hasProcessed(set, ref("summary", "NEW"))).toBe(true);
+			// The old commit no longer exists after a 1:1 rebase migration — its entry is
+			// pruned so the set doesn't grow by one dead row per rebased commit.
+			expect(hasProcessed(set, ref("summary", "OLD"))).toBe(false);
+			expect(set.processed.summary).toEqual(["NEW"]);
+		});
+
+		it("does nothing when old and new hash are identical", async () => {
+			const storage = makeFakeStorage();
+			await saveProcessedSet(addProcessed(emptyProcessedSet(), [ref("summary", "SAME")]), "/tmp/x", storage);
+			await carryProcessedSummaryHash("/tmp/x", "SAME", "SAME", storage);
+			const set = await readProcessedSet("/tmp/x", storage);
+			expect(set.processed.summary).toEqual(["SAME"]);
+		});
+
+		it("is a no-op when the old hash was never processed", async () => {
+			const storage = makeFakeStorage();
+			await carryProcessedSummaryHash("/tmp/x", "OLD", "NEW", storage);
+			const set = await readProcessedSet("/tmp/x", storage);
+			expect(hasProcessed(set, ref("summary", "NEW"))).toBe(false);
+		});
+
+		it("is idempotent when the new hash is already processed", async () => {
+			const storage = makeFakeStorage();
+			await saveProcessedSet(
+				addProcessed(emptyProcessedSet(), [ref("summary", "OLD"), ref("summary", "NEW")]),
+				"/tmp/x",
+				storage,
+			);
+			await carryProcessedSummaryHash("/tmp/x", "OLD", "NEW", storage);
+			const set = await readProcessedSet("/tmp/x", storage);
+			expect(set.processed.summary).toEqual(["OLD", "NEW"]);
+		});
 	});
 });

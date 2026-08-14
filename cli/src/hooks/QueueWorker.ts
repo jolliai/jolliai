@@ -82,6 +82,7 @@ import { readOpenCodeTranscript } from "../core/OpenCodeTranscriptReader.js";
 import { evaluatePlanProgress } from "../core/PlanProgressEvaluator.js";
 import { formatPlansBlock } from "../core/PlanPromptFormatter.js";
 import { estimateCostUsd, PRICES_AS_OF } from "../core/Pricing.js";
+import { carryProcessedSummaryHash } from "../core/ProcessedSourceStore.js";
 import { triggerPushForNewSummaries } from "../core/PushExecutor.js";
 import { createPlanSourceClassifier, partitionForeignPlans } from "../core/plans/PlanContainment.js";
 import { baseKeyOf, mergeRefsNewWins } from "../core/RefMerge.js";
@@ -152,6 +153,7 @@ import { generateTranscriptId } from "../core/TranscriptId.js";
 import { getParserForSource } from "../core/TranscriptParser.js";
 import type { SessionTranscript } from "../core/TranscriptReader.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
+import { wikiRebuildIsAuto } from "../core/WikiRebuildMode.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
@@ -809,7 +811,12 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// IngestTrigger's per-cwd cooldown collapses rapid commit bursts to one
 			// drain. Without this, the topic KB only updated on `git pull` merges or
 			// a manual `jolli compile`, so commit-heavy workflows went stale.
-			if (committedThisRun) {
+			//
+			// gated on wikiRebuild === "auto". In the default MANUAL mode
+			// the wiki/graph never auto-rebuilds — summaries are still generated above
+			// (recall/commit-search stay fresh), and the user folds them into the wiki
+			// on demand from the dashboard / VS Code sidebar.
+			if (committedThisRun && wikiRebuildIsAuto(await loadConfig())) {
 				await enqueueIngestOperation(cwd, "post-commit");
 			}
 
@@ -2853,6 +2860,24 @@ async function handleRebasePickFromQueue(op: CommitGitOperation, cwd: string): P
 
 	// Re-associate plans and notes with the new hash
 	await reassociateMetadata([oldSummary], op.commitHash, cwd);
+
+	// carry the old hash's "already ingested" mark onto
+	// the new hash so the byte-identical migrated summary is not re-reconciled as a
+	// brand-new source on the next wiki rebuild. This is a pure optimization — its
+	// own try/catch (like the stale-child cleanup tail) so an orphan-write throw
+	// (contention / IO) can NEVER turn a successful, already-durable migration into
+	// a reported failure; worst case we skip the mark and the next rebuild
+	// re-reconciles this one summary, i.e. the pre-2164 behaviour.
+	try {
+		await carryProcessedSummaryHash(cwd, oldHash, op.commitHash);
+	} catch (err) {
+		log.warn(
+			"Rebase-pick: could not carry processed mark %s → %s (next rebuild will re-reconcile it): %s",
+			oldHash.substring(0, 8),
+			op.commitHash.substring(0, 8),
+			errMsg(err),
+		);
+	}
 
 	log.info("Rebase-pick: migrated %s → %s", oldHash.substring(0, 8), op.commitHash.substring(0, 8));
 	// The 1:1 migration produced a summary at the new hash, so report the capture

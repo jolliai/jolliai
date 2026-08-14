@@ -331,6 +331,51 @@ export function buildSidebarCss(): string {
   .toolbar-worker-icon-error {
     color: var(--vscode-errorForeground, var(--vscode-editorError-foreground, #f48771));
   }
+  /* Folder-wide wiki/graph freshness banner — a full-width strip below the kb
+     toolbar, above the tree (mirrors the dashboard). Message + a Rebuild button
+     that triggers the same folder-wide "Build Knowledge Wiki" sweep. The .warn
+     variant tints it when the wiki is well behind. */
+  .kb-wiki-banner {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px;
+    font-size: var(--vscode-font-size, 13px);
+    line-height: 1.45;
+    border-bottom: 1px solid var(--vscode-inputValidation-infoBorder, var(--vscode-panel-border));
+    background: var(--vscode-inputValidation-infoBackground, var(--vscode-editorWidget-background));
+    color: var(--vscode-foreground);
+  }
+  .kb-wiki-banner.warn {
+    /* Match the dashboard's warn tint (main.css .warning-banner): a low-% mix of
+       the warning color over the editor background — same 9%/28% formula, using
+       VSCode's theme warning color so it still respects light/dark. Avoids the
+       heavier, theme-varying inputValidation-warningBackground. */
+    border-bottom-color: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 28%, var(--vscode-panel-border));
+    background: color-mix(in srgb, var(--vscode-editorWarning-foreground, #cca700) 9%, var(--vscode-editor-background));
+  }
+  .kb-wiki-banner-text {
+    flex: 1;
+    min-width: 0;
+  }
+  .kb-wiki-banner-btn {
+    flex: none;
+    white-space: nowrap;
+    border: 0;
+    border-radius: 2px;
+    padding: 5px 12px;
+    font-size: var(--vscode-font-size, 13px);
+    cursor: pointer;
+    color: var(--vscode-button-foreground);
+    background: var(--vscode-button-background);
+  }
+  .kb-wiki-banner-btn:hover {
+    background: var(--vscode-button-hoverBackground, var(--vscode-button-background));
+  }
+  .kb-wiki-banner-btn:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
   .iconbtn {
     width: 24px;
     height: 22px;

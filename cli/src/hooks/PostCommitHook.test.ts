@@ -592,12 +592,22 @@ describe("PostCommitHook", () => {
 		expect(spawn).not.toHaveBeenCalled();
 	});
 
-	it("debounce-enqueues a post-commit ingest after processing a commit", async () => {
+	it("debounce-enqueues a post-commit ingest after processing a commit when wikiRebuild is auto", async () => {
 		setupFullPipeline();
+		// the post-commit ingest enqueue is gated on wikiRebuild==="auto".
+		vi.mocked(loadConfig).mockResolvedValue({ wikiRebuild: "auto" });
 
 		await runWorker("/test/project");
 
 		expect(enqueueIngestOperation).toHaveBeenCalledWith("/test/project", "post-commit");
+	});
+
+	it("does NOT enqueue a post-commit ingest in the default manual mode", async () => {
+		setupFullPipeline(); // loadConfig defaults to {} → wikiRebuild absent → manual
+
+		await runWorker("/test/project");
+
+		expect(enqueueIngestOperation).not.toHaveBeenCalled();
 	});
 
 	it("should run the full pipeline successfully", async () => {

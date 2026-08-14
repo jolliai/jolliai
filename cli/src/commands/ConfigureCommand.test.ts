@@ -192,6 +192,26 @@ describe("ConfigureCommand — settable keys", () => {
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ aiProvider: "local-agent" }));
 	});
 
+	it("accepts wikiRebuild as the manual|auto enum and rejects other values", async () => {
+		await runConfigure(["--set", "wikiRebuild=manual"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ wikiRebuild: "manual" }));
+
+		await runConfigure(["--set", "wikiRebuild=auto"]);
+		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ wikiRebuild: "auto" }));
+
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		mockSaveConfig.mockClear();
+		try {
+			await runConfigure(["--set", "wikiRebuild=maual"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("manual"));
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prevExitCode;
+		}
+	});
+
 	it("accepts localAgentTool and localAgentPath for the Local Agent provider", async () => {
 		await runConfigure(["--set", "localAgentTool=claude-code"]);
 		expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentTool: "claude-code" }));

@@ -1391,6 +1391,18 @@ export function activate(context: vscode.ExtensionContext): void {
 			getMode: historyProvider.getMode.bind(historyProvider),
 		},
 		kbFolders: kbFoldersService,
+		// Folder-wide wiki/graph freshness for the kb-tab banner. Maps the bridge's
+		// full AggregateWikiFreshness to the compact shape the webview renders.
+		getWikiFreshness: async () => {
+			const f = await bridge.getWikiFreshness();
+			return {
+				severity: f.severity,
+				behindRepoNames: f.behindRepoNames,
+				summary: f.pending.summary,
+				total: f.pending.total,
+				lastRebuiltAt: f.lastRebuiltAt,
+			};
+		},
 		// Breadcrumb dropdowns. The discoverRepos output carries `kbRoot` /
 		// `dirName` fields that the webview doesn't need (selector key is
 		// the configured repoName, with remoteUrl forwarded for cross-repo
@@ -2332,13 +2344,23 @@ export function activate(context: vscode.ExtensionContext): void {
 		statusStore.setIngest(busy, phase);
 	};
 	ingestPhaseWatcher.onDidCreate(() => void refreshIngestState());
+	// Only refresh the (cheap) ingest pill here. Deliberately NOT pushing wiki
+	// freshness: the worker rewrites this file on a 60s heartbeat (not just on real
+	// phase transitions), so a push here would re-run the whole-folder freshness
+	// scan every minute for the entire ingest. The backlog refresh rides the
+	// authoritative end-of-ingest signal (onDidDelete) instead, and a manual rebuild
+	// already shows "Rebuilding…" via setWikiRebuilding.
 	ingestPhaseWatcher.onDidChange(() => void refreshIngestState());
 	// An explicit delete of the phase file is authoritative teardown: the worker
 	// removes it when the ingest ends. Clear the pill directly rather than going
 	// through readIngestPhase — otherwise the `ingest.lock` liveness backstop
 	// (the lock is released just AFTER the phase file) could momentarily resurrect
 	// a stale (and possibly mislabeled) pill until the 60s timer catches it.
-	ingestPhaseWatcher.onDidDelete(() => statusStore.setIngest(false, null));
+	ingestPhaseWatcher.onDidDelete(() => {
+		statusStore.setIngest(false, null);
+		// Ingest ended — the backlog just dropped, so refresh the freshness chip.
+		void sidebarProvider?.pushWikiFreshness();
+	});
 	context.subscriptions.push(ingestPhaseWatcher);
 	// The watcher fires on file writes but NOT when the phase file / `ingest.lock`
 	// simply age out (a crashed ingest leaves them behind). Re-check on a 60s timer

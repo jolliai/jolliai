@@ -171,6 +171,19 @@ export interface SidebarWebviewDeps {
 		...args: ReadonlyArray<unknown>
 	) => Thenable<unknown>;
 	getInitialState: () => SidebarState;
+	/**
+	 * wiki/graph freshness for the workspace repo, pushed read-only
+	 * to the kb-tab toolbar. Delegates to the shared core rule via the bridge.
+	 * Optional so tests that don't exercise the indicator keep compiling; when
+	 * absent the indicator simply never appears.
+	 */
+	getWikiFreshness?: () => Promise<{
+		readonly severity: "never" | "fresh" | "info" | "warn";
+		readonly behindRepoNames: ReadonlyArray<string>;
+		readonly summary: number;
+		readonly total: number;
+		readonly lastRebuiltAt: string | null;
+	} | null>;
 	/** Extension installation root — used to compute webview-resolvable URIs for bundled assets (codicons). */
 	extensionUri: vscode.Uri;
 	/** Optional in scaffold; required once Phase 2 lands. */
@@ -824,6 +837,7 @@ export class SidebarWebviewProvider
 		void this.pushCommits();
 		void this.pushConversations();
 		void this.pushPins();
+		void this.pushWikiFreshness();
 		if (this.deps.branchWatcher) {
 			const cur = this.deps.branchWatcher.current();
 			this.postMessage({
@@ -860,6 +874,10 @@ export class SidebarWebviewProvider
 					const view = msg.tab === "branch" ? "current" : msg.tab === "kb" ? "bank" : undefined;
 					if (view) track("view_switched", { view });
 				}
+				// refresh the freshness indicator when the user lands on the
+				// kb tab (its toolbar is the only place it shows), so it reflects any
+				// summaries generated since the sidebar opened without a full refresh.
+				if (msg.tab === "kb") void this.pushWikiFreshness();
 				return;
 			}
 			case "kb:memoryToggled":
@@ -2153,6 +2171,41 @@ export class SidebarWebviewProvider
 		// dropdown frozen on the pre-sync set until the user manually switched
 		// repos.
 		this.pushBreadcrumbSelection();
+		// a refresh (external write, migration, or a just-finished
+		// compile) may have moved the wiki/graph forward or left new summaries
+		// pending — re-push the freshness indicator so the kb toolbar reflects it.
+		void this.pushWikiFreshness();
+	}
+
+	/**
+	 * compute the workspace repo's wiki/graph freshness (via the
+	 * bridge → shared core rule) and push it to the kb-tab toolbar as a read-only
+	 * indicator. No-op when the host didn't wire `getWikiFreshness`. Never throws:
+	 * a freshness probe failure must never disturb the sidebar, so it posts `null`
+	 * (clears the chip) on error.
+	 */
+	async pushWikiFreshness(): Promise<void> {
+		if (!this.deps.getWikiFreshness) return;
+		try {
+			const freshness = await this.deps.getWikiFreshness();
+			this.postMessage({ type: "wiki:freshness", freshness });
+		} catch (err) {
+			log.warn(
+				"SidebarWebviewProvider",
+				`getWikiFreshness failed: ${err instanceof Error ? err.message : String(err)}`,
+			);
+			this.postMessage({ type: "wiki:freshness", freshness: null });
+		}
+	}
+
+	/**
+	 * Drive the kb-tab banner's "Rebuilding the wiki/graph…" state for the whole
+	 * compile sweep (called by CompileCommand: true at start, false at end), so the
+	 * banner mirrors the dashboard's in-flight message rather than only changing its
+	 * button text. The subsequent `pushWikiFreshness()` re-renders the final state.
+	 */
+	setWikiRebuilding(active: boolean): void {
+		this.postMessage({ type: "wiki:rebuilding", active });
 	}
 
 	/**

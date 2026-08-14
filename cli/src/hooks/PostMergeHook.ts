@@ -21,6 +21,7 @@ import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
+import { wikiRebuildIsAuto } from "../core/WikiRebuildMode.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { launchWorker } from "./QueueWorker.js";
 
@@ -120,6 +121,14 @@ export async function handlePostMerge(cwd: string): Promise<void> {
 	const config = await loadConfig();
 	if (resolveLlmCredentialSource(config) === null) {
 		log.info("No API key configured -- skipping compile enqueue");
+		return;
+	}
+
+	// In the default MANUAL mode a `git pull`'s merged commits are NOT
+	// auto-folded into the wiki/graph — the per-commit summaries already exist, and
+	// the user rebuilds the wiki on demand from the dashboard / VS Code sidebar.
+	if (!wikiRebuildIsAuto(config)) {
+		log.info("wikiRebuild=manual -- skipping post-merge ingest enqueue (rebuild on demand)");
 		return;
 	}
 

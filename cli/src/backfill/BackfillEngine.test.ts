@@ -94,7 +94,10 @@ const summaryResult = {
 beforeEach(() => {
 	vi.clearAllMocks();
 	vi.mocked(getIndexEntryMap).mockResolvedValue(new Map());
-	vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-test" } as never);
+	// the post-backfill wiki/graph ingest is now gated on
+	// wikiRebuild === "auto"; these legacy tests assert that ingest, so default
+	// the config to auto here. A dedicated manual-mode test overrides it below.
+	vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-test", wikiRebuild: "auto" } as never);
 	vi.mocked(generateSummary).mockResolvedValue(summaryResult as never);
 	vi.mocked(getCurrentBranch).mockResolvedValue("main");
 });
@@ -296,6 +299,20 @@ describe("runBackfill", () => {
 		expect(vi.mocked(storeSummary).mock.calls[0][3]).toBeUndefined();
 		// Diff-only summaries still count as generated → ingest fires once.
 		expect(vi.mocked(enqueueIngestOperation)).toHaveBeenCalledTimes(1);
+	});
+
+	it("does NOT enqueue the wiki ingest in the default MANUAL mode, even when a summary was generated", async () => {
+		// wikiRebuild absent → manual: back-fill still generates the summary (the
+		// expensive work the user asked for) but leaves folding it into the wiki to
+		// an explicit rebuild.
+		vi.mocked(loadConfig).mockResolvedValue({ apiKey: "sk-ant-test" } as never);
+		vi.mocked(attributeCommits).mockReturnValue({ attributed: new Map([["c1", attrFor("c1")]]), skipped: [] });
+
+		const report = await runBackfill({ cwd: CWD, hashes: ["c1"] });
+
+		expect(report.generated).toBe(1);
+		expect(vi.mocked(enqueueIngestOperation)).not.toHaveBeenCalled();
+		expect(vi.mocked(launchWorker)).not.toHaveBeenCalled();
 	});
 
 	it("errors (not throws) when no LLM credentials are configured", async () => {

@@ -49,6 +49,7 @@ import {
 	generateSquashMessage,
 } from "../../cli/src/core/Summarizer.js";
 import { getDisplayDate } from "../../cli/src/core/SummaryFormat.js";
+import { type AggregateWikiFreshness, getAggregateWikiFreshness } from "../../cli/src/core/WikiFreshness.js";
 import {
 	deleteNoteVisibleArtifact,
 	deletePlanVisibleArtifact,
@@ -536,6 +537,23 @@ export class JolliMemoryBridge {
 	// ── Status ────────────────────────────────────────────────────────────
 
 	/** Returns the current JolliMemory status by calling Installer.getStatus() directly. */
+	/**
+	 * How far the wiki/graph lags across the WHOLE Memory Bank folder, for the
+	 * kb-tab freshness banner. Aggregate (all repos) so the banner matches its
+	 * rebuild action — the "Build Knowledge Wiki" command runs the same folder-wide
+	 * sweep (`compileAllRepos`). Delegates entirely to the shared core rule
+	 * (`cli/src/core/WikiFreshness.ts`); the host only reads it. A missing
+	 * `localFolder` yields an all-`fresh` (empty) snapshot.
+	 */
+	async getWikiFreshness(): Promise<AggregateWikiFreshness> {
+		const config = (await loadConfig()) as Record<string, unknown>;
+		const localFolder = config.localFolder as string | undefined;
+		if (!localFolder) {
+			return { repos: [], behindRepoNames: [], pending: { summary: 0, total: 0 }, lastRebuiltAt: null, everBuilt: false, severity: "fresh" };
+		}
+		return getAggregateWikiFreshness(localFolder, config as never);
+	}
+
 	async getStatus(): Promise<StatusInfo> {
 		try {
 			const storage = await this.getStorage();

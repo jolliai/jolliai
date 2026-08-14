@@ -1772,6 +1772,20 @@ export interface JolliMemoryConfig {
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
 	/**
+	 * When the wiki/graph (topic KB) is rebuilt from newly-summarized commits.
+	 *  - "manual" (DEFAULT — an absent value means manual): no git operation
+	 *    (commit / rebase / amend / squash / merge) auto-triggers a wiki/graph
+	 *    rebuild. The user rebuilds on demand from the dashboard or the VS Code
+	 *    sidebar. recall and commit-search stay fresh regardless (they read the
+	 *    per-commit summaries, not the topic KB).
+	 *  - "auto": the legacy behaviour — every commit / merge / backfill enqueues an
+	 *    ingest pass that folds new summaries into the wiki and rebuilds the graph.
+	 *
+	 * Read via `wikiRebuildIsAuto(config)`; the polarity is deliberately
+	 * `=== "auto"` so an absent key (every existing install) means manual.
+	 */
+	readonly wikiRebuild?: "manual" | "auto";
+	/**
 	 * Whether the post-commit hook prints live memory-capture progress to stdout
 	 * (so a `git commit` driven from a terminal or AI-agent session shows the
 	 * capture lifecycle inline, and blocks until it drains).

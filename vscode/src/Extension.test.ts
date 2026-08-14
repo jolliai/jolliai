@@ -360,6 +360,16 @@ const {
 		openReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 		previewReferenceMarkdown: vi.fn().mockResolvedValue(undefined),
 		removeReference: vi.fn().mockResolvedValue(undefined),
+		// Folder-wide wiki/graph freshness. Full AggregateWikiFreshness by default;
+		// the Extension.ts dep maps it to the compact webview shape.
+		getWikiFreshness: vi.fn().mockResolvedValue({
+			repos: [],
+			behindRepoNames: ["acme", "beta"],
+			pending: { summary: 2, total: 3 },
+			lastRebuiltAt: "2026-08-10T00:00:00.000Z",
+			everBuilt: true,
+			severity: "info",
+		}),
 	};
 
 	const mockCommitCommand_ = { execute: vi.fn().mockResolvedValue(undefined) };
@@ -1036,6 +1046,7 @@ vi.mock("./views/SidebarWebviewProvider.js", () => ({
 		}
 		resolveWebviewView() {}
 		dispose() {}
+		pushWikiFreshness = vi.fn().mockResolvedValue(undefined);
 		refreshKnowledgeBaseFolders = mockRefreshKnowledgeBaseFolders;
 		clearKnowledgeBaseFolderDivergence = mockClearKnowledgeBaseFolderDivergence;
 		refreshConversationsPanel = mockRefreshConversationsPanel;
@@ -1614,6 +1625,31 @@ describe("Extension", () => {
 			};
 			expect(typeof deps.getSummaryAnyRepoWithSource).toBe("function");
 			expect(typeof deps.readTranscriptForRepo).toBe("function");
+		});
+
+		it("maps the bridge's full AggregateWikiFreshness to the compact getWikiFreshness dep", async () => {
+			const ctx = makeContext();
+
+			activate(ctx);
+
+			const deps = sidebarDepsCaptured as {
+				getWikiFreshness: () => Promise<{
+					severity: string;
+					behindRepoNames: ReadonlyArray<string>;
+					summary: number;
+					total: number;
+					lastRebuiltAt: string | null;
+				}>;
+			};
+			expect(typeof deps.getWikiFreshness).toBe("function");
+			await expect(deps.getWikiFreshness()).resolves.toEqual({
+				severity: "info",
+				behindRepoNames: ["acme", "beta"],
+				summary: 2,
+				total: 3,
+				lastRebuiltAt: "2026-08-10T00:00:00.000Z",
+			});
+			expect(mockBridge.getWikiFreshness).toHaveBeenCalled();
 		});
 
 		it("registers all expected commands", () => {

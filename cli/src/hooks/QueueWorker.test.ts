@@ -532,6 +532,13 @@ vi.mock("../core/IngestPipeline.js", () => ({
 	drainIngest: vi.fn(async () => ({ batches: 0, ingested: 0, outcome: "NO_PENDING", topicFailures: [] })),
 }));
 
+// the only ProcessedSourceStore symbol QueueWorker imports is the
+// rebase-pick processed-carry. Mock it so the rebase-pick wiring test can assert
+// the call without a real orphan-branch write.
+vi.mock("../core/ProcessedSourceStore.js", () => ({
+	carryProcessedSummaryHash: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/TopicWikiRenderer.js", () => ({
 	renderTopicKBWiki: vi.fn(async () => {}),
 }));
@@ -4250,6 +4257,48 @@ describe("QueueWorker", () => {
 			// type; setupPipelineMocks() at the top of every other test rebuilds the
 			// full mock pack, but here we only need the branch reader.
 			vi.mocked(getCurrentBranch).mockResolvedValue("feature/test");
+		});
+
+		// a real rebase-pick (with sourceHashes) migrates
+		// the summary 1:1 and MUST carry the old hash's "already ingested" mark onto
+		// the new hash, or the next wiki rebuild re-reconciles a byte-identical
+		// summary. The other rebase-pick tests early-return (no sourceHashes), so
+		// this is the only one that exercises the carry wiring.
+		it("carries the processed mark old→new on a real rebase-pick migration", async () => {
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const { carryProcessedSummaryHash } = await import("../core/ProcessedSourceStore.js");
+			vi.mocked(carryProcessedSummaryHash).mockClear();
+			vi.mocked(getSummary).mockResolvedValue({
+				version: 5,
+				commitHash: "oldhash",
+				commitMessage: "Old",
+				commitAuthor: "Jane",
+				commitDate: "2026-04-01T10:00:00.000Z",
+				branch: "feature/test",
+				generatedAt: "2026-04-01T10:00:00.000Z",
+				topics: [],
+			} as Awaited<ReturnType<typeof getSummary>>);
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: "newhash123",
+				message: "New",
+				author: "Jane",
+				date: "2026-04-02T10:00:00.000Z",
+			} as never);
+
+			await __test__.processQueueEntry(
+				{
+					type: "rebase-pick",
+					commitHash: "newhash123",
+					branch: "feature/test",
+					sourceHashes: ["oldhash"],
+					createdAt: new Date().toISOString(),
+				} as never,
+				"/test/cwd",
+				mockStorage as never,
+				false,
+			);
+
+			expect(carryProcessedSummaryHash).toHaveBeenCalledWith("/test/cwd", "oldhash", "newhash123");
 		});
 
 		// Use op.type === "rebase-pick" with no sourceHashes: the handler early-

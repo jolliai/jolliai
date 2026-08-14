@@ -172,6 +172,14 @@ export function buildSidebarScript(): string {
     // in a sticky terminal failure. Shape: { label, severity } | null. Not
     // persisted — host re-pushes on reload.
     syncPhase: null,
+    // wiki/graph freshness for the workspace repo, pushed read-only
+    // for the kb-tab toolbar. Shape: { severity, summary, total, lastRebuiltAt }
+    // | null. Not persisted — host re-pushes on reload / kb activation / refresh.
+    wikiFreshness: null,
+    // True while a folder-wide rebuild sweep is running (host drives it via the
+    // 'wiki:rebuilding' message across the whole compile). Makes the banner show
+    // "Rebuilding the wiki/graph…" for the duration, mirroring the dashboard.
+    wikiRebuilding: false,
     // Aggregated token usage for the current branch, pushed alongside
     // branch:commitsData. Shape: { input, output, total } | null. Not
     // persisted -- host re-pushes on reload.
@@ -204,6 +212,8 @@ export function buildSidebarScript(): string {
   state.ingestPhase = null;
   state.summarizingHash = null;
   state.syncPhase = null;
+  state.wikiFreshness = null;
+  state.wikiRebuilding = false;
   state.tokenStats = null;
   // Cold-start signals + card runtime are host-driven / transient — never
   // resurrected from persisted state (would flash a stale card on reload).
@@ -311,6 +321,11 @@ export function buildSidebarScript(): string {
     branch: document.getElementById('tab-content-branch'),
     status: document.getElementById('tab-content-status')
   };
+  // Folder-wide wiki freshness banner. A persistent sibling BETWEEN the toolbar
+  // and the kb panel (not inside it): renderFolders/renderMemories replaceChildren
+  // the panel on every render, so a banner mounted inside would be wiped — this
+  // outside slot survives, and renderWikiBanner gates its visibility on the kb tab.
+  const wikiBannerEl = document.getElementById('kb-wiki-banner');
   // Status panel has two stacked children: the disabled-banner (intro + Enable
   // button shown when state.enabled === false) and the status-entries list
   // (rendered by renderStatus when state.enabled === true). They are siblings
@@ -408,6 +423,9 @@ export function buildSidebarScript(): string {
     Object.keys(tabContents).forEach(function(t) { tabContents[t].classList.toggle('hidden', t !== tab); });
     renderToolbar();
     applyRepoFilterVisibility();
+    // Show/hide the folder-wide wiki banner with the kb tab (it lives in a
+    // persistent slot outside the tab panels, so it isn't toggled by the loop above).
+    renderWikiBanner();
     const incoming = tabContents[tab];
     if (incoming) incoming.scrollTop = state.scrollTops[tab] || 0;
     // Tab content can be stale if data arrived while a different tab was active
@@ -567,6 +585,8 @@ export function buildSidebarScript(): string {
       // header explains why.)
       items.push(iconButton('sync-now', 'Sync to Personal Space', 'cloud-upload'));
       items.push(iconButton('compile-now', 'Build Knowledge Wiki', 'database'));
+      // Folder-wide "N behind" now renders as a banner at the top of the kb tab
+      // body (renderWikiBanner), mirroring the dashboard — not a toolbar chip.
       items.push(iconButton('refresh', 'Refresh', 'refresh'));
       mountIn(tabToolbar, items);
     } else if (state.activeTab === 'status') {
@@ -614,6 +634,63 @@ export function buildSidebarScript(): string {
       }));
     }
     return busyEl;
+  }
+
+  // Folder-wide wiki/graph freshness banner — the same message and Rebuild action
+  // as the dashboard. Lives in the persistent wikiBannerEl slot above the kb
+  // panel; shown only on the kb tab, and only when something is behind.
+  function renderWikiBanner() {
+    if (!wikiBannerEl) return;
+    const f = state.wikiFreshness;
+    const names = (f && f.behindRepoNames) || [];
+    const wasWarn = !!f && f.severity === 'warn';
+    // Rebuilding takes precedence over the freshness snapshot: while the sweep
+    // runs the banner shows "Rebuilding the wiki/graph…" for its whole duration
+    // (mirrors the dashboard), keeping the warn tint if it was warn.
+    if (state.activeTab === 'kb' && state.wikiRebuilding) {
+      wikiBannerEl.classList.remove('hidden');
+      wikiBannerEl.classList.toggle('warn', wasWarn);
+      clear(wikiBannerEl);
+      wikiBannerEl.appendChild(el('i', { className: 'codicon codicon-loading codicon-modifier-spin', 'aria-hidden': 'true' }));
+      wikiBannerEl.appendChild(el('span', { className: 'kb-wiki-banner-text', text: 'Rebuilding the wiki/graph…' }));
+      return;
+    }
+    const show = state.activeTab === 'kb' && !!f && f.severity !== 'fresh' && names.length > 0;
+    wikiBannerEl.classList.toggle('hidden', !show);
+    if (!show) {
+      clear(wikiBannerEl);
+      return;
+    }
+    clear(wikiBannerEl);
+    wikiBannerEl.classList.toggle('warn', f.severity === 'warn');
+
+    const repoLabel = names.length === 1
+      ? ('for ' + names[0])
+      : ('for ' + names.length + ' repos (' + names.join(', ') + ')');
+    const n = f.summary || 0;
+    const extra = (f.total || 0) > n ? (f.total || 0) - n : 0;
+    const countLabel = n > 0
+      ? (n + ' new ' + (n === 1 ? 'memory' : 'memories') + ' to fold in')
+      : (extra + ' ' + (extra === 1 ? 'item' : 'items') + ' pending');
+
+    wikiBannerEl.appendChild(el('span', {
+      className: 'kb-wiki-banner-text',
+      text: 'Wiki is behind ' + repoLabel + ' — ' + countLabel + '. Rebuilding uses your LLM.'
+    }));
+    const btn = el('button', {
+      className: 'kb-wiki-banner-btn',
+      type: 'button',
+      text: 'Rebuild wiki',
+      title: 'Rebuild the wiki/graph for every Memory Bank repo'
+    });
+    btn.addEventListener('click', function() {
+      // Immediate feedback; the compile shows its own progress notification, and
+      // the next freshness push re-renders this banner (fresh → hidden).
+      btn.disabled = true;
+      btn.textContent = 'Rebuilding…';
+      vscode.postMessage({ type: 'command', command: 'jollimemory.compileNow' });
+    });
+    wikiBannerEl.appendChild(btn);
   }
 
   tabToolbar.addEventListener('click', function(e) {
@@ -959,6 +1036,26 @@ export function buildSidebarScript(): string {
         state.syncPhase = msg.phase || null;
         if (state.activeTab === 'kb') {
           renderToolbar();
+        }
+        break;
+      }
+      case 'wiki:freshness': {
+        // Folder-wide wiki/graph freshness, rendered as a banner at the top of
+        // the kb tab body (mirrors the dashboard). A push also arrives while/after
+        // a rebuild, so re-rendering here is what clears the "Rebuilding…" button.
+        state.wikiFreshness = msg.freshness || null;
+        if (state.activeTab === 'kb') {
+          renderWikiBanner();
+        }
+        break;
+      }
+      case 'wiki:rebuilding': {
+        // Host-driven in-flight flag for the whole sweep (CompileCommand: true at
+        // start, false at end). renderWikiBanner shows "Rebuilding the wiki/graph…"
+        // while true, then the trailing wiki:freshness push renders the final state.
+        state.wikiRebuilding = !!msg.active;
+        if (state.activeTab === 'kb') {
+          renderWikiBanner();
         }
         break;
       }

@@ -1553,22 +1553,51 @@ body {
      min-height:100vh, which grows past the viewport under `.main`'s 48px
      padding-bottom + the footer note) and drop both for these views. */
   .jd:has(.knowledge-page), .jd:has(.graph-page) { height: 100vh; overflow: hidden; }
-  .main:has(.knowledge-page), .main:has(.graph-page) { padding-bottom: 0; }
+  /* Column layout so the freshness banner (first child, auto height) + the header
+     + the content stack, and the content fills the REMAINING space rather than a
+     hardcoded calc that ignores the banner (which pushed the list bottom past the
+     viewport and clipped it). Heights below are parent-relative (100%), not
+     viewport calc, so the banner's height is subtracted automatically. */
+  .main:has(.knowledge-page), .main:has(.graph-page) {
+    padding-bottom: 0; display: flex; flex-direction: column; height: 100vh; min-height: 0;
+  }
   .main:has(.knowledge-page) .footer-note, .main:has(.graph-page) .footer-note { display: none; }
   /* Graph carries its own header (repo name + search) inside the framed viz, so
      the dashboard topbar ("Graph · knowledge graph · per-repo") is redundant — hide
      it and let the graph fill the full viewport; the repo picker below is the only
      dashboard chrome the page needs. Knowledge keeps its topbar. */
   .main:has(.graph-page) .topbar { display: none; }
-  .wrap:has(.knowledge-page) { max-width: none; padding: 0 56px 0 0; }
-  .wrap:has(.graph-page) { max-width: none; padding: 0; }
-  .grid:has(.knowledge-page), .grid:has(.graph-page) { display: block; }
+  /* margin:0 overrides the base `.wrap { margin: 0 auto }`: inside `.main`'s flex
+     column those horizontal auto margins would shrink-to-content + center the item
+     (collapsing the list/graph to a narrow centered strip) instead of stretching. */
+  /* Pure flex chain (each level flex:1 + min-height:0), NOT percentage heights:
+     a height:100% chain breaks at the grid (its implicit row is auto, so
+     `.kn-side { height:100% }` can't resolve and the list stops scrolling). margin:0
+     overrides the base `.wrap { margin: 0 auto }` — horizontal auto margins in a
+     flex column shrink-to-content + center instead of stretching. */
+  .wrap:has(.knowledge-page) {
+    max-width: none; margin: 0; padding: 0 56px 0 0;
+    flex: 1; min-height: 0; display: flex; flex-direction: column;
+  }
+  .wrap:has(.graph-page) {
+    max-width: none; margin: 0; padding: 0;
+    flex: 1; min-height: 0; display: flex; flex-direction: column;
+  }
+  /* Target #app by id, NOT `.grid`: main.js sets `#app.className = view.grid ? "grid" : ""`,
+     so on the Knowledge/Graph views (grid:false) #app has NO class and a `.grid:has(...)`
+     rule never matches — the flex chain would break here and the content collapse. */
+  #app:has(.knowledge-page), #app:has(.graph-page) {
+    display: flex; flex-direction: column; flex: 1; min-height: 0;
+  }
   .knowledge-page {
     display: grid; grid-template-columns: 344px minmax(0, 1fr);
-    gap: 6px; height: calc(100vh - 58px);
+    /* Row fills the flex-definite height so the grid items (kn-side/kn-detail) get
+       a definite height to resolve their own 100% / internal scroll against. */
+    grid-template-rows: minmax(0, 1fr);
+    gap: 6px; flex: 1; min-height: 0;
   }
   .kn-side {
-    min-width: 0; height: calc(100vh - 58px); align-self: start; overflow: hidden;
+    min-width: 0; height: 100%; align-self: start; overflow: hidden;
     border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
     box-shadow: 0 2px 5px rgba(20, 30, 50, .05); display: flex; flex-direction: column;
   }
@@ -1620,7 +1649,7 @@ body {
      The whole page IS the framed `/graph-viewer` viz (its own header carries the
      repo switcher + search). Dashboard topbar hidden (above); iframe fills the
      viewport. It needs an explicit height — an iframe with none collapses to ~150px. */
-  .graph-page { display: flex; flex-direction: column; height: 100vh; padding: 0; }
+  .graph-page { display: flex; flex-direction: column; flex: 1; min-height: 0; padding: 0; }
   .graph-frame { flex: 1; min-height: 0; width: 100%; border: 0; background: var(--surface); }
   .graph-page .empty { margin: 24px; }
 
@@ -1632,13 +1661,31 @@ body {
     /* Stacked layout is taller than the viewport, so let the OUTER page scroll
        again (undo the viewport cap) rather than clipping the reading pane. */
     .jd:has(.knowledge-page), .jd:has(.graph-page) { height: auto; overflow: visible; }
-    .main:has(.knowledge-page), .main:has(.graph-page) { padding-bottom: 48px; }
-    .wrap:has(.knowledge-page) { padding: 0 16px; }
-    .wrap:has(.graph-page) { padding: 0 16px; }
-    .knowledge-page { grid-template-columns: 1fr; gap: 0; height: auto; }
+    .main:has(.knowledge-page), .main:has(.graph-page) { padding-bottom: 48px; display: block; height: auto; }
+    /* Undo the flex chain from the wide layout so the stacked page scrolls normally. */
+    .wrap:has(.knowledge-page) { padding: 0 16px; display: block; flex: none; }
+    .wrap:has(.graph-page) { padding: 0 16px; display: block; flex: none; }
+    #app:has(.knowledge-page), #app:has(.graph-page) { display: block; flex: none; }
+    .knowledge-page { grid-template-columns: 1fr; grid-template-rows: auto; gap: 0; flex: none; }
     .kn-side { height: auto; }
     .kn-list { height: min(42vh, 360px); }
     .kn-detail { height: min(60vh, 520px); }
-    .graph-page { height: auto; }
+    .graph-page { flex: none; }
     .graph-frame { height: min(70vh, 560px); }
   }
+
+/* wiki/graph freshness banner (shared by Knowledge + Graph pages). */
+/* Folder-wide freshness banner: a full-width strip flush at the very top of the
+   content column (`.main`), above the page header — identical placement on the
+   Knowledge and Graph pages. In normal flow (a banner, not a floating tag), so it
+   reads as a page-level notice. Empty (up-to-date) collapses to nothing. */
+.jd .wiki-freshness { margin: 0; }
+.jd .wiki-freshness:empty { display: none; }
+.jd .wiki-freshness .callout,
+.jd .wiki-freshness .warning-banner {
+	/* Both flex so the Rebuild button's `margin-left:auto` pushes it to the far
+	   right consistently. `.callout` is already flex; `.warning-banner` is block by
+	   default, which is why warn used to sit the button right next to the text. */
+	display: flex; gap: 10px; align-items: center; border-radius: 0; border-width: 0 0 1px;
+}
+.jd .wiki-freshness .cta.sm { margin-left: auto; white-space: nowrap; }

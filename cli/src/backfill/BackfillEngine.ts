@@ -25,6 +25,7 @@ import { generateSummary } from "../core/Summarizer.js";
 import { getIndexEntryMap, setActiveStorage, storeSummary } from "../core/SummaryStore.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
 import { buildMultiSessionContext } from "../core/TranscriptReader.js";
+import { wikiRebuildIsAuto } from "../core/WikiRebuildMode.js";
 import { launchWorker } from "../hooks/QueueWorker.js";
 import { createLogger } from "../Logger.js";
 import { type CommitSummary, CURRENT_SCHEMA_VERSION, type LlmConfig, type StoredTranscript } from "../Types.js";
@@ -403,7 +404,12 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 	// the debounce cooldown so a deliberate back-fill always refreshes the
 	// knowledge wiki/graph; `launchWorker` drains the enqueued ingest op in a
 	// detached worker. Skipped on dry-run and when nothing was generated.
-	if (!dryRun && outcomes.some((o) => o.status === "generated")) {
+	//
+	// also gated on wikiRebuild === "auto". In the default MANUAL mode
+	// back-fill still generates every summary (the expensive part users asked for)
+	// but leaves folding them into the wiki/graph to an explicit user rebuild; the
+	// freshness indicator then shows the newly-generated summaries as pending.
+	if (!dryRun && wikiRebuildIsAuto(config) && outcomes.some((o) => o.status === "generated")) {
 		log.info("Back-fill batch done — triggering one repo-wide wiki/graph ingest");
 		await enqueueIngestOperation(cwd, "manual", { force: true });
 		launchWorker(cwd);

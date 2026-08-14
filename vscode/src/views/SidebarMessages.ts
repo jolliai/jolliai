@@ -1165,6 +1165,34 @@ export type SidebarInboundMsg =
 	  }
 	| {
 			/**
+			 * Folder-wide wiki/graph freshness, shown as a banner at the top of the
+			 * kb tab ("Wiki is behind for N repos — M new memories to fold in" with a
+			 * Rebuild button). Aggregated across every Memory Bank repo so it matches
+			 * its rebuild action — the "Build Knowledge Wiki" command runs the same
+			 * folder-wide sweep. `null` clears it. A compact shape, not the full core
+			 * `AggregateWikiFreshness`, so the webview client stays dumb.
+			 */
+			readonly type: "wiki:freshness";
+			readonly freshness: {
+				readonly severity: "never" | "fresh" | "info" | "warn";
+				readonly behindRepoNames: ReadonlyArray<string>;
+				readonly summary: number;
+				readonly total: number;
+				readonly lastRebuiltAt: string | null;
+			} | null;
+	  }
+	| {
+			/**
+			 * Drive the kb-tab banner's "Rebuilding the wiki/graph…" state for the
+			 * whole compile sweep — `true` at start, `false` at end (CompileCommand).
+			 * Mirrors the dashboard's in-flight banner (which stays up for the whole
+			 * folder sweep) instead of only flipping the button label.
+			 */
+			readonly type: "wiki:rebuilding";
+			readonly active: boolean;
+	  }
+	| {
+			/**
 			 * Push the list of repos discoverable under the Memory Bank parent.
 			 * Drives the breadcrumb repo dropdown. When `repos.length <= 1`, the
 			 * webview hides the dropdown affordance entirely (no point offering

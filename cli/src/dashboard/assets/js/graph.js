@@ -56,7 +56,14 @@ window.JD = window.JD || {};
 			src +
 			'"></iframe></section>';
 		syncUrlWithFrame(available);
+		// wiki/graph freshness + on-demand Rebuild (folder-wide aggregate).
+		if (JD.mountWikiFreshness) JD.mountWikiFreshness();
 	}
+
+	// Note: the "No graphs yet" empty state above returns before this, so the
+	// banner shows only when at least one graph exists — matching where a rebuild
+	// makes sense. The banner is folder-wide: it reports how far behind ALL Memory
+	// Bank repos are (aggregate), and its `never`/`fresh`/`behind` states cover that.
 
 	// Mirror the frame's in-iframe repo switch into this page's /graph?kb= URL.
 	// Re-registered per render with the current repo list; the previous handler

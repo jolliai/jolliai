@@ -199,6 +199,7 @@ export function buildSidebarHtml(
     </div>
     <div class="dropdown-menu hidden" id="breadcrumb-menu" role="menu"></div>
     <div class="tab-toolbar hidden" id="tab-toolbar"></div>
+    <div class="kb-wiki-banner hidden" id="kb-wiki-banner"></div>
     <div class="tab-content hidden" id="tab-content-kb"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-branch"><p class="placeholder">Loading...</p></div>
     <div class="tab-content hidden" id="tab-content-status">

@@ -84,6 +84,52 @@ export function addProcessed(set: ProcessedSet, refs: ReadonlyArray<SourceRef>):
 	return { schemaVersion: 1, processed: next };
 }
 
+/**
+ * After a 1:1 rebase migration (`migrateOneToOne`), carries the OLD summary
+ * hash's processed status onto the NEW hash.
+ *
+ * A rebase-pick rewrites a summary under a new commit hash without changing its
+ * content, but the topic-KB pipeline keys "already ingested" on `{summary, hash}`
+ * (see `SourceTimeline`). Without this, the migrated summary looks like a
+ * brand-new pending source and the next ingest re-reconciles every topic page it
+ * touched — full-page LLM rewrites for zero content change. No-op when the old
+ * hash was never processed (nothing folded yet) or the new hash is already marked
+ * (idempotent re-run).
+ */
+export async function carryProcessedSummaryHash(
+	cwd: string | undefined,
+	oldHash: string,
+	newHash: string,
+	storage?: StorageProvider,
+): Promise<void> {
+	// Read-modify-write MUST happen inside the orphan-write lock, mirroring the
+	// ingest pipeline's guarded read (the only other writer of this file). The
+	// summary phase (which runs this carry) and the ingest phase run in separate
+	// workers on separate locks, so an unlocked read here would let a concurrent
+	// ingest write land between our read and our write and be clobbered — dropping
+	// a batch of already-folded sources and forcing their full-page re-reconcile.
+	// The lock is re-entrant, so the nested saveProcessedSet is safe.
+	if (oldHash === newHash) return;
+	await withRequiredOrphanWriteLock(cwd, "carryProcessedSummaryHash", async () => {
+		const set = await readProcessedSet(cwd, storage);
+		const oldRef: SourceRef = { type: "summary", id: oldHash, timestamp: "" };
+		if (!hasProcessed(set, oldRef)) return;
+		const newRef: SourceRef = { type: "summary", id: newHash, timestamp: "" };
+		if (hasProcessed(set, newRef)) return;
+		// Carry the mark AND prune the now-dead old hash: a 1:1 rebase migration
+		// re-points the summary onto `newHash`, so the old commit no longer exists and
+		// its processed entry is a dead row. Leaving it (the old behaviour) let the set
+		// grow by one per rebased commit forever — every save re-serialises the whole
+		// file and every `hasProcessed` is a linear scan.
+		const next = addProcessed(set, [newRef]);
+		const pruned: ProcessedSet = {
+			schemaVersion: 1,
+			processed: { ...next.processed, summary: next.processed.summary.filter((h) => h !== oldHash) },
+		};
+		await saveProcessedSet(pruned, cwd, storage);
+	});
+}
+
 /** Persists the set via the active StorageProvider. */
 export async function saveProcessedSet(set: ProcessedSet, cwd?: string, storage?: StorageProvider): Promise<void> {
 	const resolved = await resolveStorage(storage, cwd);

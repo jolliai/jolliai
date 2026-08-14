@@ -100,6 +100,7 @@ import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
+import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
 import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import { install } from "../install/Installer.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -992,6 +993,13 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	// paying for every summary twice. Process-scoped: it guards this server, not
 	// a separate CLI `jolli backfill` (those still serialise on the orphan lock).
 	let generateMissingInFlight = false;
+	// Same one-at-a-time guard as `generateMissingInFlight`, for the folder-wide
+	// wiki rebuild. The rebuild (`compileAllRepos`) runs IN this long-lived server
+	// process (fire-and-forget), so a plain process-scoped boolean observes its
+	// start and end — the freshness endpoint reports it as `inFlight` and the page
+	// polls it to completion. (The old per-repo detached-worker rebuild needed the
+	// real lock/queue state; a folder sweep in-process does not.)
+	let wikiRebuildInFlight = false;
 	const buildModel =
 		options.buildModel ??
 		((request: ModelRequest) =>
@@ -1434,6 +1442,27 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
+		// Folder-wide wiki/graph freshness, aggregated across EVERY Memory Bank repo
+		// (matches the whole-folder rebuild below). Slow (scans source refs per
+		// repo), so it is its own endpoint off first paint (like missing-summaries).
+		// `inFlight` reflects the in-process rebuild flag. `available:false` when no
+		// `localFolder` (Memory Bank) is configured.
+		if (url.pathname === "/api/wiki/freshness") {
+			try {
+				const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
+				if (!config.localFolder) {
+					sendJson(res, 200, { available: false });
+					return;
+				}
+				const freshness = await getAggregateWikiFreshness(config.localFolder, config);
+				sendJson(res, 200, { available: true, inFlight: wikiRebuildInFlight, ...freshness });
+			} catch (err) {
+				log.warn("wiki freshness failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not compute wiki freshness" });
+			}
+			return;
+		}
+
 		sendText(res, 404, "Not found");
 	}
 
@@ -1496,6 +1525,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		}
 		if (url.pathname === "/api/settings/generate-missing") {
 			await handleGenerateMissing(res);
+			return;
+		}
+		if (url.pathname === "/api/wiki/rebuild") {
+			await handleWikiRebuild(res);
 			return;
 		}
 		if (url.pathname === "/api/settings/probe-local-agent") {
@@ -1645,6 +1678,59 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		} finally {
 			generateMissingInFlight = false;
 		}
+	}
+
+	/**
+	 * Knowledge/Graph page: rebuild the WHOLE Memory Bank folder's wiki/graph on
+	 * demand — the same folder-wide sweep as `jolli compile` / VS Code's "Build
+	 * Knowledge Wiki" (`compileAllRepos`). Runs IN this long-lived server process,
+	 * fire-and-forget: returns 202 immediately while the sweep proceeds, and the
+	 * page polls `/api/wiki/freshness` (whose `inFlight` reflects the flag below)
+	 * to completion. 409 when one is already running so the page shows one
+	 * "Rebuilding…", not two.
+	 *
+	 * In-process (not a detached worker) is what lets a plain server-local boolean
+	 * observe start and end — `compileAllRepos` uses folder-only storage per repo
+	 * (no git worktree), so it needs no per-repo queue/worker.
+	 */
+	async function handleWikiRebuild(res: ServerResponse): Promise<void> {
+		const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
+		if (!config.localFolder) {
+			sendJson(res, 400, { error: "no Memory Bank folder is configured" });
+			return;
+		}
+		// Gate on a usable LLM provider up front — the same check VS Code's
+		// "Build Knowledge Wiki" does. Without it, `compileAllRepos` would fail every
+		// batch silently (its per-repo errors are caught, not thrown), the flag would
+		// flip back, and the banner would return to the identical "behind" state with
+		// no signal to the user beyond a server log line. Surfacing it as an error the
+		// page renders (shell.js's non-409 catch → callout + Retry) keeps parity.
+		const { resolveLlmCredentialSource } = await import("../core/LlmClient.js");
+		if (resolveLlmCredentialSource(config) === null) {
+			sendJson(res, 400, {
+				error: "Building the knowledge wiki needs an AI provider — open Settings to sign in, add a key, or select the Local Agent, then try again.",
+			});
+			return;
+		}
+		if (wikiRebuildInFlight) {
+			sendJson(res, 409, { error: "a wiki rebuild is already running — wait for it to finish" });
+			return;
+		}
+		wikiRebuildInFlight = true;
+		const localFolder = config.localFolder;
+		// Fire-and-forget: the sweep is multi-minute and LLM-bearing, so it must not
+		// block this handler. The flag is cleared in the tail regardless of outcome.
+		void (async () => {
+			try {
+				const { compileAllRepos } = await import("../core/MultiRepoCompile.js");
+				await compileAllRepos(localFolder, config);
+			} catch (err) {
+				log.warn("wiki rebuild (compile all repos) failed: %s", errMsg(err));
+			} finally {
+				wikiRebuildInFlight = false;
+			}
+		})();
+		sendJson(res, 202, { ok: true });
 	}
 
 	/** Settings → AI Summary: probe whether a local-agent CLI is usable (spawns `--version`). */

@@ -6779,3 +6779,69 @@ describe("broadcast targets", () => {
 		expect(applyPlanCheckbox).toHaveBeenCalledWith("p1", false);
 	});
 });
+
+describe("SidebarWebviewProvider.pushWikiFreshness", () => {
+	function providerWith(
+		getWikiFreshness?: () => Promise<{
+			severity: "never" | "fresh" | "info" | "warn";
+			behindRepoNames: ReadonlyArray<string>;
+			summary: number;
+			total: number;
+			lastRebuiltAt: string | null;
+		} | null>,
+	): SidebarWebviewProvider {
+		return new SidebarWebviewProvider({
+			executeCommand: vi.fn().mockResolvedValue(undefined) as never,
+			getInitialState: () => ({
+				enabled: true,
+				authenticated: false,
+				activeTab: "kb",
+				kbMode: "folders",
+				branchName: "main",
+				detached: false,
+			}),
+			extensionUri: mockExtensionUri as unknown as never,
+			...(getWikiFreshness ? { getWikiFreshness } : {}),
+		});
+	}
+
+	function freshnessMessages(view: MockWebviewView): SidebarInboundMsg[] {
+		return (view.webview.postMessage.mock.calls.map((c) => c[0]) as SidebarInboundMsg[]).filter(
+			(m) => m.type === "wiki:freshness",
+		);
+	}
+
+	it("posts the freshness snapshot on success", async () => {
+		const view = makeMockView();
+		const p = providerWith(
+			vi.fn().mockResolvedValue({ severity: "info", behindRepoNames: ["acme"], summary: 2, total: 3, lastRebuiltAt: null }),
+		);
+		p.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		await p.pushWikiFreshness();
+		expect(freshnessMessages(view)).toEqual([
+			{
+				type: "wiki:freshness",
+				freshness: { severity: "info", behindRepoNames: ["acme"], summary: 2, total: 3, lastRebuiltAt: null },
+			},
+		]);
+	});
+
+	it("posts null on failure and never throws", async () => {
+		const view = makeMockView();
+		const p = providerWith(vi.fn().mockRejectedValue(new Error("boom")));
+		p.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		await expect(p.pushWikiFreshness()).resolves.toBeUndefined();
+		expect(freshnessMessages(view)).toEqual([{ type: "wiki:freshness", freshness: null }]);
+	});
+
+	it("no-ops when the host did not wire getWikiFreshness", async () => {
+		const view = makeMockView();
+		const p = providerWith(undefined);
+		p.resolveWebviewView(view as unknown as never);
+		view.webview.postMessage.mockClear();
+		await p.pushWikiFreshness();
+		expect(freshnessMessages(view)).toEqual([]);
+	});
+});

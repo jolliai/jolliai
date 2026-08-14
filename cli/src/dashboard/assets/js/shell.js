@@ -1051,7 +1051,11 @@ window.JD = window.JD || {};
 			body: JSON.stringify(body || {}),
 		}).then(async (res) => {
 			var data = await res.json().catch(() => ({}));
-			if (!res.ok) throw new Error(data.error || "request failed (" + res.status + ")");
+			if (!res.ok) {
+				var err = new Error(data.error || "request failed (" + res.status + ")");
+				err.status = res.status;
+				throw err;
+			}
 			return data;
 		});
 
@@ -1170,5 +1174,147 @@ window.JD = window.JD || {};
 	JD.startRefresh = (render) => {
 		if ((window.__JOLLI_DASHBOARD__ || {}).view !== "stats") return;
 		setInterval(() => JD.refreshNow(render), PAGE_REFRESH_MS);
+	};
+
+	/* the folder-wide wiki/graph freshness banner shared by the Knowledge and
+	   Graph pages. Fetches /api/wiki/freshness (slow, off first paint) into the
+	   container, and offers a Rebuild button that POSTs /api/wiki/rebuild (a whole-
+	   folder `compileAllRepos` sweep) and polls freshness to completion. The freshness
+	   is aggregated across every Memory Bank repo, so the banner describes the whole
+	   folder, not one repo. */
+	// 5s, not a tight loop: each tick re-runs the whole-folder freshness scan (every
+	// repo's index / processed-set / plans / notes / user files) in the same process
+	// as the LLM sweep, so a shorter interval would turn a documented "slow probe"
+	// into a hot loop. Completion latency of a few seconds is invisible next to a
+	// multi-minute rebuild.
+	var WIKI_POLL_MS = 5000;
+	// Poll budget per attempt (~16 min). `inFlight` is the server's in-process
+	// `wikiRebuildInFlight` flag (the sweep runs inside the dashboard process, fire-
+	// and-forget), so it drops to false when the sweep ends and the poll terminates.
+	// This bound only governs a still-running sweep: on exhaustion we re-probe once
+	// and, if still inFlight, resume polling (showing continued progress is preferable
+	// to abandoning a long-but-live rebuild).
+	var WIKI_POLL_MAX = 200;
+	// The single live poll timer. Every scheduled tick clears the previous one before
+	// arming, so if the banner is ever re-mounted mid-rebuild (a future in-page
+	// re-render) the new chain replaces the old rather than stacking a second one.
+	var wikiPollTimer = null;
+
+	function wikiBannerHtml(f) {
+		var esc = JD.esc;
+		if (!f || f.available === false) return "";
+		if (f.inFlight) {
+			// Keep the warn tint while rebuilding if the wiki was warn-behind — the
+			// banner shouldn't lose its severity color mid-rebuild.
+			var inCls = f.severity === "warn" ? "warning-banner" : "callout";
+			return (
+				'<div class="' + inCls + '"><span class="spin" aria-hidden="true"></span>' +
+				"<span>Rebuilding the wiki/graph…</span></div>"
+			);
+		}
+		// Aggregate across the whole Memory Bank folder. Up to date (nothing behind):
+		// show nothing — the empty container collapses via `.wiki-freshness:empty`.
+		var names = (f.behindRepoNames || []).slice();
+		if (!names.length) return "";
+		var repo =
+			names.length === 1
+				? "for <strong>" + esc(names[0]) + "</strong>"
+				: "for <strong>" + names.length + " repos</strong> (" + esc(names.join(", ")) + ")";
+		var n = f.pending ? f.pending.summary : 0;
+		var extra = f.pending && f.pending.total > n ? f.pending.total - n : 0;
+		var label =
+			n > 0
+				? n + " new " + (n === 1 ? "memory" : "memories") + " to fold in"
+				: extra + " " + (extra === 1 ? "item" : "items") + " pending";
+		var cls = f.severity === "warn" ? "warning-banner" : "callout";
+		return (
+			'<div class="' + cls + '"><span>Wiki is behind ' + repo + " — " + esc(String(label)) +
+			". Rebuilding uses your LLM.</span> " +
+			'<button type="button" class="cta sm" data-wiki-rebuild="1">Rebuild wiki</button></div>'
+		);
+	}
+
+	function pollWikiUntilDone(container, tries) {
+		if (tries <= 0) {
+			refreshWikiBanner(container);
+			return;
+		}
+		// One timer only: clear any pending tick so a re-mounted chain replaces this
+		// one instead of running in parallel.
+		clearTimeout(wikiPollTimer);
+		wikiPollTimer = setTimeout(function () {
+			JD.getJson("/api/wiki/freshness")
+				.then(function (f) {
+					if (f && f.inFlight) {
+						container.innerHTML = wikiBannerHtml(f);
+						pollWikiUntilDone(container, tries - 1);
+					} else {
+						// Worker no longer running — read the final state once. A drop to
+						// fresh is success; still-behind means the run failed or held some
+						// sources, so we surface the (behind) banner again for a retry.
+						container.innerHTML = wikiBannerHtml(f);
+						wireWikiRebuild(container);
+					}
+				})
+				.catch(function () {
+					refreshWikiBanner(container);
+				});
+		}, WIKI_POLL_MS);
+	}
+
+	function wireWikiRebuild(container) {
+		var btn = container.querySelector("[data-wiki-rebuild]");
+		if (!btn) return;
+		btn.onclick = function () {
+			btn.disabled = true;
+			btn.textContent = "Rebuilding…";
+			JD.post("/api/wiki/rebuild", {})
+				.then(function () {
+					pollWikiUntilDone(container, WIKI_POLL_MAX);
+				})
+				.catch(function (e) {
+					// 409 (already running) is not an error for the user — just start polling.
+					if (e && e.status === 409) {
+						pollWikiUntilDone(container, WIKI_POLL_MAX);
+						return;
+					}
+					// Any other failure: surface it BUT keep a wired retry button — these
+					// pages have no auto-refresh poll, so a buttonless error callout would
+					// leave the feature dead until a full reload.
+					container.innerHTML = '<div class="callout err"><span>Could not start the rebuild: ' +
+						JD.esc(String((e && e.message) || "error")) + "</span> " +
+						'<button type="button" class="cta sm" data-wiki-rebuild="1">Retry</button></div>';
+					wireWikiRebuild(container);
+				});
+		};
+	}
+
+	function refreshWikiBanner(container) {
+		JD.getJson("/api/wiki/freshness")
+			.then(function (f) {
+				container.innerHTML = wikiBannerHtml(f);
+				if (f && f.inFlight) pollWikiUntilDone(container, WIKI_POLL_MAX);
+				else wireWikiRebuild(container);
+			})
+			.catch(function () {
+				container.innerHTML = ""; // slow probe failed — show nothing rather than a scary error
+			});
+	}
+
+	/* Mount the folder-wide freshness banner as the FIRST child of the right
+	   content column (`.main`) — the same top-of-column spot on both Knowledge and
+	   Graph, above the page header. Idempotent: `.main` outlives per-page `#app`
+	   re-renders, so reuse an existing banner instead of stacking a second one.
+	   Safe no-op when the column is missing. */
+	JD.mountWikiFreshness = function () {
+		var host = document.querySelector(".main");
+		if (!host) return;
+		var banner = host.querySelector(".wiki-freshness");
+		if (!banner) {
+			banner = document.createElement("div");
+			banner.className = "wiki-freshness";
+			host.insertBefore(banner, host.firstChild);
+		}
+		refreshWikiBanner(banner);
 	};
 })(window.JD);

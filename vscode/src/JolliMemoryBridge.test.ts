@@ -309,6 +309,10 @@ vi.mock("../../cli/src/core/SummaryStore.js", () => ({
 	storeSummary,
 }));
 
+vi.mock("../../cli/src/core/WikiFreshness.js", () => ({
+	getAggregateWikiFreshness: vi.fn(),
+}));
+
 vi.mock("../../cli/src/core/RegenerateContext.js", () => ({
 	loadRegenerateContext,
 }));
@@ -427,6 +431,7 @@ vi.mock("node:fs/promises", () => ({
 
 // ── Import under test (after mocks) ─────────────────────────────────────────
 
+import { getAggregateWikiFreshness } from "../../cli/src/core/WikiFreshness.js";
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -6520,5 +6525,41 @@ describe("JolliMemoryBridge", () => {
 				{ path: "README.md", dir: "", status: "A" },
 			]);
 		});
+	});
+});
+
+describe("JolliMemoryBridge.getWikiFreshness", () => {
+	it("delegates to the shared aggregate rule with the configured localFolder", async () => {
+		const bridge = makeBridge();
+		loadConfig.mockResolvedValue({ localFolder: "/mb" });
+		const freshness = {
+			repos: [],
+			behindRepoNames: ["acme"],
+			pending: { summary: 4, total: 5 },
+			lastRebuiltAt: "2026-08-12T00:00:00.000Z",
+			everBuilt: true,
+			severity: "warn" as const,
+		};
+		vi.mocked(getAggregateWikiFreshness).mockResolvedValue(freshness);
+		const result = await bridge.getWikiFreshness();
+		expect(result).toEqual(freshness);
+		// Folder-wide: called with the configured localFolder (not a single repo).
+		expect(vi.mocked(getAggregateWikiFreshness).mock.calls[0][0]).toBe("/mb");
+	});
+
+	it("returns an all-fresh empty snapshot when no localFolder is configured", async () => {
+		const bridge = makeBridge();
+		loadConfig.mockResolvedValue({});
+		vi.mocked(getAggregateWikiFreshness).mockClear();
+		const result = await bridge.getWikiFreshness();
+		expect(result).toEqual({
+			repos: [],
+			behindRepoNames: [],
+			pending: { summary: 0, total: 0 },
+			lastRebuiltAt: null,
+			everBuilt: false,
+			severity: "fresh",
+		});
+		expect(getAggregateWikiFreshness).not.toHaveBeenCalled();
 	});
 });
