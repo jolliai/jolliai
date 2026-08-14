@@ -20,7 +20,7 @@
  */
 
 import { readFile } from "node:fs/promises";
-import { createLogger, type Logger } from "../Logger.js";
+import { createLogger, isEnoent, type Logger } from "../Logger.js";
 import type {
 	ConversationTokenBreakdown,
 	ModelTokenUsage,
@@ -76,10 +76,6 @@ const SKIP_USER_PREFIXES = ["Base directory for this skill:", "[Request interrup
 const IDE_TAG_PATTERN =
 	/<(?:system-reminder|ide_opened_file|ide_selection|local-command-caveat|command-name|command-message|command-args|local-command-stdout)>[\s\S]*?<\/(?:system-reminder|ide_opened_file|ide_selection|local-command-caveat|command-name|command-message|command-args|local-command-stdout)>/g;
 
-export function isMissingFileError(error: unknown): boolean {
-	return (error as NodeJS.ErrnoException | null)?.code === "ENOENT";
-}
-
 /**
  * True when a transcript-read rejection was "the file is gone" rather than a real
  * read failure. Callers that already treat a vanished transcript as normal (a
@@ -87,20 +83,25 @@ export function isMissingFileError(error: unknown): boolean {
  * the terminal quiet while a genuine I/O fault still gets reported.
  *
  * TWO shapes carry the ENOENT, because the per-source readers disagree on how they
- * rethrow: the shared {@link readTranscript} wraps the original as `cause` (ES2020
- * `lib` predates the `Error(msg, {cause})` constructor), while the SQLite-backed
- * readers copy the original `.code` straight onto their wrapper (their callers
- * branch on `.code`). Inspecting only one shape is exactly the gap that left ten of
- * thirteen sources logging a rotated transcript as a fault every poll — see
- * {@link throwTranscriptReadError}, which now produces both.
+ * rethrow: the SQLite-backed readers copy the original `.code` straight onto their
+ * wrapper (their callers branch on `.code`), and every rethrow that goes through
+ * {@link throwTranscriptReadError} additionally carries the original as `cause`.
+ * Inspecting only one shape is exactly the gap that left ten of thirteen sources
+ * logging a rotated transcript as a fault every poll.
  *
  * One reader is bound to the `.code` shape and cannot be moved onto the other:
  * `CopilotChatTranscriptReader`'s `cause` is its own structured scan payload, which
  * `CopilotChatSessionDiscoverer` reads as `error.cause.kind`. So do not "simplify"
  * this to the `cause` branch alone.
+ *
+ * The predicate itself is {@link isEnoent} — the repo-wide one, ~25 call sites — and
+ * not a local restatement of it. The local copy this replaces differed by dropping
+ * `isEnoent`'s `instanceof Error` guard, which is a difference no producer here can
+ * exercise (every shape above wraps a real `fs` rejection) and a trap for whoever
+ * next has to decide which of two ENOENT tests to reach for.
  */
 export function isMissingTranscriptError(error: unknown): boolean {
-	return isMissingFileError(error) || isMissingFileError((error as { cause?: unknown } | null)?.cause);
+	return isEnoent(error) || isEnoent((error as { cause?: unknown } | null)?.cause);
 }
 
 /**
@@ -113,7 +114,7 @@ export function isMissingTranscriptError(error: unknown): boolean {
  */
 export function logTranscriptReadFailure(log: Logger, message: string, error: unknown): void {
 	const detail = error instanceof Error ? error.message : String(error);
-	(isMissingFileError(error) ? log.debug : log.error)("%s (%s)", message, detail);
+	(isEnoent(error) ? log.debug : log.error)("%s (%s)", message, detail);
 }
 
 /**
@@ -159,20 +160,16 @@ export async function readTranscript(
 	try {
 		content = await readFile(transcriptPath, "utf-8");
 	} catch (error: unknown) {
-		// A transcript the agent host rotated or deleted is an ordinary condition
-		// every caller already degrades gracefully on, so it stays out of the
-		// terminal: warn/error reach stderr even in CLI mode, debug does not.
-		// Anything else is a genuine read failure and keeps the error line.
-		if (isMissingFileError(error)) {
-			log.debug("Transcript file no longer exists: %s", transcriptPath);
-		} else {
-			log.error("Failed to read transcript file: %s", (error as Error).message);
-		}
-		// The cause is what lets a caller tell the two apart — see
-		// {@link isMissingTranscriptError}. Attached rather than passed to the
-		// constructor because this package's `lib` is ES2020, which predates the
-		// second argument (the runtime floor, Node 22, has it either way).
-		throw Object.assign(new Error(`Cannot read transcript: ${transcriptPath}`), { cause: error });
+		// Through the shared rethrow, like every per-source reader: a transcript the
+		// agent host rotated or deleted is an ordinary condition each caller already
+		// degrades on, so it logs at `debug` and stays out of the terminal while a
+		// genuine read failure keeps its `error` line — and the wrapper carries the
+		// original BOTH ways `isMissingTranscriptError` inspects. The hand-rolled
+		// version here attached only `cause`, so a caller that branched on `.code`
+		// (the shape the SQLite-backed readers produce) read a vanished transcript as
+		// an I/O fault. No caller does today; both go through that predicate. It was
+		// the next reader's trap, not a live bug.
+		throwTranscriptReadError(log, `Cannot read transcript: ${transcriptPath}`, error);
 	}
 
 	const lines = content.split("\n").filter((line) => line.trim().length > 0);

@@ -99,14 +99,11 @@ const options = {
 		// + "/<Worker>.js" — must exist as their own files in this dist.
 		{ in: resolve(jmSrc, "hooks", "QueueWorker.ts"), out: "QueueWorker" },
 		{ in: resolve(jmSrc, "hooks", "PrePushWorker.ts"), out: "PrePushWorker" },
-		// Read-only dashboard server. Needed because this dist can WIN dist-paths
-		// arbitration: `run-cli` would then launch THIS Cli.js for
-		// `jolli dashboard`, and DashboardCommand spawns its sibling
-		// DashboardServerEntry.js by name (same dirname+filename contract as
-		// QueueWorker.launchWorker). Without it `jolli enable`'s auto-open throws
-		// "Dashboard server entry not found" at the end of a successful enable.
-		// Its assets are copied below.
-		{ in: resolve(jmSrc, "dashboard", "ServerEntry.ts"), out: "DashboardServerEntry" },
+		// No dashboard server entry: `jolli dashboard` serves in its own process,
+		// so the server rides in Cli.js. Its ASSETS are still copied below, and
+		// still for the dist-paths reason — this dist can win arbitration, and
+		// `run-cli` would then launch THIS Cli.js, which reads the page runtime
+		// from `dashboard-assets/` beside itself.
 	],
 	outdir: resolve(pluginDir, "dist"),
 	// Entry points resolve their imports from cli/src, so start module resolution
@@ -126,10 +123,9 @@ const options = {
 // Guard the dist against a silently-dropped entry point. esbuild only fails on a
 // missing *source* file, not on a removed `entryPoints` line. Asserting here means
 // `build:codex-plugin` — and therefore CI — catches the drift. Kept in lockstep with
-// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus three
+// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus two
 // entries that never resolve through dist-paths/: CodexPluginBootstrapHook, which
-// the manifest launches directly; McpLauncher; and DashboardServerEntry, which
-// Cli.js spawns by name).
+// the manifest launches directly; and McpLauncher).
 const EXPECTED_ENTRY_OUTS = [
 	"Cli",
 	"CodexPluginBootstrapHook",
@@ -143,7 +139,6 @@ const EXPECTED_ENTRY_OUTS = [
 	"PrePushHook",
 	"QueueWorker",
 	"PrePushWorker",
-	"DashboardServerEntry",
 ];
 const actualOuts = options.entryPoints.map((e) => e.out).sort();
 const expectedOuts = [...EXPECTED_ENTRY_OUTS].sort();
@@ -172,8 +167,8 @@ if (isWatch) {
 	copyDashboardAssets();
 	console.log(
 		`Built Codex plugin dist/ v${pluginPkg.version} — ${options.entryPoints.length} entries ` +
-			"(Cli.js, CodexPluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, both workers, " +
-			"and the dashboard server + assets)",
+			"(Cli.js, CodexPluginBootstrapHook.js, McpLauncher.js, Stop/SessionStart hooks, the 5 git hooks, " +
+			"both workers) plus the dashboard assets",
 	);
 }
 
@@ -184,7 +179,7 @@ if (isWatch) {
  * and copied verbatim here — same DRY arrangement as claude-plugin's build.mjs and
  * vscode's scripts/copy-dashboard-assets.mjs. The server reads them from disk
  * relative to its own bundle (resolveDashboardAssetsDir), so they must sit beside
- * DashboardServerEntry.js.
+ * Cli.js — which is the bundle the server rides in now.
  *
  * Hard-fails rather than shipping a server with no pages: a silently asset-less
  * dist would only surface as a 500 the first time a user ran `jolli dashboard`.

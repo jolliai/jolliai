@@ -5637,9 +5637,12 @@ export function buildSidebarScript(): string {
     }
     var footerDashboard = e.target.closest('.cmd-btn[data-action="footer-dashboard"]');
     if (footerDashboard) {
-      // Starts (or reuses) the local dashboard server and opens the browser.
-      // Everything about that decision lives in the CLI's executeDashboard —
-      // see services/DashboardLauncher.ts for the host-side plugs.
+      // Starts the local dashboard and opens the browser. NOTE: no backticks in
+      // this comment -- the whole script is a template literal, so one would end
+      // it. The jolli dashboard command is a foreground command now, so the host
+      // runs it as a child process it owns rather than calling into the CLI
+      // in-process, and there is no reuse of an existing server -- see
+      // services/DashboardLauncher.ts.
       vscode.postMessage({ type: 'command', command: 'jollimemory.openDashboard' });
       e.stopPropagation(); return;
     }

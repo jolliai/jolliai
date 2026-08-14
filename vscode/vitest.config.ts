@@ -25,6 +25,8 @@ export default {
 		// file's header before adding a git env var — in particular it explains
 		// why an author identity is deliberately NOT injected.
 		setupFiles: [resolve(packageRoot, "../test/gitEnv.ts")],
+		// Pairs with the line above — see `test/scratchHome.ts`.
+		globalSetup: [resolve(packageRoot, "../test/scratchHome.ts")],
 		// This suite is not pure-unit: `ManualDisableFlag` / `BackfillDismissFlag`
 		// read and write real flag files through `RepoProfile`, which resolves the
 		// main worktree by spawning `git rev-parse --git-common-dir`, and

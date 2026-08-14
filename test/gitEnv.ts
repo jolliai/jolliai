@@ -70,6 +70,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setIsolatedHome } from "../cli/src/testUtils/isolatedHome.js";
+import { SCRATCH_HOME_ROOT_VAR } from "./scratchHome.js";
 
 /**
  * ## Home isolation: the default, not an opt-in
@@ -94,23 +95,36 @@ import { setIsolatedHome } from "../cli/src/testUtils/isolatedHome.js";
  * the cleanup is a manual `disabled_at` stamp against a live database.
  *
  * Hence: applied here, to every file, so a test is hermetic by construction with
- * nothing to remember — the same reasoning as the git isolation below. The
- * scratch home is per WORKER, not per file: setup modules re-evaluate for each
- * test file in a reused worker process, and `mkdtemp` per file would leave one
- * directory per test file behind. `process.env` is what survives across that
- * re-evaluation, so it doubles as the "already made one" flag.
+ * nothing to remember — the same reasoning as the git isolation below.
+ *
+ * The scratch home is per test FILE, and that is what the pool makes it: the CLI
+ * config pins `pool: "forks"` and takes vitest's default `isolate: true`, so every
+ * file gets a fresh process. An earlier version of this block described the home
+ * as per WORKER and used `process.env.JOLLI_TEST_HOME` as its "already made one"
+ * flag, on the reading that a setup module re-evaluates inside a REUSED process.
+ * Under `isolate: true` nothing survives to be found, so the flag was never set on
+ * entry and the guard never once fired.
+ *
+ * Per-file is the right granularity anyway — files run concurrently and
+ * `~/.jolli/jollimemory/` is a single machine-global path — so what changed is
+ * only WHERE they go: inside this run's root from `test/scratchHome.ts`, whose
+ * `teardown` removes the lot. Directly under `os.tmpdir()` nothing ever removed
+ * them, because no worker knows whether it is the last; 2708 had piled up in one
+ * developer's `%TEMP%` before that was noticed.
+ *
+ * The fallback matters for anyone running vitest with a config that forgot the
+ * `globalSetup`: a home is still isolated (the dangerous half), it just goes back
+ * to accumulating.
  *
  * The six files that call `setIsolatedHome` themselves keep working and are
  * still worth keeping: they need a home they can inspect, and their `restore()`
  * now returns to THIS scratch home rather than the real one.
- *
- * It is deliberately NOT removed at the end of the run. Nothing here knows when
- * the last worker is done, `os.tmpdir()` is the OS's to reap, and a half-deleted
- * home under a still-running worker is a far worse failure than a stale
- * directory.
  */
 if (!process.env.JOLLI_TEST_HOME) {
-	process.env.JOLLI_TEST_HOME = mkdtempSync(join(tmpdir(), "jolli-test-home-"));
+	const root = process.env[SCRATCH_HOME_ROOT_VAR];
+	process.env.JOLLI_TEST_HOME = root
+		? mkdtempSync(join(root, "home-"))
+		: mkdtempSync(join(tmpdir(), "jolli-test-home-"));
 }
 setIsolatedHome(process.env.JOLLI_TEST_HOME);
 

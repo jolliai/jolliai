@@ -1187,6 +1187,7 @@ vi.mock("node:timers", () => ({
 // ─── Import under test ─────────────────────────────────────────────────────
 
 import * as vscode from "vscode";
+import { referencesRoot } from "../../cli/src/core/references/ReferenceStore.js";
 import { runCopyBranchRecallPrompt, runRecallInClaudeCode } from "./commands/BranchRecallCommands.js";
 import {
 	ARCHIVED_MARKDOWN_SCHEME,
@@ -6350,9 +6351,17 @@ describe("Extension", () => {
 			expect(mockBridge.listNotes).not.toHaveBeenCalled();
 		});
 
-		// Mirrors `referencesRoot(workspaceRoot)` — the gate the handler applies before
-		// it will spend a bridge call. Same shape as the notes-dir paths above.
-		const REFERENCES_DIR = "/test/workspace/.jolli/jollimemory/references";
+		// The exact call the handler makes to build the gate it applies before it will
+		// spend a bridge call — not a re-spelling of it. `referencesRoot` ends in
+		// `join`, so on Windows it answers with `\` separators while a hard-coded
+		// POSIX literal does not, and the handler's `startsWith` gate then rejects
+		// every path here: the three arms that expect a bridge call failed on win32
+		// alone, silently passing CI (ubuntu-only). `referenceFile` keeps the children
+		// in the same separator space for the same reason. The notes-dir paths above
+		// need no equivalent because `getNotesDir` is mocked to a literal.
+		const REFERENCES_DIR = referencesRoot("/test/workspace");
+		const referenceFile = (source: string, stem: string): string =>
+			join(REFERENCES_DIR, source, `${stem}.md`);
 
 		it("pushes a saved reference file at its open preview", async () => {
 			// A reference preview renders through our own virtual document (the only way
@@ -6363,7 +6372,7 @@ describe("Extension", () => {
 			const saveCallback = onDidSaveTextDocument.mock.calls[0]?.[0] as
 				| ((doc: { fileName: string }) => Promise<void>)
 				| undefined;
-			const sourcePath = `${REFERENCES_DIR}/vercel/dpl_abc123.md`;
+			const sourcePath = referenceFile("vercel", "dpl_abc123");
 			// A preview must actually be open, which is what the name has always claimed:
 			// the arm is gated on one, so without this the handler correctly does nothing.
 			await showArchivedMarkdownPreview(
@@ -6395,7 +6404,7 @@ describe("Extension", () => {
 			mockBridge.listReferences.mockReset().mockResolvedValue([]);
 
 			await expect(
-				saveCallback?.({ fileName: `${REFERENCES_DIR}/vercel/dpl_abc123.md` }),
+				saveCallback?.({ fileName: referenceFile("vercel", "dpl_abc123") }),
 			).resolves.toBeUndefined();
 
 			expect(mockBridge.listReferences).not.toHaveBeenCalled();
@@ -6429,12 +6438,12 @@ describe("Extension", () => {
 			mockBridge.listReferences.mockReset().mockResolvedValue([
 				{
 					mapKey: "vercel:dpl_abc123",
-					sourcePath: `${REFERENCES_DIR}/vercel/dpl_abc123.md`,
+					sourcePath: referenceFile("vercel", "dpl_abc123"),
 				} as never,
 			]);
 
 			await expect(
-				saveCallback?.({ fileName: `${REFERENCES_DIR}/vercel/dpl_orphaned.md` }),
+				saveCallback?.({ fileName: referenceFile("vercel", "dpl_orphaned") }),
 			).resolves.toBeUndefined();
 
 			expect(mockBridge.listReferences).toHaveBeenCalled();
@@ -6458,7 +6467,7 @@ describe("Extension", () => {
 			mockBridge.listReferences.mockReset().mockRejectedValueOnce(new Error("bridge down"));
 
 			await expect(
-				saveCallback?.({ fileName: `${REFERENCES_DIR}/jira/KAN-5.md` }),
+				saveCallback?.({ fileName: referenceFile("jira", "KAN-5") }),
 			).resolves.toBeUndefined();
 
 			expect(mockBridge.listReferences).toHaveBeenCalled();
@@ -6540,8 +6549,10 @@ describe("Extension", () => {
 		// SAME mapKey, and plans.json (which PlansStore does watch) cannot say which
 		// body changed.
 		describe("references watcher", () => {
-			const REFERENCES_DIR = "/test/workspace/.jolli/jollimemory/references";
-			const SOURCE_PATH = `${REFERENCES_DIR}/vercel/dpl_abc123.md`;
+			// Reuses the enclosing `referenceFile` rather than re-spelling the layout: a
+			// watcher event carries `uri.fsPath`, which is separator-native, and this
+			// path has no `startsWith` gate to fail loudly if the two ever disagree.
+			const SOURCE_PATH = referenceFile("vercel", "dpl_abc123");
 			const MAP_KEY = "vercel:dpl_abc123";
 
 			/**
@@ -6632,7 +6643,7 @@ describe("Extension", () => {
 					.mockResolvedValue([{ mapKey: MAP_KEY, sourcePath: SOURCE_PATH } as never]);
 
 				// A stray file, or one a commit already archived out of the registry.
-				changeCallback()?.({ fsPath: `${REFERENCES_DIR}/vercel/dpl_orphaned.md` });
+				changeCallback()?.({ fsPath: referenceFile("vercel", "dpl_orphaned") });
 
 				await vi.waitFor(() => {
 					expect(mockBridge.listReferences).toHaveBeenCalled();

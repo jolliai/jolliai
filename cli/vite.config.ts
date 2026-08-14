@@ -237,9 +237,10 @@ export default defineConfig(({ mode }) => {
 					PrePushHook: resolve(__dirname, "src/hooks/PrePushHook.ts"),
 					PrePushWorker: resolve(__dirname, "src/hooks/PrePushWorker.ts"),
 					QueueWorker: resolve(__dirname, "src/hooks/QueueWorker.ts"),
-					// Spawned detached by DashboardCommand — "dist contains
-					// DashboardServerEntry.js" is a build contract, same as QueueWorker.
-					DashboardServerEntry: resolve(__dirname, "src/dashboard/ServerEntry.ts"),
+					// No DashboardServerEntry: `jolli dashboard` serves in its own
+					// process now, so the server is part of Cli.js. `dist/dashboard-assets/`
+					// is still emitted (see the copy plugin above) — the page runtime is
+					// read from disk at render time, not bundled.
 				},
 				formats: ["es"],
 			},
@@ -308,6 +309,11 @@ export default defineConfig(({ mode }) => {
 			// vscode suites) for what is neutralized and why an author identity is
 			// deliberately NOT injected.
 			setupFiles: ["../test/gitEnv.ts"],
+			// Makes (and afterwards removes) the one root the per-file scratch homes
+			// above go into. Must be paired with that `setupFiles` entry wherever it
+			// appears: without it the homes are still isolated, they just accumulate
+			// in `os.tmpdir()` forever — see `test/scratchHome.ts`.
+			globalSetup: ["../test/scratchHome.ts"],
 			// `--mode slow` inverts the split: run ONLY the heavy files. Coverage
 			// thresholds would obviously fail on 12 files, which is why
 			// `npm run test:slow` does not pass `--coverage`.

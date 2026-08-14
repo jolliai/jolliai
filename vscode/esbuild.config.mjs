@@ -95,12 +95,11 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
-		// Read-only dashboard server, spawned detached by `jolli dashboard` (and
-		// later the extension). Serves dist/dashboard-assets/, mirrored from the
-		// CLI build by scripts/copy-dashboard-assets.mjs. node:sqlite is
-		// lazy-imported and gated, so this entry imposes no floor of its own —
-		// the shared node22 target above is set by the extension host, not here.
-		{ in: `${jmSrc}/dashboard/ServerEntry.ts`,        out: "DashboardServerEntry" },
+		// No DashboardServerEntry: `jolli dashboard` serves in its own process, so
+		// the server rides in Cli.js. dist/dashboard-assets/ is still mirrored from
+		// the CLI build by scripts/copy-dashboard-assets.mjs — the page runtime is
+		// read from disk at render time, and this dist can win dist-paths
+		// arbitration and be the one serving it.
 	],
 	outdir: "dist",
 	// CLI entry points live under ../cli/src/, so esbuild's Node module

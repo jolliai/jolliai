@@ -2,6 +2,12 @@
 
 <!-- Last synced commit: 09554198 | 2026-08-13 -->
 
+## Unreleased
+
+- **Breaking: `jolli dashboard` runs in the foreground** — it now serves the dashboard from its own terminal until you press **Ctrl+C**, instead of leaving a background server running. `jolli dashboard --stop` is gone with it: there is nothing left to stop but the command in front of you, and closing the terminal stops it too. If you are upgrading with a background server still running from the old version, the new command recognises it as a Jolli dashboard and takes port 1818 back from it, saying so — there is nothing you need to stop by hand first.
+- **Opening the dashboard replaces the one already running.** `jolli dashboard` (and the dashboard that first-time `jolli` setup opens) now stops a dashboard already on its port before taking it, so you always get a fresh one on the address you expect. Only a Jolli dashboard is ever stopped — an unrelated service on port 1818 is left alone, and the new one moves to 18118 as before.
+- **`jolli` ends by opening your dashboard** — after the closing "Next steps", so nothing is left unsaid, and it keeps serving until you press Ctrl+C. This is every `jolli` run at a terminal, not only first-time setup: the status line, the memory count and Next steps are all on screen before it starts serving, so nothing is withheld, and opening the dashboard whenever it can is what makes `jolli` the one command to remember. A piped or non-interactive `jolli` is unchanged — it prints the command list as before and never blocks.
+
 ## 0.99.12
 
 - **Lighter with several AI sessions open** — sessions now share one MCP server per checkout instead of each starting its own.

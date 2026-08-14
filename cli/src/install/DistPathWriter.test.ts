@@ -192,23 +192,21 @@ describe("REQUIRED_RUNTIME_FILES — lockstep with sibling copies", () => {
 		expect([...requiredRuntimeFiles]).toEqual(writerList);
 	});
 
-	it("is a subset of claude-plugin's entry set (plugin adds PluginBootstrapHook + DashboardServerEntry)", async () => {
+	it("is a subset of claude-plugin's entry set (plugin adds PluginBootstrapHook)", async () => {
 		const [writerSrc, buildSrc] = await Promise.all([
 			readFile(join(repoRoot, "cli", "src", "install", "DistPathWriter.ts"), "utf-8"),
 			readFile(join(repoRoot, "claude-plugin", "plugins", "jolli", "scripts", "build.mjs"), "utf-8"),
 		]);
 		const writerList = extractStringArray(writerSrc, "REQUIRED_RUNTIME_FILES");
 		const pluginList = extractStringArray(buildSrc, "EXPECTED_ENTRY_OUTS");
-		// build.mjs strips `.js` from each entry (`Cli.js` → `Cli`) and adds
-		// two entries that never resolve through `dist-paths/`:
-		// `PluginBootstrapHook` (the manifest launches it directly) and
-		// `DashboardServerEntry` (the local dashboard server, deliberately kept
-		// OUT of REQUIRED_RUNTIME_FILES — promoting it would make every
-		// already-installed dist fail the completeness check and de-register
-		// itself, exactly as for codex-plugin's `McpLauncher`). Reconstruct the
-		// plugin's expected shape and assert the relation both ways so a
-		// removal on either side fails loudly.
-		const pluginOnly = ["PluginBootstrapHook", "DashboardServerEntry"];
+		// build.mjs strips `.js` from each entry (`Cli.js` → `Cli`) and adds one
+		// entry that never resolves through `dist-paths/`: `PluginBootstrapHook`,
+		// which the manifest launches directly. (It used to add a second,
+		// `DashboardServerEntry`; `jolli dashboard` serves in its own process now,
+		// so the dashboard server is part of `Cli.js` and there is no separate file
+		// to ship.) Reconstruct the plugin's expected shape and assert the relation
+		// both ways so a removal on either side fails loudly.
+		const pluginOnly = ["PluginBootstrapHook"];
 		const pluginExpected = new Set([...writerList.map((f) => f.replace(/\.js$/, "")), ...pluginOnly]);
 		expect(new Set(pluginList)).toEqual(pluginExpected);
 	});

@@ -309,10 +309,10 @@ tasks.named<PrepareSandboxTask>("prepareSandbox") {
     doFirst {
         // Both are checked, because Gradle's `from(<missing dir>)` is a silent
         // no-op: a vscode/dist produced before the dashboard existed — or by
-        // `build:watch`, which used to skip the asset copy — has Cli.js and
-        // DashboardServerEntry.js but no dashboard-assets/, and that ships a
-        // plugin whose `jolli dashboard` throws "Dashboard assets not found" at
-        // runtime instead of failing here where the message is actionable.
+        // `build:watch`, which used to skip the asset copy — has Cli.js but no
+        // dashboard-assets/, and that ships a plugin whose `jolli dashboard`
+        // throws "Dashboard assets not found" at runtime instead of failing here
+        // where the message is actionable.
         // index.html stands in for the tree: the copy is all-or-nothing, and the
         // per-file inventory is asserted by the plugins' own publish scripts.
         val required = listOf(
@@ -334,9 +334,9 @@ tasks.named<PrepareSandboxTask>("prepareSandbox") {
         exclude("Extension.js")
     }
     // The dashboard page runtime is a DIRECTORY, so the `include("*.js")` filter
-    // above skips it entirely — and DashboardServerEntry.js reads these files from
-    // disk beside itself (resolveDashboardAssetsDir), so a dist without them serves
-    // a broken page. Copied as its own spec, preserving the subtree.
+    // above skips it entirely — and Cli.js reads these files from disk beside
+    // itself (resolveDashboardAssetsDir), so a dist without them serves a broken
+    // page. Copied as its own spec, preserving the subtree.
     from(vscodeDistDir.dir("dashboard-assets")) {
         into("${rootProject.name}/cli-dist/dashboard-assets")
     }

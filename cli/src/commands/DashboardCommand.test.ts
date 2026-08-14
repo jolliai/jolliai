@@ -1,10 +1,10 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
+import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { DashboardServerState } from "../dashboard/DashboardServer.js";
-import { writeDashboardState } from "../dashboard/DashboardServer.js";
+import type { StartedDashboardServer } from "../dashboard/DashboardServer.js";
 import type { DbBackfillProgress } from "../dashboard/DbBackfill.js";
 import type { RegisteredRepo } from "../dashboard/RepoRegistry.js";
 
@@ -52,51 +52,94 @@ import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
+import { DASHBOARD_HEALTH_SERVICE } from "../dashboard/DashboardServer.js";
 import { dbBackfillRepos } from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import {
-	acquireSpawnLock,
 	createDeferredWriter,
 	createProgressPrinter,
 	type DashboardDeps,
-	ensureServerRunning,
 	executeDashboard,
+	identifyDashboardHealth,
 	importDashboardHistory,
 	registerDashboardCommand,
-	releaseSpawnLock,
 	resolveServerCwd,
+	startForegroundDashboard,
 } from "./DashboardCommand.js";
 
 let configDir: string;
 
-const state = (over: Partial<DashboardServerState> = {}): DashboardServerState => ({
-	pid: process.pid,
-	port: 1818,
-	startedAt: "2026-07-30T00:00:00.000Z",
-	schemaVersion: 1,
-	...over,
-});
-
+/**
+ * Every seam that would bind a socket, open a browser or park on a signal.
+ *
+ * `waitForShutdown` resolving immediately is what keeps this suite finite:
+ * `executeDashboard` awaits it last and, in production, does not return until
+ * the user presses Ctrl+C. A test that forgets it does not fail — it hangs.
+ */
 function deps(over: Partial<DashboardDeps> = {}): DashboardDeps & {
 	opened: string[];
-	spawned: Array<{ port: number | undefined }>;
+	started: Array<{ port: number | undefined; serverCwd: string | undefined }>;
+	probed: number[];
+	killed: number[];
+	waited: number;
+	telemetryStops: number;
 } {
 	const opened: string[] = [];
-	const spawned: Array<{ port: number | undefined }> = [];
+	const started: Array<{ port: number | undefined; serverCwd: string | undefined }> = [];
+	const probed: number[] = [];
+	const killed: number[] = [];
+	const box = { waited: 0, telemetryStops: 0 };
+	// A VIRTUAL clock the fake `sleep` drives, paired with `now` below. The
+	// reclaim's release wait is bounded in wall-clock time (see `reclaimPort`), so
+	// a no-op `sleep` against a real `Date.now` would make the "will not let go"
+	// case spin on the probe for two real seconds. Advancing the clock by exactly
+	// what was slept makes that budget deterministic and instant instead.
+	let clock = 0;
 	return {
 		configDir,
 		opened,
-		spawned,
+		started,
+		probed,
+		killed,
+		get waited() {
+			return box.waited;
+		},
+		get telemetryStops() {
+			return box.telemetryStops;
+		},
+		// Nothing on the port by default, so the reclaim step is a no-op unless a
+		// case says otherwise.
+		probeHealth: async (port: number) => {
+			probed.push(port);
+			return null;
+		},
+		killPid: (pid: number) => {
+			killed.push(pid);
+			return true;
+		},
+		sleep: async (ms: number) => {
+			clock += ms;
+		},
+		now: () => clock,
 		openBrowser: async (url: string) => {
 			opened.push(url);
 		},
-		spawnServer: (port) => {
-			spawned.push({ port });
-			// Simulate the child writing its state file once healthy.
-			void writeDashboardState(state({ port: port ?? 1818 }), configDir);
+		startServer: async (options): Promise<StartedDashboardServer> => {
+			started.push({ port: options.port, serverCwd: options.serverCwd });
+			return {
+				server: { closeAllConnections: () => {}, close: () => {} } as unknown as Server,
+				port: options.port ?? 1818,
+				fellBack: false,
+			};
 		},
-		fetchHealth: async () => ({ ok: true, pid: process.pid }),
-		sleep: async () => {},
+		startTelemetry: async () => ({
+			stop: async () => {
+				box.telemetryStops += 1;
+			},
+		}),
+		waitForShutdown: async () => {
+			box.waited += 1;
+		},
 		...over,
 	};
 }
@@ -126,149 +169,54 @@ afterEach(() => {
 	process.exitCode = undefined;
 });
 
-describe("spawn lock", () => {
-	it("is exclusive while the holder lives, and reclaimable when it dies", () => {
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		// Same-pid holder counts as alive → a second take fails.
-		expect(acquireSpawnLock(configDir)).toBe(false);
-		releaseSpawnLock(configDir);
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		releaseSpawnLock(configDir);
+describe("importDashboardHistory — the disabled repo", () => {
+	it("does not re-register a repo the user disabled", async () => {
+		// `registerRepo` REBUILDS the entry and clears the `disabledAt` that
+		// `jolli disable` set, so running it here silently undoes the user's own
+		// opt-out. Reachable whenever the flag is set while the hooks survive — an
+		// uninstall that failed after the flag was persisted, which is the order
+		// `uninstall` documents — and the front door reaches this on a bare `jolli`.
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await importDashboardHistory("/w", deps());
+		expect(registerRepo).not.toHaveBeenCalled();
 	});
 
-	it("reclaims a lock whose holder is a dead pid", () => {
-		writeFileSync(join(configDir, "dashboard-spawn.lock"), "999999999");
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		// Reclaimed through the exclusive create, so the file now names us.
-		expect(readFileSync(join(configDir, "dashboard-spawn.lock"), "utf-8")).toBe(String(process.pid));
-		releaseSpawnLock(configDir);
+	it("does not attempt a cutover on a repo the user disabled", async () => {
+		// The heavier of the two: it stamps `cutoverAttemptedAtMs` into that repo's
+		// profile and, on a passing compare, FREEZES its orphan branch behind a
+		// fence `jolli enable` may not clear.
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await importDashboardHistory("/w", deps());
+		expect(maybeAutoCutover).not.toHaveBeenCalled();
 	});
 
-	it("reclaims a lock whose contents are unreadable garbage", () => {
-		// A launcher killed mid-write must not wedge the dashboard forever.
-		writeFileSync(join(configDir, "dashboard-spawn.lock"), "");
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		releaseSpawnLock(configDir);
+	it("still sweeps every registered repo when this one is disabled", async () => {
+		// The import is machine-scoped — it walks the registry, not `cwd` — so one
+		// repo's opt-out must not stop the others being brought up to date.
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await importDashboardHistory("/w", deps());
+		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
 	});
 
-	it("does not reclaim a stale lock a live holder already took over", () => {
-		writeFileSync(join(configDir, "dashboard-spawn.lock"), "999999999");
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		// The reclaimed lock is now held by a live pid, so a second reclaimer is
-		// turned away instead of overwriting it — the double-spawn the blind
-		// overwrite used to allow.
-		expect(acquireSpawnLock(configDir)).toBe(false);
-		releaseSpawnLock(configDir);
+	it("says why the repo was left out", async () => {
+		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
+		await importDashboardHistory("/w", deps());
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("disabled here");
 	});
 });
 
-describe("ensureServerRunning", () => {
-	it("reuses a healthy recorded server without spawning", async () => {
-		await writeDashboardState(state(), configDir);
-		const d = deps();
-		const result = await ensureServerRunning(undefined, d);
-		expect(result.port).toBe(1818);
-		expect(d.spawned).toEqual([]);
+describe("importDashboardHistory — the cutover throttle", () => {
+	it("is the caller's choice, and off by default", async () => {
+		// `jolli enable` runs once and wants the attempt unconditionally.
+		await importDashboardHistory("/w", deps());
+		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.not.objectContaining({ throttle: true }));
 	});
 
-	it("passes the resolved cwd through to the spawned server", async () => {
-		let spawnedCwd: string | undefined;
-		const d = deps({
-			cwd: "/repo/root",
-			spawnServer: (port, cwd) => {
-				spawnedCwd = cwd;
-				void writeDashboardState(state({ port: port ?? 1818 }), configDir);
-			},
-		});
-		await ensureServerRunning(undefined, d);
-		expect(spawnedCwd).toBe("/repo/root");
-	});
-
-	it("reuses a healthy server when --port names the port it is already on", async () => {
-		await writeDashboardState(state({ port: 1818 }), configDir);
-		const d = deps();
-		expect((await ensureServerRunning(1818, d)).port).toBe(1818);
-		expect(d.spawned).toEqual([]);
-	});
-
-	it("replaces the live server when --port names a different one", async () => {
-		await writeDashboardState(state({ pid: 424242, port: 1818 }), configDir);
-		const killed: number[] = [];
-		const d = deps({
-			fetchHealth: async () => ({ ok: true, pid: 424242 }),
-			killPid: (pid) => {
-				killed.push(pid);
-				return true;
-			},
-		});
-		const result = await ensureServerRunning(2000, d);
-		// One server, on the requested port — not a second one beside the first,
-		// which would leave whichever lost the dashboard.json race unreachable.
-		expect(killed).toEqual([424242]);
-		expect(d.spawned).toEqual([{ port: 2000 }]);
-		expect(result.port).toBe(2000);
-	});
-
-	it("does not reuse a record whose port answers as a different process", async () => {
-		await writeDashboardState(state({ pid: 424242 }), configDir);
-		let calls = 0;
-		const d = deps({
-			// A foreign pid on our recorded port: the record is not ours to trust.
-			fetchHealth: async () => (++calls > 1 ? { ok: true, pid: process.pid } : { ok: true, pid: 777 }),
-		});
-		await ensureServerRunning(undefined, d);
-		expect(d.spawned).toHaveLength(1);
-	});
-
-	it("clears a stale record (dead server) and respawns", async () => {
-		await writeDashboardState(state({ pid: 999999999 }), configDir);
-		let calls = 0;
-		const d = deps({
-			fetchHealth: async () => ({ ok: ++calls > 1 }), // dead once, healthy after respawn
-		});
-		const result = await ensureServerRunning(undefined, d);
-		expect(d.spawned).toHaveLength(1);
-		expect(result.port).toBe(1818);
-	});
-
-	it("waits for a competing launcher instead of double-spawning", async () => {
-		// Someone else holds the lock…
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		const other = state({ port: 2222 });
-		const d = deps({
-			sleep: async () => {
-				// …and their server comes up while we wait.
-				await writeDashboardState(other, configDir);
-			},
-		});
-		try {
-			const result = await ensureServerRunning(undefined, d);
-			expect(result.port).toBe(2222);
-			expect(d.spawned).toEqual([]);
-		} finally {
-			releaseSpawnLock(configDir);
-		}
-	});
-
-	it("times out with a clear error when the competitor never delivers", async () => {
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		const d = deps({ fetchHealth: async () => ({ ok: false }) });
-		try {
-			await expect(ensureServerRunning(undefined, d)).rejects.toThrow(/never became healthy/);
-		} finally {
-			releaseSpawnLock(configDir);
-		}
-	});
-
-	it("times out when its own spawn never becomes healthy", async () => {
-		const d = deps({
-			spawnServer: () => {},
-			fetchHealth: async () => ({ ok: false }),
-		});
-		await expect(ensureServerRunning(undefined, d)).rejects.toThrow(/did not become healthy/);
-		// The lock was released on the way out.
-		expect(acquireSpawnLock(configDir)).toBe(true);
-		releaseSpawnLock(configDir);
+	it("throttles when the caller asks", async () => {
+		// The front door does: a bare `jolli` is typed many times a day, and the
+		// containment compare reads every file the frozen tip lists.
+		await importDashboardHistory("/w", deps(), { throttleCutover: true });
+		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.objectContaining({ throttle: true }));
 	});
 });
 
@@ -279,7 +227,7 @@ describe("importDashboardHistory", () => {
 		expect(registerRepo).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/w" }));
 		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
 		// The whole point of the split: enable must not bind a port or open a browser.
-		expect(d.spawned).toEqual([]);
+		expect(d.started).toEqual([]);
 		expect(d.opened).toEqual([]);
 	});
 
@@ -389,6 +337,323 @@ describe("importDashboardHistory", () => {
 	});
 });
 
+describe("identifyDashboardHealth — what a launch is allowed to signal", () => {
+	it("accepts the current payload, which names the service", () => {
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, service: DASHBOARD_HEALTH_SERVICE })).toEqual({
+			pid: 4242,
+		});
+	});
+
+	it("rejects a bare {ok, pid} — the payload any local service might answer", () => {
+		// The regression this guards: `reclaimPort` SIGTERMs whatever pid it is
+		// handed, so accepting this shape means killing an unrelated service that
+		// happens to hold 1818 — or, more likely, an explicit `--port` aimed at a
+		// dev server.
+		expect(identifyDashboardHealth({ ok: true, pid: 4242 })).toBeNull();
+	});
+
+	it("accepts the legacy detached server's four-field payload", () => {
+		// It predates the marker and SURVIVES the upgrade that added it, so without
+		// this arm a freshly upgraded CLI could never take its port back and would
+		// serve on the fallback for as long as that process lived.
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, port: 1818, schemaVersion: 12 })).toEqual({ pid: 4242 });
+	});
+
+	it("rejects a half-legacy payload — it is the two fields TOGETHER that identify it", () => {
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, port: 1818 })).toBeNull();
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, schemaVersion: 12 })).toBeNull();
+	});
+
+	it("rejects a foreign marker, a missing or non-numeric pid, ok:false, and non-objects", () => {
+		expect(identifyDashboardHealth({ ok: true, pid: 1, service: "some-other-tool" })).toBeNull();
+		expect(identifyDashboardHealth({ ok: true, service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+		expect(identifyDashboardHealth({ ok: true, pid: "4242", service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+		expect(identifyDashboardHealth({ ok: false, pid: 1, service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+		expect(identifyDashboardHealth(null)).toBeNull();
+		expect(identifyDashboardHealth("ok")).toBeNull();
+	});
+
+	it("rejects pid 0 and negatives — `process.kill` reads those as a process GROUP", () => {
+		// Not input hygiene. `process.kill(0)` signals every process in THIS
+		// process's group, so accepting a `pid: 0` body means the launch SIGTERMs
+		// itself and whatever shares its group — the user's shell pipeline included.
+		// A negative names the group `-pid`, which is the same weapon aimed further.
+		for (const pid of [0, -1, -4242]) {
+			expect(identifyDashboardHealth({ ok: true, pid, service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+			expect(identifyDashboardHealth({ ok: true, pid, port: 1818, schemaVersion: 12 })).toBeNull();
+		}
+		// Not a process id either, and it throws ERR_OUT_OF_RANGE rather than
+		// signalling anything — rejected here so the throw is never reached.
+		expect(identifyDashboardHealth({ ok: true, pid: 4.5, service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+		expect(identifyDashboardHealth({ ok: true, pid: Number.NaN, service: DASHBOARD_HEALTH_SERVICE })).toBeNull();
+	});
+
+	it("marks a responder from another pid namespace foreign rather than signallable", () => {
+		const local = { platform: "win32", host: "DESKTOP-1" };
+		// The measured case: a dashboard inside WSL answering a Windows CLI. Its pid
+		// is real in WSL and means nothing here — resolving it locally finds either
+		// nothing or an unrelated process, and killing that one neither frees the
+		// port nor leaves a trace.
+		expect(
+			identifyDashboardHealth(
+				{ ok: true, pid: 1873602, service: DASHBOARD_HEALTH_SERVICE, platform: "linux", host: "DESKTOP-1" },
+				local,
+			),
+		).toEqual({ pid: 1873602, foreign: true });
+		// A container on the same platform is caught by the hostname instead — its
+		// default is the container id.
+		expect(
+			identifyDashboardHealth(
+				{ ok: true, pid: 31, service: DASHBOARD_HEALTH_SERVICE, platform: "win32", host: "3f1c9a2b7e04" },
+				local,
+			),
+		).toEqual({ pid: 31, foreign: true });
+	});
+
+	it("treats a matching namespace, and an unstated one, as reachable", () => {
+		const local = { platform: "win32", host: "DESKTOP-1" };
+		expect(
+			identifyDashboardHealth(
+				{ ok: true, pid: 4242, service: DASHBOARD_HEALTH_SERVICE, platform: "win32", host: "DESKTOP-1" },
+				local,
+			),
+		).toEqual({ pid: 4242 });
+		// No evidence either way is NOT evidence of foreignness: every build before
+		// these two fields existed, and the legacy detached server, say nothing.
+		// Gating on their absence would make all of them unreclaimable, which is the
+		// exact failure the legacy arm was added to avoid.
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, service: DASHBOARD_HEALTH_SERVICE }, local)).toEqual({
+			pid: 4242,
+		});
+		expect(identifyDashboardHealth({ ok: true, pid: 4242, port: 1818, schemaVersion: 12 }, local)).toEqual({
+			pid: 4242,
+		});
+	});
+});
+
+describe("startForegroundDashboard — reclaiming the port", () => {
+	/** A dashboard answering on the preferred port. */
+	function occupiedBy(pid: number, over: Partial<DashboardDeps> = {}) {
+		let alive = true;
+		const d = deps({
+			probeHealth: async (port: number) => (alive && port === 1818 ? { pid } : null),
+			killPid: (killedPid: number) => {
+				if (killedPid === pid) alive = false;
+				return true;
+			},
+			...over,
+		});
+		return d;
+	}
+
+	it("kills the dashboard already on the preferred port, then binds it", async () => {
+		const d = occupiedBy(4242);
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		// Bound the port it just freed rather than falling through to 18118.
+		expect(d.started).toHaveLength(1);
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("Stopped the dashboard already running");
+	});
+
+	it("leaves a foreign service on the port alone", async () => {
+		// Anything that does not answer our own /health is not ours to signal —
+		// killing whatever holds 1818 would take down an unrelated local service.
+		const d = deps();
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.probed).toContain(1818);
+		expect(d.killed).toEqual([]);
+	});
+
+	it("never signals itself", async () => {
+		// A probe that somehow answers with our own pid must not make this process
+		// kill itself on the way to binding.
+		const d = deps({ probeHealth: async () => ({ pid: process.pid }) });
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.killed).toEqual([]);
+	});
+
+	it("reclaims the explicit --port rather than the default", async () => {
+		// Its own recorder: an injected `probeHealth` replaces the one `deps()`
+		// records through, so `d.probed` would stay empty here.
+		const asked: number[] = [];
+		const d = deps({
+			probeHealth: async (port: number) => {
+				asked.push(port);
+				return { pid: 99 };
+			},
+		});
+		await startForegroundDashboard("stats", { cwd: "/w", port: 3000 }, d);
+		expect(asked[0]).toBe(3000);
+		expect(d.killed).toEqual([99]);
+	});
+
+	it("binds anyway when the previous dashboard will not let go, and does not claim it stopped", async () => {
+		// The probe keeps answering, so the release wait times out. Falling through is
+		// the pre-existing behaviour: the bind loop moves to the next candidate.
+		const d = deps({ probeHealth: async () => ({ pid: 77 }), killPid: () => true });
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.started).toHaveLength(1);
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		// `killPid` answers whether the SIGNAL was delivered, never whether the
+		// process died. Reporting this as "Stopped" put that line directly above the
+		// fallback line saying the same port was still in use — one port, two
+		// contradictory sentences, and the first one false.
+		expect(printed).not.toContain("Stopped the dashboard");
+		expect(printed).toContain("still holding the port");
+	});
+
+	it("names a dashboard it found but could not stop", async () => {
+		// Measured case: a dashboard inside WSL answers a Windows CLI on loopback
+		// and reports a Linux process id that does not exist on the Windows side.
+		// Reporting that as "nothing there" left the port silently changing.
+		const d = deps({ probeHealth: async () => ({ pid: 1873602 }), killPid: () => false });
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).not.toContain("Stopped the dashboard");
+		expect(printed).toContain("could not be stopped from here");
+	});
+
+	it("never signals a responder that proved it is in another pid namespace", async () => {
+		// `killPid` answering false is what the case above relies on, and it only
+		// answers false while nothing local happens to hold that id. When something
+		// does, the signal LANDS — on a stranger — the port stays held, and the
+		// outcome is indistinguishable from a slow release. So the decision has to
+		// be made before `killPid` is reached, not from its answer.
+		const d = deps({
+			probeHealth: async () => ({ pid: 1873602, foreign: true }),
+			killPid: () => true,
+		});
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.killed).toEqual([]);
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("could not be stopped from here");
+	});
+
+	it("reclaims the fallback port too, so an occupied 1818 cannot leave two dashboards", async () => {
+		// The scenario, with nothing unusual in it: an unrelated local service holds
+		// 1818, so the first launch falls back to 18118. A second launch that only
+		// reclaimed its preferred port would find 1818 not ours, 18118 taken by the
+		// first dashboard, and land on an OS-assigned one — two dashboards running
+		// concurrent imports and cutover attempts against one database.
+		// Its own recorders: injected seams replace the ones `deps()` records
+		// through, so `d.probed` / `d.killed` would stay empty here.
+		const asked: number[] = [];
+		const killed: number[] = [];
+		let alive = true;
+		const d = deps({
+			probeHealth: async (port: number) => {
+				asked.push(port);
+				return alive && port === 18118 ? { pid: 4242 } : null;
+			},
+			killPid: (pid: number) => {
+				killed.push(pid);
+				alive = false;
+				return true;
+			},
+		});
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(asked).toContain(18118);
+		expect(killed).toEqual([4242]);
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain(
+			"Stopped the dashboard already running on port 18118",
+		);
+	});
+
+	it("keeps an explicit --port to that port alone", async () => {
+		// The bind's own candidate list is one long under `--port`, so reclaiming the
+		// defaults would kill a dashboard this launch is not competing with.
+		const asked: number[] = [];
+		const d = deps({
+			probeHealth: async (port: number) => {
+				asked.push(port);
+				return null;
+			},
+		});
+		await startForegroundDashboard("stats", { cwd: "/w", port: 3000 }, d);
+		expect(asked).toEqual([3000]);
+	});
+});
+
+describe("startForegroundDashboard", () => {
+	it("binds, opens the plain page URL and hands back an unresolved wait", async () => {
+		const d = deps();
+		const dashboard = await startForegroundDashboard("standup", { cwd: "/w" }, d);
+		expect(d.started).toHaveLength(1);
+		// No `?t=` — the URL is hand-openable, which is why the token was dropped.
+		expect(d.opened[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/dashboard\/standup$/);
+		// Returning BEFORE the wait is the whole point of the split: the caller
+		// decides what runs while the page is already up.
+		expect(d.waited).toBe(0);
+		await dashboard.waitForShutdown();
+		expect(d.waited).toBe(1);
+	});
+
+	it("passes the resolved repo root as the server's cwd", async () => {
+		const d = deps();
+		await startForegroundDashboard("stats", { cwd: process.cwd() }, d);
+		// Whatever resolveServerCwd answers, it must reach the server — that value
+		// is what the Settings page's repo-scoped actions act on.
+		expect(d.started[0]?.serverCwd).toBe(await resolveServerCwd(process.cwd()));
+	});
+
+	it("honours --no-open", async () => {
+		const d = deps();
+		await startForegroundDashboard("stats", { cwd: "/w", open: false }, d);
+		expect(d.opened).toEqual([]);
+	});
+
+	it("a browser failure is non-fatal — the server is still up", async () => {
+		const d = deps({
+			openBrowser: async () => {
+				throw new Error("no display");
+			},
+		});
+		await expect(startForegroundDashboard("stats", { cwd: "/w" }, d)).resolves.toBeDefined();
+	});
+
+	it("announces the port it fell back to", async () => {
+		const d = deps({
+			startServer: async () => ({
+				server: { closeAllConnections: () => {}, close: () => {} } as unknown as Server,
+				port: 18118,
+				fellBack: true,
+			}),
+		});
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		// With no state record and no reuse probe, this line is the only signal
+		// that something else already holds the preferred port.
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain(
+			"Port 1818 was in use — serving on 18118 instead.",
+		);
+	});
+
+	it("names BOTH preferred ports when the bind landed on an OS-assigned one", async () => {
+		// Reaching a third candidate means 1818 AND 18118 were taken. Naming only
+		// 1818 there is true but reads as though the documented fallback were still
+		// free — the one thing the user would try next.
+		const d = deps({
+			startServer: async () => ({
+				server: { closeAllConnections: () => {}, close: () => {} } as unknown as Server,
+				port: 54321,
+				fellBack: true,
+			}),
+		});
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain(
+			"Ports 1818 and 18118 were in use — serving on 54321 instead.",
+		);
+	});
+
+	it("stops telemetry through the shutdown seam, not on its own", async () => {
+		const d = deps();
+		const dashboard = await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.telemetryStops).toBe(0);
+		await dashboard.waitForShutdown();
+		// The injected seam does not stop it; the DEFAULT one does. What this pins
+		// is that nothing else stops it early — a stopped flusher would silently
+		// strand every beacon event for the rest of the session.
+		expect(d.telemetryStops).toBe(0);
+	});
+});
+
 describe("executeDashboard", () => {
 	it("refuses below the node:sqlite floor", async () => {
 		vi.mocked(canUseDashboardDb).mockReturnValueOnce(false);
@@ -399,15 +664,35 @@ describe("executeDashboard", () => {
 		await expect(executeDashboard("stats", { port: "not-a-port" }, deps())).resolves.toBe(false);
 	});
 
-	it("registers the repo, ensures the server, opens the plain page URL, then backfills", async () => {
+	it("registers the repo, binds, opens the page, then backfills, then waits", async () => {
 		const d = deps();
 		await executeDashboard("standup", { cwd: "/w" }, d);
 		expect(registerRepo).toHaveBeenCalledWith(expect.objectContaining({ cwd: "/w" }));
-		expect(d.spawned).toHaveLength(1);
-		expect(d.opened).toHaveLength(1);
-		// No `?t=` — the URL is hand-openable, which is why the token was dropped.
+		expect(d.started).toHaveLength(1);
 		expect(d.opened[0]).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/dashboard\/standup$/);
 		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
+		// The import runs while the page is already serving — that ordering is why
+		// a first-run sweep does not leave the browser on a blank tab.
+		expect(d.waited).toBe(1);
+	});
+
+	it("does not return until the shutdown seam resolves", async () => {
+		let release = (): void => {};
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const d = deps({ waitForShutdown: () => blocked });
+		let returned = false;
+		const run = executeDashboard("stats", { cwd: "/w" }, d).then((ok) => {
+			returned = true;
+			return ok;
+		});
+		// Everything else runs to completion; the command then parks on the signal.
+		await vi.waitFor(() => expect(dbBackfillRepos).toHaveBeenCalledTimes(1));
+		await vi.waitFor(() => expect(opportunisticSnapshot).toHaveBeenCalledTimes(1));
+		expect(returned).toBe(false);
+		release();
+		await expect(run).resolves.toBe(true);
 	});
 
 	it("attempts a THROTTLED auto-cutover after the import", async () => {
@@ -422,12 +707,16 @@ describe("executeDashboard", () => {
 		);
 	});
 
-	it("a launch that never got a server does not attempt a cutover", async () => {
-		// Everything past `ensureServerRunning` is skipped on the failure return, so
-		// a repo whose dashboard cannot start is not silently fenced either.
-		const d = deps({ fetchHealth: async () => ({ ok: false }) });
+	it("a launch that never bound does not import, cut over or wait", async () => {
+		const d = deps({
+			startServer: async () => {
+				throw new Error("EADDRINUSE");
+			},
+		});
 		await expect(executeDashboard("stats", {}, d)).resolves.toBe(false);
+		expect(dbBackfillRepos).not.toHaveBeenCalled();
 		expect(maybeAutoCutover).not.toHaveBeenCalled();
+		expect(d.waited).toBe(0);
 	});
 
 	it("opens the dashboard for a disabled repo but writes nothing to that repo", async () => {
@@ -460,10 +749,7 @@ describe("executeDashboard", () => {
 		expect(printed.some((line) => line.includes("disabled here"))).toBe(true);
 	});
 
-	it("takes the daily snapshot here, not in the read-only server process", async () => {
-		// The trigger used to live in `startDashboardServer`, where it opened a
-		// WRITABLE handle (and so could run schema migrations) from the one
-		// long-lived process whose build can lag behind the launcher's.
+	it("takes the daily snapshot in this process", async () => {
 		const d = deps();
 		await executeDashboard("stats", {}, d);
 		expect(opportunisticSnapshot).toHaveBeenCalledTimes(1);
@@ -482,78 +768,9 @@ describe("executeDashboard", () => {
 		expect(d.opened).toEqual([]);
 	});
 
-	it("a browser failure is non-fatal", async () => {
-		const d = deps({
-			openBrowser: async () => {
-				throw new Error("no display");
-			},
-		});
-		await expect(executeDashboard("stats", {}, d)).resolves.toBe(true);
-	});
-
 	it("a backfill failure warns but does not fail the command", async () => {
 		vi.mocked(dbBackfillRepos).mockRejectedValueOnce(new Error("db locked"));
 		await expect(executeDashboard("stats", {}, deps())).resolves.toBe(true);
-	});
-
-	it("reports a server that cannot start", async () => {
-		const d = deps({ spawnServer: () => {}, fetchHealth: async () => ({ ok: false }) });
-		await expect(executeDashboard("stats", {}, d)).resolves.toBe(false);
-	});
-
-	it("--stop kills the recorded pid and clears state; a second --stop reports not running", async () => {
-		await writeDashboardState(state({ pid: 424242 }), configDir);
-		const killed: number[] = [];
-		const d = deps({
-			// /health confirms the recorded pid is still the server on that port.
-			fetchHealth: async () => ({ ok: true, pid: 424242 }),
-			killPid: (pid) => {
-				killed.push(pid);
-				return true;
-			},
-		});
-		await executeDashboard("stats", { stop: true }, d);
-		expect(killed).toEqual([424242]);
-		await executeDashboard("stats", { stop: true }, d); // state cleared → "not running"
-		expect(killed).toEqual([424242]);
-	});
-
-	it("--stop copes with a pid that already exited", async () => {
-		await writeDashboardState(state({ pid: 424242 }), configDir);
-		const d = deps({ fetchHealth: async () => ({ ok: true, pid: 424242 }), killPid: () => false });
-		await expect(executeDashboard("stats", { stop: true }, d)).resolves.toBe(true);
-	});
-
-	it("--stop never signals a pid /health cannot confirm", async () => {
-		// The recorded server is gone and the OS may have handed 424242 to anything.
-		await writeDashboardState(state({ pid: 424242 }), configDir);
-		const killed: number[] = [];
-		const d = deps({
-			fetchHealth: async () => ({ ok: false }),
-			killPid: (pid) => {
-				killed.push(pid);
-				return true;
-			},
-		});
-		await expect(executeDashboard("stats", { stop: true }, d)).resolves.toBe(true);
-		expect(killed).toEqual([]);
-		// The stale record is still cleared — there is nothing of ours to stop.
-		expect(existsSync(join(configDir, "dashboard.json"))).toBe(false);
-	});
-
-	it("--stop never signals when the port answers as a different process", async () => {
-		await writeDashboardState(state({ pid: 424242 }), configDir);
-		const killed: number[] = [];
-		const d = deps({
-			// Something is listening there, but it is not the pid we recorded.
-			fetchHealth: async () => ({ ok: true, pid: 777 }),
-			killPid: (pid) => {
-				killed.push(pid);
-				return true;
-			},
-		});
-		await executeDashboard("stats", { stop: true }, d);
-		expect(killed).toEqual([]);
 	});
 });
 
@@ -569,7 +786,10 @@ describe("registerDashboardCommand", () => {
 		expect(names).not.toContain("standup");
 		const dashboard = program.commands.find((c) => c.name() === "dashboard");
 		const flags = dashboard?.options.map((o) => o.long);
-		expect(flags).toEqual(expect.arrayContaining(["--port", "--no-open", "--stop", "--cwd"]));
+		expect(flags).toEqual(expect.arrayContaining(["--port", "--no-open", "--cwd"]));
+		// `--stop` went with the background server: Ctrl+C is the stop now, and a
+		// flag that signalled a recorded pid has nothing left to signal.
+		expect(flags).not.toContain("--stop");
 	});
 
 	it("turns an executeDashboard failure into exit code 1 (soft callers like enable see only the boolean)", async () => {

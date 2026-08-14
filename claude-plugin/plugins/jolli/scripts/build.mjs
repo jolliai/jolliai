@@ -91,13 +91,11 @@ const options = {
 		// + "/<Worker>.js" — must exist as their own files in this dist.
 		{ in: resolve(jmSrc, "hooks", "QueueWorker.ts"), out: "QueueWorker" },
 		{ in: resolve(jmSrc, "hooks", "PrePushWorker.ts"), out: "PrePushWorker" },
-		// Read-only dashboard server. Needed because this dist can WIN dist-paths
-		// arbitration: `run-cli` would then launch THIS Cli.js for
-		// `jolli dashboard`, and DashboardCommand spawns its sibling
-		// DashboardServerEntry.js by name (same dirname+filename contract as
-		// QueueWorker.launchWorker). Without it the dashboard cannot start from a
-		// plugin-only install. Its assets are copied below.
-		{ in: resolve(jmSrc, "dashboard", "ServerEntry.ts"), out: "DashboardServerEntry" },
+		// No dashboard server entry: `jolli dashboard` serves in its own process,
+		// so the server rides in Cli.js. Its ASSETS are still copied below, and
+		// still for the dist-paths reason — this dist can win arbitration, and
+		// `run-cli` would then launch THIS Cli.js, which reads the page runtime
+		// from `dashboard-assets/` beside itself.
 	],
 	outdir: resolve(pluginDir, "dist"),
 	// Entry points resolve their imports from cli/src, so start module resolution
@@ -133,7 +131,6 @@ const EXPECTED_ENTRY_OUTS = [
 	"PrePushHook",
 	"QueueWorker",
 	"PrePushWorker",
-	"DashboardServerEntry",
 ];
 const actualOuts = options.entryPoints.map((e) => e.out).sort();
 const expectedOuts = [...EXPECTED_ENTRY_OUTS].sort();
@@ -162,8 +159,8 @@ if (isWatch) {
 	copyDashboardAssets();
 	console.log(
 		`Built plugin dist/ v${pluginPkg.version} — ${options.entryPoints.length} entries ` +
-			"(Cli.js, PluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, both workers, " +
-			"and the dashboard server + assets)",
+			"(Cli.js, PluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, both workers) " +
+			"plus the dashboard assets",
 	);
 }
 
@@ -173,8 +170,8 @@ if (isWatch) {
  * The assets are minified ONCE by the CLI's vite build (cli/dist/dashboard-assets)
  * and copied verbatim here — same DRY arrangement as vscode's
  * scripts/copy-dashboard-assets.mjs. The server reads them from disk relative to
- * its own bundle (resolveDashboardAssetsDir), so they must sit beside
- * DashboardServerEntry.js.
+ * its own bundle (resolveDashboardAssetsDir), so they must sit beside Cli.js —
+ * which is the bundle the server rides in now.
  *
  * Hard-fails rather than shipping a server with no pages: a silently asset-less
  * dist would only surface as a 500 the first time a user ran `jolli dashboard`.

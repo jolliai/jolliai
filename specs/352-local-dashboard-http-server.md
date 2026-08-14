@@ -2,25 +2,24 @@
 
 ## Topic Statement
 
-The loopback-only HTTP service that renders the local dashboard's pages and answers its JSON endpoints: how it binds and advertises itself, the complete route surface it serves, the browser-facing checks each route is subject to, and how a page is assembled entirely from inlined assets.
+The loopback-only HTTP service that renders the local dashboard's pages and answers its JSON endpoints: how it binds, the complete route surface it serves, the browser-facing checks each route is subject to, and how a page is assembled entirely from inlined assets. It is a library bound inside the `jolli dashboard` command's own process and owns nothing about that process's lifecycle.
 
 ## Scope
 
 **In scope:**
 
-- Process start: the detached entry, its runtime refusal, the port it is told to use, and the signal/idle teardown.
-- Bind address, the ordered port candidates, and the state record written on a successful bind and cleared on shutdown.
+- Bind address, the ordered port candidates, and the fallback signal returned to the caller.
 - The full route surface: every method and path, its inputs, and its response body — including the redirects and the paths that deliberately answer 404.
 - The browser security model in the order the checks run: host allowlist, origin rejection, framing denial, the mutation token, and the fetch-metadata signal.
 - **The access boundary**: which routes require the token and which do not.
 - Page assembly: how the asset directory is located, what a partial tree does, and what is inlined into the served HTML.
 - The one model-spending read path and the two conditions that suppress it, plus the one model-spending mutation and its concurrency guard.
-- The two database writes this process makes, and the different version conditions each is subject to.
+- The two database writes this process makes, and the version condition the schema-existence one is still subject to.
 - Per-request work that is skipped or memoised (reachability, per-worktree git identity, the asset directory).
 
 **Boundaries (consumed here, owned elsewhere):**
 
-- The launcher command that spawns this process, probes it, waits for it, opens the browser, and runs the history import — a separate topic. Only the contract between them (the state record, the health route, the port environment variable) is stated here.
+- The command that binds this server, opens the browser, runs the history import and waits for the stop signal — a separate topic (361). This server is a library to it: it is constructed and listened on in that command's own process, and owns nothing about the process lifecycle.
 - The dashboard database, its schema, and every model-building query behind `/api/model`, `/api/memories` and `/api/context`.
 - The browser-side page modules that consume the inlined model and call these routes.
 - The repository registry, the identity derivation, and the folder probe — the Repository Registry and Probe topic.
@@ -36,25 +35,23 @@ The listener always binds **`127.0.0.1`** — never a wildcard address.
 
 Port selection:
 
-- An explicit port (supplied by the launcher through the environment variable **`JOLLI_DASHBOARD_PORT`**, parsed as a base-10 integer and used only when finite) is the **only** candidate. There is no fallback from it.
+- An explicit port (passed by the caller) is the **only** candidate. There is no fallback from it, so an occupied explicit port is an error rather than a move.
 - Otherwise the candidates are tried in order: **`1818`**, then **`18118`**, then **`0`** (OS-assigned). A bind failure on one candidate discards that listener and tries the next; the trailing `0` cannot collide, so the loop always settles.
 
-### The state record
+A successful bind answers with the listener, the port, and a **fallback flag** — true whenever the winning candidate was not the first one tried. That flag is the only trace of a taken preferred port: there is no state record and no liveness probe, so an unexplained port would otherwise be unexplainable to the user.
 
-Written to **`~/.jolli/jollimemory/dashboard.json`** immediately after a successful bind, with owner-only permissions (`0600`), pretty-printed JSON plus a trailing newline:
+### No state record, and one liveness route with a narrow purpose
 
-```json
-{
-  "pid": 12345,
-  "port": 1818,
-  "startedAt": "2026-01-01T00:00:00.000Z",
-  "schemaVersion": 5
-}
-```
+Nothing is written to disk on bind, and nothing is cleaned up on exit. This server is bound inside the command process that serves it and dies with it.
 
-Reading it tolerates anything: a parse failure, or a body whose `port` is not a number, reads as **absent**. A missing file reads as absent silently; any other read error is logged.
+Removed, and their absence is load-bearing: the `~/.jolli/jollimemory/dashboard.json` record of pid/port/schema version, the pid-conditional clear on shutdown, and the two-hour idle self-shutdown. They existed so a later invocation could find and **reuse** a detached server, and reuse is what let a server outlive the build that started it — see the database-writes section for the constraint that used to follow from it.
 
-Clearing it is **conditional on a pid** when the caller supplies one: the record is re-read first, and if it now names a different pid it is left alone. Read-then-unlink is not atomic, so a record rewritten inside that window can still be removed.
+**`GET /health` survives, inverted.** It answers `{"ok":true,"pid":<number>}`, ungated, and its one consumer is the next launch — which uses it to STOP this server and take its port, never to attach to it. Two properties make that safe, and both are the reason it is a route rather than a file:
+
+- **The pid is fresh.** It arrives in a response from the port about to be taken, so the process is alive by construction. A recorded pid could have been recycled onto something else, which is the hazard the state file carried.
+- **Silence protects a stranger.** Anything holding the port that does not answer this route is not a dashboard, is left alone, and the bind falls through to the next candidate.
+
+It exposes a process id and the fact that a dashboard is running, which is why it needs no token.
 
 ### The mutation token
 
@@ -90,19 +87,11 @@ That same nine-script inventory is restated in **three** places outside the serv
 
 ## Behavior
 
-### Process start
-
-1. Refuse outright when the runtime cannot load the built-in database module without an experimental flag: the process throws before binding, so the launcher's health probe fails fast and its own message names the runtime floor.
-2. Read the port from the environment variable.
-3. Prime telemetry for this process and start its periodic flush. Best-effort — a failure here never blocks serving.
-4. Bind (below), then write the state record.
-5. Register `SIGINT` and `SIGTERM` handlers.
-
 ### Binding
 
-For each candidate port in order: construct a listener, attach a **bind-phase-only** error listener, and listen on `127.0.0.1`. On success the bind-phase listener is detached and replaced with one that merely logs later errors; on failure the listener is closed (which is what releases its idle poll) and the next candidate is tried.
+For each candidate port in order: construct a listener, attach a **bind-phase-only** error listener, and listen on `127.0.0.1`. On success the bind-phase listener is detached and replaced with one that merely logs later errors; on failure the listener is closed and the next candidate is tried.
 
-The idle clock starts and the idle poll is armed **when a listener actually starts serving**, not when it was constructed — so a candidate that lost the port never arms a timer that could later shut down the winner sharing the same process.
+The runtime floor is checked by the command before it gets here, so this module assumes a usable built-in database module.
 
 ### Per-request gate order
 
@@ -133,7 +122,7 @@ Stated plainly, because it is the security-relevant default:
 | --- | --- | --- | --- |
 | `/api/repo-probe` | **required** | `path` (query) | 403 plain `Forbidden` on a bad/absent token; **400** `{"error":"path is required"}` when `path` is empty; else **200** with the folder probe result. **No shipped caller** — see the note below |
 | `/api/settings/check-folder` | **required** | `path` (query, defaults to `""`) | 403 as above; **200** `{"status":"empty"\|"ok"\|"relative"\|"missing"\|"not-a-dir"\|"not-writable"}` |
-| `/health` | no | — | **200** `{"ok":true,"pid":<number>,"port":<number>,"schemaVersion":<number>}` |
+| `/health` | no | — | **200** `{"ok":true,"pid":<number>}`. Consumed only by the next launch, to stop this server and take its port |
 | `/` | no | window params (ignored except scope) | **302** to `/repositories` when no enabled repository exists, else to `/dashboard` |
 | `/decisions` | no | — | **302** to `/memories`, unconditionally |
 | `/repositories`, `/dashboard`, `/dashboard/standup`, `/memories` | no | window params | **200** assembled HTML — or **302** to `/repositories` for the three gated paths (below) |
@@ -225,46 +214,23 @@ Two, and only two:
 
 ### The database writes this process makes
 
-Two, not one — and the widely-repeated rule that this process never migrates the schema is **false as an absolute**.
+Two, not one.
 
-**The schema-existence open** runs while building the model for *any* model-building route. It first reads the version read-only; if the file is missing, or its schema is **behind** this build, it opens writable and brings it up to date. A file **ahead** of this build is left alone. So the real guarantee is one-directional: a lagging server cannot downgrade or migrate a newer file, but a current server will happily upgrade an older one mid-request. The step exists because a read-only open on a missing file surfaces as the scriptless plain-text 500 that nothing polls its way out of.
+**The schema-existence open** runs while building the model for *any* model-building route. It first reads the version read-only; if the file is missing, or its schema is **behind** this build, it opens writable and brings it up to date. A file **ahead** of this build is left alone. The step exists because a read-only open on a missing file surfaces as the scriptless plain-text 500 that nothing polls its way out of — and since the command migrated the schema before binding, in practice it only fires when the file disappears under a running server.
 
-**The registry projection** runs after a successful enable, disable or resume, so the change is visible to the very next request rather than at the next launcher run. Mechanically it is not a table poke: it re-reads the registry and puts the resulting repository event through the same write protocol every producer uses (spec 354).
+**The registry projection** runs after a successful enable, disable or resume, so the change is visible to the very next request rather than at the next `jolli dashboard` run. Mechanically it is not a table poke: it re-reads the registry and puts the resulting repository event through the same write protocol every producer uses (spec 354). It is an ordinary writable open, with no version gate of its own.
 
-It carries the stricter gate: the version is read through a read-only open first, and the projection is **skipped unless the file is already at exactly this build's version**. The reasoning is that this is the one long-lived process whose build can lag behind whatever spawned it — a launcher reuses whatever server the state record names once its health probe answers, and that probe's verdict is built from the reported liveness and pid alone, never from the version the route also returns.
+It used to carry one: the version was read read-only first and the projection was skipped unless the file was already at exactly this build's version. That gate existed because the server was **detached** and a later invocation would reuse it after a liveness probe that reported no version — making it the one long-lived process whose build could lag behind whatever started it. Serving in the command's own process removes the premise, and the command has already migrated the file by the time anything can be projected.
 
 Failure never fails the request. The route answers 200 with a `warning` string ("the repository list may be out of date until the next `jolli dashboard` run"), because the install or uninstall it follows has already succeeded and a 500 would claim a rollback that did not happen. A registry entry that cannot be found at all yields no warning and no projection.
 
 A third route reaches a write indirectly: generate-missing stores the summaries it produces through the ordinary storage layer, which for a cut-over repository is this database.
 
-### Idle shutdown and signals
+### Shutdown
 
-- The idle timeout defaults to **2 hours**. It is enforced by a **60-second unref'd poll** comparing "now" against the timestamp of the last request received (updated on every request, before dispatch, and reset when the listener starts serving). A non-positive timeout arms no poll.
-- On expiry: disarm the poll, close all open connections, close the listener, and on the close callback run the shutdown sequence.
-- `SIGINT` / `SIGTERM` run the same sequence directly.
-- The shutdown sequence is: stop telemetry (which does one final best-effort flush), clear the state record **guarded by this process's own pid**, then exit with code `0`.
-- Closing the listener by any route also disarms the idle poll.
+There is none here. The listener is closed by whoever bound it; this module registers no signal handler, arms no idle timer and never calls exit. See spec 361 for the signal handling and the final telemetry flush.
 
 ## State Transitions
-
-### The state record
-
-| From | Event | To |
-| --- | --- | --- |
-| absent | a candidate port bound successfully | present: this pid, the bound port, the start instant, the build's schema version |
-| present (this pid) | idle timeout or signal | removed |
-| present (another pid) | this process shuts down | **left alone** — it belongs to the successor |
-| present | process killed without a signal handler running | left behind, stale; a later reader's health probe is what detects it |
-
-### The idle poll
-
-| From | Event | To |
-| --- | --- | --- |
-| unarmed | listener starts serving | armed (60 s interval), idle clock reset |
-| armed | any request | idle clock reset |
-| armed | idle interval elapsed | disarmed, connections closed, shutdown sequence |
-| armed | listener closed for any reason | disarmed |
-| unarmed | candidate lost the port and was closed | stays unarmed |
 
 ### The generate-missing guard
 
@@ -290,7 +256,7 @@ A third route reaches a write indirectly: generate-missing stores the summaries 
 - **A partially-shipped asset tree is skipped, not used.** The door check requires the template, the stylesheet and every script; a candidate that has only the template falls through, and a total failure produces a scriptless plain-text 500 that nothing polls its way out of. (Notable; this is why the asset list is restated in the publish inventories — where it is currently one file short.)
 - **An absent `Sec-Fetch-Site` header is trusted as a non-browser caller and may spend model budget.** The reasoning is that a local process can spend the user's budget by far easier routes; the practical effect is that the cheapest possible client is the one with the fewest restrictions. (Surprising.)
 - **The base URL builds the `repositories` model, not the `stats` one**, and asks it to skip reachability — so that merely opening the server by hand costs neither a model call nor one git subprocess per repository, for a value that is then thrown away in favour of a 302. (Notable.)
-- **"This process never migrates the schema" is stated all over this subsystem and is not true.** The per-request schema-existence step opens the database writable and migrates any file behind this build. What holds is the weaker, still-load-bearing half: a file *ahead* of this build is never touched, and the registry projection additionally refuses to run on any version mismatch at all, returning a warning to the page instead. (Surprising; the absolute form is what the code's own commentary claims, and it is why this is the one long-lived process whose build can lag.)
+- **The whole "this process must never migrate the schema" rule is gone, and it was never about the read-only handle.** It followed from *reuse*: a detached server outlived the CLI that started it, so a later, newer CLI could attach to an older build and let it upgrade the file. Binding in the command's own process removes the premise, and the read-only open per render stays for two reasons that never depended on it — WAL's one-writer/N-readers split, and the SQLite-enforced guarantee that a browser-reachable render path cannot write. (Notable; the rule outlived its reason for a while, and its stricter half — the registry projection's version gate — was removed with it.)
 - **A repository row with an empty worktree path is deliberately given no git subprocess**, in both the reachability and the standup-identity reads: an empty working directory would silently execute in this process's own directory and answer for whichever repository the server happens to have been launched in. (Notable.)
 - **The per-worktree git identity cache has a 5-minute TTL, and caches the empty answer too.** A repository with no configured identity would otherwise pay two subprocesses on every poll precisely because it has nothing to remember. (Notable.)
 - **An array body passes the object-shape check** and then fails on the per-route required-field checks. (Surprising; benign.)
@@ -300,10 +266,10 @@ A third route reaches a write indirectly: generate-missing stores the summaries 
 
 ## Shared Behavior
 
-- The launcher that spawns this process detached, probes `/health`, verifies that the recorded pid still answers on the recorded port, waits for the state record to appear, opens the browser, and runs the history import — a separate topic. Its `--stop` path and its spawn lock are also there.
+- The command that binds this server, opens the browser, runs the history import and then waits for `SIGINT`/`SIGTERM` — spec 361. The runtime-floor refusal, the schema creation that precedes the bind, and the periodic telemetry flush are all there too.
 - The registry file, identity derivation and folder probe behind `/api/repo-probe`, `/api/repos/*` and the repositories model — the Repository Registry and Probe topic.
 - The dashboard database, its schema version, its read-only/writable open modes, and the runtime floor that decides whether it can be used at all.
 - Every model-building query behind `/api/model`, the memories page cursor semantics behind `/api/memories`, and the context-document lookup behind `/api/context`.
-- Telemetry buffering, consent handling, the registered event names, and the periodic flush this process arms.
+- Telemetry buffering, consent handling, the registered event names, and the periodic flush the command arms around this server.
 - The settings mutation semantics behind `/api/settings/apply` (masked-key reuse, tri-state global instructions, the cross-repository hook sweep), the folder-status verdicts shared with `/api/settings/check-folder`, what the two open settings reads expose, and what the deleted folder-browser took with it — spec 363. **The access boundary is not shared with that topic**: it is enumerated here, and that topic names only the settings routes that are exceptions to it. Same for the generate-missing guard, which is stated here in full and referenced there.
 - The inline-script escaping applied to both page globals, which is shared with the other surfaces that inline model JSON into a page.

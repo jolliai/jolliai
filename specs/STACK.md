@@ -129,13 +129,14 @@ devDependency and both schema URLs together.
 across root, `cli/`, `vscode/`). Do not add a "start the app" step to a workflow that targets this
 repo on the strength of a framework convention.
 
-The one exception is real and browser-reachable: **`jolli dashboard`**. The command is a launcher, not
-the server — it registers the current repo, ensures the dashboard SQLite database exists, probes
-`/health` and spawns a detached loopback HTTP server (`dist/DashboardServerEntry.js`) if none is
-running, opens a browser at it, and only *then* runs the import sweep that fills the database, so the
-page appears immediately and history arrives behind it. It binds `127.0.0.1` on `1818`, falling back to `18118`;
-`--port` overrides, `--no-open` prints the URL instead of opening it, `--stop` kills the recorded
-server, `--cwd` picks the repo to register. So a change to a dashboard page, an `/api/*` endpoint, or
+The one exception is real and browser-reachable: **`jolli dashboard`**. The command *is* the server —
+it registers the current repo, ensures the dashboard SQLite database exists, binds a loopback HTTP
+listener in its own process, opens a browser at it, and only *then* runs the import sweep that fills
+the database, so the page appears immediately and history arrives behind it. It then serves until
+Ctrl+C; there is no background process, no state file and no `--stop`. It binds `127.0.0.1` on `1818`,
+falling back to `18118` (and saying so);
+`--port` overrides, `--no-open` prints the URL instead of opening it,
+`--cwd` picks the repo to register. So a change to a dashboard page, an `/api/*` endpoint, or
 the **Settings** modal (opened over any page, fed by `/api/model?view=settings`, mutating through the
 same `install` / `registerRepo` functions the CLI commands use) is exercised in a browser against a
 real repo: build the CLI (§4.3), then run the command.
@@ -192,11 +193,10 @@ npm install -g .
 plain `npm run build` (in `cli/`) is enough — the global `jolli` picks it up immediately with no
 re-install. `postbuild` chmods `dist/Cli.js` to `0o755`.
 
-`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 14 ES entries
-(`Cli`, `Api`, `PostInstall`, the hook/worker entries `StopHook`, `PostCommitHook`,
+`cli` build = `vite build && tsc --project tsconfig.build.json` — the Vite step emits 13 ES entries
+(`Cli`, `Api`, `PostInstall`, and the hook/worker entries `StopHook`, `PostCommitHook`,
 `PostRewriteHook`, `PrepareMsgHook`, `GeminiAfterAgentHook`, `SessionStartHook`, `PostMergeHook`,
-`PrePushHook`, `PrePushWorker`, `QueueWorker`, and `DashboardServerEntry` — the detached dashboard
-server of §3, a build contract in the same way `QueueWorker` is) plus two asset trees,
+`PrePushHook`, `PrePushWorker`, `QueueWorker`) plus two asset trees,
 `dist/graph-assets/` (the knowledge-graph viz runtime) and `dist/dashboard-assets/` (the dashboard's
 HTML/CSS/JS), both minified here and copied verbatim by every downstream consumer; the `tsc` step
 emits declarations. Externals: `@anthropic-ai/sdk`, `commander`, `open`, `semver`, `node:*`.

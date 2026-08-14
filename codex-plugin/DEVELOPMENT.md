@@ -112,9 +112,9 @@ all of the following even though its manifest registers only the bootstrap:
 - `PostCommitHook.js`, `PostMergeHook.js`, `PostRewriteHook.js`,
   `PrepareMsgHook.js`, and `PrePushHook.js`
 - `QueueWorker.js` and `PrePushWorker.js`
-- `DashboardServerEntry.js` plus its `dashboard-assets/` tree — this dist can win
-  dist-paths arbitration, and `jolli dashboard` spawns that entry by name from its
-  own directory
+- the `dashboard-assets/` tree — this dist can win dist-paths arbitration, and the
+  `jolli dashboard` inside its `Cli.js` reads the page runtime from that directory,
+  beside itself
 
 The build and publish scripts assert this exact inventory. Omitting a git hook or
 worker can turn a user's git operation into `node <missing-file>` and block it.

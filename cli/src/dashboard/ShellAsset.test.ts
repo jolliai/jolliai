@@ -507,6 +507,28 @@ describe("the topbar repo picker", () => {
 		expect(h.href()).not.toContain("gone");
 	});
 
+	it("counts only the live half of the scope on the button", () => {
+		// The label is drawn from the same scope as the ticks, the footer and
+		// `everyRepoSelected`, and those three already count only what is there —
+		// a dead token folds to a row id matching nothing, so the page under this
+		// button is showing ONE repo. Counting the token said "2 repos" over it.
+		const h = loadJD();
+		h.JD.renderShell(threeRepos({ scope: scoped(GHOST, JOLLIAI) }));
+		expect(h.element("repoScopeLabel").textContent).toBe("jolliai");
+		// The dead token is not hidden, it just does not COUNT: the button's title
+		// is still the full list, which is what shows the reader what to drop.
+		expect(h.element("repoScopeBtn").getAttribute("title")).toBe(`${GHOST}\n${JOLLIAI}`);
+	});
+
+	it("says no repo matched rather than borrowing the empty scope's label", () => {
+		// Every token dead. "All repos" is the EMPTY scope and would be the exact
+		// inverse of what this page shows, which is nothing at all; a lone token
+		// still names itself (asserted above), but several have no name to give.
+		const h = loadJD();
+		h.JD.renderShell(threeRepos({ scope: scoped(GHOST, `${GHOST}-2`) }));
+		expect(h.element("repoScopeLabel").textContent).toBe("No matching repos");
+	});
+
 	it("stays visible with a single repo when the URL carries a dead token", () => {
 		// The one case where "nothing to pick between" is false with one repo: the
 		// page is showing an empty scope nothing on it explains, and every link

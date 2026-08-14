@@ -25,7 +25,8 @@ const h = vi.hoisted(() => ({
 	saveUserProfile: vi.fn(),
 	isInsideGitWorkTree: vi.fn(),
 	isLocalAgentUsable: vi.fn(),
-	executeDashboard: vi.fn(),
+	importDashboardHistory: vi.fn(),
+	startForegroundDashboard: vi.fn(),
 	canUseDashboardDb: vi.fn(),
 }));
 
@@ -54,7 +55,10 @@ vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashb
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/GitHookInstaller.js", () => ({ isGitPipelineFullyInstalled: h.isGitPipelineFullyInstalled }));
 vi.mock("../install/Installer.js", () => ({ install: h.install }));
-vi.mock("./DashboardCommand.js", () => ({ executeDashboard: h.executeDashboard }));
+vi.mock("./DashboardCommand.js", () => ({
+	importDashboardHistory: h.importDashboardHistory,
+	startForegroundDashboard: h.startForegroundDashboard,
+}));
 vi.mock("./EnableCommand.js", () => ({ promptSetup: h.promptSetup }));
 vi.mock("./SpaceSyncStep.js", () => ({ runSpaceSyncStep: h.runSpaceSyncStep }));
 vi.mock("./BackfillFrontDoorStep.js", () => ({ runBackfillFrontDoorStep: h.runBackfillFrontDoorStep }));
@@ -125,7 +129,11 @@ describe("GuidedFrontDoor", () => {
 		h.isInsideGitWorkTree.mockReturnValue(true);
 		h.isLocalAgentUsable.mockResolvedValue(true);
 		h.canUseDashboardDb.mockReturnValue(true);
-		h.executeDashboard.mockResolvedValue(true);
+		h.importDashboardHistory.mockResolvedValue(undefined);
+		h.startForegroundDashboard.mockResolvedValue({ port: 1818, waitForShutdown: async () => {} });
+		// The dashboard offer is TTY-gated; default to a non-TTY stdin so only the
+		// tests that opt in ever reach the prompt (and its blocking serve).
+		Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
 	});
 
 	afterEach(() => {
@@ -790,19 +798,25 @@ describe("GuidedFrontDoor", () => {
 		expect(out()).not.toContain("Next steps");
 	});
 
-	// ── Waking the local web service. Triggered by the back-fill STEP COMPLETING
-	// (not by it having built anything), because that step reports nothing back,
-	// and because this call is the only thing that moves freshly built memories
-	// into the dashboard database AND puts them on screen. ──
+	// ── The local dashboard, in two halves. The IMPORT is triggered by the
+	// back-fill STEP COMPLETING (not by it having built anything), because that
+	// step reports nothing back and this is the only thing that moves freshly
+	// built memories into the dashboard database. SERVING is a separate, later
+	// decision: `jolli dashboard` does not return until Ctrl+C, so offering it
+	// mid-function would mean the front door never printed Next steps and never
+	// exited — on every run, not just the first. ──
 
-	describe("local dashboard wake-up", () => {
-		it("wakes the dashboard after the back-fill step, before Next steps", async () => {
+	describe("local dashboard import", () => {
+		it("imports after the back-fill step, before Next steps", async () => {
 			await runGuidedFrontDoor();
 
-			expect(h.executeDashboard).toHaveBeenCalledWith("stats", { cwd: "/repo" });
-			// Order matters: the import half is what picks up whatever the back-fill just wrote.
+			// Throttled: a bare `jolli` is typed many times a day, and the cutover's
+			// containment compare reads every file the frozen tip lists. `jolli enable`
+			// is the caller that wants it unconditional, and it passes nothing.
+			expect(h.importDashboardHistory).toHaveBeenCalledWith("/repo", {}, { throttleCutover: true });
+			// Order matters: the import is what picks up whatever the back-fill just wrote.
 			expect(h.runBackfillFrontDoorStep.mock.invocationCallOrder[0]).toBeLessThan(
-				h.executeDashboard.mock.invocationCallOrder[0] as number,
+				h.importDashboardHistory.mock.invocationCallOrder[0] as number,
 			);
 			// And it lands before the closing orientation.
 			expect(logs.findIndex((l) => l.includes("Jolli is listening"))).toBeLessThan(
@@ -810,51 +824,92 @@ describe("GuidedFrontDoor", () => {
 			);
 		});
 
-		it("wakes even when the back-fill offer was declined or never appeared", async () => {
-			// The step is a no-op in both cases and returns void either way — the wake-up
-			// is deliberately not conditional on it having built anything.
+		it("imports even when the back-fill offer was declined or never appeared", async () => {
+			// The step is a no-op in both cases and returns void either way — the
+			// import is deliberately not conditional on it having built anything.
 			h.runBackfillFrontDoorStep.mockResolvedValue(undefined);
 			await runGuidedFrontDoor();
-			expect(h.executeDashboard).toHaveBeenCalledTimes(1);
-		});
-
-		it("a dashboard that refuses or throws prints a retry hint and finishes cleanly", async () => {
-			// `executeDashboard` reports failure as `false` (it prints its own reason);
-			// the front door's exit code stays reserved for hard blockers either way.
-			h.executeDashboard.mockResolvedValue(false);
-			await runGuidedFrontDoor();
-			expect(out()).toContain("run 'jolli dashboard' to retry");
-			expect(out()).toContain("Next steps");
-			expect(process.exitCode).toBeUndefined();
-
-			logs.length = 0;
-			h.executeDashboard.mockRejectedValue(new Error("port in use"));
-			await runGuidedFrontDoor();
-			expect(out()).toContain("run 'jolli dashboard' to retry");
-			expect(process.exitCode).toBeUndefined();
+			expect(h.importDashboardHistory).toHaveBeenCalledTimes(1);
 		});
 
 		it("runtime without flag-free node:sqlite → skipped silently", async () => {
 			h.canUseDashboardDb.mockReturnValue(false);
 			await runGuidedFrontDoor();
-			expect(h.executeDashboard).not.toHaveBeenCalled();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+			expect(h.startForegroundDashboard).not.toHaveBeenCalled();
 			expect(out()).not.toContain("Dashboard");
 			expect(out()).toContain("Next steps");
 			expect(process.exitCode).toBeUndefined();
 		});
 
-		it("generation not configured → no back-fill step and no wake-up", async () => {
+		it("generation not configured → no back-fill step and no import", async () => {
 			h.loadAuthToken.mockResolvedValue(undefined);
 			h.loadConfig.mockResolvedValue({});
 			await runGuidedFrontDoor();
 			expect(h.runBackfillFrontDoorStep).not.toHaveBeenCalled();
-			expect(h.executeDashboard).not.toHaveBeenCalled();
+			expect(h.importDashboardHistory).not.toHaveBeenCalled();
+		});
+	});
+
+	describe("local dashboard offer", () => {
+		/** A first run at an interactive terminal — the run that also enables. */
+		function firstRunAtATty(): void {
+			h.isGitPipelineFullyInstalled.mockResolvedValue(false); // not enabled yet → this run enables
+			h.promptText.mockResolvedValue("y");
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+		}
+
+		it("a returning run serves too — every `jolli` at a TTY opens the dashboard", async () => {
+			// The first-run-only gate is gone: `jolli` opens the dashboard whenever it
+			// can, which is what makes it the one command a user has to remember.
+			Object.defineProperty(process.stdin, "isTTY", { value: true, configurable: true });
+			await runGuidedFrontDoor(); // already enabled by the suite's default
+			expect(h.startForegroundDashboard).toHaveBeenCalledWith("stats", { cwd: "/repo" });
+			expect(out()).toContain("Next steps");
 		});
 
-		it("dead ends (not a repo / enable declined) never wake the dashboard", async () => {
+		it("a non-TTY run prints the hint and returns", async () => {
+			// The one gate that survives, and the load-bearing one: there is no Ctrl+C
+			// in a CI job or an install script, so serving there would hold the
+			// process open forever at the end of a successful setup.
+			Object.defineProperty(process.stdin, "isTTY", { value: false, configurable: true });
+			await runGuidedFrontDoor();
+			expect(h.startForegroundDashboard).not.toHaveBeenCalled();
+			expect(out()).toContain("jolli dashboard");
+		});
+
+		it("a first run at a TTY serves until shutdown, without asking", async () => {
+			firstRunAtATty();
+			let waited = 0;
+			h.startForegroundDashboard.mockResolvedValue({
+				port: 1818,
+				waitForShutdown: async () => {
+					waited += 1;
+				},
+			});
+			await runGuidedFrontDoor();
+			expect(h.startForegroundDashboard).toHaveBeenCalledWith("stats", { cwd: "/repo" });
+			expect(waited).toBe(1);
+			// The question that used to guard this is gone: after Next steps there is
+			// no output left for a blocking serve to swallow, which was its only job.
+			expect(h.promptText).not.toHaveBeenCalledWith(expect.stringContaining("Open your dashboard now?"));
+			// Next steps came FIRST — a blocking serve after it is the only ordering
+			// in which the user ever sees it.
+			expect(out()).toContain("Next steps");
+		});
+
+		it("a dashboard that throws prints a retry hint and finishes cleanly", async () => {
+			firstRunAtATty();
+			h.startForegroundDashboard.mockRejectedValue(new Error("port in use"));
+			await runGuidedFrontDoor();
+			expect(out()).toContain("run 'jolli dashboard' to retry");
+			expect(process.exitCode).toBeUndefined();
+		});
+
+		it("dead ends (not a repo / enable declined) never reach the offer", async () => {
 			h.isInsideGitWorkTree.mockReturnValue(false);
 			await runGuidedFrontDoor();
-			expect(h.executeDashboard).not.toHaveBeenCalled();
+			expect(h.startForegroundDashboard).not.toHaveBeenCalled();
 
 			vi.clearAllMocks();
 			h.isInsideGitWorkTree.mockReturnValue(true);
@@ -867,7 +922,7 @@ describe("GuidedFrontDoor", () => {
 			h.createStorage.mockResolvedValue({});
 			h.getSummaryCount.mockResolvedValue(0);
 			await runGuidedFrontDoor();
-			expect(h.executeDashboard).not.toHaveBeenCalled();
+			expect(h.startForegroundDashboard).not.toHaveBeenCalled();
 		});
 	});
 

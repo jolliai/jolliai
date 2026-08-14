@@ -1,18 +1,25 @@
 /**
- * DashboardCommand — `jolli dashboard`, the only launcher command (the
- * `jolli stats` / `jolli standup` page aliases are retired; the pages
- * themselves stay served).
+ * DashboardCommand — `jolli dashboard`, the one command that serves the local
+ * dashboard (the `jolli stats` / `jolli standup` page aliases are retired; the
+ * pages themselves stay served).
  *
- * The launcher, not the server: it registers the current repo, brings the
- * database up to date (bootstrap or gap recovery — the write side), makes sure
- * the read-only server is running (probe `/health`, spawn detached if not),
- * and opens the browser at the plain page URL (no token — see DashboardServer's
- * security model for what does and does not gate access).
+ * An ordinary foreground command: it registers the current repo, brings the
+ * database schema up, binds the loopback port **in this process**, opens the
+ * browser at the plain page URL (no token — see DashboardServer's security
+ * model for what does and does not gate access), and serves until Ctrl+C.
  *
- * The wake sequence is ordered so the page appears fast: ensure server →
- * open browser → then run the backfill. The page renders whatever the DB
- * already holds and polls `/api/model`, so history fills in as the import
- * lands rather than blocking the launch.
+ * It used to be a launcher for a detached server, with everything that implies:
+ * a `dashboard.json` pid/port record, a `/health` reuse probe, a spawn lock, an
+ * idle self-shutdown and a `--stop` flag. All of that existed to keep ONE
+ * background process alive across invocations, and it is gone — along with its
+ * most expensive consequence, that a reused server could be running an older
+ * build than the CLI that found it and therefore could not be allowed to
+ * migrate the schema.
+ *
+ * The order still puts the page first: bind → open browser → run the backfill,
+ * then wait for the signal. The page renders whatever the DB already holds and
+ * polls `/api/model`, so history fills in behind it. The import now shares this
+ * process's event loop, which is why it stays after the bind rather than before.
  *
  * Browser opening deliberately does NOT go through `openUrlOrPrint` — that
  * helper enforces an https-only allowlist that (correctly) rejects
@@ -21,9 +28,8 @@
  * open v11 is pure ESM and the VS Code bundle is CJS.
  */
 
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { statSync } from "node:fs";
+import { hostname } from "node:os";
 import type { Command } from "commander";
 import { getProjectRootDir } from "../core/GitOps.js";
 import { readManualDisableFlagSync } from "../core/RepoProfile.js";
@@ -31,21 +37,22 @@ import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb, DASHBOARD_SQLITE_MIN_VERSION, ensureDashboardDbExists } from "../dashboard/DashboardDb.js";
-import { clearDashboardState, type DashboardServerState, readDashboardState } from "../dashboard/DashboardServer.js";
+import {
+	DASHBOARD_HEALTH_SERVICE,
+	DASHBOARD_PORTS,
+	type StartedDashboardServer,
+	startDashboardServer,
+} from "../dashboard/DashboardServer.js";
 import { type DbBackfillProgress, dbBackfillRepos } from "../dashboard/DbBackfill.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
+import { type ServerTelemetryHandle, startServerTelemetry } from "../dashboard/ServerTelemetry.js";
 import { createLogger, errMsg } from "../Logger.js";
-import { spawnHidden } from "../util/Subprocess.js";
 
 const log = createLogger("DashboardCommand");
-
-/** How long the launcher waits for a freshly spawned server's /health. */
-const STARTUP_TIMEOUT_MS = 10_000;
 
 export interface DashboardOptions {
 	readonly port?: string;
 	readonly open?: boolean;
-	readonly stop?: boolean;
 	readonly cwd?: string;
 }
 
@@ -114,66 +121,184 @@ export interface DashboardDeps {
 	 * caller that omits it gets the pre-seam behaviour byte for byte.
 	 */
 	readonly output?: DashboardOutput;
-	/**
-	 * Spawns the detached server. `cwd` is the launcher's resolved repo directory
-	 * (`--cwd` or the process cwd): the child runs there so its telemetry buffer
-	 * lands under that repo's `.jolli` rather than wherever the launcher happened
-	 * to be invoked from.
-	 */
-	readonly spawnServer?: (port: number | undefined, cwd: string) => void;
 	readonly openBrowser?: (url: string) => Promise<void>;
-	readonly fetchHealth?: (port: number) => Promise<{ ok: boolean; pid?: number }>;
+	/** Binds the port. Injected so tests never open a real socket. */
+	readonly startServer?: (options: {
+		readonly port?: number;
+		readonly configDir?: string;
+		readonly dbPath?: string;
+		readonly serverCwd?: string;
+	}) => Promise<StartedDashboardServer>;
+	/** Arms the periodic telemetry flush this long-lived process needs. */
+	readonly startTelemetry?: () => Promise<ServerTelemetryHandle>;
+	/**
+	 * Blocks until the user stops the server. The default registers
+	 * SIGINT/SIGTERM; tests pass a resolved promise so the suite does not hang.
+	 */
+	readonly waitForShutdown?: (started: StartedDashboardServer, telemetry: ServerTelemetryHandle) => Promise<void>;
+	/** Asks a port whether a dashboard is on it. `null` means "not one of ours". */
+	readonly probeHealth?: (port: number) => Promise<DashboardHealth | null>;
+	/** Signals the previous dashboard. Returns whether the signal was delivered. */
 	readonly killPid?: (pid: number) => boolean;
-	readonly now?: () => number;
 	readonly sleep?: (ms: number) => Promise<void>;
-	/** Launcher's resolved repo directory, threaded to {@link spawnServer}. Defaults to `process.cwd()`. */
-	readonly cwd?: string;
+	readonly now?: () => number;
 }
 
-/* v8 ignore start -- default seams do real process/network/browser work; tests inject fakes */
-async function defaultFetchHealth(port: number): Promise<{ ok: boolean; pid?: number }> {
+/** What a `/health` answer says about the process holding a candidate port. */
+export interface DashboardHealth {
+	/** The responder's own process id, already checked to be signal-shaped. */
+	readonly pid: number;
+	/**
+	 * The responder PROVED it is in a different pid namespace, so {@link
+	 * reclaimPort} must not resolve `pid` locally. Absent means "no evidence
+	 * either way", which is the legacy payload and every pre-`platform` build.
+	 */
+	readonly foreign?: boolean;
+}
+
+/** The pid namespace `identifyDashboardHealth` is deciding reachability against. */
+export interface LocalIdentity {
+	readonly platform: string;
+	readonly host: string;
+}
+
+/**
+ * Whether a value is a process id this may hand to `process.kill`.
+ *
+ * `typeof pid === "number"` is NOT that test, and the gap is the whole reason
+ * this exists. `process.kill` forwards its argument to `kill(2)`, where **0 means
+ * every process in the CALLER's own process group** and a negative means the
+ * group `-pid` — so a `/health` body answering `pid: 0` does not fail, it SIGTERMs
+ * this CLI along with whatever shares its group (the user's shell pipeline
+ * included). A non-integer throws `ERR_OUT_OF_RANGE` instead, which is merely
+ * noise, but it is not a pid either.
+ */
+function isSignalablePid(pid: unknown): pid is number {
+	return typeof pid === "number" && Number.isInteger(pid) && pid > 0;
+}
+
+/**
+ * Decides whether a `/health` body belongs to one of our dashboards, and yields
+ * the pid to signal if it does.
+ *
+ * A pure function of its own, deliberately OUTSIDE the ignore region below,
+ * because this is the decision that authorises a SIGTERM in {@link reclaimPort} —
+ * the one thing on this path worth testing directly rather than through a socket.
+ *
+ * Two accepted shapes, and the second is a compatibility story rather than
+ * redundancy:
+ *
+ *  - **Current** — must NAME the service (`DASHBOARD_HEALTH_SERVICE`). Matching
+ *    `{ok: true, pid: number}` instead, as this once did, means signalling
+ *    whatever happens to answer: that is among the most common health payloads
+ *    there is, and under an explicit `--port` the probe is aimed straight at a
+ *    port a dev server is far more likely to hold than a dashboard.
+ *  - **Legacy** — the detached server this command replaced answered `{ok, pid,
+ *    port, schemaVersion}` and knows nothing about the marker. That process
+ *    SURVIVES the upgrade which introduced it (it was detached and self-managed,
+ *    so nothing stops it), and without this arm a freshly upgraded CLI could never
+ *    take 1818 back from it — it would silently serve on the fallback port for as
+ *    long as the old process lived. Those four fields together are specific enough
+ *    to accept on their own; the two the current arm rejects were not.
+ *
+ * Being one of ours is necessary and not sufficient, because a process id is only
+ * meaningful inside the namespace that issued it. A dashboard in WSL, a container
+ * or another user's session answers loopback perfectly well; resolving its id here
+ * finds either nothing (which `unstoppable` already covers) or an UNRELATED local
+ * process, which is then killed while the port stays held — a wrong kill with no
+ * symptom, since the fallback line that follows looks exactly the same either way.
+ * So `platform`/`host` are compared against this process's own, and a mismatch is
+ * reported rather than signalled. Neither field being present is the pre-existing
+ * "no evidence" case and stays signallable: gating on their absence would make
+ * every dashboard from an older build unreclaimable, which is the failure the
+ * legacy arm exists to avoid.
+ *
+ * `local` is a parameter so the comparison is testable without a second machine.
+ */
+export function identifyDashboardHealth(
+	body: unknown,
+	local: LocalIdentity = { platform: process.platform, host: hostname() },
+): DashboardHealth | null {
+	if (typeof body !== "object" || body === null) return null;
+	const { ok, pid, service, port, schemaVersion, platform, host } = body as Record<string, unknown>;
+	if (ok !== true || !isSignalablePid(pid)) return null;
+	const ours =
+		service === DASHBOARD_HEALTH_SERVICE || (typeof port === "number" && typeof schemaVersion === "number");
+	if (!ours) return null;
+	const elsewhere =
+		(typeof platform === "string" && platform !== local.platform) ||
+		(typeof host === "string" && host !== local.host);
+	return elsewhere ? { pid, foreign: true } : { pid };
+}
+
+/* v8 ignore start -- default seams do real socket/browser/signal work; tests inject fakes */
+/**
+ * Asks a port whether one of our dashboards is on it.
+ *
+ * Any failure — nothing listening, a foreign service, a non-JSON body — is
+ * `null` rather than a throw, so a launch is never blocked by whatever else
+ * happens to hold the port. Whether an answer counts as ours is
+ * {@link identifyDashboardHealth}'s call, not this function's.
+ *
+ * **The timeout is generous on purpose, and "it is local so it will be fast" is
+ * the wrong way to set it.** The thing being probed is a dashboard, and a
+ * dashboard runs its history import on the very event loop that has to answer
+ * this — `node:sqlite` is synchronous, so a first full sweep stalls it for well
+ * over half a second at a time. A probe that gives up early reads a busy
+ * dashboard as ABSENT, and the reclaim then reports "nothing there" while the
+ * port is still held: the bind falls through to 18118 and the user ends up with
+ * two live dashboards running concurrent imports and cutover attempts against
+ * one database. That is the exact failure this whole step exists to prevent.
+ *
+ * Waiting longer is nearly free in the case that actually matters: a port with
+ * nothing on it refuses the connection immediately rather than timing out, so
+ * this budget is only ever spent on something that accepted the connection and
+ * then went quiet.
+ */
+const HEALTH_PROBE_TIMEOUT_MS = 1_500;
+
+async function defaultProbeHealth(port: number): Promise<DashboardHealth | null> {
+	const controller = new AbortController();
+	const timer = setTimeout(() => controller.abort(), HEALTH_PROBE_TIMEOUT_MS);
 	try {
-		const controller = new AbortController();
-		const timer = setTimeout(() => controller.abort(), 1500);
 		const res = await fetch(`http://127.0.0.1:${port}/health`, { signal: controller.signal });
-		clearTimeout(timer);
-		if (!res.ok) return { ok: false };
-		const body = (await res.json()) as { ok?: boolean; pid?: number };
-		return { ok: body.ok === true, ...(typeof body.pid === "number" ? { pid: body.pid } : {}) };
+		if (!res.ok) return null;
+		return identifyDashboardHealth(await res.json());
 	} catch {
-		return { ok: false };
+		return null;
+	} finally {
+		// Cleared once the BODY is parsed, never when the headers arrive. The abort
+		// has to stay armed across `res.json()` or the budget above does not bound
+		// this call at all: a service that answers 200 and then stalls its body
+		// leaves undici's own `bodyTimeout` as the only remaining limit at 300 s,
+		// and that one is an INACTIVITY timer, so a slow-drip body resets it for as
+		// long as it likes — an unbounded hang on the launch path, under a comment
+		// promising a short timeout.
+		clearTimeout(timer);
+		// Aborted on EVERY exit, not only on the timeout, because the non-2xx arm
+		// above returns without reading the body: undici keeps that socket and its
+		// pending response alive, ref'd, so a `jolli dashboard` whose probe met an
+		// unrelated service could sit on a live handle for the rest of the run. A
+		// request that already finished ignores this.
+		controller.abort();
 	}
 }
 
-function defaultSpawnServer(port: number | undefined, cwd: string): void {
-	// Resolve the entry by directory + filename, not import.meta.url alone —
-	// same rationale as QueueWorker.launchWorker: this function gets inlined
-	// into whichever bundle imports it, and the sibling file is the contract.
-	const dir = dirname(fileURLToPath(import.meta.url));
-	const scriptPath = join(dir, "DashboardServerEntry.js");
-	if (!existsSync(scriptPath)) {
-		throw new Error(
-			`Dashboard server entry not found at ${scriptPath} — this dist was built without a DashboardServerEntry entry.`,
-		);
+function defaultKillPid(pid: number): boolean {
+	// Last check before the syscall, and not redundant with
+	// `identifyDashboardHealth`: this is a seam, so the pid reaching it came from
+	// whatever `probeHealth` a caller supplied. See {@link isSignalablePid} for why
+	// a plain `typeof === "number"` is not a guard here — `process.kill(0)` signals
+	// this process's whole group rather than failing.
+	if (!isSignalablePid(pid)) return false;
+	try {
+		process.kill(pid);
+		return true;
+	} catch {
+		// Already gone, or not ours to signal. Either way there is nothing to
+		// reclaim and the bind below reports what actually happened.
+		return false;
 	}
-	const child = spawnHidden(process.execPath, [scriptPath], {
-		detached: true,
-		stdio: "ignore",
-		// Run the server in the launcher's resolved repo dir so its telemetry
-		// buffer (ServerTelemetry uses process.cwd()) lands under that repo's
-		// `.jolli`, not wherever `jolli dashboard` was invoked from.
-		cwd,
-		env: {
-			...process.env,
-			...(port !== undefined ? { JOLLI_DASHBOARD_PORT: String(port) } : {}),
-		},
-	});
-	// A detached spawn emits `error` asynchronously (e.g. a cwd that vanished
-	// between the resolve and the spawn); with no listener Node re-throws it as an
-	// uncaught exception and kills the launcher. Swallow it — a failed spawn means
-	// no dashboard, and the /health probe already reports that to the user.
-	child.on("error", (err) => log.warn("dashboard server failed to spawn: %s", errMsg(err)));
-	child.unref();
 }
 
 async function defaultOpenBrowser(url: string): Promise<void> {
@@ -182,32 +307,58 @@ async function defaultOpenBrowser(url: string): Promise<void> {
 	child.unref();
 }
 
-function defaultKillPid(pid: number): boolean {
-	try {
-		process.kill(pid);
-		return true;
-	} catch {
-		return false;
-	}
+/**
+ * Waits for Ctrl+C (or a `kill`), then closes the listener.
+ *
+ * Deliberately does NOT call `process.exit()`. The detached entry this replaces
+ * had to — nothing ran after it — but here the stack unwinds back into `Cli.ts`,
+ * whose tail flushes telemetry one last time and triggers the machine-global
+ * daemon. Exiting here would skip both.
+ *
+ * The listeners are removed on the way out so a second server started in the
+ * same process (tests, a future embedder) does not inherit them.
+ */
+function defaultWaitForShutdown(started: StartedDashboardServer, telemetry: ServerTelemetryHandle): Promise<void> {
+	return new Promise<void>((resolve) => {
+		let done = false;
+		const stop = (): void => {
+			if (done) return;
+			done = true;
+			process.off("SIGINT", stop);
+			process.off("SIGTERM", stop);
+			started.server.closeAllConnections();
+			started.server.close();
+			void telemetry.stop().then(resolve, resolve);
+		};
+		// SIGTERM is never delivered on Windows; Ctrl+C arrives as SIGINT there.
+		// Registering both keeps one code path across platforms.
+		process.on("SIGINT", stop);
+		process.on("SIGTERM", stop);
+	});
 }
 
 /**
  * Resolves every seam to a concrete implementation, so the `?? default`
  * fallbacks live in exactly one place — inside this region, because a test that
- * took one of them would spawn a process, hit the network or open a browser,
- * which is the whole reason the seams exist. Callers below then work with plain
- * functions instead of re-deciding the default at each call site, where the same
- * `??` had to be repeated (and could disagree between two of them).
+ * took one of them would bind a socket, open a browser or park on a signal,
+ * which is the whole reason the seams exist.
  */
 function resolveSeams(deps: DashboardDeps): ResolvedSeams {
 	return {
 		configDir: deps.configDir ?? getGlobalConfigDir(),
 		output: outputOf(deps),
-		spawnServer: deps.spawnServer ?? defaultSpawnServer,
 		openBrowser: deps.openBrowser ?? defaultOpenBrowser,
-		fetchHealth: deps.fetchHealth ?? defaultFetchHealth,
+		startServer: deps.startServer ?? startDashboardServer,
+		startTelemetry: deps.startTelemetry ?? (() => startServerTelemetry()),
+		waitForShutdown: deps.waitForShutdown ?? defaultWaitForShutdown,
+		probeHealth: deps.probeHealth ?? defaultProbeHealth,
 		killPid: deps.killPid ?? defaultKillPid,
 		sleep: deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))),
+		// Resolved here as well as being read raw by `runHistoryImport`, which
+		// forwards `deps.now` to `dbBackfillRepos` and needs the ABSENCE preserved
+		// (that option is optional there too). The reclaim's deadline needs a
+		// function it can call unconditionally, so it takes the resolved one.
+		now: deps.now ?? Date.now,
 	};
 }
 /* v8 ignore stop */
@@ -227,117 +378,158 @@ function outputOf(deps: DashboardDeps): DashboardOutput {
 interface ResolvedSeams {
 	readonly configDir: string;
 	readonly output: DashboardOutput;
-	readonly spawnServer: (port: number | undefined, cwd: string) => void;
 	readonly openBrowser: (url: string) => Promise<void>;
-	readonly fetchHealth: (port: number) => Promise<{ ok: boolean; pid?: number }>;
-	readonly killPid: (pid: number) => boolean;
+	readonly startServer: NonNullable<DashboardDeps["startServer"]>;
+	readonly startTelemetry: () => Promise<ServerTelemetryHandle>;
+	readonly waitForShutdown: (started: StartedDashboardServer, telemetry: ServerTelemetryHandle) => Promise<void>;
+	readonly probeHealth: NonNullable<DashboardDeps["probeHealth"]>;
+	readonly killPid: NonNullable<DashboardDeps["killPid"]>;
 	readonly sleep: (ms: number) => Promise<void>;
-}
-
-/** True when `pid` is a live process we may signal. */
-function isPidAlive(pid: number): boolean {
-	try {
-		process.kill(pid, 0);
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/** Exclusive create — the only way this module ever claims the lock. */
-function tryCreateLock(lockPath: string): boolean {
-	try {
-		writeFileSync(lockPath, String(process.pid), { flag: "wx" });
-		return true;
-	} catch {
-		return false;
-	}
-}
-
-/** The pid recorded in the lock, or null if it is missing or unparseable. */
-function readLockHolder(lockPath: string): number | null {
-	try {
-		const holder = Number.parseInt(readFileSync(lockPath, "utf-8").trim(), 10);
-		return Number.isFinite(holder) ? holder : null;
-	} catch {
-		return null;
-	}
+	readonly now: () => number;
 }
 
 /**
- * The spawn lock: prevents two launchers (CLI + a second CLI, or later the
- * extension) racing each other into a double server.
+ * Takes one candidate port back from a dashboard that is already on it.
  *
- * `wx` create is the atomic take, and reclaiming a stale lock goes through that
- * same exclusive create — never a blind overwrite. An overwrite is what made
- * reclaim unsafe: two launchers that both read the same dead pid would both
- * write themselves in and both return `true`, which is precisely the double
- * spawn the lock exists to prevent. Now the loser's create fails, it falls into
- * the "wait for the other launcher" branch, and one server comes up.
+ * Every launch starts a fresh server, so an earlier one has to go. Finding it
+ * needs SOME discovery, and this is the cheapest form that is still safe:
  *
- * A lock that is unreadable or holds a non-numeric pid counts as stale too:
- * a launcher killed mid-write must not wedge the dashboard permanently.
+ *  - **Ask the port, not a file.** There is no `dashboard.json` any more, and it
+ *    is not coming back. The candidate ports are fixed, so a probe of each one
+ *    answers "is a dashboard here" without anything on disk to go stale.
+ *  - **Only kill what identifies itself.** The pid comes from `/health` on the
+ *    port about to be taken, so it is alive by construction, and the body has to
+ *    NAME this service before that pid is signalled — see
+ *    {@link identifyDashboardHealth}, which is where "identifies itself" is
+ *    actually decided. Anything else holding 1818 — an unrelated local service,
+ *    very much including one whose own `/health` answers `{ok: true, pid: …}` —
+ *    fails that check, is left alone, and the bind falls through to the next
+ *    candidate exactly as before.
+ *  - **Only kill what this process's pids can name.** Identifying itself is not
+ *    enough: an id is only meaningful inside the namespace that issued it, so a
+ *    body declaring a foreign `platform`/`host` is reported, never signalled.
  *
- * Residual race, deliberately accepted: remove-then-create is two syscalls, so a
- * second reclaimer whose `rm` lands after the first has already created *and*
- * read back its own lock still takes it. Closing that needs a real CAS the
- * filesystem does not offer. The consequence is bounded on the other side —
- * {@link ensureServerRunning} probes `/health` and reuses a live server before
- * spawning at all, and `dashboard.json` is only ever cleared by the pid that
- * owns it — so the worst case is one short-lived extra process, not a
- * permanently orphaned server.
+ * That is the whole difference from the launcher this replaced: it discovers in
+ * order to REPLACE, never to attach. Nothing here can serve a page from a build
+ * older than this one, which is what made the old reuse expensive.
+ *
+ * FOUR outcomes, which is why this does not return a boolean: nothing of ours was
+ * there, we stopped it, we signalled it and it is STILL holding the port, or we
+ * found one and could not signal it at all.
+ *
+ * The last two are both real rather than theoretical, and they are not the same
+ * thing. `killPid` answers whether the signal was DELIVERED, never whether the
+ * process died — so a delivered signal followed by a port that never frees is
+ * `signalled`, not `stopped`. Collapsing the two is a message bug with teeth:
+ * "Stopped the dashboard already running on port 1818" printed immediately above
+ * "Port 1818 was in use — serving on 18118 instead" tells the user two
+ * contradictory things about one port, and the first of them is false.
+ * `unstoppable` is the other half — the process id comes from an HTTP response,
+ * and answering on loopback does not make a process ours to signal. A dashboard
+ * running inside WSL answers a Windows `jolli` perfectly well and reports a Linux
+ * process id; the same holds for a container, or another user's process.
+ * Reporting either as "nothing there" left the port silently changing with no
+ * explanation anywhere, which is precisely what the fallback line exists to
+ * prevent.
+ *
+ * That outcome is now reached two ways, and only one of them is a failed signal.
+ * Treating "the kill did not land" as the whole story assumed a foreign id would
+ * not resolve here — true for the pid a Linux dashboard reports to a Windows CLI
+ * only while nothing local happens to hold it. When something does, the signal
+ * lands on a stranger: an unrelated process dies, the port stays held, and the
+ * outcome is `signalled` — indistinguishable from a dashboard being slow to let
+ * go. So a proven-foreign responder short-circuits to `unstoppable` BEFORE
+ * `killPid` is reached, which is the only point at which the two are still
+ * distinguishable.
  */
-export function acquireSpawnLock(configDir: string): boolean {
-	const lockPath = join(configDir, "dashboard-spawn.lock");
-	mkdirSync(configDir, { recursive: true });
-	if (tryCreateLock(lockPath)) return true;
-	const holder = readLockHolder(lockPath);
-	if (holder !== null && isPidAlive(holder)) return false;
-	rmSync(lockPath, { force: true });
-	// Read back: the create alone proves only that the file did not exist a
-	// moment ago, not that what is on disk now is ours.
-	return tryCreateLock(lockPath) && readLockHolder(lockPath) === process.pid;
+type ReclaimOutcome = "none" | "stopped" | "signalled" | "unstoppable";
+
+async function reclaimPort(port: number, seams: ResolvedSeams): Promise<ReclaimOutcome> {
+	const health = await seams.probeHealth(port);
+	if (!health || !isSignalablePid(health.pid)) return "none";
+	// One of ours, but running where this process's pids do not apply — see
+	// `identifyDashboardHealth`. Reported rather than signalled: resolving that id
+	// here would hit an unrelated local process, and killing it would neither free
+	// the port nor leave any sign of what happened.
+	if (health.foreign) return "unstoppable";
+	if (health.pid === process.pid) return "none";
+	if (!seams.killPid(health.pid)) return "unstoppable";
+	// A killed listener does not release the port synchronously. Poll the probe
+	// rather than sleeping a fixed amount: the common case frees in a few ms, and
+	// a bounded wait beats binding the fallback port for a server that was about
+	// to let go. Falling through after the budget is safe — the bind loop then
+	// moves to the next candidate, which is the pre-existing behaviour.
+	//
+	// The budget is WALL CLOCK, not an iteration count, and the difference is the
+	// probe: each pass also awaits `probeHealth`, which can spend
+	// `HEALTH_PROBE_TIMEOUT_MS` before answering. At 50 ms per iteration a
+	// count-based budget of 2 s buys 40 passes, so a port that stops answering
+	// *slowly* rather than refusing outright stretched this to a minute or more —
+	// on the launch path, under a constant that says two seconds.
+	//
+	// Wall clock does not make the ceiling exactly two seconds either, and the
+	// overshoot is bounded rather than absent: the deadline is checked BEFORE a
+	// pass, so the last one can start just under it and still spend a sleep plus a
+	// full probe timeout, i.e. ~3.5 s worst case. That also means a port answering
+	// at the timeout gets ~2 polls, not 40 — which is the right number, because
+	// the case this wait exists for (a listener releasing a port it was just told
+	// to drop) refuses the connection instantly and is answered on the first pass.
+	const deadline = seams.now() + RECLAIM_TIMEOUT_MS;
+	while (seams.now() < deadline) {
+		await seams.sleep(RECLAIM_POLL_MS);
+		if (!(await seams.probeHealth(port))) return "stopped";
+	}
+	return "signalled";
 }
 
-export function releaseSpawnLock(configDir: string): void {
-	rmSync(join(configDir, "dashboard-spawn.lock"), { force: true });
-}
+/** How long to wait for a killed dashboard to release its port. */
+const RECLAIM_TIMEOUT_MS = 2_000;
+const RECLAIM_POLL_MS = 50;
 
 /**
- * Confirms that the pid in `dashboard.json` is still the dashboard server on
- * that port, by asking the port itself.
+ * Says what the reclaim of one candidate port did, if anything.
  *
- * `dashboard.json` can outlive its process (SIGKILL, a crash, a reboot that left
- * the file behind) and the OS recycles pids, so a recorded pid is a *claim*, not
- * a fact. Everything that signals or replaces the recorded server verifies here
- * first — signalling a stale record blind is how a launcher kills whichever
- * unrelated process happens to have inherited the number.
- *
- * A `/health` that answers without a pid also fails the check: our own handler
- * always reports one, so a pid-less `{ ok: true }` is some other service on that
- * port and must not be signalled either.
+ * Takes the port it is reporting on rather than reading the preferred one,
+ * because the caller now walks every fixed candidate and a line naming the wrong
+ * port is worse than no line: the whole purpose of these three is to explain a
+ * port change the user did not ask for.
  */
-async function isRecordedServerLive(state: DashboardServerState, seams: ResolvedSeams): Promise<boolean> {
-	const health = await seams.fetchHealth(state.port);
-	return health.ok && health.pid === state.pid;
+function reportReclaim(port: number, outcome: ReclaimOutcome, output: DashboardOutput): void {
+	if (outcome === "stopped") {
+		output.log(`\n  Stopped the dashboard already running on port ${port}.`);
+	} else if (outcome === "signalled") {
+		// Says what was actually observed, because the fallback line below is about
+		// to say the port is still in use. Claiming "Stopped" here — which is what a
+		// single "we sent the signal" outcome did — put those two lines together and
+		// made one of them a lie.
+		output.log(`\n  Asked the dashboard on port ${port} to stop, but it is still holding the port.`);
+	} else if (outcome === "unstoppable") {
+		// Names the process this launch could not stop, because the user is the
+		// only one who can: it answers on loopback but is out of this process's
+		// reach — another user, a container, or (measured) a dashboard inside WSL
+		// answering a Windows CLI with a Linux process id.
+		output.log(
+			`\n  A dashboard is already on port ${port} and could not be stopped from here` +
+				" — it may belong to another user, a container, or WSL. Stop it there, or use --port.",
+		);
+	}
 }
 
 /**
- * Resolves the working directory the detached server should run in, from the
- * launcher's raw `--cwd`/process cwd.
+ * Resolves the repo directory the server answers for, from the raw
+ * `--cwd`/process cwd.
  *
- * Two review-driven guarantees, both about the fact that the server inherits its
- * cwd and that the telemetry buffer's identity IS the literal cwd (JOLLI-1957):
+ * Two guarantees, both inherited from when this computed a detached child's
+ * `cwd` and both still load-bearing now that it feeds `serverCwd` directly:
  *
- *  - **Always a real directory.** A bad `--cwd` (nonexistent, or a file) would
- *    make the detached `spawn` emit an `error` (ENOENT) and — before the
- *    `child.on("error")` guard — crash the whole launcher. An invalid path falls
- *    back to `process.cwd()`, which is always valid.
+ *  - **Always a real directory.** An invalid `--cwd` (nonexistent, or a file)
+ *    falls back to `process.cwd()`, which always exists. The Settings page reads
+ *    this path per request; a bogus one would surface as a failure per render
+ *    rather than once, at launch, where it can be reasoned about.
  *  - **The repo ROOT, not a subdir.** Launched from `repo/sub`, the raw cwd is
- *    `repo/sub`, whose buffer no other surface (hooks, QueueWorker, `jolli
- *    compile`, VS Code) drains — the server's own 60 s flush would be the only
- *    thing shipping it. Resolving to the git top level lets the server share the
- *    one repo-root buffer everything else uses.
+ *    `repo/sub`, and the Settings page's per-repo displays and repo-scoped
+ *    actions (generate-missing, migrate, sync-now, the push list's "this repo"
+ *    marker) would then answer for a subdirectory rather than the repo.
  *
  * `getRoot` is injected for tests; production uses the real `getProjectRootDir`.
  * Non-repo directories (and any git failure) keep the validated base dir.
@@ -361,95 +553,130 @@ export async function resolveServerCwd(
 	return base;
 }
 
+/** A bound foreground dashboard: already serving, not yet waited on. */
+export interface ForegroundDashboard {
+	readonly port: number;
+	/** Resolves once the user has stopped the server. */
+	readonly waitForShutdown: () => Promise<void>;
+}
+
 /**
- * Ensures a healthy server is running and returns its state. Reuses a live one
- * (verified pid via /health), restarts after a stale `dashboard.json`, and
- * spawns fresh when nothing is up.
+ * Binds the port, opens the browser and prints the URL — everything up to, but
+ * not including, waiting for the signal.
  *
- * An explicit `--port` that disagrees with a live server **replaces** it rather
- * than starting a second one beside it: both would compete for the single
- * `dashboard.json`, so only one of them would ever be findable by a later
- * launcher — and the loser keeps running, invisible, until its idle timeout.
+ * Split from {@link executeDashboard} for one caller: the guided front door has
+ * already run the import by the time it offers to open the dashboard, and going
+ * back through `executeDashboard` would run it a second time — printing "all N
+ * memories were already migrated" directly under the block that just migrated
+ * them, which reads as a failure.
+ *
+ * Returns before the wait so the caller controls the ordering: `executeDashboard`
+ * runs the import between the two halves, which is what keeps the page up while
+ * history fills in behind it.
  */
-export async function ensureServerRunning(
-	requestedPort: number | undefined,
-	deps: DashboardDeps,
-): Promise<DashboardServerState> {
+export async function startForegroundDashboard(
+	page: "stats" | "standup",
+	options: { readonly port?: number; readonly open?: boolean; readonly cwd?: string },
+	deps: DashboardDeps = {},
+): Promise<ForegroundDashboard> {
 	const seams = resolveSeams(deps);
-	const { configDir, fetchHealth, sleep } = seams;
+	const serverCwd = await resolveServerCwd(options.cwd ?? process.cwd());
 
-	const existing = await readDashboardState(configDir);
-	if (existing) {
-		const live = await isRecordedServerLive(existing, seams);
-		if (live && (requestedPort === undefined || requestedPort === existing.port)) return existing;
-		if (live) seams.killPid(existing.pid);
-		// Either the record was stale, or we just retired its server. Guarded on
-		// the pid we read so we never delete a record that has moved on.
-		await clearDashboardState(configDir, existing.pid);
+	// Every launch is a fresh server, so a dashboard already running has to go —
+	// see {@link reclaimPort} for why this discovers by asking the port rather than
+	// by reading a file, and why it can only ever kill one of ours.
+	//
+	// EVERY fixed candidate is reclaimed, not just the one this launch prefers, and
+	// the difference is not hypothetical. Reclaiming only the preferred port is
+	// correct exactly while the preferred port is available: let an unrelated local
+	// service hold 1818, and the first launch falls back to 18118, the second
+	// reclaims a 1818 that was never ours, finds 18118 taken by the first
+	// dashboard and lands on an OS-assigned port. That is two dashboards running
+	// concurrent history imports and cutover attempts against one database —
+	// precisely the state this step exists to prevent, reached without either
+	// launch doing anything unusual. Probing the second candidate is nearly free
+	// when nothing is on it: the connection is refused immediately rather than
+	// timing out.
+	//
+	// An explicit `--port` narrows this to that port alone, matching the bind's own
+	// candidate list. The OS-assigned fallback cannot be covered either way — there
+	// is no port to probe — so the invariant is "one dashboard across the fixed
+	// candidates", not "one on the machine".
+	const candidates = options.port !== undefined ? [options.port] : [...DASHBOARD_PORTS];
+	for (const candidate of candidates) {
+		reportReclaim(candidate, await reclaimPort(candidate, seams), seams.output);
 	}
 
-	if (!acquireSpawnLock(configDir)) {
-		// Another launcher is mid-spawn — wait for its server instead of racing it.
-		for (let waited = 0; waited < STARTUP_TIMEOUT_MS; waited += 250) {
-			await sleep(250);
-			const state = await readDashboardState(configDir);
-			if (state && (await fetchHealth(state.port)).ok) return state;
-		}
-		throw new Error("Another process is starting the dashboard but it never became healthy.");
-	}
+	// Armed after the reclaim and before the bind: this process serves for as long
+	// as the user leaves the tab open, so the `/api/telemetry` beacon's events need
+	// a periodic drain rather than only the one `Cli.ts` does on exit.
+	const telemetry = await seams.startTelemetry();
+	let started: StartedDashboardServer;
 	try {
-		seams.spawnServer(requestedPort, deps.cwd ?? process.cwd());
-		for (let waited = 0; waited < STARTUP_TIMEOUT_MS; waited += 250) {
-			await sleep(250);
-			const state = await readDashboardState(configDir);
-			if (state && (await fetchHealth(state.port)).ok) return state;
+		started = await seams.startServer({
+			...(options.port !== undefined ? { port: options.port } : {}),
+			configDir: seams.configDir,
+			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
+			serverCwd,
+		});
+	} catch (err) {
+		// The flusher is armed before the bind and nothing else will ever stop it
+		// on this path, since the caller only gets a handle on success.
+		await telemetry.stop();
+		throw err;
+	}
+
+	// View token → its ONE served path. `/stats` and `/standup` were removed as
+	// paths (see `VIEW_PATHS`), so this mapping is what keeps the command from
+	// opening a 404 — the token and the URL are no longer the same string.
+	const url = `http://127.0.0.1:${started.port}${page === "standup" ? "/dashboard/standup" : "/dashboard"}`;
+	if (options.open !== false) {
+		try {
+			await seams.openBrowser(url);
+		} catch (err) {
+			log.warn("could not open the browser (non-fatal): %s", errMsg(err));
 		}
-		throw new Error(
-			"The dashboard server did not become healthy in time — check .jolli/jollimemory/debug.log for details.",
+	}
+	if (started.fellBack) {
+		// The only symptom of something else already holding the preferred port —
+		// with no state record and no reuse probe, an unexplained port is otherwise
+		// unexplainable. The likeliest cause is a background server from a build
+		// before this one, which exits on its own within a couple of hours.
+		//
+		// Names every candidate that was actually passed over rather than only the
+		// first. `fellBack` is true for BOTH later candidates, and when the bind
+		// lands on the OS-assigned one it is because 1818 *and* 18118 were taken —
+		// reporting just 1818 there is true but reads as though the documented
+		// fallback port were still free, which is the one thing a user would check
+		// next. An explicit `--port` cannot reach this line (its candidate list is
+		// one long), so these two are the whole set.
+		const taken = DASHBOARD_PORTS.filter((candidate) => candidate !== started.port);
+		const ports = taken.join(" and ");
+		seams.output.log(
+			taken.length > 1
+				? `\n  Ports ${ports} were in use — serving on ${started.port} instead.`
+				: `\n  Port ${ports} was in use — serving on ${started.port} instead.`,
 		);
-	} finally {
-		releaseSpawnLock(configDir);
 	}
+	seams.output.log(`\n  Jolli dashboard → ${url}`);
+	seams.output.log("  Press Ctrl+C to stop.\n");
+
+	return { port: started.port, waitForShutdown: () => seams.waitForShutdown(started, telemetry) };
 }
 
 /**
- * `--stop`: kill the recorded server and clear its state file.
+ * The write side on its own: bring the dashboard database up to date from every
+ * registered repo (bootstrap or gap recovery, plus the orphan-branch
+ * source-of-truth import) and report what actually landed.
  *
- * The signal is sent only once `/health` on the recorded port confirms the
- * recorded pid — see {@link isRecordedServerLive}. When it does not, the record
- * is simply cleared: there is nothing of ours to stop, and the pid may well
- * belong to something else by now.
- */
-async function stopServer(deps: DashboardDeps): Promise<void> {
-	const seams = resolveSeams(deps);
-	const state = await readDashboardState(seams.configDir);
-	if (!state) {
-		seams.output.log("\n  The dashboard server is not running.\n");
-		return;
-	}
-	const live = await isRecordedServerLive(state, seams);
-	const killed = live && seams.killPid(state.pid);
-	await clearDashboardState(seams.configDir, state.pid);
-	seams.output.log(
-		killed
-			? `\n  Dashboard server stopped (pid ${state.pid}).\n`
-			: "\n  The dashboard server had already exited — cleared its stale record.\n",
-	);
-}
-
-/**
- * The write side of the launcher, on its own: bring the dashboard database up
- * to date from every registered repo (bootstrap or gap recovery, plus the
- * orphan-branch source-of-truth import) and report what actually landed.
- *
- * Split out of {@link executeDashboard} because the import is the only part of
- * the launcher `jolli enable` and the guided front door actually need.
- * `dbBackfillRepos` is the sole production caller of the SOT import, so memories
- * just written would otherwise sit outside the database until someone ran
- * `jolli dashboard` by hand — but wanting that import is no reason to bind a
- * port, spawn a detached server and take over the user's browser at enable
- * time. Those two entry points call this; the server stays a `jolli dashboard`
- * decision.
+ * Split out of {@link executeDashboard} because the import is the only part
+ * `jolli enable` and the guided front door actually need. `dbBackfillRepos` is
+ * the sole production caller of the SOT import, so memories just written would
+ * otherwise sit outside the database until someone ran `jolli dashboard` by
+ * hand — but wanting that import is no reason to bind a port, take over the
+ * user's browser, or (now that the server is in the foreground) hold their
+ * terminal until Ctrl+C. Those two entry points call this; serving stays a
+ * `jolli dashboard` decision.
  *
  * Never throws: a failed import is a warning, not a failed enable.
  */
@@ -777,17 +1004,51 @@ const PHASE_LABELS: Record<"commits" | "summaries" | "sessions", string> = {
  * layer, `SqliteStorage` never on the path. `maybeAutoCutover` reports nothing
  * and cannot throw, so it cannot turn a successful setup into a failure; the
  * two states short of `cutover` are both workable and converge later.
+ *
+ * **Carries the same disabled-repo gate as {@link executeDashboard}, and for the
+ * same two writes.** This used to be reachable only from `jolli enable`, where
+ * `install` has already cleared the opt-out by the time it runs — so the gate
+ * looked redundant. The guided front door now comes here too, and it does NOT
+ * clear anything: a repo whose `userDisabled` is set while its hooks survive (an
+ * uninstall that failed after the flag was persisted, which is the documented
+ * order) would have had `registerRepo` rebuild its registry entry and clear the
+ * `disabledAt` that `jolli disable` set — silently undoing the user's decision
+ * on a command they ran to look at status. `runHistoryImport` is deliberately
+ * NOT gated: it sweeps every registered repo, so it belongs to the machine
+ * rather than to `cwd`, exactly like `opportunisticSnapshot`.
+ *
+ * `throttleCutover` is the caller's policy, not a default, because the two
+ * callers are opposites: `jolli enable` runs once and wants the attempt
+ * unconditionally, while the front door is a command a user types many times a
+ * day and would otherwise pay the containment compare — which reads every file
+ * the frozen tip lists — on every one of them.
  */
-export async function importDashboardHistory(cwd: string, deps: DashboardDeps = {}): Promise<void> {
+export async function importDashboardHistory(
+	cwd: string,
+	deps: DashboardDeps = {},
+	options: { readonly throttleCutover?: boolean } = {},
+): Promise<void> {
 	if (!canUseDashboardDb()) return;
-	try {
-		await registerRepo({ cwd, ...(deps.configDir ? { configDir: deps.configDir } : {}) });
-	} catch (err) {
-		log.info("not registering a repo from %s: %s", cwd, errMsg(err));
+	const repoDisabled = readManualDisableFlagSync(cwd);
+	if (repoDisabled) {
+		// `notice` for the same reason `executeDashboard` uses it: this is the only
+		// explanation the user gets for a run that succeeded while leaving their
+		// repo out of the database.
+		outputOf(deps).notice("\n  Jolli Memory is disabled here — leaving this repo out of the dashboard.\n");
+	} else {
+		try {
+			await registerRepo({ cwd, ...(deps.configDir ? { configDir: deps.configDir } : {}) });
+		} catch (err) {
+			log.info("not registering a repo from %s: %s", cwd, errMsg(err));
+		}
 	}
 	await runHistoryImport(deps);
-	// No throttle: a fresh import is the one attempt worth making unconditionally.
-	await maybeAutoCutover(cwd, deps.dbPath ? { dbPath: deps.dbPath } : {});
+	if (!repoDisabled) {
+		await maybeAutoCutover(cwd, {
+			...(options.throttleCutover ? { throttle: true } : {}),
+			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
+		});
+	}
 }
 
 /**
@@ -813,13 +1074,9 @@ export async function executeDashboard(
 ): Promise<boolean> {
 	// Resolved ahead of the runtime gate below, not with the rest of the seams:
 	// the first two failure branches print before there is any reason to resolve
-	// a spawner or a browser opener, and those two messages are the ones a GUI
+	// a listener or a browser opener, and those two messages are the ones a GUI
 	// host most needs to be able to show.
 	const output = outputOf(deps);
-	if (options.stop) {
-		await stopServer(deps);
-		return true;
-	}
 	if (!canUseDashboardDb()) {
 		output.error(
 			`\n  Error: the dashboard needs Node >= ${DASHBOARD_SQLITE_MIN_VERSION.major}.${DASHBOARD_SQLITE_MIN_VERSION.minor}` +
@@ -828,13 +1085,15 @@ export async function executeDashboard(
 		return false;
 	}
 
-	// Before anything reads: the server opens read-only handles, and read-only
+	// Before anything reads: every render opens a read-only handle, and read-only
 	// is the one mode that must not create a schema. Nothing else on this path
 	// is guaranteed to create the file either — `registerRepo` below is skipped
 	// outside a repo, and `runHistoryImport` with zero registered repos returns
 	// without opening a writable handle — so a first run in a non-repo
 	// directory used to serve a plain-text 500 on every page, with no scripts
-	// on it to ever recover.
+	// on it to ever recover. It is also what makes the schema THIS build's
+	// before anything serves, which is why the registry projection no longer
+	// needs a version gate of its own.
 	try {
 		await ensureDashboardDbExists(deps.dbPath ? { dbPath: deps.dbPath } : {});
 	} catch (err) {
@@ -843,7 +1102,6 @@ export async function executeDashboard(
 	}
 
 	const cwd = options.cwd ?? process.cwd();
-	const seams = resolveSeams(deps);
 
 	// The user's own opt-out for THIS repo, which gates this command's two writes
 	// to it (registration below, the cutover attempt at the end) and nothing else.
@@ -890,40 +1148,30 @@ export async function executeDashboard(
 		return false;
 	}
 
-	// The server runs at the repo root and only at a real directory — see
-	// resolveServerCwd. `registerRepo` above keeps using the raw `cwd`.
-	const serverCwd = await resolveServerCwd(cwd);
-	let state: DashboardServerState;
+	let dashboard: ForegroundDashboard;
 	try {
-		state = await ensureServerRunning(port, { ...deps, configDir: seams.configDir, cwd: serverCwd });
+		dashboard = await startForegroundDashboard(
+			page,
+			{
+				...(port !== undefined ? { port } : {}),
+				...(options.open !== undefined ? { open: options.open } : {}),
+				cwd,
+			},
+			deps,
+		);
 	} catch (err) {
-		output.error(`\n  Error: ${errMsg(err)}\n`);
+		output.error(`\n  Error: could not start the dashboard: ${errMsg(err)}\n`);
 		return false;
 	}
 
-	// View token → its ONE served path. `/stats` and `/standup` were removed as
-	// paths (see `VIEW_PATHS`), so this mapping is what keeps the launcher from
-	// opening a 404 — the token and the URL are no longer the same string.
-	const url = `http://127.0.0.1:${state.port}${page === "standup" ? "/dashboard/standup" : "/dashboard"}`;
-	if (options.open !== false) {
-		try {
-			await seams.openBrowser(url);
-		} catch (err) {
-			log.warn("could not open the browser (non-fatal): %s", errMsg(err));
-		}
-	}
-	output.log(`\n  Jolli dashboard → ${url}`);
-	output.log("  Reopen anytime with `jolli dashboard`; stop with `jolli dashboard --stop`.\n");
-
-	// Write side last: the page is already up and polling, so history fills in
-	// as this lands. Runs in this command process — the server never writes.
+	// Write side after the bind: the page is already up and polling, so history
+	// fills in as this lands. It shares this process's event loop now, so a first
+	// full sweep makes the page slower while it runs — still far better than a
+	// blank browser for the minutes it takes.
 	await runHistoryImport(deps);
 	// Attempted for the same reason {@link importDashboardHistory} does it: the
 	// import above has just filled the database from the orphan branch, so this is
-	// when the containment compare is most likely to pass. Without a call here the
-	// guided front door — which wakes the dashboard through this function rather
-	// than the import-only entry point — would be the one setup path that never
-	// converges past `uncutover`.
+	// when the containment compare is most likely to pass.
 	//
 	// THROTTLED, unlike that caller, and the difference is the invocation
 	// frequency rather than the moment: `jolli dashboard` is a reopen command a
@@ -940,17 +1188,18 @@ export async function executeDashboard(
 	if (!repoDisabled) {
 		await maybeAutoCutover(cwd, { throttle: true, ...(deps.dbPath ? { dbPath: deps.dbPath } : {}) });
 	}
-	// The "dashboard start" half of the no-daemon backup schedule (the other is
-	// the post-commit QueueWorker). It belongs here, not in the server: taking a
-	// snapshot needs a WRITABLE handle, which runs schema migrations, and the
-	// server is the one long-lived process whose build can lag. Internally
+	// The "dashboard start" half of the backup schedule (the others are the
+	// post-commit QueueWorker and the machine-global daemon). Internally
 	// day-gated and never throws, so this costs nothing on a normal reopen.
 	await opportunisticSnapshot(deps.dbPath);
+
+	// Serve until Ctrl+C. Everything above ran while the page was already up.
+	await dashboard.waitForShutdown();
 	return true;
 }
 
 /**
- * Registers the one launcher command.
+ * Registers the one dashboard command.
  *
  * `jolli stats` / `jolli standup` used to sit beside it as page-specific
  * aliases and are retired: they differed from `jolli dashboard` only in which
@@ -961,10 +1210,9 @@ export async function executeDashboard(
 export function registerDashboardCommand(program: Command): void {
 	program
 		.command("dashboard")
-		.description("Open the local Jolli dashboard (stats + standup) in your browser")
+		.description("Serve the local Jolli dashboard in your browser until you stop it (Ctrl+C)")
 		.option("--port <port>", "Port for the dashboard server (default: 1818, then 18118)")
 		.option("--no-open", "Do not open the browser, just print the URL")
-		.option("--stop", "Stop the running dashboard server")
 		.option("--cwd <dir>", "Repo directory to register (default: current directory)")
 		.action(async (options: DashboardOptions) => {
 			if (!(await executeDashboard("stats", options))) process.exitCode = 1;

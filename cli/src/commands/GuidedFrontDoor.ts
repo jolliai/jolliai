@@ -12,7 +12,12 @@
  * its state still needs):
  *   git repo? → onboarding (fresh only) → repair broken provider → Sign in? →
  *   Enable? → status line → cloud side-effects → backfill → listening →
- *   wake the local dashboard (import history, serve, open) → Next steps
+ *   import history into the dashboard DB → Next steps → serve the dashboard
+ *
+ * The dashboard is LAST, after Next steps, because serving blocks until Ctrl+C —
+ * anything printed after it would never be seen. That splits what used to be one
+ * `jolli dashboard` call into an import half and a serve half; see
+ * `importLocalDashboard` and `offerLocalDashboard`.
  *
  * `Sign in?` deliberately precedes `Enable?`. The opening status line moved to
  * AFTER `Enable?` so `✓ enabled` is always truthful. Non-git directories are a
@@ -36,7 +41,7 @@ import { install } from "../install/Installer.js";
 import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
 import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
-import { executeDashboard } from "./DashboardCommand.js";
+import { importDashboardHistory, startForegroundDashboard } from "./DashboardCommand.js";
 import { promptSetup } from "./EnableCommand.js";
 import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
 import { offerOptionalJolliLogin } from "./OptionalLogin.js";
@@ -118,7 +123,6 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	let token = await loadAuthToken();
 	let config = await loadConfig();
 	let { enabled, summaryCount } = await getGuidedFrontDoorStatus(cwd);
-
 	// Onboarding-funnel snapshot on entry, reusing the front door's lightweight
 	// status so the heavy `getStatus()` probe is skipped. Fires for every path
 	// past the git gate — including the user who declines to enable — so those
@@ -255,9 +259,9 @@ export async function runGuidedFrontDoor(): Promise<void> {
 		console.log(`\n  ${listening}`);
 		// Whatever the back-fill offer did (built memories, was declined, or never
 		// appeared), the memories it may have just written reach the dashboard
-		// database only through this import — and the guided front door is the one
-		// entry point that finishes by SHOWING them. See below.
-		await wakeLocalDashboard(cwd);
+		// database only through this import. Import-only: opening the dashboard is
+		// a separate, later decision — see `offerLocalDashboard`.
+		await importLocalDashboard(cwd);
 	}
 
 	// Next steps orientation — printed on EVERY path that reaches here, for new
@@ -269,50 +273,104 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	//   2. enable declined at the [Y/n] prompt → returned early (a valid choice)
 	//   3. install failure             → returned early with exitCode 1
 	printNextSteps();
+
+	// LAST, because it may never return: the dashboard serves in this process
+	// until Ctrl+C. Everything the front door has to say has been said by here.
+	if (canGenerate) await offerLocalDashboard(cwd);
 }
 
 /**
- * Wakes the local web service: registers this repo, imports its memory into the
- * dashboard database, brings up (or reuses) the read-only server and opens the
- * browser on it — one `executeDashboard` call, which is exactly what `jolli
- * dashboard` runs.
+ * Registers this repo and imports its memory into the dashboard database.
  *
- * Placed AFTER the back-fill step on purpose. `dbBackfillRepos` (which the import
- * half wraps) is the ONLY production caller of the source-of-truth import:
- * memories the back-fill just wrote would otherwise sit outside the dashboard
- * database until the user happened to run `jolli dashboard` by hand.
+ * Placed AFTER the back-fill step on purpose. `dbBackfillRepos` (which the
+ * import half wraps) is the ONLY production caller of the source-of-truth
+ * import: memories the back-fill just wrote would otherwise sit outside the
+ * dashboard database until the user happened to run `jolli dashboard` by hand.
  * Registration alone is not the point — the hooks self-register from the write
  * path on the next commit (see ProducerHooks) — the import is.
- *
- * Opening the browser is the point of doing it HERE rather than reusing
- * `importDashboardHistory`. This is the guided setup, the one path a new user
- * walks to completion, and the memories it just spent LLM budget building have
- * no surface until something shows them. `ensureServerRunning` probes `/health`
- * first, so a second `jolli` run reuses the live server instead of spawning a
- * second one. `jolli enable` deliberately stays import-only — there the server
- * is a side effect of a narrower request.
  *
  * Deliberately triggered by the STEP COMPLETING, not by it having built
  * anything: `runBackfillFrontDoorStep` returns `void` by contract (it reports
  * nothing to the front door).
  *
- * Never fails the front door: `executeDashboard` reports success as a boolean
- * precisely so soft callers can shrug a failure off, and `process.exitCode` must
- * stay untouched here — the front door's exit code is non-zero only for a hard
- * blocker (not a repo, install failure). A browser that will not open is already
- * non-fatal inside the launcher, which prints the URL either way.
+ * This is the import HALF of what used to be one `executeDashboard` call. The
+ * other half — binding a port and opening a browser — moved to
+ * {@link offerLocalDashboard}, after Next steps, because `jolli dashboard` now
+ * serves in its own process and does not return until Ctrl+C. Calling it from
+ * here would mean the front door never printed Next steps and never exited, on
+ * every run.
  */
-async function wakeLocalDashboard(cwd: string): Promise<void> {
-	// No flag-free `node:sqlite` → no database to import into and nothing to
-	// serve. Gated here rather than left to `executeDashboard`, which reports that
-	// runtime as an ERROR — correct when the user typed `jolli dashboard`, wrong
-	// as the closing line of a successful setup. Same gate as `jolli enable`.
+async function importLocalDashboard(cwd: string): Promise<void> {
+	// No flag-free `node:sqlite` → no database to import into. Gated here rather
+	// than left to the importer, so nothing below announces a dashboard this
+	// runtime cannot serve. Same gate as `jolli enable`.
 	if (!canUseDashboardDb()) return;
+	// Throttled, unlike `jolli enable`'s one-shot call: this runs on every bare
+	// `jolli`, and the cutover's containment compare reads every file the frozen
+	// tip lists. `executeDashboard` throttles for exactly this reason, and that
+	// was lost for a while when this switched from calling it to calling the
+	// import directly.
+	await importDashboardHistory(cwd, {}, { throttleCutover: true });
+}
+
+/**
+ * Opens the dashboard and serves it in this process, on any front-door run at a
+ * terminal.
+ *
+ * Runs LAST, after Next steps, and that position is what makes it unconditional.
+ * There used to be an `Open your dashboard now? [Y/n]` here, and its whole job
+ * was to stop a blocking serve from swallowing the closing orientation — a
+ * problem that only existed while this ran mid-function. Everything the front
+ * door has to say has been said by the time we get here, so the question cost a
+ * keystroke and bought nothing: declining it and pressing Ctrl+C are the same
+ * one key, and only one of the two leaves the user with the dashboard that
+ * finishing setup was for.
+ *
+ * **The one gate it did NOT replace:** `isTTY`, and it is defence in depth rather
+ * than the thing that actually decides. Its point is that a non-interactive run
+ * has no Ctrl+C, so serving would hold the process open forever at the very end
+ * of an otherwise successful setup, where it reads as a hang rather than a
+ * choice — but no CI job or install script reaches this line to find out.
+ * `Api.ts` runs the front door only when stdin AND stdout are both TTYs, and it
+ * is the only caller, so this branch is unreachable from the CLI today
+ * (**measured**: bare `jolli` on a pipe prints the grouped help and exits — it
+ * never enters `runGuidedFrontDoor` at all). Keep it anyway: it is what makes the
+ * function safe for any future caller that does not pre-check, and
+ * `GuidedFrontDoor.test.ts` pins both branches. Do not promote it back to
+ * "load-bearing" — the gate that carries that weight is the one in `Api.ts`.
+ * (`canUseDashboardDb` sits alongside it, but that one is capability, not policy
+ * — there is no database on this runtime to serve.)
+ *
+ * **A `justEnabled` gate is deliberately NOT among them, and this is the place
+ * that decision is recorded.** A returning `jolli` at a terminal serves too:
+ * opening the dashboard whenever it can is what makes `jolli` the one command a
+ * user has to remember. The objection it answers — that a returning run is only a
+ * status check, so taking its terminal is not an answer to "how are things" — is
+ * settled by the position rather than by a gate: the status line, the listening
+ * line and Next steps are all on screen before this blocks, so nothing the run had
+ * to say is withheld, and Ctrl+C costs the same one keystroke that declining a
+ * prompt would have. `GuidedFrontDoor.test.ts` pins it ("a returning run serves
+ * too"), so re-adding the gate fails that test rather than quietly reverting the
+ * contract.
+ *
+ * Never fails the front door: `process.exitCode` must stay untouched here — the
+ * front door's exit code is non-zero only for a hard blocker (not a repo,
+ * install failure).
+ */
+async function offerLocalDashboard(cwd: string): Promise<void> {
+	if (!canUseDashboardDb()) return;
+	if (!process.stdin.isTTY) {
+		console.log("  Open your dashboard anytime: jolli dashboard\n");
+		return;
+	}
 	try {
-		const opened = await executeDashboard("stats", { cwd });
-		if (!opened) console.log("  (Dashboard did not open — run 'jolli dashboard' to retry.)\n");
+		// The import already ran above, so this is the serve half only — going
+		// through `executeDashboard` would re-run it and print "all N memories were
+		// already migrated" directly under the block that just migrated them.
+		const dashboard = await startForegroundDashboard("stats", { cwd });
+		await dashboard.waitForShutdown();
 	} catch (err) {
-		log.warn("dashboard wake failed (non-fatal): %s", errMsg(err));
+		log.warn("dashboard did not start (non-fatal): %s", errMsg(err));
 		console.log("  (Dashboard did not open — run 'jolli dashboard' to retry.)\n");
 	}
 }

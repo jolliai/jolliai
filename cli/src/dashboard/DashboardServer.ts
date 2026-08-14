@@ -13,17 +13,16 @@
  * enable/pause/resume made here is visible to the very next request instead of
  * waiting for the next `jolli dashboard` (every read surface filters on
  * `repos.disabled_at IS NULL`, so an unprojected registry write is invisible in
- * both directions). It is guarded to preserve the rule that matters — this
- * process NEVER migrates the schema; see the function.
+ * both directions).
  *
- * That rule is load-bearing enough to have been broken once: the daily
- * backup snapshot used to fire from `startDashboardServer`, and
- * `opportunisticSnapshot` opens a WRITABLE handle — which runs schema
- * migrations. This is the one long-lived process whose build can lag (a
- * launcher reuses a recorded server after probing `/health`, which reports no
- * version), so it is the last one that should be able to migrate the schema.
- * Both halves of the no-daemon backup schedule now live in processes that
- * already write: `executeDashboard` and the post-commit `QueueWorker`.
+ * That write used to stand down unless the file was already at this build's
+ * schema version, because the server was a DETACHED process a launcher would
+ * reuse after probing `/health` — the one long-lived process whose build could
+ * lag behind the CLI that spawned it. `jolli dashboard` now serves in its own
+ * command process, so server build ≡ CLI build and that gate is gone. The
+ * read-only open per render stays, for two reasons that never depended on the
+ * daemon: WAL's one-writer/N-readers split, and the SQLite-enforced guarantee
+ * that a browser-reachable process cannot write through a render path.
  *
  * DbBackfill is deliberately NOT part of that write surface: the import sweep
  * that fills the database from summaries already written is `jolli dashboard`'s
@@ -87,8 +86,8 @@
 
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
+import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { clearAuthCredentials, getJolliUrl } from "../auth/AuthConfig.js";
@@ -103,15 +102,9 @@ import { isTelemetryEventName, type TelemetryEventName } from "../core/Telemetry
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import { install } from "../install/Installer.js";
-import { createLogger, errMsg, isEnoent } from "../Logger.js";
+import { createLogger, errMsg } from "../Logger.js";
 import type { LocalAgentToolId } from "../Types.js";
-import {
-	DASHBOARD_SCHEMA_VERSION,
-	ensureDashboardDbExists,
-	isSchemaCurrent,
-	withDashboardDb,
-	withReadonlyDashboardDb,
-} from "./DashboardDb.js";
+import { ensureDashboardDbExists, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import {
 	CONTEXT_DOC_KINDS,
 	type DashboardModel,
@@ -153,68 +146,22 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 /** Preferred ports: both verified free of mainstream registered services. */
 export const DASHBOARD_PORTS = [1818, 18118] as const;
 
-/** Shut down after this long with no requests. Restarting is cheap and lossless. */
-const DEFAULT_IDLE_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-
-/** State the launcher needs to find (or verify) a running server. */
-export interface DashboardServerState {
-	readonly pid: number;
-	readonly port: number;
-	readonly startedAt: string;
-	readonly schemaVersion: number;
-}
-
-/** Path of `dashboard.json` — pid/port, so the launcher can find a live server. */
-export function getDashboardStatePath(configDir: string = getGlobalConfigDir()): string {
-	return join(configDir, "dashboard.json");
-}
-
-export async function readDashboardState(configDir?: string): Promise<DashboardServerState | null> {
-	try {
-		const raw = JSON.parse(await readFile(getDashboardStatePath(configDir), "utf-8")) as DashboardServerState;
-		return typeof raw?.port === "number" ? raw : null;
-	} catch (err) {
-		if (!isEnoent(err)) log.warn("dashboard.json unreadable: %s", errMsg(err));
-		return null;
-	}
-}
-
-export async function writeDashboardState(state: DashboardServerState, configDir?: string): Promise<void> {
-	const path = getDashboardStatePath(configDir);
-	await mkdir(dirname(path), { recursive: true });
-	await writeFile(path, `${JSON.stringify(state, null, 2)}\n`, { encoding: "utf-8", mode: 0o600 });
-}
-
 /**
- * Removes `dashboard.json`.
+ * Names this service in the `/health` body, so the next `jolli dashboard` can
+ * tell one of ours from anything else answering on the port.
  *
- * `expectedPid` makes the removal **conditional**: clear the record only while
- * it still describes that pid. A shutting-down server must never delete a
- * successor's record — should two servers ever be alive at once, the first to
- * exit would orphan the second, leaving a healthy server that no launcher can
- * find and every later `jolli dashboard` spawning yet another one. Callers
- * cleaning up after a server they merely *read about* (`--stop`, the launcher's
- * replace path) pass the pid they read, for the same reason.
+ * Load-bearing rather than cosmetic: the launch path SIGTERMs the pid it reads
+ * out of that body, and the shape it would otherwise match on — `{ok: true, pid:
+ * number}` — is one of the most common health payloads there is. Requiring the
+ * marker is what keeps an unrelated local service from being identified as a
+ * dashboard and killed, which matters most under an explicit `--port`, where the
+ * user aims the probe at a port a dev server is far more likely to hold.
  *
- * Read-then-unlink is not atomic, so a record rewritten inside that window can
- * still be removed. That is a far smaller race than the unconditional delete,
- * and the recovery is the same one that already covers a crashed server: the
- * next launcher finds no record and spawns.
+ * Consumed by `identifyDashboardHealth` in `commands/DashboardCommand.ts`. Both
+ * halves must agree on this string, which is why it lives here and is imported
+ * there rather than being spelled twice.
  */
-export async function clearDashboardState(configDir?: string, expectedPid?: number): Promise<void> {
-	if (expectedPid !== undefined) {
-		const current = await readDashboardState(configDir);
-		if (current && current.pid !== expectedPid) {
-			log.info("dashboard.json now records pid %d — leaving it for that server", current.pid);
-			return;
-		}
-	}
-	try {
-		await unlink(getDashboardStatePath(configDir));
-	} catch (err) {
-		if (!isEnoent(err)) log.warn("could not remove dashboard.json: %s", errMsg(err));
-	}
-}
+export const DASHBOARD_HEALTH_SERVICE = "jolli-dashboard";
 
 // ── Asset assembly ──────────────────────────────────────────────────────────
 
@@ -556,7 +503,7 @@ async function defaultModelBuilder(
 	now: () => number,
 	launchCwd: string,
 ): Promise<DashboardModel> {
-	// The launcher creates the file before this process starts, so this only
+	// The command creates the file before it binds, so this only
 	// covers the case where it disappears under a running server (a wiped
 	// `~/.jolli/jollimemory`, a `doctor` mid-restore). Recreating an empty
 	// schema beats the alternative: a read-only open raises SQLITE_CANTOPEN,
@@ -621,13 +568,10 @@ async function defaultModelBuilder(
 }
 
 export interface DashboardServerOptions {
-	/** 0 lets the OS pick (tests); the launcher passes a preferred port. */
+	/** 0 lets the OS pick (tests); the command passes a preferred port. */
 	readonly port: number;
 	readonly buildModel?: ModelBuilder;
 	readonly assetsDir?: string;
-	readonly idleTimeoutMs?: number;
-	/** Called when the idle timeout fires, after the server closes. */
-	readonly onIdleShutdown?: () => void;
 	readonly now?: () => number;
 	/** Database override for the start-time snapshot trigger (tests). */
 	readonly dbPath?: string;
@@ -1032,16 +976,12 @@ const TOOL_USAGE_MAX_LIMIT = TOOL_ROWS_LIMIT * 25;
  */
 export function createDashboardServer(options: DashboardServerOptions): Server {
 	const now = options.now ?? Date.now;
-	const idleTimeoutMs = options.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
 	const configDir = options.configDir;
 	const serverCwd = options.serverCwd ?? process.cwd();
 	const token = options.token ?? randomBytes(32).toString("hex");
 	let assetsDir: string | undefined;
 	/** Lazily-resolved knowledge-graph viz assets (`<dist>/graph-assets/`) — reused by both iframe routes. */
 	let graphAssetsDir: string | undefined;
-	let lastRequestMs = now();
-	/** The idle poll, armed on `listening` and cleared on `close`. See `armIdlePoll`. */
-	let idlePoll: ReturnType<typeof setInterval> | undefined;
 	let boundPort = options.port;
 	/** Lives as long as this server; see {@link IdentityCache}. */
 	const identityCache: IdentityCache = new Map();
@@ -1058,7 +998,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			defaultModelBuilder(request, configDir, options.dbPath, identityCache, now, serverCwd));
 
 	const server = createServer(async (req, res) => {
-		lastRequestMs = now();
 		try {
 			await handle(req, res);
 		} catch (err) {
@@ -1138,12 +1077,35 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			sendJson(res, 200, { status: await checkLocalFolder(url.searchParams.get("path") ?? "") });
 			return;
 		}
+		// Identifies this listener to the next `jolli dashboard`, which reclaims the
+		// port by killing whatever holds it — but only once this answers, because
+		// signalling an unidentified process on 1818 would kill some unrelated local
+		// service. The pid it returns is live BY CONSTRUCTION (it just answered on
+		// the port being taken), which is what makes this safe where the state file
+		// it replaces was not: a recorded pid could have been recycled.
+		//
+		// `service` is what makes "unidentified" a real test rather than a hopeful
+		// one: `{ok: true, pid: number}` on its own is a payload plenty of unrelated
+		// services emit. See DASHBOARD_HEALTH_SERVICE.
+		//
+		// `platform` and `host` say WHICH pid namespace that process id belongs to,
+		// and they are what stops the reclaim signalling a stranger. Answering on
+		// loopback does not put a process within reach: a dashboard inside WSL or a
+		// container answers a host CLI perfectly well, and the id it reports is real
+		// THERE. The host resolving it locally either finds nothing (harmless) or
+		// finds an unrelated process and SIGTERMs it — a wrong kill that also leaves
+		// the port held, so nothing downstream can tell it happened. `process.kill`
+		// takes any integer; only these two fields let the caller decline.
+		//
+		// Ungated, like every other read here, and it exposes nothing beyond a
+		// process id, a hostname, and the fact that a dashboard is running.
 		if (url.pathname === "/health") {
 			sendJson(res, 200, {
 				ok: true,
 				pid: process.pid,
-				port: boundPort,
-				schemaVersion: DASHBOARD_SCHEMA_VERSION,
+				service: DASHBOARD_HEALTH_SERVICE,
+				platform: process.platform,
+				host: hostname(),
 			});
 			return;
 		}
@@ -1772,23 +1734,21 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	 * gets for free from the backfill it runs and a long-lived server does not.
 	 *
 	 * The reachability reads filter on `repos.disabled_at IS NULL`, and this server
-	 * never re-backfills (its only timer is the idle-shutdown poll), so an
-	 * unprojected write stays invisible until the next `jolli dashboard`: a repo
-	 * added from this page has no row, so it is missing everywhere, while a paused
-	 * one keeps counting in every KPI (the repo picker now lists it, marked paused,
-	 * rather than dropping it).
+	 * never re-backfills, so an unprojected write stays invisible until the next
+	 * `jolli dashboard`: a repo added from this page has no row, so it is missing
+	 * everywhere, while a paused one keeps counting in every KPI (the repo picker
+	 * now lists it, marked paused, rather than dropping it).
 	 *
 	 * Re-reads the registry rather than taking the caller's entry: `registerRepo` /
 	 * `deregisterRepo` are the writers, and what has to be projected is the state
 	 * they LANDED (registerRepo clears `disabledAt`, deregisterRepo stamps it).
 	 *
-	 * The ONE write this process makes to the database, and it stays inside the
-	 * "never migrates" rule at the top of this file: a writable open runs pending
-	 * migrations, and this is the one long-lived process whose build can lag behind
-	 * the CLI that spawned it. So the schema version is read read-only first and the
-	 * projection is skipped unless the file is already at this build's version —
-	 * an older schema means the caller is the wrong process to upgrade it, and the
-	 * `jolli dashboard` that migrates will project on the way through.
+	 * The ONE write this process makes to the database, and it is now an ordinary
+	 * one. It used to stand down unless the file was already at this build's schema
+	 * version, because a writable open MIGRATES and the detached server was the one
+	 * long-lived process whose build could lag behind the CLI that spawned it. The
+	 * server runs in the command process now, so it carries that command's own
+	 * build and `executeDashboard` has already migrated the file before binding.
 	 *
 	 * Returns a warning string instead of throwing. The install/uninstall it
 	 * follows has already succeeded, so answering 500 would report a rollback that
@@ -1802,23 +1762,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			const entry = registry.repos.find((r) => r.repoIdentity === repoIdentity);
 			if (!entry) return undefined;
 			const dbOpts = options.dbPath ? { dbPath: options.dbPath } : {};
-			// ONE reason to stand down, and it is not about compatibility: a writable
-			// open MIGRATES, and this long-lived process is the wrong one to do that
-			// (see the module header). A file AHEAD of this build is written to
-			// normally — the database refuses nobody, see the compatibility note in
-			// `DashboardDb`. The exact-equality test this replaces also degraded the
-			// list whenever the file was merely newer.
-			//
-			// The predicate is `isSchemaCurrent`, NOT `found < DASHBOARD_SCHEMA_VERSION`:
-			// under the name key a file can be at the current stamp with a named migration
-			// still pending, and `withDashboardDb` below would then MIGRATE it from this
-			// long-lived process — exactly what the guard exists to prevent. Standing down
-			// leaves the apply to the startup `ensureDashboardDbExists` or a hook.
-			const current = await withReadonlyDashboardDb(isSchemaCurrent, dbOpts);
-			if (!current) {
-				log.info("skipping registry projection: a schema migration is pending for this build");
-				return staleList;
-			}
 			await withDashboardDb((db) => projectRepoRegistryState(db, entry), dbOpts);
 			return undefined;
 		} catch (err) {
@@ -1882,47 +1825,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		const addr = server.address();
 		/* v8 ignore next -- address() is always AddressInfo once listening */
 		boundPort = typeof addr === "object" && addr ? addr.port : boundPort;
-		// The idle clock starts when we begin SERVING, not when the object was
-		// constructed — `startDashboardServer` builds one server per candidate
-		// port and the losers can sit around for a while before the winner binds.
-		lastRequestMs = now();
-		armIdlePoll();
 	});
-
-	// Idle shutdown: poll rather than re-arm a timer per request — requests are
-	// bursty and the poll is cheap. unref'd so it never keeps the process alive
-	// by itself.
-	//
-	// Armed from the `listening` handler, NOT here. `startDashboardServer` walks
-	// the candidate ports by constructing a server per port and discarding the
-	// ones that hit EADDRINUSE; a timer armed at construction outlives that
-	// discard (nothing clears it, and `close()` on a server that never listened
-	// still invokes its callback), so the loser's frozen `lastRequestMs` would
-	// fire the shutdown hours later and take down the HEALTHY server sharing the
-	// process — `unref` does not help, because the live server keeps the loop
-	// alive. Arming on `listening` means a server that never bound never arms.
-	function armIdlePoll(): void {
-		if (idleTimeoutMs <= 0 || idlePoll) return;
-		idlePoll = setInterval(() => {
-			if (now() - lastRequestMs >= idleTimeoutMs) {
-				log.info("idle for %d ms — shutting down", idleTimeoutMs);
-				disarmIdlePoll();
-				server.closeAllConnections();
-				server.close(() => options.onIdleShutdown?.());
-			}
-		}, 60_000);
-		idlePoll.unref();
-	}
-
-	function disarmIdlePoll(): void {
-		if (!idlePoll) return;
-		clearInterval(idlePoll);
-		idlePoll = undefined;
-	}
-
-	// A server closed by any route (idle, signal, a failed bind after listening)
-	// must not leave the poll behind.
-	server.on("close", disarmIdlePoll);
 
 	return server;
 }
@@ -1930,18 +1833,29 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 export interface StartedDashboardServer {
 	readonly server: Server;
 	readonly port: number;
+	/**
+	 * True when the preferred port was taken and a later candidate won. The
+	 * command prints a line for it: with no state file and no reuse probe, an
+	 * unexplained port change is the only symptom of an older `jolli dashboard`
+	 * (or anything else) already holding 1818.
+	 */
+	readonly fellBack: boolean;
 }
 
 /**
  * Starts the server on the first available preferred port, falling back to an
- * OS-assigned one, and persists `dashboard.json` so launchers can find it.
+ * OS-assigned one.
+ *
+ * No state file is written. `jolli dashboard` serves in its own process and
+ * lives until Ctrl+C, so there is nothing for another process to discover and
+ * nothing to leave behind on a hard kill.
  */
 export async function startDashboardServer(
 	options: Omit<DashboardServerOptions, "port"> & { readonly port?: number; readonly configDir?: string },
 ): Promise<StartedDashboardServer> {
 	const candidates = options.port !== undefined ? [options.port] : [...DASHBOARD_PORTS, 0];
 	let lastError: Error | null = null;
-	for (const candidate of candidates) {
+	for (const [index, candidate] of candidates.entries()) {
 		const server = createDashboardServer({ ...options, port: candidate });
 		try {
 			const port = await new Promise<number>((resolve, reject) => {
@@ -1959,27 +1873,9 @@ export async function startDashboardServer(
 					resolve(typeof addr === "object" && addr ? addr.port : candidate);
 				});
 			});
-			await writeDashboardState(
-				{
-					pid: process.pid,
-					port,
-					startedAt: new Date((options.now ?? Date.now)()).toISOString(),
-					schemaVersion: DASHBOARD_SCHEMA_VERSION,
-				},
-				options.configDir,
-			);
 			log.info("dashboard listening on 127.0.0.1:%d", port);
-			// No snapshot trigger here — the backup schedule's "dashboard start"
-			// half lives in `executeDashboard` (the command process). This process
-			// must stay read-only: `opportunisticSnapshot` opens a WRITABLE handle,
-			// which runs schema migrations, and this is the one long-lived process
-			// whose build can lag (a launcher only probes the recorded pid's
-			// `/health`, never its version). See the module header's first claim.
-			return { server, port };
+			return { server, port, fellBack: index > 0 };
 		} catch (err) {
-			// `close()` is what releases the loser's idle poll (createDashboardServer
-			// disarms on the 'close' event). A discarded server that kept its poll
-			// would later shut down the winner, which shares this process.
 			server.close();
 			lastError = err instanceof Error ? err : new Error(String(err));
 			// EADDRINUSE on a preferred port → try the next candidate.

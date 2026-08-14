@@ -15,7 +15,11 @@ const { mockLogInfo, mockLogDebug, mockLogError } = vi.hoisted(() => ({
 	mockLogDebug: vi.fn(),
 	mockLogError: vi.fn(),
 }));
-vi.mock("../Logger.js", () => ({
+// Only the logger is faked. `isEnoent` is the REAL one — it is the predicate under
+// test on half these cases (which level a read failure logs at, and whether a
+// rejection counts as a missing transcript), so a stub would be asserting the stub.
+vi.mock("../Logger.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../Logger.js")>()),
 	createLogger: () => ({
 		info: mockLogInfo,
 		warn: vi.fn(),

@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 // Unlike the graph viz (webview, shipped under assets/), the dashboard server
 // reads its assets from DISK relative to its own bundle
 // (resolveDashboardAssetsDir), so the copy lands in dist/dashboard-assets/
-// beside DashboardServerEntry.js.
+// beside Cli.js — which is the bundle `jolli dashboard` serves from.
 //
 // ORDER: the CLI must be built before this runs (the extension build depends
 // on the CLI). If cli/dist/dashboard-assets is missing, build the CLI first.

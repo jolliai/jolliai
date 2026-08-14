@@ -18,7 +18,7 @@ Every mutually-exclusive critical section in the product is guarded by an adviso
 
 **Out of scope (boundaries):**
 
-- What each guarded critical section actually does — those belong to their own topics (queue draining, orphan-branch writes, Memory Bank sync rounds, the folder-tree tidy-up, the plan/note registry, the pending-push ledger, the repository profile, hook installation, the runtime registry, the machine-global repository registry, the dashboard launcher).
+- What each guarded critical section actually does — those belong to their own topics (queue draining, orphan-branch writes, Memory Bank sync rounds, the folder-tree tidy-up, the plan/note registry, the pending-push ledger, the repository profile, hook installation, the runtime registry, the machine-global repository registry).
 - The per-vault write lock's path canonicalisation, acquired-handle interface, heartbeat cadence, hold windows, cross-repository waiter registry and diagnostic probe. Only its catalogue row and its two-discipline anomaly are described here.
 - Coordination artifacts that are **not** mutual-exclusion locks even though they sit beside these files and share the ownership-record convention: the display-only ingest phase marker and the per-commit capture-progress ownership file that a progress watcher probes to detect a dead producer. They are described where their consumers are.
 - In-process synchronisation of any kind. Every lock here is a filesystem artifact, so it serialises separate processes as well as separate asynchronous flows inside one process.
@@ -90,7 +90,6 @@ Callers must therefore handle the two disciplines differently. A best-effort cal
 | `push-control.lock` | Machine-global | 5 seconds, polled at 25 ms | **Strict primitive, best-effort at its one call site** — see below |
 | `repo-registry.lock` | Machine-global | 5 seconds, polled at 25 ms | **Best-effort** |
 | `vault-<hash>.lock` | Per-configured-vault, filed machine-globally | Two named budgets plus a fail-fast mode: 60 seconds for a holder with queued on-disk work, 10 seconds for a holder that would rather yield; all polled at 100 ms | Acquisition result returned to the caller — and, uniquely, **two callers over one budget answer a miss oppositely**; see below |
-| `dashboard-spawn.lock` | Machine-global | Fail-fast, with one reclaim-and-retry attempt; no polling | Acquisition result returned to the caller, which falls back to waiting for the winning launcher. **Does not use the shared convention** — see below |
 
 The three oldest entries (`worker.lock`, `ingest.lock`, `orphan-write.lock`), the sync lock and the per-vault write lock are neither strict nor best-effort in the sense above: they hand the acquisition result back and let each caller decide. Every caller of the first four declines the work on failure; the per-vault lock is the one place where two callers make different choices. The strict/best-effort distinction applies to the wrappers that run a callback on the caller's behalf.
 
@@ -119,16 +118,13 @@ Two further properties of these particular holders are worth recording here beca
 
 The contrast is **not** "every other holder passes the hook": the hook is passed by the queue worker's ingest write guard and the two compile write guards, while the worker's own summary drain calls the same drain by hand right after releasing, and the Memory Bank sync round's drain is **round-scoped rather than release-scoped** — a round-complete callback that fires after the whole round, not when this lock frees mid-round. The two editor-host spans are therefore the only holders that leave a recorded waiter untouched, but they are not the only ones without the hook.
 
-### The dashboard spawn lock re-implements the convention rather than using it
+### The dashboard spawn lock is REMOVED
 
-`dashboard-spawn.lock` is the one entry in the catalogue that does not go through the shared primitive. It keeps the shape — a single regular file whose existence means "held", containing the owning process's numeric identifier, taken by exclusive create — and drops two of the three guarantees around it:
+`dashboard-spawn.lock` used to be the one entry in the catalogue that did not go through the shared primitive: same shape (a regular file whose existence means "held", holding the owner's numeric identifier, taken by exclusive create) but with no staleness ceiling, no freshness signal and an unconditional release. It existed for exactly one job — stopping two launchers from racing each other into two detached dashboard servers.
 
-- **No staleness ceiling and no freshness signal.** Reclamation is by dead owner only: an unreadable lock, or one holding a non-numeric identifier, also counts as reclaimable so a launcher killed mid-write cannot wedge the dashboard permanently. There is no modification-time test anywhere, and therefore no heartbeat obligation on the holder.
-- **Release is not ownership-checked.** It removes the file unconditionally.
+There are no launchers any more. `jolli dashboard` binds the port in its own process and serves until the user stops it, so two concurrent invocations are two ordinary listeners: the second finds the preferred port taken, moves to the next candidate, and says so. The failure the lock prevented — a second *background* server nobody can find, because both were competing to be named by one state record — cannot be constructed.
 
-Its reclaim path is nonetheless careful about the thing that matters for it: the retry after removing a dead owner's file goes through the **same exclusive create**, then reads the file back to confirm the recorded identifier is its own. An earlier blind overwrite let two launchers that both observed the same dead identifier both believe they had won, which is exactly the double spawn the lock exists to prevent; now the loser's create fails and it falls into the wait-for-the-other-launcher branch.
-
-One residual race is accepted in place: remove-then-create is two syscalls, so a second reclaimer whose removal lands after the first has already created and read back its own lock still takes it. The consequence is bounded on the other side rather than in the lock — the launcher probes the recorded server's own health endpoint and reuses a live server before it ever tries to spawn — so the worst case is one short-lived extra process, not a permanently orphaned server.
+Nothing replaced it. Do not reintroduce a lock here on the strength of "two dashboards at once": that is now a supported outcome, not a race.
 
 ### The repository profile lock has two disciplines
 
@@ -229,6 +225,6 @@ For any single lock file:
 - **The repository-profile / manual-disable topic** owns the state guarded by the strict profile lock, including the abort-without-teardown behaviour on a lock timeout.
 - **The cutover compare-and-swap** is the one sanctioned bare acquisition of the summary-ref write lock, and owns why it holds several clones' locks at once, in what order, and what it does inside them — defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
 - **The per-vault write lock's own topic** owns its path canonicalisation, its acquired-handle interface, its heartbeat cadence, its hold windows, the cross-repository waiter registry drained on release, and its diagnostic probe. This topic owns only its place in the catalogue and the fact that it is the one lock with two callers whose disciplines are opposites. The two editor-host holders that produce that split, and their omission of the release hook, are owned by the Memory Bank unused-folder archival spec and the Memory Bank duplicate-folder consolidation spec.
-- **The dashboard launcher** owns why the spawn lock exists, the health probe that bounds its residual race, and the recorded-server record it protects; this topic owns only the fact that the lock re-implements the shared convention and what it drops.
+- **The dashboard command** (361) owns why the spawn lock no longer exists: it serves in its own process, so there is no detached server for two invocations to race into creating.
 - **The machine-global repository registry** — the durable record from which the dashboard database is rebuilt — owns its own read-modify-write; its lock is best-effort for the same reason as the other state-document locks, and running that section unlocked narrows to a small lost-registration window rather than dropping the registration outright.
 - **Queue draining, orphan-branch writes, Memory Bank sync rounds, the plan/note registry, the commit-selection record, the pending-push ledger, session/cursor registries, and machine-global configuration** each own their guarded critical section; this topic owns only the lock characteristics.

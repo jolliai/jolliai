@@ -1103,13 +1103,47 @@ export async function withRepairDashboardDb<T>(
  * fault itself.
  */
 export function isSchemaCurrent(db: DashboardDbHandle): boolean {
-	const state = readMigrationLogState(db);
-	if (state.kind === "rows") {
-		const done = new Set<string>();
-		for (const row of state.rows) if (row.outcome === "applied" || row.outcome === "baseline") done.add(row.name);
-		return MIGRATIONS.every((m) => done.has(m.name));
-	}
+	const done = readAppliedMigrationNames(db);
+	if (done) return MIGRATIONS.every((m) => done.has(m.name));
 	return readSchemaVersion(db) >= DASHBOARD_SCHEMA_VERSION;
+}
+
+/**
+ * The names `schema_migrations` records as run (`applied` or `baseline`), or
+ * `undefined` when there is no log to believe.
+ *
+ * Its own SELECT rather than a projection over {@link readMigrationLogState},
+ * and the reason is the `ddl` column: it stores each migration's entire source
+ * text — the baseline entry alone is ~35 KB — while this answers a question
+ * about NAMES. That read is on the dashboard's hot path, not a startup one:
+ * `defaultModelBuilder` calls {@link ensureDashboardDbExists} on EVERY
+ * `/api/model`, so once per page load and once per 30 s poll for as long as the
+ * tab is open. Pulling every migration's DDL there moved tens of KB per request
+ * to look at two columns.
+ *
+ * Collapses `none` and `unreadable` into one `undefined`, which the full read
+ * deliberately does not: this caller answers BOTH by deferring to the version
+ * stamp (see {@link isSchemaCurrent}), so it needs no `migrationLogTableExists`
+ * probe to tell them apart — one query, not two. A caller that must report the
+ * difference is exactly the caller that should use `readMigrationLogState`.
+ */
+function readAppliedMigrationNames(db: DashboardDbHandle): ReadonlySet<string> | undefined {
+	try {
+		// No ORDER BY: this collects into a set, so `seq` order buys nothing here —
+		// unlike the full read, whose `rows` are documented as being in that order.
+		const rows = db.prepare("SELECT name, outcome FROM schema_migrations").all() as ReadonlyArray<{
+			name: string;
+			outcome: string;
+		}>;
+		const done = new Set<string>();
+		for (const row of rows) if (row.outcome === "applied" || row.outcome === "baseline") done.add(row.name);
+		return done;
+	} catch {
+		// `no such table` (a database from before entry 5) and a genuinely broken log
+		// alike. An EMPTY set is not this answer — it is "the log is readable and
+		// records nothing run", which correctly reports the schema as not current.
+		return undefined;
+	}
 }
 
 /**

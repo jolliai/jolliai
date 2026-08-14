@@ -277,6 +277,11 @@
 				"command": "jollimemory.openDashboard",
 				"title": "Open Dashboard",
 				"category": "Jolli Memory"
+			},
+			{
+				"command": "jollimemory.stopDashboard",
+				"title": "Stop Dashboard",
+				"category": "Jolli Memory"
 			}
 		],
 		"menus": {

@@ -1,20 +1,26 @@
 /**
  * DashboardLauncher tests.
  *
- * The subject is the wiring, not the launcher: `executeDashboard` is injected by
- * every case except the one that exists to prove the default is wired (and that
- * one gets a module mock), and `spawnHidden` is mocked throughout — so nothing
- * here binds a port, starts a process or opens a browser. What is worth pinning
- * is the six things this module decides on its own: the remote gate, the argv +
- * env that make Electron run the server entry as node, that the progress
- * notification ends at the BROWSER rather than at the end of the command, that a
- * failure reaches the user, that a repeat click reuses the running launch rather
- * than starting a second one, and that a refused browser is reported at all.
+ * The subject is the wiring, not the dashboard: the child process is injected by
+ * every case except the one that exists to prove the default spawner is wired
+ * (and that one mocks `spawnHidden`), so nothing here binds a port, starts a
+ * process or opens a browser.
+ *
+ * What is worth pinning is what this module decides on its own now that
+ * `jolli dashboard` is a foreground command it runs as a CHILD: the remote gate,
+ * the argv that runs the CLI entry as node with `--no-open`, that the URL is
+ * recovered from the child's own output (nothing on disk records the port any
+ * more), that the progress notification ends at the BROWSER rather than at the
+ * child's exit, that a child which dies before serving is reported, that a
+ * repeat click reuses the running dashboard, that a refused browser is reported
+ * at all, and that the child can be stopped — the Ctrl+C a button cannot offer.
  */
 
+import { EventEmitter } from "node:events";
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 // `withProgress` runs its task here (rather than being an inert `vi.fn()`)
@@ -32,20 +38,12 @@ vi.mock("vscode", () => ({
 	ProgressLocation: { Notification: 15 },
 }));
 
-const { spawnHiddenMock, executeDashboardMock } = vi.hoisted(() => ({
-	spawnHiddenMock: vi.fn(),
-	executeDashboardMock: vi.fn(),
-}));
+const { spawnHiddenMock } = vi.hoisted(() => ({ spawnHiddenMock: vi.fn() }));
 
-// No real process is ever started: the spawner's whole job here is the argv +
-// env it hands to `spawnHidden`, which is what makes Electron run the entry as
-// a plain node process.
+// No real process is ever started: the default spawner's whole job here is the
+// argv + env it hands to `spawnHidden`, which is what makes Electron run the
+// CLI entry as a plain node process.
 vi.mock("../../../cli/src/util/Subprocess.js", () => ({ spawnHidden: spawnHiddenMock }));
-
-// The launcher itself is injected as `run` by nearly every case; this mock only
-// covers the one case that omits it, so the `?? executeDashboard` fallback can
-// be exercised without binding a port or touching the repo.
-vi.mock("../../../cli/src/commands/DashboardCommand.js", () => ({ executeDashboard: executeDashboardMock }));
 
 const logCalls: Array<{ level: string; message: string }> = [];
 vi.mock("../util/Logger.js", () => ({
@@ -61,15 +59,17 @@ vi.mock("../util/Logger.js", () => ({
 import {
 	__resetDashboardLaunchForTests,
 	BROWSER_FAILURE_MESSAGE,
-	createOutput,
-	createServerSpawner,
+	CLI_ENTRY_FILE,
 	type DashboardLauncherUi,
+	type DashboardSpawner,
 	FAILURE_MESSAGE,
+	isDashboardRunning,
 	isRemoteWorkspace,
 	launchDashboard,
 	PROGRESS_TITLE,
 	REMOTE_HINT,
-	SERVER_ENTRY_FILE,
+	stopDashboard,
+	URL_PATTERN,
 } from "./DashboardLauncher.js";
 
 interface FakeUiCalls {
@@ -120,15 +120,75 @@ function fakeUi(
 	return { ui, calls };
 }
 
-/** A stand-in for the detached child: only `on` and `unref` are ever touched. */
-function fakeChild(): { on: ReturnType<typeof vi.fn>; unref: ReturnType<typeof vi.fn> } {
-	return { on: vi.fn(), unref: vi.fn() };
+/**
+ * A stand-in for the spawned `jolli dashboard`.
+ *
+ * Real streams rather than stubs, because the module reads them through
+ * `readline` — the line buffering is part of what is under test (a chunk
+ * boundary inside the URL line must not lose it).
+ */
+function fakeChild(): {
+	child: EventEmitter & { stdout: PassThrough; stderr: PassThrough; kill: ReturnType<typeof vi.fn>; exitCode: null };
+	say: (line: string) => Promise<void>;
+	gone: (code: number) => Promise<void>;
+	closed: (code: number) => Promise<void>;
+	exit: (code: number) => Promise<void>;
+} {
+	const stdout = new PassThrough();
+	const stderr = new PassThrough();
+	const child = Object.assign(new EventEmitter(), {
+		stdout,
+		stderr,
+		kill: vi.fn(),
+		exitCode: null as null,
+	});
+	// The two halves of a child ending, exposed separately because the GAP between
+	// them is what this module has to survive: `exit` fires the moment the process
+	// is gone, while lines it printed a moment earlier are still travelling through
+	// the pipes, and `close` is the event that waits for those pipes.
+	//
+	// They are separate here rather than sequenced inside one helper because a
+	// `PassThrough` written from a test delivers synchronously — the gap a real
+	// pipe has does not exist unless a case opens it deliberately.
+	const gone = async (code: number) => {
+		child.emit("exit", code);
+		await flushMicrotasks();
+	};
+	const closed = async (code: number) => {
+		stdout.end();
+		stderr.end();
+		await flushMicrotasks();
+		child.emit("close", code);
+		await flushMicrotasks();
+	};
+	return {
+		child,
+		say: async (line: string) => {
+			stdout.write(`${line}\n`);
+			await flushMicrotasks();
+		},
+		gone,
+		closed,
+		/** The ordinary case: nothing was left in flight, so both fire back to back. */
+		exit: async (code: number) => {
+			await gone(code);
+			await closed(code);
+		},
+	};
 }
 
-/** A real dist directory holding a real server entry, so `existsSync` passes. */
+/** The spawner seam, wired to a fake child. */
+function spawnerFor(child: unknown, record?: { args: string[]; cwd: string }[]): DashboardSpawner {
+	return (args, cwd) => {
+		record?.push({ args: [...args], cwd });
+		return child as ReturnType<DashboardSpawner>;
+	};
+}
+
+/** A real dist directory holding a real CLI entry, so `existsSync` passes. */
 function distWithEntry(): string {
 	const dir = mkdtempSync(join(tmpdir(), "jolli-dashboard-launcher-"));
-	writeFileSync(join(dir, SERVER_ENTRY_FILE), "");
+	writeFileSync(join(dir, CLI_ENTRY_FILE), "");
 	return dir;
 }
 
@@ -137,388 +197,289 @@ function flushMicrotasks(): Promise<void> {
 	return new Promise<void>((resolve) => setTimeout(resolve, 0));
 }
 
+const URL_LINE = "  Jolli dashboard → http://127.0.0.1:1818/dashboard";
+const URL = "http://127.0.0.1:1818/dashboard";
+
 beforeEach(() => {
 	logCalls.length = 0;
-	spawnHiddenMock.mockReset().mockReturnValue(fakeChild());
-	executeDashboardMock.mockReset().mockResolvedValue(true);
-	// The in-flight guard is module state, and several cases below deliberately
-	// leave a command pending — without this the next case would be treated as a
-	// repeat click on the previous one's launch.
+	spawnHiddenMock.mockReset();
+	// The live-dashboard guard is module state, and several cases below leave a
+	// child running — without this the next case would be treated as a repeat
+	// click on the previous one's dashboard.
 	__resetDashboardLaunchForTests();
 });
 
 describe("isRemoteWorkspace", () => {
-	it("is false for a local window", () => {
+	it("is true for any remote name and false only for undefined", () => {
+		expect(isRemoteWorkspace("ssh-remote")).toBe(true);
+		expect(isRemoteWorkspace("wsl")).toBe(true);
 		expect(isRemoteWorkspace(undefined)).toBe(false);
 	});
-
-	it("is true for every remote flavour, WSL included", () => {
-		for (const name of ["ssh-remote", "wsl", "dev-container", "attached-container", "codespaces"]) {
-			expect(isRemoteWorkspace(name)).toBe(true);
-		}
-	});
 });
 
-describe("createOutput", () => {
-	it("strips the CLI's terminal padding and routes by severity", () => {
-		const out = createOutput(fakeUi().ui);
-		out.log("\n  Jolli dashboard → http://127.0.0.1:1818/dashboard\n");
-		out.error("\n  Error: invalid --port value: abc\n");
-		expect(logCalls).toEqual([
-			{ level: "info", message: "Jolli dashboard → http://127.0.0.1:1818/dashboard" },
-			{ level: "error", message: "Error: invalid --port value: abc" },
-		]);
+describe("URL_PATTERN", () => {
+	it("finds the loopback URL in the command's own line", () => {
+		expect(URL_PATTERN.exec(URL_LINE)?.[1]).toBe(URL);
 	});
 
-	it("drops a blank line rather than logging an empty entry", () => {
-		const { ui, calls } = fakeUi();
-		const out = createOutput(ui);
-		out.log("\n");
-		out.error("   ");
-		out.notice("  \n ");
-		expect(logCalls).toEqual([]);
-		expect(calls.infos).toEqual([]);
-	});
-
-	it("puts a notice on screen as well as in the channel", async () => {
-		// The whole point of the third channel: a `log` line lands in an output
-		// panel nobody opens, and this one is the only explanation the user gets.
-		const { ui, calls } = fakeUi();
-		createOutput(ui).notice("\n  Jolli Memory is disabled here — opening the dashboard without adding this repo to it.\n");
-		expect(calls.infos).toEqual(["Jolli Memory is disabled here — opening the dashboard without adding this repo to it."]);
-		// Still in the channel too, so the launch reads as one story there.
-		expect(logCalls).toEqual([
-			{
-				level: "info",
-				message: "Jolli Memory is disabled here — opening the dashboard without adding this repo to it.",
-			},
-		]);
-	});
-});
-
-describe("createServerSpawner", () => {
-	it("throws when the dist has no server entry, naming the path it looked at", () => {
-		const spawn = createServerSpawner("/nonexistent-dist-dir");
-		expect(() => spawn(undefined, "/repo")).toThrow(/nonexistent-dist-dir/);
-		expect(() => spawn(undefined, "/repo")).toThrow(new RegExp(SERVER_ENTRY_FILE));
-		expect(spawnHiddenMock).not.toHaveBeenCalled();
-	});
-
-	it("runs the entry through the host's own node, detached, from the repo cwd", () => {
-		const distDir = distWithEntry();
-		createServerSpawner(distDir)(undefined, "/repo/root");
-
-		expect(spawnHiddenMock).toHaveBeenCalledWith(
-			process.execPath,
-			[join(distDir, SERVER_ENTRY_FILE)],
-			expect.objectContaining({ detached: true, stdio: "ignore", cwd: "/repo/root" }),
+	it("matches the fallback port too — the port is not knowable in advance", () => {
+		expect(URL_PATTERN.exec("  Jolli dashboard → http://127.0.0.1:18118/dashboard")?.[1]).toBe(
+			"http://127.0.0.1:18118/dashboard",
 		);
-		const env = spawnHiddenMock.mock.calls[0][2].env as Record<string, string>;
-		// Without this the extension host's Electron binary would not run the
-		// script as node at all.
-		expect(env.ELECTRON_RUN_AS_NODE).toBe("1");
-		// No port asked for → no override, so the server keeps its own default.
-		expect(env).not.toHaveProperty("JOLLI_DASHBOARD_PORT");
 	});
 
-	it("passes an explicit port through to the server entry as a string", () => {
-		const distDir = distWithEntry();
-		createServerSpawner(distDir)(1919, "/repo/root");
-		const env = spawnHiddenMock.mock.calls[0][2].env as Record<string, string>;
-		expect(env.JOLLI_DASHBOARD_PORT).toBe("1919");
-	});
-
-	it("logs a spawn failure instead of letting it surface as an uncaught exception", () => {
-		const child = fakeChild();
-		spawnHiddenMock.mockReturnValue(child);
-		const distDir = distWithEntry();
-		createServerSpawner(distDir)(undefined, "/repo");
-
-		// The detached child is released so it outlives the extension host…
-		expect(child.unref).toHaveBeenCalled();
-		// …but an async `error` with no listener would be re-thrown by Node inside
-		// the host, far from any command we control. The /health probe is what
-		// actually reports the outcome, so this only has to not explode.
-		const onError = child.on.mock.calls.find((c) => c[0] === "error")?.[1] as (err: Error) => void;
-		expect(onError).toBeTypeOf("function");
-		onError(new Error("EACCES"));
-		expect(logCalls.some((c) => c.level === "warn" && c.message.includes("EACCES"))).toBe(true);
+	it("ignores lines that carry no loopback URL", () => {
+		expect(URL_PATTERN.exec("  ✓ Migrated 3 memories.")).toBeNull();
+		expect(URL_PATTERN.exec("  Port 1818 was in use")).toBeNull();
 	});
 });
 
 describe("launchDashboard", () => {
-	it("does not start a server in a remote window; it explains instead", async () => {
+	it("refuses a remote window with a hint instead of a local server", async () => {
 		const { ui, calls } = fakeUi();
-		const run = vi.fn();
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: "ssh-remote", ui, run });
-		expect(run).not.toHaveBeenCalled();
+		const spawned: { args: string[]; cwd: string }[] = [];
+		await launchDashboard({
+			cwd: "/repo",
+			distDir: "/dist",
+			remoteName: "ssh-remote",
+			ui,
+			spawn: spawnerFor(fakeChild().child, spawned),
+		});
+		expect(spawned).toEqual([]);
 		expect(calls.infos).toEqual([REMOTE_HINT]);
-		expect(calls.errors).toEqual([]);
 	});
 
-	it("ends the progress notification when the browser opens, NOT when the command finishes", async () => {
+	it("runs `dashboard --no-open` in the repo, and opens the URL itself", async () => {
+		const { child, say } = fakeChild();
+		const spawned: { args: string[]; cwd: string }[] = [];
 		const { ui, calls } = fakeUi();
-		let finishCommand: (ok: boolean) => void = () => {};
-		const commandDone = new Promise<boolean>((resolve) => {
-			finishCommand = resolve;
-		});
-		// Stands in for the history import: opens the browser, then keeps running.
-		const run = vi.fn(async (_page, _options, deps) => {
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-			return commandDone;
-		});
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child, spawned) });
+		await say(URL_LINE);
+		await done;
 
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-
-		// Returned while the command is still pending — the whole point of the split.
-		expect(calls.progressEnded).toBe(true);
-		expect(calls.opened).toEqual(["http://127.0.0.1:1818/dashboard"]);
-		expect(calls.errors).toEqual([]);
-		finishCommand(true);
-		await commandDone;
+		// `--no-open` is what stops the child launching a browser the editor did
+		// not choose; the host opens it instead.
+		expect(spawned).toEqual([{ args: ["dashboard", "--no-open", "--cwd", "/repo"], cwd: "/repo" }]);
+		expect(calls.opened).toEqual([URL]);
 	});
 
-	it("passes the launcher the repo cwd", async () => {
+	it("ends the progress notification at the browser, not at the child's exit", async () => {
+		// The child serves until stopped and its history import runs for minutes
+		// behind the page, so a notification spanning it would read as a hang.
+		const { child, say } = fakeChild();
+		const { ui, calls } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		expect(calls.progressEnded).toBe(false);
+		await say(URL_LINE);
+		await done;
+		expect(calls.progressEnded).toBe(true);
+		// Still running — the notification ended, the dashboard did not.
+		expect(isDashboardRunning()).toBe(true);
+	});
+
+	it("drains the child's output into the log", async () => {
+		const { child, say } = fakeChild();
 		const { ui } = fakeUi();
-		const run = vi.fn(async () => true);
-		await launchDashboard({ cwd: "/repo/root", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		expect(run).toHaveBeenCalledWith("stats", { cwd: "/repo/root" }, expect.anything());
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say("  ✓ Migrated 3 memories.");
+		await say(URL_LINE);
+		await done;
+		expect(logCalls.some((c) => c.message.includes("Migrated 3 memories"))).toBe(true);
 	});
 
-	it("reports a failed launch and offers the log", async () => {
+	it("reports a child that dies before it ever served", async () => {
+		const { child, exit } = fakeChild();
 		const { ui, calls } = fakeUi({ errorChoice: "Show Log" });
-		const run = vi.fn(async () => false);
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		// The notification must end even though no browser was ever opened.
-		expect(calls.progressEnded).toBe(true);
-		await vi.waitFor(() => expect(calls.errors).toEqual([FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(true);
-	});
-
-	it("reports an unexpected rejection instead of losing it", async () => {
-		const { ui, calls } = fakeUi();
-		const run = vi.fn(async () => {
-			throw new Error("boom");
-		});
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		expect(calls.progressEnded).toBe(true);
-		await vi.waitFor(() => expect(calls.errors).toEqual([FAILURE_MESSAGE]));
-		expect(logCalls.some((c) => c.level === "error" && c.message.includes("boom"))).toBe(true);
-	});
-
-	it("leaves the log alone when the failure notification is dismissed", async () => {
-		// No button clicked (showError resolves undefined): the failure is still
-		// reported, but nothing is revealed — only "Show Log" opens the channel.
-		const { ui, calls } = fakeUi();
-		const run = vi.fn(async () => false);
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		await vi.waitFor(() => expect(calls.errors).toEqual([FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(false);
-	});
-
-	it("stringifies a non-Error rejection and still offers the log", async () => {
-		const { ui, calls } = fakeUi({ errorChoice: "Show Log" });
-		// Rejecting with a plain string exercises the String(err) arm of the
-		// `err instanceof Error ? err.message : String(err)` ternary.
-		const run = vi.fn(async () => {
-			throw "dashboard exploded";
-		});
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		await vi.waitFor(() => expect(calls.errors).toEqual([FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(true);
-		expect(logCalls.some((c) => c.level === "error" && c.message.includes("dashboard exploded"))).toBe(true);
-	});
-
-	it("falls back to the window UI and the real launcher when neither seam is injected", async () => {
-		// Production shape: no `ui`, no `run`, no `remoteName`. Nothing here binds
-		// a port — `executeDashboard` is mocked — but it is the only case that
-		// proves the two defaults are wired at all.
-		const vscode = await import("vscode");
-		await launchDashboard({ cwd: "/repo", distDir: "/dist" });
-		expect(executeDashboardMock).toHaveBeenCalledWith("stats", { cwd: "/repo" }, expect.anything());
-		expect(vscode.window.withProgress).toHaveBeenCalledWith(
-			expect.objectContaining({ title: PROGRESS_TITLE }),
-			expect.any(Function),
-		);
-	});
-
-	it("still ends the notification when opening the browser fails, and says so", async () => {
-		const { ui, calls } = fakeUi({
-			errorChoice: "Show Log",
-			overrides: {
-				openExternal: async () => {
-					throw new Error("no browser");
-				},
-			},
-		});
-		const run = vi.fn(async (_page, _options, deps) => {
-			// The launcher swallows a failed open and carries on, so this must too.
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard").catch(() => {});
-			return true;
-		});
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		expect(calls.progressEnded).toBe(true);
-		// `executeDashboard` treats this as non-fatal and returns success, so the
-		// generic failure path never fires — without a report of its own the whole
-		// thing would be a spinner that stops and nothing else.
-		await vi.waitFor(() => expect(calls.errors).toEqual([BROWSER_FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(true);
-		// Logged from the launcher because the command prints its own copy of the
-		// URL only after the call that just failed.
-		expect(logCalls.some((c) => c.level === "error" && c.message.includes("127.0.0.1:1818"))).toBe(true);
-	});
-
-	it("leaves the log alone when the browser report is dismissed", async () => {
-		const { ui, calls } = fakeUi({
-			overrides: {
-				openExternal: async () => {
-					throw new Error("no browser");
-				},
-			},
-		});
-		const run = vi.fn(async (_page, _options, deps) => {
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard").catch(() => {});
-			return true;
-		});
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		await vi.waitFor(() => expect(calls.errors).toEqual([BROWSER_FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(false);
-	});
-
-	it("re-opens the same URL on a repeat click instead of launching twice", async () => {
-		const { ui, calls } = fakeUi();
-		let finishCommand: (ok: boolean) => void = () => {};
-		const commandDone = new Promise<boolean>((resolve) => {
-			finishCommand = resolve;
-		});
-		// Opens the browser, then stands in for the multi-minute history import.
-		const run = vi.fn(async (_page, _options, deps) => {
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-			return commandDone;
-		});
-		const opts = { cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never };
-
-		await launchDashboard(opts);
-		await launchDashboard(opts);
-
-		// The second click reached the browser but NOT the command: one history
-		// import, one cutover attempt, one backup snapshot.
-		expect(run).toHaveBeenCalledTimes(1);
-		expect(calls.opened).toEqual(["http://127.0.0.1:1818/dashboard", "http://127.0.0.1:1818/dashboard"]);
-		expect(calls.errors).toEqual([]);
-		finishCommand(true);
-		await commandDone;
-	});
-
-	it("shares the startup wait with a click that lands before the browser opens", async () => {
-		const { ui, calls } = fakeUi();
-		let openTheBrowser: () => Promise<void> = async () => {};
-		// Stands in for a server that has not answered /health yet: the command is
-		// running, but no URL exists for a repeat click to re-open.
-		const run = vi.fn(async (_page, _options, deps) => {
-			await new Promise<void>((resolve) => {
-				openTheBrowser = async () => {
-					await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-					resolve();
-				};
-			});
-			return true;
-		});
-		const opts = { cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never };
-
-		const first = launchDashboard(opts);
-		const second = launchDashboard(opts);
-		expect(run).toHaveBeenCalledTimes(1);
-
-		await openTheBrowser();
-		await first;
-		await second;
-		// Both clicks were released by the one browser open, and only that one.
-		expect(calls.opened).toEqual(["http://127.0.0.1:1818/dashboard"]);
-		expect(run).toHaveBeenCalledTimes(1);
-	});
-
-	it("reports a refused re-open on a repeat click too", async () => {
-		let opens = 0;
-		const { ui, calls } = fakeUi({
-			errorChoice: "Show Log",
-			overrides: {
-				openExternal: async () => {
-					opens += 1;
-					if (opens > 1) throw new Error("no browser");
-				},
-			},
-		});
-		let finishCommand: (ok: boolean) => void = () => {};
-		const commandDone = new Promise<boolean>((resolve) => {
-			finishCommand = resolve;
-		});
-		const run = vi.fn(async (_page, _options, deps) => {
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-			return commandDone;
-		});
-		const opts = { cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never };
-
-		await launchDashboard(opts);
-		await launchDashboard(opts);
-
-		expect(run).toHaveBeenCalledTimes(1);
-		await vi.waitFor(() => expect(calls.errors).toEqual([BROWSER_FAILURE_MESSAGE]));
-		expect(calls.logRevealed).toBe(true);
-		finishCommand(true);
-		await commandDone;
-	});
-
-	it("wires the command's notice channel to a real notification", async () => {
-		// Proves the launcher hands its OWN ui to `createOutput`: a notice the
-		// command emits mid-run has to reach the screen, not just the channel.
-		const { ui, calls } = fakeUi();
-		const run = vi.fn(async (_page, _options, deps) => {
-			deps?.output?.notice("\n  Jolli Memory is disabled here — opening the dashboard without adding this repo to it.\n");
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-			return true;
-		});
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never });
-		expect(calls.infos).toEqual([
-			"Jolli Memory is disabled here — opening the dashboard without adding this repo to it.",
-		]);
-	});
-
-	it("reports a synchronous throw from the launcher seam instead of rejecting", async () => {
-		const { ui, calls } = fakeUi({ errorChoice: "Show Log" });
-		// `executeDashboard` is async and cannot do this, but `run` is a seam — and
-		// the one caller `void`s this function, so an escaping throw would land as
-		// an unhandled rejection in the extension host.
-		const boom = vi.fn(() => {
-			throw new Error("seam exploded");
-		});
-		await expect(
-			launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: boom as never }),
-		).resolves.toBeUndefined();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await exit(1);
+		await done;
 		expect(calls.errors).toEqual([FAILURE_MESSAGE]);
 		expect(calls.logRevealed).toBe(true);
-		expect(logCalls.some((c) => c.level === "error" && c.message.includes("seam exploded"))).toBe(true);
-
-		// And the guard was never published, so the button is not left dead.
-		const ok = vi.fn(async () => true);
-		await launchDashboard({ cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: ok as never });
-		expect(ok).toHaveBeenCalledTimes(1);
+		expect(isDashboardRunning()).toBe(false);
 	});
 
-	it("launches again once the previous launch has settled", async () => {
-		const { ui } = fakeUi();
-		const run = vi.fn(async (_page, _options, deps) => {
-			await deps?.openBrowser?.("http://127.0.0.1:1818/dashboard");
-			return true;
-		});
-		const opts = { cwd: "/repo", distDir: "/dist", remoteName: undefined, ui, run: run as never };
+	it("does not report a child that exits AFTER serving — that is a stop, not a failure", async () => {
+		const { child, say, exit } = fakeChild();
+		const { ui, calls } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say(URL_LINE);
+		await done;
+		await exit(0);
+		expect(calls.errors).toEqual([]);
+		expect(isDashboardRunning()).toBe(false);
+	});
 
-		await launchDashboard(opts);
-		// The guard is released in the command's settle handler, which is a
-		// microtask behind the startup barrier `launchDashboard` awaits.
+	it("does not report a stop whose URL was still in the pipe when the child ended", async () => {
+		// A dashboard stopped moments after it started serving: the process is gone
+		// while the URL it printed is still in flight. Listening on `exit` read
+		// `launch.url` at that instant, so a dashboard that HAD served was reported
+		// as one that could not be started — a modal error for a stop the user
+		// asked for. `close` is the event that waits for the pipe, and waiting is
+		// the only thing that separates this from a child that never served.
+		const { child, say, gone, closed } = fakeChild();
+		const { ui, calls } = fakeUi({ errorChoice: "Show Log" });
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await gone(0);
+		await say(URL_LINE);
+		await closed(0);
+		await done;
+		expect(calls.errors).toEqual([]);
+		expect(calls.opened).toEqual([URL]);
+	});
+
+	it("reports a failed spawn once, though both `error` and `close` fire for it", async () => {
+		// A spawn that fails emits `error` and then `close`, with no `exit` between
+		// them — so moving this listener to `close` put two modal errors on screen
+		// for one click unless the report is guarded.
+		const { child, exit } = fakeChild();
+		const { ui, calls } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		child.emit("error", new Error("ENOENT"));
 		await flushMicrotasks();
-		await launchDashboard(opts);
+		await exit(1);
+		await done;
+		expect(calls.errors).toEqual([FAILURE_MESSAGE]);
+	});
 
-		expect(run).toHaveBeenCalledTimes(2);
+	it("reports a spawn that throws", async () => {
+		const { ui, calls } = fakeUi();
+		await launchDashboard({
+			cwd: "/repo",
+			distDir: "/dist",
+			ui,
+			spawn: () => {
+				throw new Error("entry not found");
+			},
+		});
+		expect(calls.errors).toEqual([FAILURE_MESSAGE]);
+		// No guard leaked, so the button still works next time.
+		expect(isDashboardRunning()).toBe(false);
+	});
+
+	it("reports a process-level error", async () => {
+		const { child } = fakeChild();
+		const { ui, calls } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		child.emit("error", new Error("ENOENT"));
+		await flushMicrotasks();
+		await done;
+		expect(calls.errors).toEqual([FAILURE_MESSAGE]);
+		expect(isDashboardRunning()).toBe(false);
+	});
+
+	it("a repeat click re-opens the URL instead of starting a second dashboard", async () => {
+		const { child, say } = fakeChild();
+		const spawned: { args: string[]; cwd: string }[] = [];
+		const { ui, calls } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child, spawned) });
+		await say(URL_LINE);
+		await done;
+
+		await launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(fakeChild().child, spawned) });
+		// One spawn, two opens: a second child would bind a second port and run a
+		// second import against the same database.
+		expect(spawned).toHaveLength(1);
+		expect(calls.opened).toEqual([URL, URL]);
+	});
+
+	it("a click that arrives before the URL shares the wait rather than spawning", async () => {
+		const { child, say } = fakeChild();
+		const spawned: { args: string[]; cwd: string }[] = [];
+		const { ui, calls } = fakeUi();
+		const first = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child, spawned) });
+		const second = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(fakeChild().child, spawned) });
+		await say(URL_LINE);
+		await Promise.all([first, second]);
+		expect(spawned).toHaveLength(1);
+		// The first launch's browser is what ends both notifications.
+		expect(calls.opened).toEqual([URL]);
+	});
+
+	it("reports a refused browser without calling the launch a failure", async () => {
+		const { child, say } = fakeChild();
+		const { ui, calls } = fakeUi({
+			overrides: {
+				openExternal: async () => {
+					throw new Error("no handler");
+				},
+			},
+		});
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say(URL_LINE);
+		await done;
+		await flushMicrotasks();
+		// The dashboard IS up, so this is not FAILURE_MESSAGE...
+		expect(calls.errors).toEqual([BROWSER_FAILURE_MESSAGE]);
+		// ...and the spinner still ends, or a working dashboard would look hung.
+		expect(calls.progressEnded).toBe(true);
+		expect(isDashboardRunning()).toBe(true);
+	});
+
+	it("uses the default spawner when none is injected", async () => {
+		const { child, say } = fakeChild();
+		spawnHiddenMock.mockReturnValue(child);
+		const { ui } = fakeUi();
+		const dir = distWithEntry();
+		const done = launchDashboard({ cwd: "/repo", distDir: dir, ui });
+		await say(URL_LINE);
+		await done;
+
+		const [command, args, opts] = spawnHiddenMock.mock.calls[0] as [string, string[], Record<string, unknown>];
+		expect(command).toBe(process.execPath);
+		expect(args).toEqual([join(dir, CLI_ENTRY_FILE), "dashboard", "--no-open", "--cwd", "/repo"]);
+		// Electron only runs a script as node with this set.
+		expect((opts.env as Record<string, string>).ELECTRON_RUN_AS_NODE).toBe("1");
+		// Piped, so the URL line is readable — and NOT detached/unref'd, so the
+		// child cannot outlive the window that owns it.
+		expect(opts.stdio).toEqual(["ignore", "pipe", "pipe"]);
+		expect(opts.detached).toBeUndefined();
+	});
+
+	it("PROGRESS_TITLE is what the notification shows", async () => {
+		const { child, say } = fakeChild();
+		const titles: string[] = [];
+		const { ui } = fakeUi({
+			overrides: {
+				withProgress: async (title, task) => {
+					titles.push(title);
+					await task();
+				},
+			},
+		});
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say(URL_LINE);
+		await done;
+		expect(titles).toEqual([PROGRESS_TITLE]);
+	});
+});
+
+describe("stopDashboard", () => {
+	it("kills the running child and forgets it", async () => {
+		const { child, say } = fakeChild();
+		const { ui } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say(URL_LINE);
+		await done;
+
+		stopDashboard();
+		expect(child.kill).toHaveBeenCalledTimes(1);
+		expect(isDashboardRunning()).toBe(false);
+	});
+
+	it("is a no-op when nothing is running", () => {
+		expect(() => stopDashboard()).not.toThrow();
+		expect(isDashboardRunning()).toBe(false);
+	});
+
+	it("does not kill a child that already exited", async () => {
+		const { child, say, exit } = fakeChild();
+		const { ui } = fakeUi();
+		const done = launchDashboard({ cwd: "/repo", distDir: "/dist", ui, spawn: spawnerFor(child) });
+		await say(URL_LINE);
+		await done;
+		await exit(0);
+
+		stopDashboard();
+		expect(child.kill).not.toHaveBeenCalled();
 	});
 });

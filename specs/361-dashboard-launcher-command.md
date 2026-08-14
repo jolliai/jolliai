@@ -1,15 +1,16 @@
-# 361. Dashboard Launcher Command
+# 361. Dashboard Command
 
 ## Topic Statement
 
-The command a user runs to open the local dashboard, from end to end: the refusals that stop it before it touches anything (the runtime floor, an unusable port option), the schema it pre-creates so a read-only service has something to open, the directory it resolves for that service, the lock-guarded decision to reuse, replace or spawn it, the browser it opens, the separate stop path, and — running last, unable to fail the launch — the history import, whose terminal block stays hidden until a cursor-gated tier proves there was work, whose closing figures are computed only over the repositories actually swept, and whose repositories with no checkout left on disk are reported by a sampled notice of their own.
+The command a user runs to open the local dashboard, from end to end: the refusals that stop it before it touches anything (the runtime floor, an unusable port option), the schema it creates before anything reads, the directory it resolves for the server it binds **in its own process**, the browser it opens, the signal it then waits on until the user stops it, and — running between the bind and that wait, unable to fail the launch — the history import, whose terminal block stays hidden until a cursor-gated tier proves there was work, whose closing figures are computed only over the repositories actually swept, and whose repositories with no checkout left on disk are reported by a sampled notice of their own.
 
 ## Scope
 
 **In scope:**
 
-- The wake sequence and why the write side is last.
-- The spawn lock, the reuse-or-replace decision behind bringing the service up, and the stop path.
+- The launch sequence, why the write side comes after the bind, and why the command does not return.
+- Reclaiming the preferred port from a dashboard already on it: what is asked, what is signalled, and what is deliberately left alone.
+- The split between binding/opening the browser and waiting for the signal, and the one other caller that needs the first half without the second.
 - The deferred writer: what it holds, when it flushes, and why the header is chosen at reveal time rather than written up front.
 - The reveal rule — which progress tiers may put the block on screen, and which is deliberately excluded.
 - The progress printer's line rules: the phase labels, the slow-run warning and its narrowing, the resume announcement, the per-tier suppression thresholds, and the quarter-mark counters.
@@ -20,10 +21,10 @@ The command a user runs to open the local dashboard, from end to end: the refusa
 
 **Boundaries (consumed here, owned elsewhere):**
 
-- The read-only service this launcher spawns, probes and opens a browser at — its port selection, its routes, its state record and its health route are defined by the **Local Dashboard HTTP Server** topic (cross-ref 352). Only the contract between the two (the state record, the health probe, the port environment variable) appears here.
+- The service this command binds and opens a browser at — its port candidates, its routes and its security model are defined by the **Local Dashboard HTTP Server** topic (cross-ref 352). Only the contract between the two (the bind call, the port it may request, and the fallback flag it gets back) appears here.
 - The sweep itself — which repositories it walks, its four cursor keys, its tiers, its per-repository result record and its progress records — is defined by the **Dashboard Database Repository Backfill** topic (cross-ref 350). This spec defines what the caller *says* about those results, which that topic explicitly leaves to the caller.
 - The registry of enabled repositories and the identity derived for each are defined by the **Dashboard Repo Registry and Probe** topic (cross-ref 355). This command registers the current directory and never prunes an entry.
-- The routing attempt that follows the import (cross-refs 344, 345) and the snapshot pass that ends the launch (cross-ref 349). Both report nothing and neither can throw, so neither can affect this command's output or its exit status.
+- The routing attempt that follows the import (cross-refs 344, 345) and the snapshot pass after it (cross-ref 349) — the last two things that happen before the command settles into serving. Both report nothing and neither can throw, so neither can affect this command's output or its exit status.
 - The runtime floor that decides whether the database can be opened at all.
 
 ## Data Contracts
@@ -34,18 +35,22 @@ The command a user runs to open the local dashboard, from end to end: the refusa
 | --- | --- |
 | Port | An explicit port. Parsed as a base-10 integer; a non-finite value, a value at or below zero, or one above the maximum port number is refused with an error naming the value, and the command fails |
 | No-open | Print the URL instead of opening a browser. The URL is printed either way |
-| Stop | Take the stop path and return success without touching the database or the import |
-| Directory | The repository directory to register. Defaults to the process's own directory |
+| Directory | The repository directory to register, and the root the server answers for. Defaults to the process's own directory |
 
-### The spawn lock
+**There is no stop option**, because there is nothing to stop but this command. It used to exist, alongside a detached service, a pid/port state record, a spawn lock that stopped two invocations racing into two services, and a two-hour idle self-shutdown. All of that is removed.
 
-A single lock file beside the service's state record, in the machine-global configuration directory. It is claimed by an **exclusive create** — never by a blind overwrite — and reclaiming a lock whose recorded owner is dead goes through that same exclusive create, followed by a read-back to confirm the file on disk is this process's.
+### Reclaiming the preferred port
 
-The overwrite is what made reclaim unsafe: two launchers that both read the same dead owner would both write themselves in and both believe they had the lock, which is exactly the double spawn the lock exists to prevent. With an exclusive create the loser's attempt fails, it falls into the wait-for-the-other-launcher branch, and one service comes up.
+Every launch serves from a fresh process, so a dashboard already on the port this one wants is **stopped first**. The step runs before the bind:
 
-An unreadable lock, or one holding a non-numeric owner, counts as stale for the same reason: a launcher killed mid-write must not wedge the dashboard permanently.
+1. Ask the preferred port — the explicit port option when given, otherwise the first candidate — for the liveness route (cross-ref 352).
+2. No answer, or an answer that is not one of ours, or our own process id: do nothing. Something else holding that port is a stranger, and the bind falls through to the next candidate exactly as it would have.
+3. Otherwise signal the process id it reported, then poll until the port stops answering, up to a **two-second** budget. Timing out is not an error — the bind simply moves on.
+4. A delivered signal is announced on its own line, because a dashboard someone was looking at just went dead.
 
-**One race is deliberately accepted.** Remove-then-create is two operations, so a second reclaimer whose removal lands after the first has already created *and* read back its own lock still takes it. Closing that needs an atomic compare-and-swap the filesystem does not offer. The consequence is bounded on the other side — the bring-up probes the health route and reuses a live service before spawning at all, and the state record is only ever cleared by the owner it names — so the worst case is one short-lived extra process, not a permanently orphaned service.
+Only the PREFERRED port is reclaimed. A dashboard on the fallback port is left alone: nothing is competing for it, and killing it would be gratuitous.
+
+**This is discovery to REPLACE, never to attach**, which is the whole difference from the launcher that preceded it. Nothing here can serve a page from a build older than this one, so none of the reuse constraints come back with it — see 352 for why the process id it acts on cannot be stale, unlike the one the state file used to record.
 
 ### The deferred writer
 
@@ -75,41 +80,38 @@ Everything printed is a plain line; there is no carriage-return redraw and no sp
 
 ## Behaviors (execution order)
 
-### Stop
-
-Taken before anything else, and it never opens the database.
-
-1. Read the service's state record. Absent — print that the service is not running and return success.
-2. Confirm the record still describes the dashboard: ask the recorded port's health route and require both a healthy answer **and** a reported owner matching the record's. A record can outlive its process (a hard kill, a crash, a reboot) and owner numbers are recycled, so a recorded owner is a claim, not a fact. A health route that answers without an owner also fails the check — this product's own route always reports one, so an ownerless healthy answer is some other service on that port and must not be signalled.
-3. Signal it only when that confirmation passed; clear the record either way, conditionally on the owner that was read.
-4. Print either that the service was stopped, naming the owner, or that it had already exited and its stale record was cleared.
-
-### The wake sequence
+### The launch sequence
 
 1. **Refuse below the runtime floor**, naming the required runtime and the one in use. The command fails.
-2. **Create or upgrade the database schema before anything reads.** The service opens read-only handles, and read-only is the one mode that must not create a schema; nothing else on this path is guaranteed to create the file either, since registration is skipped outside a repository and an import with no registered repositories returns without opening a writable handle. A first run in a non-repository directory otherwise served a plain-text failure on every page, with no scripts on it to ever recover. A failure here is reported and the command fails.
+2. **Create or upgrade the database schema before anything reads.** Every render opens a read-only handle, and read-only is the one mode that must not create a schema; nothing else on this path is guaranteed to create the file either, since registration is skipped outside a repository and an import with no registered repositories returns without opening a writable handle. A first run in a non-repository directory otherwise served a plain-text failure on every page, with no scripts on it to ever recover. This step is also what makes the schema **this build's** before anything serves, which is why the server's registry projection needs no version gate of its own. A failure here is reported and the command fails.
 3. **Register the current directory** as a repository when it is one. Outside a repository the dashboard still opens with whatever is already registered; the failure is recorded at information level only.
 4. **Validate the port option.**
-5. **Resolve the directory the service will run in** — the repository root, and always a real directory. Always real because an invalid directory would make the detached spawn fail asynchronously; the root rather than a subdirectory because the service's telemetry buffer's identity *is* its literal directory, and a subdirectory's buffer is one no other surface drains. A directory outside a repository, or any failure resolving the root, keeps the validated directory as-is.
-6. **Bring the service up** (below). A failure here is reported and the command fails.
-7. **Open the browser** at the page URL, unless the no-open option was given. A browser failure is a warning, never a failure of the command.
-8. **Print the URL**, plus the two reopen/stop hints.
-9. **Run the history import** (below) — the write side, last.
-10. Attempt the routing conversion, **throttled**, and then the snapshot pass. Both are boundaries; neither prints anything here and neither can throw.
+5. **Start the server** (below), which reclaims the preferred port first. A failure here is reported and the command fails.
+6. **Run the history import** (below) — the write side, after the page is already up.
+7. Attempt the routing conversion, **throttled**, and then the snapshot pass. Both are boundaries; neither prints anything here and neither can throw.
+8. **Wait for the stop signal.** The command does not return until then.
 
-The order exists so the page appears fast: the page renders whatever the database already holds and polls for its model, so history fills in as the import lands rather than blocking the launch.
+The order exists so the page appears fast: the page renders whatever the database already holds and polls for its model, so history fills in as the import lands rather than blocking the launch. The import shares this process's event loop now, so a first full sweep makes the page slower while it runs — still better than a blank browser for the minutes it takes.
+
+### Starting the server
+
+Two halves, returned separately, because one caller needs the first without the second:
+
+1. **Resolve the directory the server answers for** — the repository root, and always a real directory. Always real because the Settings page reads that path per request, so a bogus one would surface once per render instead of once at launch; the root rather than a subdirectory because the Settings page's per-repository displays and repo-scoped actions would otherwise answer for a subdirectory. A directory outside a repository, or any failure resolving the root, keeps the validated directory as-is.
+2. **Reclaim the preferred port** (above). Before the flusher, so a launch that never binds does not leave a timer nothing stops.
+3. **Arm the periodic telemetry flush.** This process serves for as long as the user leaves the tab open, and it is the process the page's telemetry beacon posts into, so the one flush the command runtime does at exit is not enough. Priming is *not* done here — the CLI runtime already primed the context, with the project directory that every flusher for this project must agree on.
+4. **Bind**, passing the explicit port when one was given.
+5. **Open the browser** at the page URL, unless the no-open option was given. A browser failure is a warning, never a failure of the command.
+6. **Print** the fallback line when the bind reports one, then the URL, then the stop hint.
+7. **Return the bound port and an unresolved wait**, which the caller invokes when it has nothing left to do.
 
 The browser is opened through a general-purpose opener rather than the product's own URL-opening helper, because that helper enforces an HTTPS-only allowlist which correctly rejects a loopback address, and loosening it for the loopback case would weaken every other caller.
 
-### Bringing the service up
+### Waiting for the stop signal
 
-1. Read the state record. If it names a live service (confirmed as in the stop path) and either no port was requested or the requested port matches, **reuse it** and return.
-2. If it names a live service on a *different* port than the one requested, **replace** it: signal it, then clear the record conditionally on the owner just read. Both services would otherwise compete for the single state record, so only one of them would ever be findable by a later launcher — and the loser keeps running, invisible, until its idle timeout.
-3. If the record was merely stale, clear it the same conditional way.
-4. **Claim the spawn lock.** Failing to claim it means another launcher is mid-spawn, so wait for *its* service rather than racing it: poll for a state record whose health route answers, at a quarter-second interval, up to a **ten-second** budget, then fail with a message saying another process started the dashboard but it never became healthy.
-5. Holding the lock, spawn the service detached and hidden in the resolved directory, then poll for the record and its health on the same interval and budget. Timing out fails with a message pointing at the debug log. The lock is released either way.
+Registers `SIGINT` and `SIGTERM`; on either, removes both handlers, closes open connections, closes the listener, does one final telemetry flush and resolves. Both are registered although only `SIGINT` is ever delivered on Windows, so one code path covers every platform.
 
-The spawn's own asynchronous failure — a directory that vanished between the resolve and the spawn — is swallowed with a warning rather than left to kill the launcher: a failed spawn means no dashboard, and the health polling already reports that.
+**It deliberately does not exit the process.** The detached entry this replaces had to, because nothing ran after it; here the stack unwinds back into the command runtime, whose tail flushes telemetry a final time and triggers the machine-global daemon. Exiting here would skip both — the daemon trigger silently, which is the kind of loss nothing reports.
 
 ### The history import
 
@@ -172,9 +174,11 @@ The suppression threshold, shared by both counters, is **two hundred** items.
 
 ### The server-free sibling
 
-A second entry point runs the same registration and the same import — and therefore produces exactly the same reporting — without binding a port, spawning anything, or opening a browser. It exists because the sweep is the only production driver of the memory import, so memories just written would otherwise sit outside the database until someone ran the launcher by hand; but wanting that import is no reason to take over the user's browser.
+A second entry point runs the same registration and the same import — and therefore produces exactly the same reporting — without binding a port or opening a browser. It exists because the sweep is the only production driver of the memory import, so memories just written would otherwise sit outside the database until someone ran the command by hand; but wanting that import is no reason to take over the user's browser, and now also no reason to take over their terminal.
 
-It is **self-gating on the runtime floor**, so its callers cannot forget it: below the floor there is no database to import into, and staying silent beats an error at the end of an otherwise successful setup. It never throws and never touches the process's exit status. It ends with the same routing attempt as the launcher, but **unthrottled** — a fresh import is the one attempt worth making unconditionally, whereas the launcher is a reopen command a user can type many times a day.
+It is **self-gating on the runtime floor**, so its callers cannot forget it: below the floor there is no database to import into, and staying silent beats an error at the end of an otherwise successful setup. It never throws and never touches the process's exit status. It ends with the same routing attempt, but **unthrottled** — a fresh import is the one attempt worth making unconditionally, whereas the full command is a reopen a user can type many times a day.
+
+Both of its callers are setup paths, and the guided front door needs **both** halves of this topic: this entry point where the old blocking call used to be, and the bind/browser half separately at the very end.
 
 ## State Transitions
 
@@ -182,15 +186,14 @@ It is **self-gating on the runtime floor**, so its callers cannot forget it: bel
 
 | From | Event | To |
 | --- | --- | --- |
-| Any | Stop option given | Stop path, success, no database touched |
 | Any | Runtime below the floor | Error naming the floor, failure |
 | Any | Schema cannot be created | Error, failure |
 | Any | Port option invalid | Error naming the value, failure |
-| Live service, port matches or unrequested | Bring-up | Reused |
-| Live service, different port requested | Bring-up | Signalled, record cleared, fresh spawn |
-| Stale record | Bring-up | Record cleared, fresh spawn |
-| Spawn lock unavailable | Bring-up | Wait for the other launcher's service, or fail after the budget |
-| Service healthy | Launch continues | Browser opened (unless suppressed), URL printed, then the import |
+| Any | Bind fails on every candidate | Error, failure — no import, no routing attempt, no snapshot, no wait |
+| Bound on the preferred port | Launch continues | Browser opened (unless suppressed), URL printed |
+| Bound on a later candidate | Launch continues | Fallback line printed first, then as above |
+| Serving | Import, routing attempt and snapshot complete | Waiting on the stop signal — the command does not return |
+| Waiting | `SIGINT` / `SIGTERM` | Connections and listener closed, final telemetry flush, command returns success |
 
 ### The terminal block
 
@@ -219,11 +222,16 @@ It is **self-gating on the runtime floor**, so its callers cannot forget it: bel
 - **The slow-run warning is gated on the first-sweep flag, not on the tier alone.** A sweep triggered by a moved branch tip re-reads the commit list but skips the per-file statistics for every commit already stored, so warning that it can take minutes is simply false there. (Notable.)
 - **This is a command process, not a request path.** Its reads of session titles happen inside the sweep, once per discovered session, and they are unrelated to the request-time re-read of live transcripts that the dashboard's read model removed — that removal narrowed what the *service* does while answering a page, and says nothing about this command. Every write the import performs happens here, in a process the user is already waiting on. (Notable; the two are easy to confuse because they call the same title resolution.)
 - **The import half cannot fail the command.** It is wrapped in a catch that prints one warning line, and the two boundary steps that follow it report nothing and cannot throw — so a launch either fails at the runtime floor, the schema, the port option or the bring-up, or it succeeds. (Verified.)
-- **The spawn lock's reclaim race is accepted rather than closed**, because the filesystem offers no atomic compare-and-swap and the consequences are bounded by the health probe and the owner-conditional record clearing: one short-lived extra process at worst. (Notable.)
+- **The command does not return, and both of its in-process callers had to be restructured for that.** The guided front door used to open the dashboard mid-function, with its closing orientation printed afterwards; a blocking serve there would have swallowed that orientation and hung every invocation, including the routine status-check run. It now takes the import half in place and serves the other half at the very end, gated on this being a first-time setup **and** an interactive terminal. (Notable; both gates are load-bearing, for different reasons — see that topic.)
+- **Moving it after the closing orientation is what removed a confirmation prompt, not what needed one.** A `[Y/n]` briefly guarded the blocking serve there, and its only job was stopping it from swallowing the lines printed after it. Once nothing is printed after it, declining the question and pressing Ctrl+C cost the same single keystroke — and only one of them leaves the user with the dashboard that finishing setup was for. The two gates are what protect the cases that actually cannot block; the question protected nothing they do not. (Notable; a removed mechanism, not a missing one.)
+- **The editor host stopped calling this command altogether, and that is the load-bearing consequence.** The VS Code toolbar button used to invoke it in-process, injecting a spawner for the detached server. There is no Ctrl+C in an extension host, so an in-process call would never return *and* would put the HTTP listener inside the editor's own process for the session. The button now runs `jolli dashboard` as a child process, reads the bound port off the URL line this command prints — the only place it exists once the state record is gone — and owns the child's lifetime, which is what a terminal was providing for free. Re-importing `executeDashboard` into a GUI host is the regression to watch for; it type-checks and hangs. (Notable.)
+- **A second `jolli dashboard` stops the first one rather than sitting beside it.** That is a deliberate reversal of the shape this replaced, where a second launch REUSED the incumbent. The cost lands on whoever was looking at the first dashboard — a second editor window, or a terminal someone left running — and their page goes dead with only the new launch's own line to explain it. What it buys is the one thing the state file used to buy and nothing else does: a dashboard whose parent died has something that stops it, now that the idle timeout is gone. (Notable; the alternative considered was arming an idle timeout only when there is no terminal.)
+- **A stranger on the port is never signalled.** Reclaiming acts only on a process that answers the liveness route, so an unrelated local service on 1818 survives untouched and the bind falls through to 18118 exactly as before. Killing by port alone would have made this command a hazard to anything else sharing the machine. (Notable.)
 
 ## Shared Behavior
 
-- The state record, the health route, the port environment variable and the reuse contract are owned by the **Local Dashboard HTTP Server** topic (cross-ref 352), including the rule that the record is only ever cleared conditionally on the owner it names.
+- The port candidates, the fallback flag, the route surface and the security model are owned by the **Local Dashboard HTTP Server** topic (cross-ref 352) — including the removal of its state record, its health route and its idle shutdown, and the version gate that removal took with it.
+- The editor button that runs this command as a child process — its remote-window gate, its progress notification, its one-at-a-time guard, how it recovers the URL from this command's output, and how it stops the child on `deactivate` — belongs to the VS Code extension. The contract between the two is small and entirely one-directional: this command prints a loopback URL on a line of its own and keeps serving until it is signalled.
 - The sweep's repository selection, cursor gates, tiers, progress records and per-repository result records — including the unavailable mode this command's notice renders, and the memory count answered from the database on a converged pass so the tally never reads as data loss — are owned by the **Dashboard Database Repository Backfill** topic (cross-ref 350).
 - The repository registry, the identity derived for each entry, the recorded checkout list, and the deliberate non-empty fallback that forces the separate availability predicate are owned by the **Dashboard Repo Registry and Probe** topic (cross-ref 355).
 - The routing conversion attempted after the import, throttled here and unthrottled from the server-free entry point, is owned by the cutover topics (cross-refs 344, 345).

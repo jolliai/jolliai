@@ -241,17 +241,33 @@ window.JD = window.JD || {};
 
 	/* Button label for a selection: the repo's name at one, a count past that.
 	   Names past one would either truncate or push the range control off the row,
-	   and the popover is one click away for the detail. */
-	function repoScopeLabel(model, selected) {
+	   and the popover is one click away for the detail.
+
+	   COUNTS THE LIVE HALF, not every token in the scope. A token naming nothing
+	   registered is folded to a row id that matches nothing (`scopeToRepoIds`), so
+	   the page is filtered to the live half alone — counting the dead ones said
+	   "2 repos" over a page showing one, and disagreed with everything else drawn
+	   from the same scope: the ticks and the footer come from `live`, and
+	   `everyRepoSelected` already refuses to let a dead token count toward "all".
+
+	   With NOTHING live there is still something to say, and it is not "All repos"
+	   — that is the EMPTY scope, and this one shows no repo at all. A lone token
+	   names itself, which is both the only true thing left and what tells the
+	   reader which bookmark to drop; several say so plainly. The `title` carries
+	   the full token list either way (see the caller). */
+	function repoScopeLabel(model, selected, live) {
 		if (selected.length === 0) return "All repos";
-		if (selected.length === 1) {
-			var option = (model.repos || []).filter((r) => r.repoIdentity === selected[0])[0];
-			/* A scope naming a repo that is no longer in the list (paused since the
-			   page was rendered) still has to say SOMETHING true — the identity is
-			   what the numbers were actually filtered by. */
-			return option ? option.repoName : selected[0];
+		if (live.length === 0) return selected.length === 1 ? selected[0] : "No matching repos";
+		if (live.length === 1) {
+			var option = (model.repos || []).filter((r) => r.repoIdentity === live[0])[0];
+			/* The identity fallback cannot fire from the caller below — `live` IS the
+			   scope filtered against `model.repos`, so the lookup is guaranteed to hit.
+			   Kept as a guard for a future caller that computes `live` some other way:
+			   the identity is what the numbers were actually filtered by, so it is
+			   still the true thing to show. */
+			return option ? option.repoName : live[0];
 		}
-		return selected.length + " repos";
+		return live.length + " repos";
 	}
 
 	/* The topbar repository picker: a button plus a checkbox popover.
@@ -302,7 +318,7 @@ window.JD = window.JD || {};
 			button.setAttribute("aria-expanded", "false");
 			return;
 		}
-		label.textContent = repoScopeLabel(model, scoped);
+		label.textContent = repoScopeLabel(model, scoped, live);
 		/* The label can be ambiguous where the names are (three clones called
 		   `repo`), so the button carries the identities it actually stands for.
 		   textContent-set, never markup — these are user-controlled strings. */

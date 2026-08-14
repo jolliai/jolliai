@@ -45,7 +45,6 @@ async function startServer(): Promise<number> {
 		token: TOKEN,
 		configDir,
 		serverCwd: repoCwd,
-		idleTimeoutMs: 0,
 		buildModel: async (req) => baseModel(req.view),
 	});
 	servers.push(server);
@@ -291,7 +290,6 @@ describe("real model builder for /settings", () => {
 			configDir,
 			serverCwd: repoCwd,
 			dbPath: join(dir, "dash.db"),
-			idleTimeoutMs: 0,
 		});
 		servers.push(server);
 		return new Promise((resolve, reject) => {

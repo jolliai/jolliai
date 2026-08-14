@@ -1,6 +1,6 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
-import { tmpdir } from "node:os";
+import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -34,15 +34,7 @@ vi.mock("./RepoRegistry.js", async (importOriginal) => ({
 	deregisterRepo: vi.fn().mockResolvedValue("r1"),
 	readRepoRegistry: vi.fn().mockResolvedValue({ version: 1, repos: [] }),
 }));
-// unlink is wrapped (not replaced) so every other state-file test keeps its
-// real filesystem behavior — only the non-ENOENT-unlink-error test below ever
-// overrides it, and only for its own call.
-vi.mock("node:fs/promises", async (importOriginal) => {
-	const actual = await importOriginal<typeof import("node:fs/promises")>();
-	return { ...actual, unlink: vi.fn(actual.unlink) };
-});
 
-import { unlink } from "node:fs/promises";
 import * as gitOps from "../core/GitOps.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
@@ -52,16 +44,13 @@ import { withDashboardDb } from "./DashboardDb.js";
 import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
 	assembleDashboardHtml,
-	clearDashboardState,
 	createDashboardServer,
+	DASHBOARD_HEALTH_SERVICE,
 	DASHBOARD_SCRIPT_FILES,
-	getDashboardStatePath,
 	hasForeignOrigin,
 	isAllowedHost,
-	readDashboardState,
 	resolveDashboardAssetsDir,
 	startDashboardServer,
-	writeDashboardState,
 } from "./DashboardServer.js";
 import * as repoRegistry from "./RepoRegistry.js";
 import { applyStatsEvents } from "./StatsWriter.js";
@@ -256,9 +245,26 @@ describe("security layers", () => {
 		const port = await listen(testServer());
 		expect((await get(port, "/memories")).status).toBe(200);
 		expect((await get(port, "/api/model")).status).toBe(200);
+		// `/health` is back, but for the opposite purpose: it identifies this
+		// listener to the NEXT launch, which stops it and takes the port. Nothing
+		// attaches to a server it did not start.
 		const health = await get(port, "/health");
 		expect(health.status).toBe(200);
-		expect(await health.json()).toMatchObject({ ok: true, pid: process.pid });
+		// `service` is what the next launch requires before it signals the pid —
+		// `{ok, pid}` alone is a payload unrelated services emit too, so dropping
+		// this field turns the reclaim into "kill whatever holds the port".
+		//
+		// `platform`/`host` say which pid namespace `pid` belongs to. Dropping them
+		// does not fail anything loudly: the launch simply goes back to resolving a
+		// container's or WSL's process id locally, where it names either nothing or
+		// a stranger it then kills.
+		expect(await health.json()).toEqual({
+			ok: true,
+			pid: process.pid,
+			service: DASHBOARD_HEALTH_SERVICE,
+			platform: process.platform,
+			host: hostname(),
+		});
 	});
 
 	it("never emits Access-Control-Allow-Origin", async () => {
@@ -703,93 +709,7 @@ describe("routes", () => {
 		expect((await get(port, "/nope")).status).toBe(404);
 		expect((await get(port, "/dashboard/standup")).status).toBe(500);
 		// Still alive afterwards.
-		expect((await get(port, "/health")).status).toBe(200);
-	});
-});
-
-describe("idle shutdown", () => {
-	it("closes the server once no request has arrived within the timeout", async () => {
-		vi.useFakeTimers();
-		try {
-			let nowMs = 0;
-			const onIdleShutdown = vi.fn();
-			const server = testServer({ idleTimeoutMs: 120_000, now: () => nowMs, onIdleShutdown });
-			const port = await listen(server);
-			expect(port).toBeGreaterThan(0);
-			nowMs = 200_000; // idle past the timeout
-			await vi.advanceTimersByTimeAsync(60_000); // one poll tick
-			expect(onIdleShutdown).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("does not shut down on a poll tick that is not yet idle", async () => {
-		vi.useFakeTimers();
-		try {
-			let nowMs = 0;
-			const onIdleShutdown = vi.fn();
-			const server = testServer({ idleTimeoutMs: 120_000, now: () => nowMs, onIdleShutdown });
-			const port = await listen(server);
-			expect(port).toBeGreaterThan(0);
-			nowMs = 30_000; // well under the timeout
-			await vi.advanceTimersByTimeAsync(60_000); // one poll tick, not idle yet
-			expect(onIdleShutdown).not.toHaveBeenCalled();
-			nowMs = 200_000; // now past the timeout
-			await vi.advanceTimersByTimeAsync(60_000); // next poll tick
-			expect(onIdleShutdown).toHaveBeenCalledTimes(1);
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("does not arm the poll on a server that never bound", async () => {
-		// `startDashboardServer` builds one server per candidate port and discards the
-		// EADDRINUSE losers. A poll armed at construction outlived that discard —
-		// nothing cleared it, `close()` on a never-listened server still invokes its
-		// callback, and `unref` cannot help while a live sibling keeps the loop alive.
-		// So the loser's frozen `lastRequestMs` fired hours later and shut down the
-		// HEALTHY server sharing the process, deleting dashboard.json with it.
-		vi.useFakeTimers();
-		try {
-			const onIdleShutdown = vi.fn();
-			// Never listened: no `listen()` call at all.
-			testServer({ idleTimeoutMs: 120_000, now: () => 1e12, onIdleShutdown });
-			await vi.advanceTimersByTimeAsync(600_000);
-			expect(onIdleShutdown).not.toHaveBeenCalled();
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("starts the idle clock when it begins SERVING, not when it was constructed", async () => {
-		vi.useFakeTimers();
-		try {
-			// A loser can sit around a while before the winner binds; counting that
-			// wait against the winner's idle budget would shut it down early.
-			let nowMs = 0;
-			const onIdleShutdown = vi.fn();
-			const server = testServer({ idleTimeoutMs: 120_000, now: () => nowMs, onIdleShutdown });
-			nowMs = 10_000_000; // long gap between construction and listen
-			await listen(server);
-			await vi.advanceTimersByTimeAsync(60_000);
-			expect(onIdleShutdown).not.toHaveBeenCalled();
-		} finally {
-			vi.useRealTimers();
-		}
-	});
-
-	it("does not arm the poll when the timeout is disabled", async () => {
-		vi.useFakeTimers();
-		try {
-			const onIdleShutdown = vi.fn();
-			const server = testServer({ idleTimeoutMs: 0, now: () => 1e12, onIdleShutdown });
-			await listen(server);
-			await vi.advanceTimersByTimeAsync(600_000);
-			expect(onIdleShutdown).not.toHaveBeenCalled();
-		} finally {
-			vi.useRealTimers();
-		}
+		expect((await get(port, "/memories")).status).toBe(200);
 	});
 });
 
@@ -886,66 +806,35 @@ describe("resolveDashboardAssetsDir", () => {
 	});
 });
 
-describe("state file", () => {
-	it("round-trips dashboard.json with 0600 and clears it", async () => {
-		const state = {
-			pid: process.pid,
-			port: 12345,
-			startedAt: "2026-07-30T00:00:00.000Z",
-			schemaVersion: 1,
-		};
-		await writeDashboardState(state, dir);
-		expect(await readDashboardState(dir)).toEqual(state);
-		await clearDashboardState(dir);
-		expect(await readDashboardState(dir)).toBeNull();
-		// Clearing an absent file is fine.
-		await clearDashboardState(dir);
-	});
-
-	it("clears the state file only for the pid that owns it", async () => {
-		const state = { pid: 111, port: 12345, startedAt: "2026-07-30T00:00:00.000Z", schemaVersion: 1 };
-		await writeDashboardState(state, dir);
-		// A server exiting after its record was replaced must leave the successor's
-		// record alone, or the live server becomes unfindable to every launcher.
-		await clearDashboardState(dir, 222);
-		expect(await readDashboardState(dir)).toEqual(state);
-		await clearDashboardState(dir, 111);
-		expect(await readDashboardState(dir)).toBeNull();
-		// An absent (or unreadable) record is nobody's to protect.
-		await clearDashboardState(dir, 111);
-	});
-
-	it("returns null for corrupt or wrong-shape state", async () => {
-		writeFileSync(getDashboardStatePath(dir), "{broken");
-		expect(await readDashboardState(dir)).toBeNull();
-		writeFileSync(getDashboardStatePath(dir), JSON.stringify({ port: "not-a-number" }));
-		expect(await readDashboardState(dir)).toBeNull();
-	});
-
-	it("swallows a non-ENOENT unlink failure while clearing the state file", async () => {
-		const state = { pid: process.pid, port: 12345, startedAt: "2026-07-30T00:00:00.000Z", schemaVersion: 1 };
-		await writeDashboardState(state, dir);
-		vi.mocked(unlink).mockRejectedValueOnce(new Error("EPERM: permission denied"));
-		await expect(clearDashboardState(dir)).resolves.toBeUndefined();
-	});
-});
-
 describe("startDashboardServer", () => {
-	it("binds a preferred (here: explicit) port and persists dashboard.json", async () => {
+	it("binds and writes no state file", async () => {
 		const started = await startDashboardServer({
 			port: 0,
 			assetsDir,
 			buildModel: async (req) => model(req.view),
 			configDir: dir,
-			now: () => 1_700_000_000_000,
 		});
 		servers.push(started.server);
 		expect(started.port).toBeGreaterThan(0);
-		const state = await readDashboardState(dir);
-		expect(state).toMatchObject({ pid: process.pid, port: started.port });
+		// The pid/port record is gone with the daemon: nothing discovers this
+		// server, because nothing else is meant to attach to it.
+		expect(existsSync(join(dir, "dashboard.json"))).toBe(false);
 	});
 
-	it("falls back to the next candidate when a preferred port is taken", async () => {
+	it("reports fellBack=false for the first candidate it takes", async () => {
+		const started = await startDashboardServer({
+			port: 0,
+			assetsDir,
+			buildModel: async (req) => model(req.view),
+			configDir: dir,
+		});
+		servers.push(started.server);
+		// An explicit port is a single candidate, so index 0 is the only outcome —
+		// which is also why an occupied explicit port throws rather than moving.
+		expect(started.fellBack).toBe(false);
+	});
+
+	it("surfaces a bind failure when the only candidate is taken", async () => {
 		const first = await startDashboardServer({
 			port: 0,
 			assetsDir,
@@ -953,7 +842,6 @@ describe("startDashboardServer", () => {
 			configDir: dir,
 		});
 		servers.push(first.server);
-		// Occupy → same explicit port now collides → error surfaces (single candidate).
 		await expect(
 			startDashboardServer({
 				port: first.port,

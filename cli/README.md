@@ -489,25 +489,24 @@ Claude transcripts for now. Requires an API key (same as summary generation). Th
 
 ### `jolli dashboard`
 
-Starts a private web server on your machine and opens a dashboard with your memories, per-repo stats, and a standup summary. Everything is served locally from your own data — nothing is uploaded.
+Serves a private web dashboard from your machine and opens it in your browser: your memories, per-repo stats, and a standup summary. Everything is served locally from your own data — nothing is uploaded. The command keeps running until you stop it with **Ctrl+C**.
 
 Alongside the overview it carries a **Memories** list, a **Decisions** view, a **Repositories** view, a **Knowledge** view that browses your knowledge wiki page by page, and a **Graph** view that renders the knowledge map in place (no `jolli graph --export` step needed). Tool-usage rows break down per agent, so you can see which agent made which calls. A **Settings** modal mirrors the editor extensions' five sections — AI Agents, AI Summary, Sync to Jolli, Memory Bank, Others — saved through a single **Apply**; API keys are held server-side and only masked values ever reach the page.
 
 ```bash
-# Start the dashboard and open it in your browser
+# Serve the dashboard and open it in your browser (Ctrl+C to stop)
 jolli dashboard
 
-# Print the URL instead of opening a browser
+# Print the URL instead of opening a browser (still serves until Ctrl+C)
 jolli dashboard --no-open
 
 # Pick a port (default: 1818, then 18118 if taken)
 jolli dashboard --port 3000
-
-# Stop the running dashboard server
-jolli dashboard --stop
 ```
 
-The server keeps running in the background; re-running `jolli dashboard` reuses it rather than starting a second one. Requires Node 22.13+ (it reads a local SQLite database).
+The server lives in this command's own process, so closing the terminal stops it. That also means the command does not return on its own — including with `--no-open` — so a script or CI job that runs it will block until something stops it. Requires Node 22.13+ (it reads a local SQLite database).
+
+Launching it again replaces the dashboard that is already running rather than starting a second one beside it, so you always get a fresh server on the address you expect. Only a Jolli dashboard is ever stopped: an unrelated service holding port 1818 is left alone and the new dashboard moves to 18118 instead.
 
 ### `jolli cutover`
 

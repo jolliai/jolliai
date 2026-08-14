@@ -30,6 +30,8 @@ export default defineConfig({
 		// child blocks on an external process and the round dies as a timeout.
 		// Env vars are inherited by those children; `-c` flags are not.
 		setupFiles: ["../test/gitEnv.ts"],
+		// Pairs with the line above — see `test/scratchHome.ts`.
+		globalSetup: ["../test/scratchHome.ts"],
 		// Real git + filesystem fixtures need a healthy timeout per test, and
 		// `fileParallelism: false` below does NOT make them immune to load: these
 		// rounds are git-subprocess-bound, so pressure from anything else on the
