@@ -5,6 +5,10 @@
  * separate concern (FolderStorage / WikiMarkdownBuilder).
  */
 
+// The one home for "which `topics/` files are pages" — shared with the cutover
+// compare so the two cannot drift. Kept OUT of this module because this one is
+// widely `vi.mock`ed, which would hand the compare an undefined predicate.
+import { isTopicPagePath } from "../dashboard/ImportablePaths.js";
 import { createLogger } from "../Logger.js";
 import type { FileWrite } from "../Types.js";
 import type { StorageProvider } from "./StorageProvider.js";
@@ -12,9 +16,6 @@ import { resolveStorage, withRequiredOrphanWriteLock } from "./SummaryStore.js";
 import type { TopicPage } from "./TopicKBTypes.js";
 
 const log = createLogger("TopicPageStore");
-
-/** Reserved file names under `topics/` that are NOT topic pages. */
-const RESERVED = new Set(["index", "processed"]);
 
 /**
  * Guards a slug before it is interpolated into a `topics/<slug>.json` path.
@@ -62,10 +63,7 @@ export async function saveTopicPage(page: TopicPage, cwd?: string, storage?: Sto
 export async function listTopicPageSlugs(cwd?: string, storage?: StorageProvider): Promise<ReadonlyArray<string>> {
 	const resolved = await resolveStorage(storage, cwd);
 	const files = await resolved.listFiles("topics/");
-	return files
-		.filter((f) => f.startsWith("topics/") && f.endsWith(".json"))
-		.map((f) => f.slice("topics/".length, -".json".length))
-		.filter((slug) => slug.length > 0 && !slug.includes("/") && !RESERVED.has(slug));
+	return files.filter(isTopicPagePath).map((f) => f.slice("topics/".length, -".json".length));
 }
 
 /**

@@ -53,6 +53,7 @@ import type { StorageProvider } from "../core/StorageProvider.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { CutoverRecord } from "./CutoverRouter.js";
 import { inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
+import { IMPORT_FAMILIES, importTakesPath } from "./ImportablePaths.js";
 import { existingWorktrees, type RegisteredRepo, readRepoRegistry, resolveRepoIdentityForCwd } from "./RepoRegistry.js";
 import { countMemoriesAbsentFromListing, importRepoMemory } from "./SotImport.js";
 
@@ -88,8 +89,6 @@ export interface CutoverOptions {
 	readonly nowMs?: number;
 	/** Tip-moved retries before giving up (retries are normal, not errors). */
 	readonly maxRetries?: number;
-	/** Admission floor override — see {@link FENCE_AWARE_MIN_VERSION}. */
-	readonly minSurfaceVersion?: string;
 	/**
 	 * Per-source compare, injected so tests can pin protocol behavior without
 	 * a full orphan fixture. Defaults to {@link compareSourceContainment}.
@@ -101,35 +100,32 @@ export interface CutoverOptions {
 }
 
 /**
- * The default compare: every path the frozen tip lists must read back from
- * the database. Byte-exact for every family except summaries, which use the
+ * The default compare: every path the IMPORT WOULD TAKE must read back from the
+ * database. Byte-exact for every family except summaries, which use the
  * measured criterion (children are reassembled from CURRENT child rows —
  * fresher than the parent file's stale embedded copies) — shell-equal with an
  * identical child set and order. Containment by construction: paths only the
  * database has are never visited.
+ *
+ * "What the import would take", not "every file on the branch", and the
+ * difference is the whole point — see `ImportablePaths`. The old form demanded
+ * the database answer for files the import is designed never to store, which it
+ * can never do, on every attempt, forever.
  */
 export async function compareSourceContainment(
 	orphan: StorageProvider,
 	sqlite: SqliteStorage,
 ): Promise<{ ok: boolean; detail: string }> {
-	// Every family the orphan tree can carry. A family missing from this list is
-	// not "unchecked", it is INVISIBLE: containment only ever visits paths the
-	// list produces, so an absent family reports ok having read nothing — which
-	// is how archived skills came within one release of being certified and then
-	// silently unreadable.
-	const families = [
-		"summaries/",
-		"transcripts/",
-		"plans/",
-		"notes/",
-		"references/",
-		"skills/",
-		"plan-progress/",
-		"topics/",
-	];
 	let checked = 0;
-	for (const prefix of families) {
-		const paths = await orphan.listFiles(prefix);
+	for (const prefix of IMPORT_FAMILIES) {
+		const listed = await orphan.listFiles(prefix);
+		const paths = listed.filter((p) => importTakesPath(prefix, p));
+		const dropped = listed.length - paths.length;
+		// Not silent: a path the compare stops asking about is a deliberate
+		// narrowing, and this is the only place it can be seen.
+		if (dropped > 0) {
+			log.info("compare: %d path(s) under %s are not importable — not compared", dropped, prefix);
+		}
 		// batchReadFiles is optional on the interface; GitRefStorage has it, but
 		// keep an injected fake honest with a per-path fallback.
 		const want = orphan.batchReadFiles
@@ -143,28 +139,124 @@ export async function compareSourceContainment(
 			if (a === b) continue;
 			if (a == null || b == null) return { ok: false, detail: `${path}: missing from the database` };
 			if (path.startsWith("summaries/") && summariesEquivalent(a, b)) continue;
-			// `topics/index.json` and `topics/processed.json` ALONE. Both are
-			// synthesized UNION views: they are rendered from every row of the repo
-			// id, and step 2 imports every registered source into that one id
-			// (identity is the shared remote). So for a repo with two clones — which
-			// `collectSources` supports — the database renders A∪B and equality
-			// against A's file, or B's, can never hold; byte-comparing them made such
-			// a repo answer `not-ready` on every attempt and never converge. The
-			// criterion is CONTAINMENT (every entry the source lists is in the
-			// database), which is the same thing the family loop asserts for every
-			// other path and is why `index.json` / `catalog.json` are skipped below.
-			// A topic PAGE is not one of these: `topic_source_refs.pos` exists
-			// precisely to preserve its array order, and the `startsWith` this used
-			// to carry swallowed every page into the loose compare, certifying a
-			// reordered page as contained.
-			if (TOPIC_UNION_VIEWS.has(path) && jsonContains(a, b)) continue;
 			return { ok: false, detail: `${path}: content differs` };
+		}
+		// The two synthesized union views are not importable paths, so the loop
+		// above never yields them. They still have to be compared — by containment,
+		// against the whole-repo view the database renders. AFTER the pages, so a
+		// concrete missing page is what the user is told about: a page the database
+		// lacks also makes the index disagree, and "topics/index.json: content
+		// differs" points at a synthesized view rather than at the file to look at.
+		for (const view of TOPIC_UNION_VIEWS) {
+			if (!listed.includes(view)) continue;
+			checked++;
+			const verdict = await compareUnionView(view, orphan, sqlite, listed);
+			if (!verdict.ok) return verdict;
 		}
 	}
 	// index.json / catalog.json are synthesized views; their entries are
 	// covered by the summaries family above, so they are deliberately not
 	// byte-compared (entry order and stale copies are allowlisted).
 	return { ok: true, detail: `${checked} path(s) contained` };
+}
+
+/**
+ * `topics/index.json` / `topics/processed.json` — the two synthesized UNION
+ * views. Both are rendered from every row of the repo id, so equality against
+ * one source's file can never hold for a repo with more than one source; the
+ * criterion is CONTAINMENT (every entry the source lists is in the database),
+ * the same thing the family loop asserts for every other path. A topic PAGE is
+ * NOT one of these: `topic_source_refs.pos` exists precisely to preserve its
+ * array order, so pages stay byte-exact.
+ *
+ * `topics/index.json` gets one extra narrowing, for the same reason the whole
+ * importable-path rule exists: the database renders this view from
+ * `topic_pages`, and a row only exists where a PAGE FILE was imported. An index
+ * entry whose `topics/<slug>.json` is not on the branch therefore cannot be in
+ * the database on any run — the page and the index are two independent writes,
+ * and `saveTopicIndex` never prunes entries pointing at absent pages, so the
+ * state is stable and self-sustaining. Such entries are dropped from the SOURCE
+ * side before comparing, and named in the log: their `title` / `summary` /
+ * `sourceRefs` stop being served after the freeze. That is a real (small) loss,
+ * mitigated by the fence FREEZING the branch rather than deleting it — the
+ * bytes stay recoverable by hand — and by those entries' pages already being
+ * unopenable.
+ */
+async function compareUnionView(
+	view: string,
+	orphan: StorageProvider,
+	sqlite: SqliteStorage,
+	listed: ReadonlyArray<string>,
+): Promise<{ ok: boolean; detail: string }> {
+	const a = await orphan.readFile(view);
+	// Nothing on the source side to contain.
+	if (a == null) return { ok: true, detail: "" };
+	const b = await sqlite.readFile(view);
+	if (a === b) return { ok: true, detail: "" };
+	if (view === "topics/index.json") {
+		const { filtered, kept, dropped } = dropUnbackedTopicEntries(a, listed);
+		if (dropped.length > 0) {
+			// WARN, not info: every other narrowing in this file drops something the
+			// database was never meant to hold, but these entries carry `title` /
+			// `summary` / `sourceRefs` that really do stop being served. The whole
+			// reason the admission check came out is that a verdict nobody can see
+			// is a verdict nobody can act on — a content loss must not be quieter
+			// than the refusals it replaced.
+			log.warn(
+				"compare: %d topic index entr%s have no page file on the branch and will not be served after the freeze: %s",
+				dropped.length,
+				dropped.length === 1 ? "y" : "ies",
+				dropped.join(", "),
+			);
+		}
+		// `b == null` is a REAL state, not a failure: the database renders no index
+		// at all until it holds at least one topic page. It is contained exactly
+		// when nothing survived the filter — never by comparing against a
+		// synthesized empty document, which would also have to guess at the
+		// index's other fields (`schemaVersion`) and would fail on them.
+		if (b == null) {
+			return kept === 0 ? { ok: true, detail: "" } : { ok: false, detail: `${view}: missing from the database` };
+		}
+		if (jsonContains(filtered, b)) return { ok: true, detail: "" };
+		return { ok: false, detail: `${view}: content differs` };
+	}
+	if (b != null && jsonContains(a, b)) return { ok: true, detail: "" };
+	return { ok: false, detail: b == null ? `${view}: missing from the database` : `${view}: content differs` };
+}
+
+/**
+ * Drops index entries whose `topics/<stableSlug>.json` is absent from `listed`.
+ *
+ * An unparsable index returns unchanged, so the comparison falls back to the
+ * STRICTER form — a parse failure must never widen what is accepted.
+ */
+function dropUnbackedTopicEntries(
+	indexJson: string,
+	listed: ReadonlyArray<string>,
+): { filtered: string; kept: number; dropped: string[] } {
+	try {
+		const parsed = JSON.parse(indexJson) as { topics?: Array<{ stableSlug?: string }> };
+		// Same verdict as the `catch` below, and for the same reason: a document
+		// this function cannot interpret must fall back to the STRICTER form. The
+		// `kept: 1` is what keeps a null database side a failure — returning 0 here
+		// would widen acceptance on exactly the input we understand least.
+		/* v8 ignore next -- a well-formed index always carries the array */
+		if (!Array.isArray(parsed.topics)) return { filtered: indexJson, kept: 1, dropped: [] };
+		const pages = new Set(listed);
+		const dropped: string[] = [];
+		const topics = parsed.topics.filter((t) => {
+			const slug = typeof t?.stableSlug === "string" ? t.stableSlug : "";
+			if (slug && pages.has(`topics/${slug}.json`)) return true;
+			dropped.push(slug || "(no stableSlug)");
+			return false;
+		});
+		if (dropped.length === 0) return { filtered: indexJson, kept: topics.length, dropped };
+		return { filtered: JSON.stringify({ ...parsed, topics }), kept: topics.length, dropped };
+	} catch {
+		// Unparsable: fall back to the UNFILTERED document, so the comparison is
+		// the stricter one. `kept: 1` keeps a null database side a failure here.
+		return { filtered: indexJson, kept: 1, dropped: [] };
+	}
 }
 
 /** The refined summary criterion: byte-equal with children emptied on both sides, same child set/order. */
@@ -250,42 +342,6 @@ function canonJson(x: unknown): string {
 		);
 	}
 	return JSON.stringify(x);
-}
-
-/**
- * The first release whose surfaces understand the fence protocol. Admission
- * is decided by what is INSTALLED ON THIS MACHINE, not by what has shipped:
- * dist-paths records every registered surface as `source@version`, so "every
- * surface here is fence-aware" is locally decidable. An older surface would
- * keep writing the frozen branch (it reads only the derived disable bit at
- * its NEXT start, and running hosts not even that), so the cutover refuses
- * to begin until the machine is clean.
- */
-export const FENCE_AWARE_MIN_VERSION = "0.99.9";
-
-/** Machine-local admission: every installed surface must be fence-aware. */
-export async function checkCutoverAdmission(
-	minVersion: string = FENCE_AWARE_MIN_VERSION,
-): Promise<{ ok: boolean; stale: Array<{ source: string; version: string }> }> {
-	const { traverseDistPaths } = await import("../install/DistPathResolver.js");
-	const { compareSemver } = await import("../install/SemverCompare.js");
-	const stale = traverseDistPaths()
-		// `available` is what makes "installed" true. A dist-paths entry outlives
-		// the surface that wrote it (uninstall the VS Code extension and the file
-		// stays, pointing at a deleted directory), and `pickBestDistPath` filters
-		// those out for the same reason. Counting a ghost as stale would refuse
-		// the cutover forever with advice the user cannot act on: upgrade a
-		// surface that is not installed.
-		.filter((info) => info.available)
-		.filter((info) => {
-			try {
-				return compareSemver(info.version, minVersion) < 0;
-			} catch {
-				return true; // unparsable version — treat as too old, never as fine
-			}
-		})
-		.map((info) => ({ source: info.source, version: info.version }));
-	return { ok: stale.length === 0, stale };
 }
 
 /** What the drift probe found for one source. */
@@ -430,14 +486,23 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 	const nowMs = opts.nowMs ?? Date.now();
 	const maxRetries = opts.maxRetries ?? 3;
 	const compare = opts.compare ?? compareSourceContainment;
-	const admission = await checkCutoverAdmission(opts.minSurfaceVersion);
-	if (!admission.ok) {
-		const list = admission.stale.map((s) => `${s.source}@${s.version}`).join(", ");
-		return {
-			status: "not-ready",
-			reason: `stale surfaces installed on this machine: ${list} — upgrade them first (old surfaces would keep writing the frozen branch)`,
-		};
-	}
+	// NO machine-local admission check, and its absence is the decision. This
+	// used to refuse the whole cutover when any surface registered in
+	// `dist-paths/` was below a fence-aware version floor, on the theory that an
+	// old surface would keep writing the frozen branch. The cost of that theory
+	// was total: one un-upgraded fork-editor extension pinned every repo on the
+	// machine at `uncutover` forever, with the reason only ever reaching
+	// `debug.log` — the SQLite read path was unreachable in practice.
+	//
+	// The risk it guarded moves downstream to `probeCutoverDrift`, which reports
+	// a write that bypassed the fence AND catch-up imports it, so such a memory
+	// is reported rather than stranded. That trade only holds because the probe
+	// RUNS ON ITS OWN: `maybeAutoCutover` calls it (throttled) every time it
+	// finds a repo already in `cutover`. Leaving it reachable only from
+	// `jolli cutover --probe` would have swapped a visible refusal for a silent
+	// loss — after the fence reads come from SQLite, so a bypassed write shows no
+	// symptom the user could know to investigate. Do not remove that call site
+	// without restoring a guard here.
 	const { identity } = await resolveRepoIdentityForCwd(cwd);
 	const registry = await readRepoRegistry();
 	const repo = registry.repos.find((r) => r.repoIdentity === identity);
@@ -512,9 +577,12 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// legitimate seed removes).
 		let seedLegal = fencedRoots.size === 0 && sources.length === 1;
 		if (seedLegal) {
+			// The shared predicate, not a hand-inlined copy of it: this listing is
+			// compared against database rows the IMPORT wrote, so it has to be the
+			// import's own idea of what a summary file is.
 			const listed = new Set(
 				(await new GitRefStorage(sources[0].tip, sources[0].root).listFiles("summaries/"))
-					.filter((p) => p.endsWith(".json"))
+					.filter((p) => importTakesPath("summaries/", p))
 					.map((p) => p.slice("summaries/".length, -".json".length)),
 			);
 			// Fail CLOSED — see `countMemoriesAbsentFromListing`. Refusing costs a

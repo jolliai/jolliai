@@ -2,10 +2,13 @@
  * CutoverCommand — `jolli cutover`: the user-facing entry to the phase-D
  * protocol. Plain `jolli cutover` runs (or resumes) the switch for the
  * current repo; `--status` answers with the four-state route; `--probe`
- * runs the post-cutover drift check.
+ * runs the post-cutover drift check UNTHROTTLED, which is the difference
+ * between it and the copy `maybeAutoCutover` runs on its own — this one is
+ * for someone actively hunting the writer, so it must not be suppressed by
+ * a stamp an automatic probe left minutes ago.
  *
  * The engine is deliberately conservative, so this command mostly reports:
- * a stale surface, a failing compare or a missing orphan branch are all
+ * an unregistered repo, a missing orphan branch or a failing compare are all
  * "not-ready" with the reason spelled out, and retry exhaustion leaves the
  * repo in legacy-fenced — a WORKING state (writes go to SQLite) whose CAS a
  * re-run finishes.

@@ -66,6 +66,32 @@ export interface RepoProfile {
 	 */
 	userDisabled?: boolean;
 	/**
+	 * When the automatic cutover attempt last RAN for this clone (epoch ms).
+	 *
+	 * Only a throttle, never evidence of state: the two witnesses that decide
+	 * routing are {@link cutoverFence} and the database's `repo_state.cutover`
+	 * row, and this field is deliberately not consulted by either. It exists
+	 * because the attempt's step 2 re-imports every source at its pinned tip and
+	 * step 3 then reads every file that tip lists, which is far too expensive to
+	 * repeat on every commit for a repo that keeps answering `not-ready`. Absent
+	 * means "never attempted", which is what every repo enabled before
+	 * auto-cutover shipped reads back.
+	 */
+	cutoverAttemptedAtMs?: number;
+	/**
+	 * When the automatic post-cutover DRIFT probe last ran for this clone (epoch
+	 * ms) — a separate stamp from {@link cutoverAttemptedAtMs} because the two
+	 * never run in the same state: the attempt stops once the repo is `cutover`,
+	 * which is exactly where the probe starts.
+	 *
+	 * Also only a throttle. The probe is cheap when nothing drifted (one
+	 * `rev-parse` per source) and expensive when something did (a catch-up
+	 * import), and drift is deliberately never cleared automatically — so
+	 * without a stamp a repo with a live bypassing writer would pay that import
+	 * on every single commit, forever.
+	 */
+	cutoverDriftProbedAtMs?: number;
+	/**
 	 * The cutover fence (phase D): present means this repo's orphan branch is
 	 * FROZEN — new runtimes keep working but write SQLite and read the database;
 	 * old runtimes are stopped via the derived bit. `jolli enable` must NOT
@@ -73,18 +99,6 @@ export interface RepoProfile {
 	 * there is no legitimate "unfreeze" — old clients must never write the
 	 * frozen branch again.
 	 */
-	/**
-	 * When the automatic cutover attempt last RAN for this clone (epoch ms).
-	 *
-	 * Only a throttle, never evidence of state: the two witnesses that decide
-	 * routing are {@link cutoverFence} and the database's `repo_state.cutover`
-	 * row, and this field is deliberately not consulted by either. It exists
-	 * because the attempt's step 3 reads every file the frozen tip lists, which
-	 * is far too expensive to repeat on every commit for a repo that keeps
-	 * answering `not-ready`. Absent means "never attempted", which is what every
-	 * repo enabled before auto-cutover shipped reads back.
-	 */
-	cutoverAttemptedAtMs?: number;
 	cutoverFence?: {
 		readonly reason: string;
 		readonly at: string;

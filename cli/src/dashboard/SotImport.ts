@@ -42,6 +42,9 @@ import { listTopicPageSlugs, readTopicPage } from "../core/TopicPageStore.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { CommitSummary, StoredTranscript, SummaryIndex } from "../Types.js";
 import { type DashboardDbHandle, inTransaction } from "./DashboardDb.js";
+// The same predicates the cutover compare asks. Behaviour is unchanged — this
+// is where the rule was, and it now has ONE home so the two cannot drift.
+import { importTakesPath } from "./ImportablePaths.js";
 import { cursorFingerprint, type ImportCursor, readImportStateRow, writeImportState } from "./ImportState.js";
 import { existingWorktrees, type RegisteredRepo } from "./RepoRegistry.js";
 import { REORDER_OFFSET } from "./SotSchema.js";
@@ -828,7 +831,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 
 	// ── read the orphan branch ─────────────────────────────────────────────
 	const index = await getIndex(cwd, storage);
-	const summaryPaths = (await storage.listFiles("summaries/")).filter((p) => p.endsWith(".json"));
+	const summaryPaths = (await storage.listFiles("summaries/")).filter((p) => importTakesPath("summaries/", p));
 	// Every prune set below is the FILE listing, not the parsed subset — see
 	// `pruneTable`.
 	const liveNodes = new Set(summaryPaths.map((p) => p.slice("summaries/".length, -".json".length)));
@@ -1158,7 +1161,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 	};
 
 	// ── transcripts + links, written inside each memory's slice ────────────
-	const transcriptPaths = (await storage.listFiles("transcripts/")).filter((p) => p.endsWith(".json"));
+	const transcriptPaths = (await storage.listFiles("transcripts/")).filter((p) => importTakesPath("transcripts/", p));
 	const liveTranscripts = new Set(transcriptPaths.map((p) => p.slice("transcripts/".length, -".json".length)));
 	/**
 	 * Transcripts this run has written a row for — and therefore the ONLY legal
@@ -1570,7 +1573,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 		docs++;
 	};
 
-	const planPaths = (await storage.listFiles("plans/")).filter((p) => p.endsWith(".md"));
+	const planPaths = (await storage.listFiles("plans/")).filter((p) => importTakesPath("plans/", p));
 	for (const path of planPaths) liveDocs.add(keyOf("plan", path.slice("plans/".length, -".md".length)));
 	const planContents = await readAll(storage, planPaths);
 	inChunkedTransactions(db, [...planContents.entries()], ([path, content]) => {
@@ -1580,7 +1583,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 		upsertDoc("plan", slug, content, { branch, originalSlug: original, title: markdownTitle(content) });
 	});
 
-	const notePaths = (await storage.listFiles("notes/")).filter((p) => p.endsWith(".md"));
+	const notePaths = (await storage.listFiles("notes/")).filter((p) => importTakesPath("notes/", p));
 	for (const path of notePaths) liveDocs.add(keyOf("note", path.slice("notes/".length, -".md".length)));
 	const noteContents = await readAll(storage, notePaths);
 	inChunkedTransactions(db, [...noteContents.entries()], ([path, content]) => {
@@ -1590,7 +1593,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 		upsertDoc("note", id, content, { branch, title: markdownTitle(content) });
 	});
 
-	const referencePaths = (await storage.listFiles("references/")).filter((p) => p.endsWith(".md"));
+	const referencePaths = (await storage.listFiles("references/")).filter((p) => importTakesPath("references/", p));
 	for (const path of referencePaths)
 		liveDocs.add(keyOf("reference", path.slice("references/".length, -".md".length)));
 	const referenceContents = await readAll(storage, referencePaths);
@@ -1614,7 +1617,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 	// `context` CHECKs source to kind='reference', and the segment is recoverable
 	// from `context_key` anyway (the reference rows store it twice only because
 	// their escaped native id is not).
-	const skillPaths = (await storage.listFiles("skills/")).filter((p) => p.endsWith(".md"));
+	const skillPaths = (await storage.listFiles("skills/")).filter((p) => importTakesPath("skills/", p));
 	for (const path of skillPaths) liveDocs.add(keyOf("skill", path.slice("skills/".length, -".md".length)));
 	const skillContents = await readAll(storage, skillPaths);
 	inChunkedTransactions(db, [...skillContents.entries()], ([path, content]) => {
@@ -1625,7 +1628,9 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 
 	// ── plan progress (canonical artifact JSON) ────────────────────────────
 	let planProgress = 0;
-	const progressPaths = (await storage.listFiles("plan-progress/")).filter((p) => p.endsWith(".json"));
+	const progressPaths = (await storage.listFiles("plan-progress/")).filter((p) =>
+		importTakesPath("plan-progress/", p),
+	);
 	const progressContents = await readAll(storage, progressPaths);
 	// Both spellings of an artifact's key count as live: the row it produced last
 	// time was keyed on `planSlug`, which an unreadable artifact cannot supply now.

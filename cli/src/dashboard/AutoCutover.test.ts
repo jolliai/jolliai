@@ -15,6 +15,7 @@ import { ORPHAN_BRANCH } from "../Logger.js";
 import { type RestoreHome, setIsolatedHome } from "../testUtils/isolatedHome.js";
 import { AUTO_CUTOVER_RETRY_MS, maybeAutoCutover } from "./AutoCutover.js";
 import { resolveCutoverRoute } from "./CutoverRouter.js";
+import { withDashboardDb } from "./DashboardDb.js";
 import { registerRepo } from "./RepoRegistry.js";
 
 let dir: string;
@@ -138,5 +139,72 @@ describe("maybeAutoCutover", () => {
 		await maybeAutoCutover(cwd, { dbPath, throttle: true, nowMs: now });
 		expect((await readRepoProfile(cwd)).cutoverAttemptedAtMs).toBe(now);
 		expect(await maybeAutoCutover(cwd, { dbPath, throttle: true, nowMs: now + 1000 })).toBe("skipped");
+	});
+
+	describe("post-cutover drift probe", () => {
+		it("catches a fence-bypassing write with nobody typing --probe", async () => {
+			// The whole reason the version-floor admission check could come out. After
+			// the freeze reads come from SQLite, so a write that bypassed the fence has
+			// NO symptom — a user has nothing to investigate and no reason to run the
+			// diagnostic by hand. If this call site goes away, that memory is lost
+			// silently rather than reported.
+			const now = Date.parse("2026-08-09T12:00:00Z");
+			await writeOrphanSummary(HASH);
+			expect(await maybeAutoCutover(cwd, { dbPath, nowMs: now })).toBe("cutover");
+
+			// An old surface writes the frozen branch anyway.
+			await writeOrphanSummary("e".repeat(40));
+
+			expect(await maybeAutoCutover(cwd, { dbPath, nowMs: now + AUTO_CUTOVER_RETRY_MS + 1 })).toBe("cutover");
+			const rows = await withDashboardDb(
+				(db) => db.prepare("SELECT COUNT(*) AS n FROM memories").get() as { n: number },
+				{ dbPath },
+			);
+			expect(rows.n).toBe(2);
+		});
+
+		it("does not probe on the call that performs the cutover", async () => {
+			// That call returns through the CAS, not the already-cut-over branch, and
+			// the tips it would compare are the ones it pinned itself moments ago.
+			const now = Date.parse("2026-08-09T12:00:00Z");
+			await writeOrphanSummary(HASH);
+			expect(await maybeAutoCutover(cwd, { dbPath, nowMs: now })).toBe("cutover");
+			expect((await readRepoProfile(cwd)).cutoverDriftProbedAtMs).toBeUndefined();
+		});
+
+		it("throttles on its OWN stamp — the attempt's stops moving once cut over", async () => {
+			const now = Date.parse("2026-08-09T12:00:00Z");
+			await writeOrphanSummary(HASH);
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now });
+			// First call to find the repo already cut over: this is the one that
+			// probes, and it stamps BEFORE probing — same rule as the attempt.
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now + 60_000 });
+			expect((await readRepoProfile(cwd)).cutoverDriftProbedAtMs).toBe(now + 60_000);
+
+			// Inside the window the bypassing write is NOT imported yet: the probe's
+			// repair is a full catch-up import, and drift is deliberately never
+			// cleared, so an unthrottled probe would pay that on every commit forever.
+			await writeOrphanSummary("e".repeat(40));
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now + 120_000 });
+			expect((await readRepoProfile(cwd)).cutoverDriftProbedAtMs).toBe(now + 60_000);
+			const before = await withDashboardDb(
+				(db) => db.prepare("SELECT COUNT(*) AS n FROM memories").get() as { n: number },
+				{ dbPath },
+			);
+			expect(before.n).toBe(1);
+		});
+
+		it("is throttled even for the caller that passes no throttle", async () => {
+			// The post-import caller's reason to skip the throttle — the database was
+			// just filled from the branch — is about the COMPARE. It says nothing
+			// about drift, which is slow-moving by nature, so `throttle` is not
+			// consulted here at all: no call in this test passes one.
+			const now = Date.parse("2026-08-09T12:00:00Z");
+			await writeOrphanSummary(HASH);
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now });
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now + 60_000 });
+			await maybeAutoCutover(cwd, { dbPath, nowMs: now + 120_000 });
+			expect((await readRepoProfile(cwd)).cutoverDriftProbedAtMs).toBe(now + 60_000);
+		});
 	});
 });

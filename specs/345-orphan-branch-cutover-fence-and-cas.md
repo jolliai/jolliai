@@ -11,11 +11,11 @@ Freeze a repository's parallel summary ref permanently with a per-clone marker i
 - The freeze marker's shape, its per-clone scope, and the ordering rule that materializes the user's own opt-out alongside it.
 - Everything that changes behavior once a marker is present — enumerated site by site, including the two last-line refusals on the ref-backed write batch and the several places whose reconciliation is downgraded.
 - The one-way rules: never auto-revoked, never re-seeded after freezing, never rolled back from frozen-but-unrecorded.
-- The compare-and-swap protocol end to end: admission on installed surface versions, source collection, tip pinning, import, seed legality, the containment compare, the fence writes, the locked critical section, and the recording transaction.
+- The compare-and-swap protocol end to end: source collection, tip pinning, import, seed legality, the containment compare, the fence writes, the locked critical section, and the recording transaction.
 - The retry model, what counts as a retry-worthy condition, and the outcome when retries are exhausted.
 - Every outcome the protocol can report and what each one means about the repository's resulting state.
 - What triggers the protocol automatically, and the per-clone throttle that bounds it.
-- The post-swap drift probe: what it compares, what it repairs, and what it deliberately never updates.
+- The post-swap drift probe: what it compares, what it repairs, what it deliberately never updates, and what runs it without being asked.
 
 **Out of scope (boundaries):**
 
@@ -24,7 +24,6 @@ Freeze a repository's parallel summary ref permanently with a per-clone marker i
 - The import that fills the database from a pinned ref, and its per-mode reconciliation rules; this spec states only which mode is legal when, and why.
 - The advisory file lock the critical section takes — its on-disk convention, staleness ceiling, and the re-entrancy registry the one sanctioned bare acquire opts out of — covered by **Lock Primitive Registry** (297).
 - The repository profile's other fields and the durable manual-disable decision they encode (spec 145), beyond the ordering rule and the enable path's refusal to clear the marker.
-- Per-source version selection and what makes an installed surface "available" for the admission check.
 
 ## Data Contracts
 
@@ -57,10 +56,6 @@ A four-armed result:
 | `already-cutover` | A row already existed before anything was attempted. |
 | `not-ready` | Carries a reason. The repository is in a working state — either still unfrozen, or frozen with the recording pending. |
 | `retry-exhausted` | Every attempt found a moved tip or a busy lock. The marker is up; recording is pending. |
-
-### Admission floor
-
-The first release whose surfaces understand the marker: `0.99.9`. Admission is decided from what is **installed on this machine**, not from what has shipped.
 
 ## Behavior
 
@@ -96,7 +91,7 @@ The marker's writer does accept a removal request, which deletes the field and r
 
 Given a working directory:
 
-**Admission.** Enumerate every registered install surface on this machine that is actually **available** (an entry pointing at a deleted directory is a ghost and is skipped — counting one would refuse the swap forever with advice the user cannot act on: upgrade a surface that is not installed). Any available surface below the admission floor — including one whose version cannot be parsed, which counts as too old — makes the outcome `not-ready`, listing the stale surfaces. An older surface would keep writing the frozen ref, so the machine must be clean before the freeze begins.
+**No admission gate, and its absence is a decision.** The protocol once refused to begin whenever any install surface registered on this machine was below a fence-aware version floor, on the theory that an older surface would keep writing the frozen ref. The theory was right and the remedy was worse than the disease: one un-upgraded surface pinned *every* repository on the machine as unfrozen indefinitely, with the reason reaching only the debug log, which left the database read path unreachable in practice. The risk it guarded is carried instead by the drift probe below, which both reports a bypassing write and imports what it wrote — and which runs on its own schedule precisely so that this trade is not paid in silence. A version gate here may not be reintroduced without also re-deciding that.
 
 **Registration.** Resolve the repository's identity and find it in the repository registry. An unregistered repository is `not-ready` with an instruction to enable first.
 
@@ -154,7 +149,7 @@ Three callers:
 | The dashboard history import | No |
 | The dashboard command's own start path | Yes |
 
-The unthrottled caller is the one moment the database is known to have just been filled from the ref, which is when the containment compare is most likely to pass and when the user is already waiting on setup. The throttled callers suppress a repeat attempt for **six hours** after the last one, because the compare reads every file the frozen tip lists and a repository that keeps answering `not-ready` would otherwise pay that sweep on every commit and every dashboard reopen.
+The unthrottled caller is the one moment the database is known to have just been filled from the ref, which is when the containment compare is most likely to pass and when the user is already waiting on setup. The throttled callers suppress a repeat attempt for **two hours** after the last one, because an attempt is a full re-import of every source at its pinned tip *followed by* a read of every file that tip lists, and a repository that keeps answering `not-ready` would otherwise pay both on every commit and every dashboard reopen. Two hours rather than a longer window because the common `not-ready` reasons are transient — a tip that kept moving, a lock that stayed busy — and a window long enough to allow at most one attempt per working session leaves such a repository unfrozen for most of a day.
 
 The attempt timestamp is stamped into the profile **before** the attempt, not after, so a run that dies partway still spends its slot — otherwise a repeatedly-crashing compare would re-run on every single commit. It is only a throttle: neither witness ever consults it.
 
@@ -175,6 +170,14 @@ For each recorded tip:
 
 The probe's command surface prints one line per drifted source and sets a failing exit code when anything drifted.
 
+**The probe also runs without being asked**, and that is what makes it a safety net rather than a diagnostic. The same automatic trigger that presses the swap runs the probe instead whenever it finds a repository already recorded as cut over. Three properties:
+
+- It is **always throttled**, including for the caller that passes no throttle to the swap. That caller's justification — the database was just filled from the ref — is about the compare, and says nothing about drift, which is slow-moving by nature.
+- It throttles on its **own timestamp**, on the same two-hour window. The swap's timestamp stops being written the moment a repository is recorded, which is the only state the probe runs in, so sharing it would let the first probe fire and leave every later one reading a stamp nobody updates. The stamp is written **before** the probe for the same reason the swap's is.
+- Its failures are **contained**: a probe that throws must not change what the automatic trigger reports about a repository that is cut over and working.
+
+The reason it cannot be left to the command surface alone is that after the freeze reads come from the database, so a bypassed write produces **no symptom** — a user with nothing to investigate has no reason to run a diagnostic. Reaching it only by hand would have exchanged a visible refusal for a silent loss.
+
 ## State Transitions
 
 Per clone and per identity:
@@ -183,7 +186,7 @@ Per clone and per identity:
 - **frozen, unrecorded → recorded** — the transaction landed. Reported as `committed`.
 - **unfrozen → recorded, for a clone that has no marker** — another clone of the same remote completed the protocol. Such a clone is `cutover` from the routing table's point of view (the row outranks the marker) but has no local marker, so its ref write batch is refused by the second witness alone — and is *not* refused whenever the database cannot answer.
 - **frozen, unrecorded → frozen, unrecorded** — a retry-exhausted or post-freeze `not-ready` run. The repository keeps working: writes go to the database and reads come from it. A later run finishes the recording.
-- **prepared → prepared** — a `not-ready` before any marker was written (stale surfaces, unregistered repository, no ref, a failed compare). Nothing was frozen and nothing changed.
+- **prepared → prepared** — a `not-ready` before any marker was written (unregistered repository, no ref, a failed compare). Nothing was frozen and nothing changed.
 
 ## Notable Behavior
 

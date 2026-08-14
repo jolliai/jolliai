@@ -460,11 +460,14 @@ describe("runCutover", () => {
 		expect(drift).toMatchObject({ ok: false, detail: "topics/alpha.json: content differs" });
 
 		// The index keeps its allowance: its entry order falls out of a query.
+		// Both entries carry a page file so they survive the unbacked-entry filter
+		// and the assertion is about ORDER, not about them being dropped.
+		const pages = { "topics/a.json": page([]), "topics/b.json": page([]) };
 		const index = { schemaVersion: 1, topics: [{ stableSlug: "a" }, { stableSlug: "b" }] };
 		const reversed = { schemaVersion: 1, topics: [{ stableSlug: "b" }, { stableSlug: "a" }] };
 		const ok = await compareSourceContainment(
-			provider({ "topics/index.json": JSON.stringify(index) }),
-			provider({ "topics/index.json": JSON.stringify(reversed) }) as unknown as InstanceType<
+			provider({ ...pages, "topics/index.json": JSON.stringify(index) }),
+			provider({ ...pages, "topics/index.json": JSON.stringify(reversed) }) as unknown as InstanceType<
 				typeof SqliteStorage
 			>,
 		);
@@ -494,7 +497,11 @@ describe("runCutover", () => {
 		// Two clones of one remote import into ONE repo id, so both synthesized
 		// views render A∪B. Equality could never hold against either clone's
 		// file, which left such a repo permanently un-cutoverable.
+		// The page files matter: an index entry with no `topics/<slug>.json` on the
+		// branch is dropped from the source side before comparing (it can never be
+		// in the database), so without them this would pass vacuously.
 		const cloneA = {
+			"topics/a.json": JSON.stringify({ stableSlug: "a" }),
 			"topics/index.json": JSON.stringify({ schemaVersion: 1, topics: [{ stableSlug: "a" }] }),
 			"topics/processed.json": JSON.stringify({
 				schemaVersion: 1,
@@ -502,6 +509,7 @@ describe("runCutover", () => {
 			}),
 		};
 		const union = {
+			"topics/a.json": JSON.stringify({ stableSlug: "a" }),
 			"topics/index.json": JSON.stringify({
 				schemaVersion: 1,
 				topics: [{ stableSlug: "b" }, { stableSlug: "a" }],
@@ -530,6 +538,111 @@ describe("runCutover", () => {
 			}) as unknown as InstanceType<typeof SqliteStorage>,
 		);
 		expect(missing).toMatchObject({ ok: false, detail: "topics/processed.json: content differs" });
+	});
+
+	describe("compares only what the import would take", () => {
+		const provider = (files: Record<string, string>) => ({
+			async readFile(path: string): Promise<string | null> {
+				return files[path] ?? null;
+			},
+			async batchReadFiles(paths: string[]): Promise<Map<string, string | null>> {
+				return new Map(paths.map((p) => [p, files[p] ?? null]));
+			},
+			async listFiles(prefix: string): Promise<string[]> {
+				return Object.keys(files).filter((p) => p.startsWith(prefix));
+			},
+			async writeFiles(): Promise<void> {},
+			async exists(): Promise<boolean> {
+				return true;
+			},
+			async ensure(): Promise<void> {},
+		});
+		const compare = async (source: Record<string, string>, db: Record<string, string>) => {
+			const { SqliteStorage } = await import("../core/SqliteStorage.js");
+			const { compareSourceContainment } = await import("./CutoverEngine.js");
+			return compareSourceContainment(
+				provider(source),
+				provider(db) as unknown as InstanceType<typeof SqliteStorage>,
+			);
+		};
+
+		it("ignores files whose extension the import filters out", async () => {
+			// The import reads `notes/*.md` and `summaries/*.json` only, so the
+			// database can never answer for these — demanding it did made any stray
+			// file a permanent, silent cutover blocker.
+			const verdict = await compare(
+				{ "notes/scratch.txt": "x", "summaries/a.json.bak": "y", "notes/real.md": "kept" },
+				{ "notes/real.md": "kept" },
+			);
+			expect(verdict.ok).toBe(true);
+		});
+
+		it("still blocks on a file the import WOULD take and the database lacks", async () => {
+			const verdict = await compare({ "notes/real.md": "kept" }, {});
+			expect(verdict).toMatchObject({ ok: false, detail: "notes/real.md: missing from the database" });
+		});
+
+		it("ignores nested topic paths, which listTopicPageSlugs also refuses", async () => {
+			expect((await compare({ "topics/sub/x.json": "x" }, {})).ok).toBe(true);
+		});
+
+		it("drops index entries with no page file on the branch", async () => {
+			// The database renders `topics/index.json` from `topic_pages`, and a row
+			// exists only where a PAGE was imported. An index entry whose page file
+			// is absent can therefore never be contained — and the state is stable,
+			// because `saveTopicIndex` never prunes such entries.
+			const source = {
+				"topics/kept.json": JSON.stringify({ stableSlug: "kept" }),
+				"topics/index.json": JSON.stringify({
+					schemaVersion: 1,
+					topics: [{ stableSlug: "kept" }, { stableSlug: "shell", summary: "only in the index" }],
+				}),
+			};
+			const db = {
+				"topics/kept.json": JSON.stringify({ stableSlug: "kept" }),
+				"topics/index.json": JSON.stringify({ schemaVersion: 1, topics: [{ stableSlug: "kept" }] }),
+			};
+			expect((await compare(source, db)).ok).toBe(true);
+
+			// A BACKED entry the database lacks is still drift — the narrowing is
+			// only about entries the import could never have stored.
+			const backedButMissing = {
+				...source,
+				"topics/shell.json": JSON.stringify({ stableSlug: "shell" }),
+			};
+			// Reported as the PAGE, not as the index: union views are compared after
+			// the pages precisely so the detail names a file the user can look at.
+			expect(await compare(backedButMissing, db)).toMatchObject({
+				ok: false,
+				detail: "topics/shell.json: missing from the database",
+			});
+		});
+
+		it("accepts an index of only-unbacked entries against a database with no topics at all", async () => {
+			// `synthTopicIndex` answers null until the database holds one page, and
+			// the null check runs before the union-view branch — so this shape used
+			// to report `missing from the database` and could never be filtered.
+			const verdict = await compare(
+				{ "topics/index.json": JSON.stringify({ schemaVersion: 1, topics: [{ stableSlug: "shell" }] }) },
+				{},
+			);
+			expect(verdict.ok).toBe(true);
+		});
+
+		it("falls back to the STRICTER comparison when the index cannot be parsed", async () => {
+			const verdict = await compare({ "topics/index.json": "{not json" }, { "topics/index.json": "{}" });
+			expect(verdict).toMatchObject({ ok: false, detail: "topics/index.json: content differs" });
+
+			// And the same input against an EMPTY database is a failure, not the
+			// "nothing survived the filter" pass. This is what the unparsable
+			// branch's `kept: 1` buys: an index we cannot interpret must never
+			// widen what the compare accepts, and `kept: 0` there would certify a
+			// cutover for a document nobody has read.
+			expect(await compare({ "topics/index.json": "{not json" }, {})).toMatchObject({
+				ok: false,
+				detail: "topics/index.json: missing from the database",
+			});
+		});
 	});
 
 	it("increments the cutover version over a prior generation", async () => {
@@ -648,25 +761,23 @@ describe("runCutover", () => {
 		expect(await readCutoverFence(clone2)).not.toBeNull();
 	});
 
-	it("admission: a stale surface on this machine refuses the cutover before anything happens", async () => {
+	it("an old surface installed on this machine does NOT block the cutover", async () => {
 		await writeOrphanSummary(HASH, "seed");
-		// dist-paths records what is INSTALLED here; an old surface would keep
-		// writing the frozen branch, so the cutover must not begin.
+		// This used to be a hard refusal: any `dist-paths/` entry below a
+		// fence-aware version floor refused the whole cutover. One un-upgraded
+		// fork-editor extension then pinned every repo on the machine at
+		// `uncutover` forever, with the reason only ever reaching `debug.log`.
+		// The risk it guarded — an old surface writing the frozen branch — is
+		// covered downstream by `probeCutoverDrift`, which reports such a write
+		// AND catch-up imports it (see the drift test below).
 		const distDir = join(home, ".jolli", "jollimemory", "dist-paths");
 		mkdirSync(distDir, { recursive: true });
 		const { writeFileSync } = await import("node:fs");
-		// The dist dir must EXIST: admission only counts entries whose directory
-		// is still there, so a ghost entry pointing at a deleted install is not
-		// stale — it is uninstalled.
 		const staleDist = join(dir, "stale-vscode-dist");
 		mkdirSync(staleDist, { recursive: true });
 		writeFileSync(join(distDir, "vscode"), `source=vscode@0.98.0\n${staleDist}\n`);
-		const result = await runCutover(cwd, { dbPath });
-		expect(result).toMatchObject({ status: "not-ready", reason: expect.stringContaining("vscode@0.98.0") });
-		expect(await readCutoverFence(cwd)).toBeNull();
-		// Upgrade the surface: admission passes and the cutover commits.
-		writeFileSync(join(distDir, "vscode"), `source=vscode@9.9.9\n${staleDist}\n`);
 		expect((await runCutover(cwd, { dbPath })).status).toBe("committed");
+		expect(await readCutoverFence(cwd)).not.toBeNull();
 	});
 
 	it("drift probe: a bypassing write is reported, imported, and KEEPS being reported", async () => {
