@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.99.13
+
+### Changes
+
+- **The FILES panel now matches the VS Code sidebar** — discard and "leave out of this memory" moved onto each row as hover buttons, so the panel's **AI Commit** and **Discard Selected** header buttons are gone. Committing lives on the Current Memory card.
+- **You can discard a single file from the Working Memory review too**, not just from the sidebar.
+
+### Fixes & Improvements
+
+- **Discarding a file is reliable now.** The bundled CLI does the work, so every kind of file behaves: renamed, copied, untracked and conflicted files used to fail quietly or remove the wrong thing, and one case left a file gone from both your disk and git.
+- **The confirmation matches what happens** — it used to promise to discard your changes and then delete the file.
+- **A discard that fails now tells you**, instead of reporting success while nothing happened.
+- **Unsaved editor changes are written to disk first** — without that, discarding a file you were still editing quietly did nothing.
+- **Files whose names contain `[`, `*` or `?` are safe** — discarding one of them could change a different file.
+- **Projects opened on a subdirectory of a repository work** — staging and discarding used to build the wrong paths.
+- **A repository moved to the local database is no longer shown as disabled.**
+
+### Performance
+
+- **Lighter with several AI sessions open** — one MCP server per checkout instead of one per session.
+- **Daily backups keep their own schedule** instead of waiting for a commit to wake Jolli up.
+
 ## 0.99.11
 
 ### New Features
