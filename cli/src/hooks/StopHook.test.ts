@@ -30,6 +30,13 @@ vi.mock("../core/skills/TranscriptSkillDiscovery.js", () => ({
 	scanSkillsWithCursor: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Mock the owner-ledger scan entry point for the same reason: the unit under
+// test here is the WIRING (the Stop hook is the ONLY writer of the machine-global
+// ownership ledger), and the scan itself is covered in ClaudeOwnerScan.test.ts.
+vi.mock("../core/ClaudeOwnerScan.js", () => ({
+	scanOwnersWithCursor: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
 	// Pre-cutover default: no fence (plain fn — survives mock resets).
 	readCutoverFence: async () => null,
@@ -116,6 +123,7 @@ vi.spyOn(console, "error").mockImplementation(() => {});
 import { createReadStream, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { scanOwnersWithCursor } from "../core/ClaudeOwnerScan.js";
 import { resolveStateRoot } from "../core/GitOps.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { extractReferencesFromTranscript } from "../core/references/ReferenceExtractor.js";
@@ -298,6 +306,17 @@ describe("StopHook", () => {
 			// session save + telemetry flush are surface-independent and still run
 			expect(saveSession).toHaveBeenCalled();
 			expect(flushTelemetryNow).toHaveBeenCalled();
+		});
+
+		it("skips owner discovery when it defers to the CLI hook", async () => {
+			vi.mocked(existsSync).mockReturnValue(true);
+			vi.mocked(isClaudeHookInstalled).mockResolvedValue(true);
+			process.env.CLAUDE_PLUGIN_ROOT = "/plugins/jolli";
+
+			mockStdin(hookJson());
+			await handleStopHook();
+
+			expect(scanOwnersWithCursor).not.toHaveBeenCalled();
 		});
 
 		it("runs discovery as the plugin hook when NO CLI Stop hook is installed (plugin-only install)", async () => {
@@ -618,6 +637,19 @@ describe("StopHook — plan discovery", () => {
 		await handleStopHook();
 
 		expect(scanSkillsWithCursor).toHaveBeenCalledWith(`${TRANSCRIPT_PATH}`, PROJECT_DIR, "claude");
+	});
+
+	it("runs owner discovery for the session's transcript", async () => {
+		// Fourth extractor, same turn-level site: this hook is the ONLY writer of
+		// the machine-global ownership ledger, so a missing call here means a
+		// session that moved checkouts mid-conversation never gets attributed.
+		vi.mocked(existsSync).mockReturnValue(true);
+		mockTranscriptWithLines(['{"role":"assistant","content":"Hello"}']);
+
+		mockStdin(hookJson(TRANSCRIPT_PATH, PROJECT_DIR));
+		await handleStopHook();
+
+		expect(scanOwnersWithCursor).toHaveBeenCalledWith(TRANSCRIPT_PATH, "test-session-123", PROJECT_DIR);
 	});
 
 	it("scans for skills even when the plan scan throws and holds the shared cursor", async () => {

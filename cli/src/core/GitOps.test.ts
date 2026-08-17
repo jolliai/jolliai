@@ -71,6 +71,7 @@ import {
 	resetStateRootCache,
 	resolveGitHooksDir,
 	resolveStateRoot,
+	resolveWorktreeRootOrNull,
 	writeFileToBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
@@ -1902,6 +1903,40 @@ describe("GitOps", () => {
 			resetStateRootCache();
 			resolveStateRoot("/repo/root/z");
 			expect(mockExecFileSync).toHaveBeenCalledTimes(2);
+		});
+	});
+
+	describe("resolveWorktreeRootOrNull", () => {
+		beforeEach(() => {
+			mockExecFileSync.mockReset();
+			resetStateRootCache();
+		});
+
+		it("returns the worktree root for a directory inside a repo", () => {
+			mockExecFileSync.mockReturnValue("/repo/root\n");
+			expect(resolveWorktreeRootOrNull("/repo/root/sub")).toBe("/repo/root");
+		});
+
+		it("returns null (not the input path) for a directory outside any git worktree", () => {
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("fatal: not a git repository");
+			});
+			expect(resolveWorktreeRootOrNull("/tmp/scratch")).toBeNull();
+		});
+
+		it("returns null when git prints nothing", () => {
+			mockExecFileSync.mockReturnValue("   \n");
+			expect(resolveWorktreeRootOrNull("/tmp/empty-out")).toBeNull();
+		});
+
+		it("shares the memo with resolveStateRoot, which echoes the input for the null case", () => {
+			mockExecFileSync.mockImplementation(() => {
+				throw new Error("fatal: not a git repository");
+			});
+			expect(resolveWorktreeRootOrNull("/tmp/plain")).toBeNull();
+			// resolveStateRoot reads the cached null and falls back to the input.
+			expect(resolveStateRoot("/tmp/plain")).toBe("/tmp/plain");
+			expect(mockExecFileSync).toHaveBeenCalledTimes(1);
 		});
 	});
 });

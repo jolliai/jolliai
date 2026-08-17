@@ -423,6 +423,25 @@ window.JD = window.JD || {};
 		return '<div class="gd-links">' + list.map(render).join("") + "</div>";
 	}
 
+	/**
+	 * Which of the three sentences spec §9 allows an empty Conversations list to
+	 * print, from the state the server attached to this detail
+	 * (`MemoryDetail.transcriptRepairState`, derived by the CLI's
+	 * `transcriptRepairState` predicate).
+	 *
+	 * Anything unrecognised — an absent field on an older payload, `present` on a
+	 * legacy summary that reads as captured while holding nothing — falls to the
+	 * plainest wording. "Repair may still be possible" is the one wrong direction
+	 * to guess in: it invites a repair with nothing to work from. The old copy
+	 * ("No conversations linked yet") read as *not yet*, which is exactly the lie
+	 * this replaces for a capture that already failed.
+	 */
+	function conversationsEmptyText(state) {
+		if (state === "repairable") return "Conversation capture is missing but repair may still be possible";
+		if (state === "repaired") return "Conversation capture was repaired from local transcript history";
+		return "No conversations were captured for this memory";
+	}
+
 	function conversationsSection(detail) {
 		var esc = JD.esc;
 		var body = rows(
@@ -471,7 +490,7 @@ window.JD = window.JD || {};
 				'<span class="mem-row-title">' +
 				esc(c.title || "(untitled)") +
 				'</span><span class="mem-row-meta">' + c.messageCount + " msgs</span></div>",
-			"No conversations linked yet.",
+			conversationsEmptyText(detail.transcriptRepairState),
 		);
 		return (
 			'<section class="mem-section mem-conversations"><div class="mem-section-head"><div class="gd-sec">' +

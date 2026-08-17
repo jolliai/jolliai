@@ -32,6 +32,10 @@ vi.mock("../core/GitOps.js", () => ({
 	getCurrentBranch: vi.fn(),
 	getLastReflogAction: vi.fn(),
 	readFileFromBranch: vi.fn(),
+	// Identity fake: loadSessionTranscripts keys the Claude ownership ledger
+	// lookup on this. This suite isn't exercising that lookup, so match
+	// QueueWorker.test.ts's convention rather than inventing a second one.
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
 }));
 
 vi.mock("../core/SessionTracker.js", async (importOriginal) => {

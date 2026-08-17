@@ -559,6 +559,132 @@ describe("SummaryScriptBuilder", () => {
 			expect(script).toContain("source: row.getAttribute('data-source')");
 		});
 
+		// ── the three-state empty copy (spec §9) ─────────────────────────────
+		//
+		// Driven through the real message listener rather than asserted as text:
+		// the branch is the point, and a `toContain` on the sentences passes just
+		// as happily when every state prints the same one. `renderEmptyFor` runs
+		// the emitted script against a stub document, posts `conversationsData`
+		// with no items, and reads back what the panel wrote.
+		describe("empty-state copy", () => {
+			const renderEmptyFor = (
+				state: string | undefined,
+				opts: { readonly detachToEmpty?: boolean } = {},
+			): string => {
+				const messageListeners: Array<(event: { data: unknown }) => void> = [];
+				const conversationsBody = {
+					innerHTML: "",
+					querySelector: () => null,
+					querySelectorAll: () => [] as ReadonlyArray<never>,
+				};
+				const stub = (): Record<string, unknown> => ({
+					innerHTML: "",
+					textContent: "",
+					value: "",
+					style: {} as Record<string, string>,
+					dataset: {} as Record<string, string>,
+					children: [] as ReadonlyArray<never>,
+					classList: {
+						add: () => undefined,
+						remove: () => undefined,
+						toggle: () => undefined,
+						contains: () => false,
+					},
+					querySelector: () => null,
+					querySelectorAll: () => [] as ReadonlyArray<never>,
+					addEventListener: () => undefined,
+					removeEventListener: () => undefined,
+					setAttribute: () => undefined,
+					removeAttribute: () => undefined,
+					getAttribute: () => null,
+					appendChild: () => undefined,
+					insertAdjacentHTML: () => undefined,
+					remove: () => undefined,
+					focus: () => undefined,
+					click: () => undefined,
+					closest: () => null,
+					scrollIntoView: () => undefined,
+					getBoundingClientRect: () => ({ top: 0, left: 0, width: 0, height: 0 }),
+				});
+				const doc: Record<string, unknown> = {
+					getElementById: (id: string) => (id === "conversationsBody" ? conversationsBody : stub()),
+					querySelector: () => stub(),
+					querySelectorAll: () => [] as ReadonlyArray<never>,
+					addEventListener: () => undefined,
+					createElement: stub,
+					body: stub(),
+					head: stub(),
+					documentElement: stub(),
+				};
+				const win: Record<string, unknown> = {
+					document: doc,
+					addEventListener: (type: string, fn: (event: { data: unknown }) => void) => {
+						if (type === "message") messageListeners.push(fn);
+					},
+					removeEventListener: () => undefined,
+					matchMedia: () => ({ matches: false, addEventListener: () => undefined }),
+				};
+				const acquireVsCodeApi = () => ({
+					postMessage: () => undefined,
+					getState: () => ({}),
+					setState: () => undefined,
+				});
+				new Function("window", "document", "acquireVsCodeApi", script)(win, doc, acquireVsCodeApi);
+				const post = (data: unknown): void => {
+					for (const fn of messageListeners) fn({ data });
+				};
+				post(
+					state === undefined
+						? { command: "conversationsData", items: [] }
+						: { command: "conversationsData", items: [], transcriptRepairState: state },
+				);
+				if (opts.detachToEmpty) {
+					// The panel had rows and the user detached the last one; the host
+					// sends no second `conversationsData`, so this path has to reuse
+					// the state latched above.
+					conversationsBody.innerHTML = "";
+					post({ command: "conversationDetached", sessionId: "s1", source: "claude" });
+				}
+				return conversationsBody.innerHTML;
+			};
+
+			it("says the capture failed outright when nothing local can fix it", () => {
+				expect(renderEmptyFor("unrepairable")).toContain(
+					"No conversations were captured for this memory",
+				);
+			});
+
+			it("offers repair only when the state says a repair is still possible", () => {
+				expect(renderEmptyFor("repairable")).toContain(
+					"Conversation capture is missing but repair may still be possible",
+				);
+			});
+
+			it("says so when the capture was already repaired", () => {
+				expect(renderEmptyFor("repaired")).toContain(
+					"Conversation capture was repaired from local transcript history",
+				);
+			});
+
+			it("degrades to the plainest copy for an absent or unknown state", () => {
+				// `present` is deliberately in this bucket: a legacy summary reads as
+				// `present` even when nothing was ever captured, so it must not claim
+				// a repair happened or is possible.
+				for (const state of [undefined, "present", "something-new"]) {
+					const html = renderEmptyFor(state);
+					expect(html).toContain("No conversations were captured for this memory");
+					expect(html).not.toContain("repair may still be possible");
+					expect(html).not.toContain("was repaired from");
+				}
+			});
+
+			it("keeps the state for the empty panel the last detach leaves behind", () => {
+				expect(renderEmptyFor("repairable", { detachToEmpty: true })).toContain(
+					"Conversation capture is missing but repair may still be possible",
+				);
+			});
+		});
+
 		it("renders each row with a data-source attribute so detach can match the source:sessionId composite key", () => {
 			// Two different sources can mint the same raw sessionId, so
 			// matching detach by sessionId alone risks resolving to (or

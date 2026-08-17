@@ -42,6 +42,10 @@ import {
 	groupArchivedSessions,
 } from "../../../cli/src/core/ArchivedConversations.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
+import {
+	type TranscriptRepairState,
+	transcriptRepairState,
+} from "../../../cli/src/core/TranscriptRepair.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
@@ -3963,7 +3967,49 @@ export class SummaryWebviewPanel {
 			}),
 		);
 
-		this.panel.webview.postMessage({ command: "conversationsData", items });
+		this.panel.webview.postMessage({
+			command: "conversationsData",
+			items,
+			transcriptRepairState: await this.readTranscriptRepairState(),
+		});
+	}
+
+	/**
+	 * Which of the three sentences spec §9 allows the empty Conversations panel
+	 * to print — `transcriptRepairState` in `cli/src/core/TranscriptRepair.ts`,
+	 * called in-process because this host bundles the CLI. The rule stays there:
+	 * IntelliJ asks the same predicate over the `transcript-repair-state` bridge
+	 * action, so the two surfaces cannot word the same memory differently.
+	 *
+	 * Rides on `conversationsData` rather than the build-time HTML because both
+	 * places the client prints that sentence are client-side — the initial render
+	 * and the last detach — and only a live answer is right for the second.
+	 *
+	 * Every failure answers `unrepairable`, the MILDEST verdict, and never
+	 * propagates: the conversations list is what the user came for, so an
+	 * unreadable owners ledger must not cost them the rows. Guessing the other
+	 * way would invite a repair that has nothing to work from.
+	 *
+	 * `this.workspaceRoot` is the cwd even in foreign-storage mode, matching
+	 * every other read in this class. A foreign memory's owner edges are keyed by
+	 * ITS worktree root, which this panel does not have, so such a memory falls to
+	 * `unrepairable` — the conservative answer, and the honest one: the repair
+	 * itself is per-repo and could not run from here either.
+	 */
+	private async readTranscriptRepairState(): Promise<TranscriptRepairState> {
+		const summary = this.currentSummary;
+		if (!summary) {
+			return "unrepairable";
+		}
+		try {
+			return await transcriptRepairState(summary, this.workspaceRoot);
+		} catch (err) {
+			log.warn(
+				"Transcript repair state unavailable: %s",
+				err instanceof Error ? err.message : String(err),
+			);
+			return "unrepairable";
+		}
 	}
 
 	/**

@@ -823,3 +823,47 @@ export async function withRepoRegistryLock<T>(fn: () => Promise<T>, opts: RepoRe
 		if (acquired) await releaseIfOwned(lockPath, REPO_REGISTRY_LOCK_FILE);
 	}
 }
+
+/** Serialises read-modify-write of the machine-global `claude-owners.json`. */
+const CLAUDE_OWNERS_LOCK_FILE = "claude-owners.lock";
+
+/**
+ * Serialises the read-modify-write of `claude-owners.json` across every repo's
+ * Stop hook on this machine. Same shape and same reasoning as
+ * {@link withRepoRegistryLock}: one machine-global JSON file whose whole-object
+ * overwrite would otherwise let a stale reader drop a peer's freshly-written
+ * owner edge.
+ *
+ * Best-effort — on timeout `fn` runs UNLOCKED (receiving `acquired: false`)
+ * rather than dropping the write entirely. Losing an edge is what this whole
+ * feature exists to prevent, so the recovery cannot be left to chance: `fn`
+ * gets the acquired flag and a caller that must not lose data keys off it.
+ * `recordClaudeOwners` propagates it so `scanOwnersWithCursor` advances its
+ * high-water mark ONLY on a durable (locked) write — a rare unlocked clobber
+ * then leaves the mark where it is and is re-emitted idempotently by the next
+ * Stop hook, which is the only thing that actually makes the recovery happen
+ * (advancing the mark past an unlocked write would strand the dropped edge).
+ */
+export async function withClaudeOwnersLock<T>(
+	fn: (acquired: boolean) => Promise<T>,
+	opts: RepoRegistryLockOpts = {},
+): Promise<T> {
+	const timeoutMs = opts.timeoutMs ?? DEFAULT_REPO_REGISTRY_LOCK_TIMEOUT_MS;
+	const pollMs = opts.pollMs ?? DEFAULT_PROFILE_LOCK_POLL_MS;
+	const dir = opts.globalDir ?? join(homedir(), ".jolli", "jollimemory");
+	await mkdir(dir, { recursive: true });
+	const lockPath = join(dir, CLAUDE_OWNERS_LOCK_FILE);
+	const acquired = await acquireWithPoll(lockPath, { timeoutMs, pollMs });
+	if (!acquired) {
+		log.warn(
+			"withClaudeOwnersLock: could not acquire %s within %d ms — proceeding best-effort",
+			CLAUDE_OWNERS_LOCK_FILE,
+			timeoutMs,
+		);
+	}
+	try {
+		return await fn(acquired);
+	} finally {
+		if (acquired) await releaseIfOwned(lockPath, CLAUDE_OWNERS_LOCK_FILE);
+	}
+}

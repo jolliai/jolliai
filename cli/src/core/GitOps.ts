@@ -23,8 +23,12 @@ const NUL = "\x00";
 
 const log = createLogger("GitOps");
 
-/** Memoized git-worktree-root cache, keyed by the candidate directory. */
-const _stateRootCache = new Map<string, string>();
+/**
+ * Memoized git-worktree-root cache, keyed by the candidate directory. A `null`
+ * value is a real cached result — "this directory is not inside any git
+ * worktree" — distinct from `undefined` ("not resolved yet").
+ */
+const _stateRootCache = new Map<string, string | null>();
 
 /** Test-only: clears the memo so cases don't leak resolved roots into each other. */
 export function resetStateRootCache(): void {
@@ -55,6 +59,23 @@ export function resetStateRootCache(): void {
  * marker-gated concern, not this function's job.
  */
 export function resolveStateRoot(cwd: string): string {
+	// A directory outside any git worktree still needs *some* project dir, so
+	// echo the input back — see this function's contract above.
+	return resolveWorktreeRootOrNull(cwd) ?? cwd;
+}
+
+/**
+ * Like {@link resolveStateRoot}, but returns `null` for a directory that is not
+ * inside any git worktree instead of echoing the input path back.
+ *
+ * `resolveStateRoot` falls back to `cwd` so its caller always has a usable
+ * project dir; a caller that only wants a REAL worktree root — the Claude
+ * ownership ledger, whose keys must be roots a future commit can actually look
+ * up, never a scratch directory a session merely `cd`-ed through — needs the
+ * failure distinguishable from success, which the echoed cwd silently hides.
+ * Shares {@link resolveStateRoot}'s memo, so the two never disagree on a path.
+ */
+export function resolveWorktreeRootOrNull(cwd: string): string | null {
 	const cached = _stateRootCache.get(cwd);
 	if (cached !== undefined) return cached;
 	// Filesystem first: this is the SessionStart hook's very first call, where a
@@ -73,7 +94,7 @@ export function resolveStateRoot(cwd: string): string {
 		_stateRootCache.set(cwd, fsRoot);
 		return fsRoot;
 	}
-	let root = cwd;
+	let root: string | null = null;
 	try {
 		const out = execFileSyncHidden("git", ["rev-parse", "--show-toplevel"], {
 			cwd,
@@ -84,7 +105,7 @@ export function resolveStateRoot(cwd: string): string {
 		}).trim();
 		if (out) root = out; // git prints the toplevel in forward-slash form on every platform
 	} catch {
-		// Not a git repo / git missing — keep the input path.
+		// Not a git repo / git missing — no worktree root.
 	}
 	_stateRootCache.set(cwd, root);
 	return root;

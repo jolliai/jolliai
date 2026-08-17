@@ -15,6 +15,7 @@ import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicUpdates
 import ai.jolli.jollimemory.core.TraceContext
 import ai.jolli.jollimemory.core.TranscriptEntry
+import ai.jolli.jollimemory.core.TranscriptRepairState
 import ai.jolli.jollimemory.core.WorkingContext
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.services.JolliApiClient
@@ -223,6 +224,13 @@ class SummaryPanel(
     // ConcurrentModificationException under rapid memory-tab switches.
     private val transcriptHashSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
     private val planTranslateSet = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+    // The CLI's repair verdict for THIS memory ([TranscriptRepairState]), which
+    // picks the empty Conversations sentence. Written on the loadDeferredSets pool
+    // thread, read on the EDT in doRefreshNow / maybeSendDeferredHydrate, cleared
+    // on the EDT in setSummary — hence @Volatile, like every other field on that
+    // path. Null means "not answered yet", which prints the plainest sentence.
+    @Volatile
+    private var transcriptRepairState: String? = null
     private val cwd: String
     private val service = project.getService(JolliMemoryService::class.java)
     // Refresh when a PR is created/updated or a memory is shared elsewhere (the Create PR
@@ -292,10 +300,44 @@ class SummaryPanel(
             refreshTranscriptHashes(myGen)
             if (myGen != summaryGeneration) return@executeOnPooledThread
             refreshPlanTranslateSet(myGen)
+            if (myGen != summaryGeneration) return@executeOnPooledThread
+            // Which of spec §9's three sentences an EMPTY Conversations panel is
+            // allowed to print. Asked HERE and not in [doRefreshNow] for the same
+            // reason the two sets above moved off the EDT: a bridge call is 1-30 ms
+            // warm but 100-700 ms right after IDE start, and doRefreshNow's pool
+            // task is what the first paint waits on. Hydrated in place below rather
+            // than triggering a second loadHTML.
+            //
+            // The RULE stays in the CLI; this only asks, and takes `unrepairable`
+            // for every failure rather than raising.
+            val fetched = TranscriptRepairState.fetch(cwd, currentSummary.commitHash)
+            // Re-checked AFTER the slow call and BEFORE the write, exactly as
+            // [refreshTranscriptHashes] does around its own store read — the gen
+            // test at the top of this block only proves nothing had changed when
+            // the call STARTED. This one is load-bearing precisely because the
+            // call is the slow one: memory A's cold fetch (~400 ms) can still be
+            // in flight when the user switches to memory B, whose warm fetch
+            // (~10 ms) lands first — and an unguarded write would then leave A's
+            // verdict in the field while B is on screen. The stale invokeLater
+            // below drops its own hydrate, but the FIELD survives it and is read
+            // again by `doRefreshNow`'s snapshot on any later full reload and by
+            // [maybeSendDeferredHydrate] when a save ack re-drains the pending
+            // flag. That is how "repair may still be possible" would end up on a
+            // memory where repair is impossible — the one direction this whole
+            // sentence exists to avoid, and what `setSummary`'s clear() means.
+            if (myGen != summaryGeneration) return@executeOnPooledThread
+            transcriptRepairState = fetched
             ApplicationManager.getApplication().invokeLater {
                 if (disposed) return@invokeLater
                 if (myGen != summaryGeneration) return@invokeLater
-                if (transcriptHashSet.isEmpty() && planTranslateSet.isEmpty()) return@invokeLater
+                // `transcriptRepairState` counts as new data on its own: a memory
+                // with NO transcripts and no translatable plans is exactly the one
+                // whose empty-state sentence has to be corrected, so the old
+                // both-sets-empty early return would have skipped every case this
+                // wording exists for.
+                if (transcriptHashSet.isEmpty() && planTranslateSet.isEmpty() && transcriptRepairState == null) {
+                    return@invokeLater
+                }
                 // Arm the pending flag even when the webview is currently dirty.
                 // [maybeSendDeferredHydrate] holds it back while dirty and
                 // [postToWebview] re-fires it once a persisted-save ack clears the
@@ -335,6 +377,13 @@ class SummaryPanel(
         }
         if (planTranslateSet.isNotEmpty()) {
             postToWebview("planTranslateAvailable", mapOf("slugs" to planTranslateSet.toList()))
+        }
+        // Command name and payload built by [TranscriptRepairState.hydrateMessage],
+        // never spelled here: the matching handler is a JS string in
+        // SummaryScriptBuilder with no compiler between the two, so the name lives
+        // in one constant that a test pins against the script.
+        TranscriptRepairState.hydrateMessage(transcriptRepairState)?.let { (command, data) ->
+            postToWebview(command, data)
         }
     }
 
@@ -968,6 +1017,10 @@ class SummaryPanel(
         val planTranslateSnapshot = planTranslateSet.toSet()
         val bridgeScriptSnapshot = bridgeScript
         val readOnlySnapshot = readOnly
+        // Null until [loadDeferredSets]' background pass answers, so the FIRST
+        // render prints the plainest sentence and the hydrate corrects it. Every
+        // later full reload (a memory-state event, a theme change) already has it.
+        val repairStateSnapshot = transcriptRepairState
         val pageBg = editorBackground()
         val isDark = pageBg.isDarkByLuma()
         val pageBgHex = pageBg.toCssHex()
@@ -989,6 +1042,7 @@ class SummaryPanel(
                     bridgeScriptSnapshot,
                     readOnlySnapshot,
                     pageBgHex,
+                    repairStateSnapshot,
                 )
             } catch (e: Exception) {
                 jmLog.warn("doRefreshNow: buildHtml failed: %s", e.message ?: e.toString())
@@ -1059,6 +1113,9 @@ class SummaryPanel(
         // the previous memory's transcript / plan-translate UI into the new page.
         transcriptHashSet.clear()
         planTranslateSet.clear()
+        // Same reason, and it is a per-MEMORY verdict: reusing the outgoing
+        // memory's would tell the user a repair is possible for a different commit.
+        transcriptRepairState = null
         currentSummary = newSummary
         // If the read-only mode flipped, re-run the memory-state listener
         // decision (registered only when editable) so a read-only tab reused

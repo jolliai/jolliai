@@ -16,6 +16,17 @@ vi.mock("../core/GitOps.js", () => ({
 	getLastReflogAction: vi.fn(),
 	readFileFromBranch: vi.fn(),
 	getProjectRootDir: vi.fn().mockImplementation((cwd: string) => Promise.resolve(cwd)),
+	// Identity fakes: this suite's fixtures are plain temp dirs, not git repos, and
+	// the real resolveStateRoot falls back to its input unchanged in that case
+	// anyway. What matters for these tests is that production and test build the
+	// ledger key the SAME way — the realpath/macOS-normalisation behavior itself
+	// is covered directly in GitOps.test.ts / ClaudeOwnerScan.test.ts.
+	// `resolveWorktreeRootOrNull` is what `scanOwnerEdges`' default resolver now
+	// uses; identity here so a temp-dir cwd still resolves to itself (in
+	// production it is a real worktree root, and a genuinely non-git cwd is
+	// correctly dropped — that path is covered in ClaudeOwnerScan.test.ts).
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
+	resolveWorktreeRootOrNull: vi.fn((cwd: string) => cwd),
 }));
 
 vi.mock("../core/RepoProfile.js", () => ({
@@ -85,6 +96,11 @@ vi.mock("../core/SessionTracker.js", async (importOriginal) => {
 		detectActiveNotesForBranch: vi.fn().mockResolvedValue([]),
 		getReferenceEntriesForBranch: vi.fn().mockResolvedValue([]),
 		filterSessionsByEnabledIntegrations: actual.filterSessionsByEnabledIntegrations,
+		// Real implementation (pure `join(homedir(), …)`): the ledger merge tests
+		// isolate HOME via `withIsolatedHome` and need this to follow that redirect,
+		// the same way the production code's `claudeSessionsOwnedBy(ownerRoot)` call
+		// (no `globalDir` override) does.
+		getGlobalConfigDir: actual.getGlobalConfigDir,
 		dequeueAllGitOperations: vi.fn().mockResolvedValue([]),
 		peekAllGitOperations: vi.fn().mockResolvedValue([]),
 		deleteQueueEntry: vi.fn(),
@@ -177,6 +193,11 @@ vi.mock("../core/Locks.js", () => ({
 	// per-worktree lock contract itself is covered in Locks.test.ts.
 	withPlansLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
 	withCommitSelectionLock: (_cwd: string | undefined, fn: () => Promise<unknown>) => fn(),
+	// Passthrough, same reasoning as withPlansLock above: recordClaudeOwners (used
+	// directly, unmocked, by the ledger-merge tests to seed claude-owners.json)
+	// wraps its read-merge-write in this lock. The lock contract itself is
+	// covered in Locks.test.ts.
+	withClaudeOwnersLock: (fn: () => Promise<unknown>) => fn(),
 	INGEST_PHASE_FILE: "ingest-phase",
 }));
 
@@ -564,6 +585,9 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { scanOwnerEdges } from "../core/ClaudeOwnerScan.js";
+import { type ClaudeOwnerEdge, claudeOwnersPath, recordClaudeOwners } from "../core/ClaudeOwnership.js";
+import { claudeSessionsForRepo } from "../core/ClaudeSessionDiscoverer.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
 import { readClineCliTranscript } from "../core/ClineCliTranscriptReader.js";
@@ -585,7 +609,8 @@ import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { discoverDevinSessions, isDevinInstalled } from "../core/DevinSessionDiscoverer.js";
 import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
-import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
+import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats, resolveStateRoot } from "../core/GitOps.js";
 import { drainIngest } from "../core/IngestPipeline.js";
 import { appendCredentialMissingRun } from "../core/IngestRunStore.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
@@ -600,6 +625,7 @@ import {
 	detectActiveNotesForBranch,
 	detectActivePlansForBranch,
 	detectUncommittedReferenceIds,
+	getGlobalConfigDir,
 	getReferenceEntriesForBranch,
 	loadAllSessions,
 	loadConfig,
@@ -632,6 +658,7 @@ import type {
 	ReferenceCommitRef,
 	SkillCommitRef,
 } from "../Types.js";
+import { withIsolatedHome } from "../testUtils/isolatedHome.js";
 import { __test__, buildWorkerStartupBanner, launchWorker, runWorker } from "./QueueWorker.js";
 
 describe("runWorker — manual disable guard", () => {
@@ -5561,6 +5588,379 @@ describe("QueueWorker", () => {
 			} finally {
 				rmSync(cwd, { recursive: true, force: true });
 			}
+		});
+	});
+
+	// ─── Claude ownership ledger merge: the post-commit read considers Claude
+	// sessions this worktree OWNS per the machine-global ledger, not only the
+	// ones its own sessions.json happened to record (multi-owner Claude session
+	// attribution — a session started in one checkout and continued in another).
+	describe("loadSessionTranscripts — Claude ownership ledger merge", () => {
+		const NOW = "2026-08-17T10:00:00.000Z";
+		const makeEdge = (): ClaudeOwnerEdge => ({ firstSeenAt: NOW, firstSeenLine: 0, lastSeenAt: NOW });
+		let cwd: string;
+		let transcript: string;
+
+		beforeEach(() => {
+			cwd = mkdtempSync(join(tmpdir(), "jolli-ledger-cwd-"));
+			transcript = join(cwd, "transcript.jsonl");
+			writeFileSync(transcript, "", "utf-8");
+			// A single well-formed slice: every test here has exactly one merged
+			// "claude" session pointed at `transcript`, so one shared resolved value
+			// covers all of them (the readAllTranscripts "claude" branch reads
+			// `result.newCursor.lineNumber` unguarded — an unmocked/undefined
+			// `readTranscript` result throws outside its own try/catch).
+			vi.mocked(readTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "hi", timestamp: NOW }],
+				newCursor: { transcriptPath: transcript, lineNumber: 1, updatedAt: NOW },
+				totalLinesRead: 1,
+			});
+		});
+
+		afterEach(() => {
+			rmSync(cwd, { recursive: true, force: true });
+		});
+
+		/**
+		 * Runs `fn` with HOME/USERPROFILE redirected to a scratch dir (via the
+		 * pre-existing `withIsolatedHome` — setting `process.env.HOME` alone is a
+		 * no-op on Windows) AND the file-wide `readFile` mock wired to serve the
+		 * REAL claude-owners.json from that scratch dir. Production's
+		 * `claudeSessionsOwnedBy(ownerRoot)` call inside `loadSessionTranscripts`
+		 * takes no `globalDir` override, so HOME isolation is the only way to keep
+		 * this suite off the developer's real `~/.jolli/jollimemory/`.
+		 *
+		 * Delegates to the REAL `readFile` (via `importActual`), not the
+		 * already-imported `readFileSync` — that one is ALSO mocked file-wide
+		 * (`mockReturnValue("")`, see the `node:fs` mock above) for the plan/note
+		 * fixtures this suite otherwise drives, and would silently make every
+		 * ledger read see an empty file.
+		 */
+		async function withLedgerHome(fn: (globalDir: string) => Promise<void>): Promise<void> {
+			const homeDir = mkdtempSync(join(tmpdir(), "jolli-ledger-home-"));
+			try {
+				await withIsolatedHome(homeDir, async () => {
+					const globalDir = getGlobalConfigDir();
+					mkdirSync(globalDir, { recursive: true });
+					const { readFile } = await import("node:fs/promises");
+					const { readFile: realReadFile } =
+						await vi.importActual<typeof import("node:fs/promises")>("node:fs/promises");
+					const ledgerPath = claudeOwnersPath(globalDir);
+					vi.mocked(readFile).mockImplementation(async (p: unknown) =>
+						String(p) === ledgerPath ? realReadFile(ledgerPath, "utf-8") : "",
+					);
+					await fn(globalDir);
+				});
+			} finally {
+				rmSync(homeDir, { recursive: true, force: true });
+			}
+		}
+
+		it("reads a Claude session this worktree owns even when sessions.json has none", async () => {
+			await withLedgerHome(async (globalDir) => {
+				await recordClaudeOwners(
+					{
+						sessionId: "foreign-1",
+						transcriptPath: transcript,
+						edges: new Map([[resolveStateRoot(cwd), makeEdge()]]),
+					},
+					globalDir,
+				);
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(result.allSessions).toContainEqual(
+					expect.objectContaining({ sessionId: "foreign-1", transcriptPath: transcript, source: "claude" }),
+				);
+				// End-to-end: the ledger-contributed session actually got read, not just
+				// merged into the candidate list.
+				expect(result.sessionTranscripts.some((s) => s.sessionId === "foreign-1")).toBe(true);
+			});
+		});
+
+		// Regression guard for the exact failure mode the brief calls out: an
+		// unnormalised lookup (plain `cwd` instead of `resolveStateRoot(cwd)`)
+		// "matches nothing, silently, and the whole feature does nothing". Every
+		// other test in this block builds its edge key via `resolveStateRoot(cwd)`
+		// too, but under this file's identity mock (`resolveStateRoot: vi.fn((cwd)
+		// => cwd)`) that key is indistinguishable from the raw cwd — so those tests
+		// would keep passing even if production dropped the `resolveStateRoot` call
+		// entirely. This test breaks that tie: `resolveStateRoot` is stubbed to
+		// return something OTHER than `cwd` for exactly the production call, and
+		// the ledger edge is keyed under that distinct value. Same pattern as
+		// `StopHook.test.ts` ("anchors a subdirectory cwd…") and
+		// `GeminiAfterAgentHook.test.ts`.
+		it("looks the session up under resolveStateRoot's return value, not the raw cwd", async () => {
+			await withLedgerHome(async (globalDir) => {
+				const anchoredRoot = "/anchored/repo/root";
+				vi.mocked(resolveStateRoot).mockReturnValueOnce(anchoredRoot);
+				await recordClaudeOwners(
+					{
+						sessionId: "anchored-1",
+						transcriptPath: transcript,
+						edges: new Map([[anchoredRoot, makeEdge()]]),
+					},
+					globalDir,
+				);
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(resolveStateRoot).toHaveBeenCalledWith(cwd);
+				expect(result.allSessions.some((s) => s.sessionId === "anchored-1")).toBe(true);
+			});
+		});
+
+		it("does not read a session owned only by a different worktree", async () => {
+			await withLedgerHome(async (globalDir) => {
+				await recordClaudeOwners(
+					{
+						sessionId: "other-1",
+						transcriptPath: transcript,
+						edges: new Map([["/somewhere/else", makeEdge()]]),
+					},
+					globalDir,
+				);
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(result.allSessions.some((s) => s.sessionId === "other-1")).toBe(false);
+			});
+		});
+
+		it("does not duplicate a session present in both sessions.json and the ledger", async () => {
+			await withLedgerHome(async (globalDir) => {
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{ sessionId: "dup-1", transcriptPath: transcript, updatedAt: NOW, source: "claude" },
+				]);
+				await recordClaudeOwners(
+					{
+						sessionId: "dup-1",
+						transcriptPath: transcript,
+						edges: new Map([[resolveStateRoot(cwd), makeEdge()]]),
+					},
+					globalDir,
+				);
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				expect(result.allSessions.filter((s) => s.sessionId === "dup-1")).toHaveLength(1);
+			});
+		});
+
+		it("ignores the ledger when claudeEnabled is false", async () => {
+			await withLedgerHome(async (globalDir) => {
+				await recordClaudeOwners(
+					{
+						sessionId: "off-1",
+						transcriptPath: transcript,
+						edges: new Map([[resolveStateRoot(cwd), makeEdge()]]),
+					},
+					globalDir,
+				);
+
+				const result = await __test__.loadSessionTranscripts(cwd, { claudeEnabled: false });
+
+				expect(result.allSessions.some((s) => s.sessionId === "off-1")).toBe(false);
+			});
+		});
+
+		// ─── Owner-seeded lower bound (spec §7.3): with no cursor of its own for a
+		// transcript, this worktree's first read of a ledger-owned Claude session
+		// must start at the owner's OWN firstSeenLine, not at line 0 — otherwise a
+		// checkout that joined the conversation late absorbs every earlier turn,
+		// which belonged to whichever checkout was driving it at the time.
+		describe("owner-seeded lower bound", () => {
+			it("starts a first read from the owner's firstSeenLine, not from line 0", async () => {
+				await withLedgerHome(async (globalDir) => {
+					// loadCursorForTranscript() → null by the outer beforeEach: this
+					// worktree has never read this transcript before.
+					await recordClaudeOwners(
+						{
+							sessionId: "seeded-1",
+							transcriptPath: transcript,
+							edges: new Map([
+								[resolveStateRoot(cwd), { firstSeenAt: NOW, firstSeenLine: 3, lastSeenAt: NOW }],
+							]),
+						},
+						globalDir,
+					);
+
+					await __test__.loadSessionTranscripts(cwd, {});
+
+					// Kills: (a) "ownerSeeds is never consulted" — cursor would stay
+					// null/line-0 instead of 3; (b) the ternary picking the wrong
+					// branch of the seed condition. Inspect the call's positional
+					// args directly rather than `toHaveBeenCalledWith` — the 3rd
+					// (parser) arg comes from a mock reset to `undefined` by this
+					// file's global `vi.resetAllMocks()` and isn't this test's concern.
+					const call = vi.mocked(readTranscript).mock.calls[0];
+					expect(call[0]).toBe(transcript);
+					expect(call[1]).toMatchObject({ transcriptPath: transcript, lineNumber: 3 });
+					expect(call[3]).toBeUndefined();
+				});
+			});
+
+			it("resumes from this worktree's own cursor once it has one, ignoring the seed", async () => {
+				await withLedgerHome(async (globalDir) => {
+					// This worktree already has its OWN progress on this transcript —
+					// well past the owner's firstSeenLine (7). A seed must never win
+					// over an established cursor: that would rewind it and re-read
+					// spent lines.
+					vi.mocked(loadCursorForTranscript).mockResolvedValue({
+						transcriptPath: transcript,
+						lineNumber: 4,
+						updatedAt: NOW,
+					});
+					await recordClaudeOwners(
+						{
+							sessionId: "seeded-2",
+							transcriptPath: transcript,
+							edges: new Map([
+								[resolveStateRoot(cwd), { firstSeenAt: NOW, firstSeenLine: 7, lastSeenAt: NOW }],
+							]),
+						},
+						globalDir,
+					);
+
+					await __test__.loadSessionTranscripts(cwd, {});
+
+					// Kills: dropping (or weakening) the "only when saved === null"
+					// guard — that mutant would read from line 7 (the seed) instead
+					// of 4 (this worktree's own cursor).
+					const call = vi.mocked(readTranscript).mock.calls[0];
+					expect(call[0]).toBe(transcript);
+					expect(call[1]).toMatchObject({ transcriptPath: transcript, lineNumber: 4 });
+					expect(call[3]).toBeUndefined();
+				});
+			});
+
+			it("still honours beforeTimestamp as the upper bound when seeded", async () => {
+				await withLedgerHome(async (globalDir) => {
+					await recordClaudeOwners(
+						{
+							sessionId: "seeded-3",
+							transcriptPath: transcript,
+							edges: new Map([
+								[resolveStateRoot(cwd), { firstSeenAt: NOW, firstSeenLine: 2, lastSeenAt: NOW }],
+							]),
+						},
+						globalDir,
+					);
+					const upperBound = "2099-01-01T00:00:00.000Z";
+
+					await __test__.loadSessionTranscripts(cwd, {}, upperBound);
+
+					// Kills: the seeded path forgetting to thread `beforeTimestamp`
+					// through to the reader (e.g. a seed-only branch that hardcodes
+					// `undefined` instead of forwarding the caller's upper bound).
+					const call = vi.mocked(readTranscript).mock.calls[0];
+					expect(call[0]).toBe(transcript);
+					expect(call[1]).toMatchObject({ transcriptPath: transcript, lineNumber: 2 });
+					expect(call[3]).toBe(upperBound);
+				});
+			});
+
+			it("leaves a non-Claude source's first read at line 0", async () => {
+				await withLedgerHome(async (globalDir) => {
+					// A gemini session pointed at the SAME transcript path as a Claude
+					// ledger edge, so `ownerSeeds` genuinely holds a nonzero entry keyed
+					// by this exact path. If the seed branch were gated on the path
+					// alone (not on `source === "claude"`), this would wrongly seed the
+					// gemini read too.
+					vi.mocked(loadAllSessions).mockResolvedValue([
+						{ sessionId: "gemini-1", transcriptPath: transcript, updatedAt: NOW, source: "gemini" },
+					]);
+					vi.mocked(readGeminiTranscript).mockResolvedValue({
+						entries: [],
+						newCursor: { transcriptPath: transcript, lineNumber: 0, updatedAt: NOW },
+						totalLinesRead: 0,
+					});
+					await recordClaudeOwners(
+						{
+							sessionId: "claude-owner-of-same-path",
+							transcriptPath: transcript,
+							edges: new Map([
+								[resolveStateRoot(cwd), { firstSeenAt: NOW, firstSeenLine: 5, lastSeenAt: NOW }],
+							]),
+						},
+						globalDir,
+					);
+
+					await __test__.loadSessionTranscripts(cwd, {});
+
+					// Kills: gating the seed on `ownerSeeds.has(transcriptPath)` alone
+					// instead of `source === "claude"` — that mutant would pass a
+					// synthesized non-null cursor here instead of `null`.
+					expect(readGeminiTranscript).toHaveBeenCalledWith(transcript, null, undefined);
+				});
+			});
+		});
+
+		// ─── Regression coverage for spec §10.4 ("dashboard/backfill attribution and
+		// QueueWorker attribution agree for the same session-owner relation"). The
+		// other two §10.4 guarantees are already covered: same-worktree capture with
+		// an empty ledger is exercised throughout this file's plain `loadAllSessions`
+		// + `loadSessionTranscripts` tests (e.g. the C5 usage-only-conversation tests
+		// above), and linked-worktree capture is this describe block's own "reads a
+		// Claude session this worktree owns even when sessions.json has none" test.
+		//
+		// This one is deliberately NOT two independently hand-built fixtures that
+		// happen to agree by construction. Both routes derive their answer from ONE
+		// shared raw transcript line's `cwd`: `scanOwnerEdges` is the exact function
+		// the Stop hook uses to turn transcript lines into ledger edges, and
+		// `claudeSessionsForRepo` is the exact filter the dashboard back-fill uses to
+		// narrow a machine-wide disk scan to one repo. If the two routes' notion of
+		// "does this cwd belong to this repo" ever diverged, this test would fail
+		// while two hand-picked fixtures would not.
+		describe("cross-route agreement with the disk discoverer (spec §10.4)", () => {
+			it("attributes the same session to this repo via both the ownership ledger and claudeSessionsForRepo", async () => {
+				await withLedgerHome(async (globalDir) => {
+					const sessionId = "cross-route-1";
+					// The one shared fact both routes read: a single raw transcript line
+					// recording this worktree's cwd.
+					const rawLine = JSON.stringify({
+						type: "user",
+						cwd,
+						timestamp: NOW,
+						message: { role: "user", content: "hi" },
+					});
+
+					// QueueWorker / ledger route: scanOwnerEdges (ClaudeOwnerScan.ts) is
+					// the real production function that turns transcript lines into
+					// owner edges; recordClaudeOwners/claudeSessionsOwnedBy (via
+					// loadSessionTranscripts) is the real ledger round trip.
+					const { edges } = scanOwnerEdges([rawLine], 0);
+					await recordClaudeOwners({ sessionId, transcriptPath: transcript, edges }, globalDir);
+					const queueWorkerSide = await __test__.loadSessionTranscripts(cwd, {});
+
+					// Dashboard/backfill route: claudeSessionsForRepo is the real filter
+					// scanClaudeSessionsOnDisk narrows a machine-wide scan with, fed the
+					// SAME line's own `cwd` (parsed back out of `rawLine`, not a second
+					// hand-picked literal) as the session's one recorded directory.
+					const dirsFromSameLine = [(JSON.parse(rawLine) as { cwd: string }).cwd];
+					const backfillSide = claudeSessionsForRepo(
+						[
+							{
+								sessionId,
+								transcriptPath: transcript,
+								updatedAt: NOW,
+								dirs: dirsFromSameLine,
+								complete: true,
+							},
+						],
+						cwd,
+					);
+
+					// Kills: either route silently failing to attribute this session (a
+					// broken ledger merge on one side, or a broken/inverted
+					// claudeSessionsForRepo filter on the other) collapses one side to
+					// `[]` while the other still reports the session.
+					expect(
+						queueWorkerSide.allSessions.filter((s) => s.source === "claude").map((s) => s.sessionId),
+					).toEqual(backfillSide.map((s) => s.sessionId));
+					expect(backfillSide.map((s) => s.sessionId)).toEqual([sessionId]);
+				});
+			});
 		});
 	});
 

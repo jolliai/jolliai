@@ -2,7 +2,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { deflateSync } from "node:zlib";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { transcriptRepairState } from "../core/TranscriptRepair.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import type { DashboardScope } from "./DashboardModel.js";
 import {
@@ -12,7 +13,17 @@ import {
 	buildMemoryDetail,
 	readContextDoc,
 	readConversationEntries,
+	readMemoryTranscriptRepairState,
 } from "./MemoriesQuery.js";
+
+// The predicate reads the machine-global `claude-owners.json` and stats every
+// transcript it names, so a real call would answer differently on each developer's
+// machine. Its own cases live in `TranscriptRepair.test.ts`; what these pin is the
+// wiring around it.
+vi.mock("../core/TranscriptRepair.js", () => ({
+	transcriptRepairState: vi.fn().mockResolvedValue("unrepairable"),
+}));
+
 import { applyStatsEvents } from "./StatsWriter.js";
 
 const ALL: DashboardScope = { kind: "all" };
@@ -1424,6 +1435,157 @@ describe("MemoriesQuery", () => {
 			// The source is half the key: the right session under the wrong agent is
 			// not a match.
 			expect(await read("codex", "sess-a")).toBeUndefined();
+		});
+	});
+
+	/**
+	 * The dashboard's half of the three-state memory-detail copy (spec §9).
+	 *
+	 * The predicate itself is covered by `TranscriptRepair.test.ts` and is stubbed
+	 * here: it reads the machine-global Claude owners ledger, so a real call would
+	 * make these cases answer differently on every developer's machine. What is
+	 * under test is the WIRING — that a state is produced at all, that it is
+	 * produced for the right repository, and that it reaches the payload the
+	 * client reads. Without a producer the page falls through to the plainest
+	 * sentence forever, and nothing else fails to say so.
+	 */
+	describe("readMemoryTranscriptRepairState", () => {
+		const HASH = "a".repeat(40);
+
+		beforeEach(() => {
+			vi.mocked(transcriptRepairState).mockReset();
+			vi.mocked(transcriptRepairState).mockResolvedValue("repairable");
+		});
+
+		it("answers the predicate's state for the selected memory", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+
+			const state = await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			expect(state).toBe("repairable");
+		});
+
+		it("asks about the OWNING repo's worktree, not the server's own cwd", async () => {
+			// The dashboard is machine-global: the process cwd names the wrong
+			// repository for every row but one, and the predicate resolves the
+			// Claude owner ledger against the root it is handed.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+
+			await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			expect(transcriptRepairState).toHaveBeenCalledWith(
+				expect.objectContaining({ commitHash: HASH }),
+				"/w/acme-api",
+			);
+		});
+
+		it("hands over the folded TREE, so an amended memory's children count", async () => {
+			// An amend/squash keeps its transcripts on the folded children, and the
+			// bare `memories.summary_json` row has `children` emptied — reading it
+			// alone would report a fully-captured consolidation as having none.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const superseded = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+			await seedMemory(dbPath, "repo-1", superseded, "feat: thing", { transcripts: ["t-1"] });
+			await withDashboardDb(
+				(db) => {
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+						id: number;
+					};
+					db.prepare(
+						"UPDATE memories SET parent_hash = ?, child_pos = 0, root_hash = ?, depth = 1 WHERE repo_id = ? AND commit_hash = ?",
+					).run(HASH, HASH, repoId, superseded);
+					// `assembleSummary` fills `children` in place and never inserts the
+					// key, so the stored root has to carry the emptied array the import
+					// leaves behind — which is exactly what a real amended memory has.
+					db.prepare("UPDATE memories SET summary_json = ? WHERE repo_id = ? AND commit_hash = ?").run(
+						JSON.stringify({ commitHash: HASH, commitMessage: "feat: thing", children: [] }),
+						repoId,
+						HASH,
+					);
+				},
+				{ dbPath },
+			);
+
+			await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			const summary = vi.mocked(transcriptRepairState).mock.calls[0]?.[0] as {
+				children?: ReadonlyArray<{ commitHash: string }>;
+			};
+			expect(summary.children?.map((c) => c.commitHash)).toEqual([superseded]);
+		});
+
+		it("falls back to the page scope for a stale detail-repo token", async () => {
+			// Same rule the detail pane itself follows: a token that resolves to no
+			// repo (removed, or renamed since the page rendered) must not narrow the
+			// lookup to a filter matching nothing — the hash still identifies the
+			// memory. The two must agree, or the page would word one memory's
+			// verdict onto another's conversations.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+
+			const state = await withDashboardDb(
+				(db) => readMemoryTranscriptRepairState(db, ALL, HASH, "repo-that-was-removed"),
+				{ dbPath },
+			);
+
+			expect(state).toBe("repairable");
+		});
+
+		it("answers undefined for an unknown hash without asking the predicate", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+
+			const state = await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			expect(state).toBeUndefined();
+			expect(transcriptRepairState).not.toHaveBeenCalled();
+		});
+
+		it("answers undefined with no hash at all", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+
+			const state = await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, undefined), {
+				dbPath,
+			});
+
+			expect(state).toBeUndefined();
+		});
+
+		it("answers undefined rather than throwing when the predicate fails", async () => {
+			// A wording detail must never take the memory detail page down with it,
+			// and undefined is the plainest sentence — not the optimistic one.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+			vi.mocked(transcriptRepairState).mockRejectedValue(new Error("owners ledger unreadable"));
+
+			const state = await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			expect(state).toBeUndefined();
+		});
+
+		it("attaches the state to the detail buildMemories selects", async () => {
+			// The end of the wire: `memories.js` reads exactly this field.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+
+			const model = await withDashboardDb(
+				(db) => buildMemories(db, ALL, HASH, undefined, undefined, "repaired"),
+				{ dbPath },
+			);
+
+			expect(model.selected?.transcriptRepairState).toBe("repaired");
+		});
+
+		it("omits the field entirely when no state was computed", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+
+			const model = await withDashboardDb((db) => buildMemories(db, ALL, HASH), { dbPath });
+
+			expect(model.selected).toBeDefined();
+			expect(model.selected).not.toHaveProperty("transcriptRepairState");
 		});
 	});
 });

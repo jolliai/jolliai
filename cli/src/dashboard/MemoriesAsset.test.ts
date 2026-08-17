@@ -67,7 +67,13 @@ function render(
 	context: ReadonlyArray<Record<string, unknown>>,
 	conversations: ReadonlyArray<Record<string, unknown>> = [],
 	topics: ReadonlyArray<Record<string, unknown>> = [],
-	opts: { selected?: boolean; fetch?: FakeFetch; detail?: Record<string, unknown> } = {},
+	/** `extraSelected` adds server-attached `selected` fields (e.g. `transcriptRepairState`). */
+	opts: {
+		selected?: boolean;
+		fetch?: FakeFetch;
+		detail?: Record<string, unknown>;
+		extraSelected?: Record<string, unknown>;
+	} = {},
 ): {
 	rows: FakeRow[];
 	conversationRows: FakeRow[];
@@ -192,6 +198,7 @@ function render(
 							generatedAtMs: Date.parse("2026-08-14T03:22:00Z"),
 							e2e: [],
 							...opts.detail,
+							...(opts.extraSelected ?? {}),
 						},
 			tree: [],
 		},
@@ -314,7 +321,7 @@ describe("memories.js — empty states", () => {
 		// Both sections empty — the case that used to stack two 120px voids.
 		const { html } = render([], []);
 		expect(html).toContain('<div class="gd-empty">None.</div>');
-		expect(html).toContain('<div class="gd-empty">No conversations linked yet.</div>');
+		expect(html).toContain('<div class="gd-empty">No conversations were captured for this memory</div>');
 		expect(html).not.toContain("mem-empty-pane");
 	});
 });
@@ -775,6 +782,43 @@ describe("memories.js — conversation rows", () => {
 		const cli = render([], [conversation({ source: "cursor-cli" })]).html;
 		expect(cli).toContain('aria-label="cursor-cli"');
 		expect(cli).toContain("M8 1.5 14 5v6L8 14.5 2 11V5L8 1.5Z");
+	});
+});
+
+/**
+ * The three-state empty copy (spec §9). The old single sentence ("No
+ * conversations linked yet") read as *not yet* for a capture that already failed
+ * and will never complete on its own.
+ *
+ * Driven through the real renderer, so a branch that collapses back onto one
+ * sentence fails here — a `toContain` on the three strings would not. The
+ * degrade cases are the other half: the field arrives from the server, so an
+ * older payload, a state this build does not know, and `present` on a legacy
+ * summary must all land on the PLAINEST wording, never the optimistic one.
+ */
+describe("memories.js — empty conversations copy", () => {
+	const emptyFor = (state?: string) =>
+		render([], [], [], state === undefined ? {} : { extraSelected: { transcriptRepairState: state } }).html;
+
+	it("says the capture failed outright when nothing local can fix it", () => {
+		expect(emptyFor("unrepairable")).toContain("No conversations were captured for this memory");
+	});
+
+	it("offers repair only when the state says a repair is still possible", () => {
+		expect(emptyFor("repairable")).toContain("Conversation capture is missing but repair may still be possible");
+	});
+
+	it("says so when the capture was already repaired", () => {
+		expect(emptyFor("repaired")).toContain("Conversation capture was repaired from local transcript history");
+	});
+
+	it("degrades to the plainest copy for an absent or unrecognised state", () => {
+		for (const state of [undefined, "present", "something-new"]) {
+			const html = emptyFor(state);
+			expect(html).toContain("No conversations were captured for this memory");
+			expect(html).not.toContain("repair may still be possible");
+			expect(html).not.toContain("was repaired from");
+		}
 	});
 });
 

@@ -56,6 +56,12 @@ vi.mock("node:fs/promises", async (importOriginal) => {
 // as the other write handlers) — mocked so the server-layer tests stay hermetic.
 // Freshness is folder-wide aggregate; rebuild is the whole-folder compile sweep.
 vi.mock("../core/WikiFreshness.js", () => ({ getAggregateWikiFreshness: vi.fn() }));
+// Reads the machine-global Claude owners ledger, so a real call would answer
+// differently on every developer's machine. Its own cases are in
+// TranscriptRepair.test.ts.
+vi.mock("../core/TranscriptRepair.js", () => ({
+	transcriptRepairState: vi.fn().mockResolvedValue("repairable"),
+}));
 vi.mock("../core/MultiRepoCompile.js", () => ({
 	compileAllRepos: vi.fn(async () => ({ repos: [], totalIngested: 0, failed: 0 })),
 }));
@@ -72,6 +78,7 @@ import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
+import { transcriptRepairState } from "../core/TranscriptRepair.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
 import * as installer from "../install/Installer.js";
@@ -1679,6 +1686,57 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(body.view).toBe("memories");
 		expect(gitOps.listReachableCommits).toHaveBeenCalledWith("/w/jolli");
 		expect((body.memories?.items ?? []).map((item) => item.commitHash)).toEqual(["reachable-hash"]);
+	});
+
+	// The other async read the Memories view pays for, and the only one that is
+	// per-SELECTION rather than per-repo: which of spec §9's three sentences an
+	// empty conversations list is allowed to print. Nothing else in the payload
+	// fails when this stops being computed — the page just quietly reverts to the
+	// plainest wording — so this is the test that notices.
+	it("attaches the transcript repair state to the selected memory, and skips it with no selection", async () => {
+		const dbPath = join(dir, "memories-repair.db");
+		const configDir = join(dir, "config-repair");
+		const hash = "a".repeat(40);
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, ?, NULL, NULL, ?, 0, ?, 1, 1, 1)`,
+				).run(id, hash, hash, JSON.stringify({ commitHash: hash, topics: [] }));
+			},
+			{ dbPath },
+		);
+		// Reachability filters the tree ROWS, never the detail pane, so the stub's
+		// default answer is left alone here — the selected memory resolves by hash.
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const selected = (await (await get(port, `/api/model?view=memories&hash=${hash}`)).json()) as DashboardModel;
+		expect(selected.memories?.selected?.transcriptRepairState).toBe("repairable");
+
+		// A tree render with no `?hash=` has no detail pane to word, so it must
+		// not pay the ledger read at all.
+		vi.mocked(transcriptRepairState).mockClear();
+		await get(port, "/api/model?view=memories");
+		expect(transcriptRepairState).not.toHaveBeenCalled();
 	});
 
 	// The `/` redirect builds no model at all now — it has one destination, so

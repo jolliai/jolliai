@@ -1690,6 +1690,16 @@ ${buildPrMessageScript()}
     if (msg.command === 'transcriptsAvailable') {
       applyTranscriptCount(msg.count);
     }
+    // The empty-Conversations sentence, corrected once the panel's background
+    // pass has the CLI's repair verdict (spec §9). The server-rendered HTML ships
+    // the plainest wording, because the verdict costs a bridge call this page
+    // must not wait on. Text, not the state: the three strings live once, in
+    // TranscriptRepairState.emptyConversationsText. textContent, never innerHTML.
+    if (msg.command === 'conversationsEmptyText') {
+      if (conversationsEmpty && typeof msg.text === 'string' && msg.text) {
+        conversationsEmpty.textContent = msg.text;
+      }
+    }
     if (msg.command === 'planTranslateAvailable') {
       var slugs = msg.slugs || [];
       for (var si = 0; si < slugs.length; si++) {

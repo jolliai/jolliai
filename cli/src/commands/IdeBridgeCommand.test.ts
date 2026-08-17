@@ -347,6 +347,14 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 	readReferenceMarkdownFromString: vi.fn().mockReturnValue({ description: "desc" }),
 }));
 
+// The predicate itself is covered by TranscriptRepair.test.ts; here the bridge
+// action is an adapter, so what matters is that it forwards to this and reports
+// what it answers. Stubbed also because the real one reads the machine-global
+// `claude-owners.json` and stats every transcript path it names.
+vi.mock("../core/TranscriptRepair.js", () => ({
+	transcriptRepairState: vi.fn().mockResolvedValue("unrepairable"),
+}));
+
 vi.mock("../core/SummaryStore.js", () => ({
 	// Pass-through: the must-land D6 lock wrapper's own behavior is covered in
 	// SummaryStore/Locks tests; here only "the write happens under it" matters.
@@ -1415,6 +1423,65 @@ describe("runIdeBridgeAction — discard-preview", () => {
 		await runIdeBridgeAction("discard-preview", "/repo", { relativePaths: ["a.txt"] });
 
 		expect(discardFiles).not.toHaveBeenCalled();
+	});
+});
+
+describe("runIdeBridgeAction — transcript-repair-state", () => {
+	beforeEach(async () => {
+		// `mockClear` only — the file-scope mock's resolved value is shared with
+		// every other describe here, so replacing the implementation would leak
+		// out of this block and break them.
+		const { getSummary } = await import("../core/SummaryStore.js");
+		vi.mocked(getSummary).mockClear();
+		const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+		vi.mocked(transcriptRepairState).mockReset();
+		vi.mocked(transcriptRepairState).mockResolvedValue("repairable");
+	});
+
+	it("answers the CLI predicate's state for a known commit", async () => {
+		// The action must FORWARD the predicate, not restate it: a Kotlin- or
+		// host-side restatement of "can this still be repaired?" is exactly the
+		// drift this bridge exists to prevent. Asserting the returned state comes
+		// from the predicate (and that the summary + cwd reach it) is what fails if
+		// someone hard-codes an answer here.
+		const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+
+		const result = await runIdeBridgeAction("transcript-repair-state", "/repo", { commitHash: "abc" });
+
+		expect(result).toEqual({ state: "repairable" });
+		expect(transcriptRepairState).toHaveBeenCalledWith({ commitHash: "abc" }, "/repo");
+	});
+
+	it("passes every state through unchanged", async () => {
+		const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+		for (const state of ["present", "repaired", "repairable", "unrepairable"] as const) {
+			vi.mocked(transcriptRepairState).mockResolvedValue(state);
+			expect(await runIdeBridgeAction("transcript-repair-state", "/repo", { commitHash: "abc" })).toEqual({
+				state,
+			});
+		}
+	});
+
+	it("answers unrepairable for an unknown commit rather than throwing", async () => {
+		// The mildest verdict is the right way to fail: a memory we cannot even
+		// find is no evidence that a repair is possible, and "repair may still be
+		// possible" is the one wrong direction to guess in.
+		const { getSummary } = await import("../core/SummaryStore.js");
+		vi.mocked(getSummary).mockResolvedValueOnce(null);
+		const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+
+		const result = await runIdeBridgeAction("transcript-repair-state", "/repo", { commitHash: "f".repeat(40) });
+
+		expect(result).toEqual({ state: "unrepairable" });
+		expect(transcriptRepairState).not.toHaveBeenCalled();
+	});
+
+	it("treats a missing commitHash as an unknown commit", async () => {
+		const { getSummary } = await import("../core/SummaryStore.js");
+		vi.mocked(getSummary).mockResolvedValueOnce(null);
+
+		expect(await runIdeBridgeAction("transcript-repair-state", "/repo", {})).toEqual({ state: "unrepairable" });
+		expect(getSummary).toHaveBeenCalledWith("", "/repo");
 	});
 });
 

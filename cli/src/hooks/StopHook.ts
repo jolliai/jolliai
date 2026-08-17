@@ -33,6 +33,7 @@ import { existsSync } from "node:fs";
 import { join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
+import { scanOwnersWithCursor } from "../core/ClaudeOwnerScan.js";
 import { resolveStateRoot } from "../core/GitOps.js";
 import { scanPlansFrom } from "../core/plans/TranscriptPlanDiscovery.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
@@ -277,6 +278,12 @@ async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Pr
 	// Own cursor, own error handling — a skill scan that throws must not hold the
 	// plan/reference cursor, and vice versa.
 	await scanSkillsWithCursor(transcriptPath, cwd, "claude");
+
+	// Fourth extractor, same protocol. This is the ONLY writer of the machine-global
+	// ownership ledger, and it is what lets a DIFFERENT checkout later prove it owns
+	// a slice of this session: the transcript's own `cwd` lines are the evidence, and
+	// they are only visible while the file is being scanned here.
+	await scanOwnersWithCursor(transcriptPath, sessionInfo.sessionId, cwd);
 
 	// Hold the cursor if the plan scan threw: advancing past its window (the
 	// reference scan reaching EOF) would lose those lines for plan discovery.

@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
 import { discoverAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
 import { readAntigravityTranscript } from "../core/AntigravityTranscriptReader.js";
+import { claudeSessionsOwnedBy } from "../core/ClaudeOwnership.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
 import { discoverClineCliSessions } from "../core/ClineCliSessionDiscoverer.js";
@@ -61,7 +62,7 @@ import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { discoverDevinSessions, isDevinInstalled } from "../core/DevinSessionDiscoverer.js";
 import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
-import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats } from "../core/GitOps.js";
+import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats, resolveStateRoot } from "../core/GitOps.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { discoverKimiConversations } from "../core/KimiDiscovery.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
@@ -3926,7 +3927,40 @@ async function loadSessionTranscripts(
 }> {
 	const trackedSessions = filterSessionsByEnabledIntegrations(await loadAllSessions(cwd), config);
 
-	let allSessions = trackedSessions;
+	// Claude candidates from the machine-global ownership ledger (multi-owner
+	// Claude session attribution). `sessions.json` only knows the sessions whose
+	// Stop hook fired against THIS checkout; the ledger knows every checkout a
+	// session's transcript proves it visited — a session started in one worktree
+	// and continued in another. Merged, not replaced: the local registry stays
+	// the cheap fast path and the fallback for a session the ledger never got
+	// (an older dist, a wiped global dir).
+	//
+	// The lookup key MUST be the anchored root, never the raw `cwd`: this `cwd`
+	// is git's hook cwd, and on macOS that is `/var/…` where `resolveStateRoot`
+	// wrote `/private/var/…` into the ledger. An unnormalised lookup matches
+	// nothing, silently, and the whole feature does nothing.
+	const ownerRoot = resolveStateRoot(cwd);
+	const ledgerOwned = config.claudeEnabled === false ? [] : await claudeSessionsOwnedBy(ownerRoot);
+	// transcriptPath → this owner's lower bound, threaded into `readAllTranscripts`
+	// below. It seeds a session's first read (no saved cursor yet) instead of
+	// starting at line 0 — see the seed comment there for why.
+	const ownerSeeds = new Map<string, number>();
+	for (const owned of ledgerOwned) ownerSeeds.set(owned.transcriptPath, owned.edge.firstSeenLine);
+
+	const seen = new Set(trackedSessions.map((s) => `${s.source ?? "claude"}:${s.sessionId}:${s.transcriptPath}`));
+	const ledgerSessions = ledgerOwned
+		.filter((o) => !seen.has(`claude:${o.sessionId}:${o.transcriptPath}`))
+		.map((o) => ({
+			sessionId: o.sessionId,
+			transcriptPath: o.transcriptPath,
+			updatedAt: o.edge.lastSeenAt,
+			source: "claude" as const,
+		}));
+	if (ledgerSessions.length > 0) {
+		log.info("Claude ownership ledger contributed %d session(s) for %s", ledgerSessions.length, ownerRoot);
+	}
+
+	let allSessions = [...trackedSessions, ...ledgerSessions];
 	if (config.codexEnabled !== false && (await isCodexInstalled())) {
 		const codexSessions = await discoverCodexSessions(cwd);
 		if (codexSessions.length > 0) {
@@ -4045,7 +4079,7 @@ async function loadSessionTranscripts(
 			.map((s) => conversationKey(s.source ?? "claude", s.sessionId)),
 	);
 
-	const rawAll = await readAllTranscripts(allSessions, cwd, beforeTimestamp);
+	const rawAll = await readAllTranscripts(allSessions, cwd, beforeTimestamp, ownerSeeds);
 	// Keep only checked conversations for the summary; excluded ones were read
 	// purely to advance their cursor (discard). Drop them at this SINGLE point from
 	// BOTH the entry stream and the per-session token map — the downstream token
@@ -4348,6 +4382,12 @@ async function readAllTranscripts(
 	sessions: ReadonlyArray<{ sessionId: string; transcriptPath: string; source?: TranscriptSource }>,
 	cwd: string,
 	beforeTimestamp?: string,
+	/**
+	 * Claude-only lower bounds from the ownership ledger, keyed by transcriptPath.
+	 * Consulted ONLY when this worktree has no cursor of its own for that
+	 * transcript — see the seed below.
+	 */
+	ownerSeeds?: ReadonlyMap<string, number>,
 ): Promise<{
 	sessionTranscripts: SessionTranscript[];
 	totalEntries: number;
@@ -4385,9 +4425,26 @@ async function readAllTranscripts(
 	const sessionIdentity = new Map<string, { sessionId: string; transcriptPath: string; source: TranscriptSource }>();
 
 	for (const session of sessions) {
-		const cursor = await loadCursorForTranscript(session.transcriptPath, cwd);
-		const startLine = cursor?.lineNumber ?? 0;
 		const source = session.source ?? "claude";
+		const saved = await loadCursorForTranscript(session.transcriptPath, cwd);
+		// THE load-bearing rule (spec §7.3). With no saved cursor the reader used to
+		// start at line 0 and stop only at `beforeTimestamp`, which for a session this
+		// checkout joined late means absorbing every earlier turn — turns that belong
+		// to whichever checkout was driving the conversation then. The ledger knows
+		// where this owner first appears, so that is the floor.
+		//
+		// Only when there is NO saved cursor: an established cursor is this owner's own
+		// progress and always wins, or a seed would rewind it and re-read spent lines.
+		// Claude-only, because the ledger has no other source in it (spec §2.2).
+		const seedLine = saved === null && source === "claude" ? ownerSeeds?.get(session.transcriptPath) : undefined;
+		const cursor =
+			seedLine !== undefined && seedLine > 0
+				? { transcriptPath: session.transcriptPath, lineNumber: seedLine, updatedAt: new Date().toISOString() }
+				: saved;
+		const startLine = cursor?.lineNumber ?? 0;
+		if (seedLine !== undefined && seedLine > 0) {
+			log.info("Seeding first read of %s from owner line %d", session.sessionId, seedLine);
+		}
 
 		// Fire ai_source_detected the first time this machine ever
 		// processes a transcript from `source` (markAiSourceSeen dedupes globally,

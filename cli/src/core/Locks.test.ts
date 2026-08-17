@@ -50,6 +50,7 @@ import {
 	releaseWorkerLock,
 	SESSIONS_LOCK_FILE,
 	WORKER_LOCK_FILE,
+	withClaudeOwnersLock,
 	withConfigLock,
 	withPlansLock,
 	withProfileLock,
@@ -870,6 +871,40 @@ describe("Locks", () => {
 			releaseFirst();
 			await second;
 			expect(order).toEqual(["first-enter", "first-exit", "second-enter"]);
+		});
+	});
+
+	describe("withClaudeOwnersLock — machine-global claude-owners.json RMW serialisation", () => {
+		it("acquires the lock and passes acquired:true to the body", async () => {
+			let seen: boolean | undefined;
+			const result = await withClaudeOwnersLock(
+				async (acquired) => {
+					seen = acquired;
+					return "ok";
+				},
+				{ globalDir: tempDir },
+			);
+			expect(result).toBe("ok");
+			expect(seen).toBe(true);
+			await expect(stat(join(tempDir, "claude-owners.lock"))).rejects.toThrow();
+		});
+
+		it("still runs the body with acquired:false when the lock can't be taken in time", async () => {
+			// Pre-hold the lock so the poll times out and the body runs unlocked —
+			// the best-effort path a caller keys off to avoid advancing a cursor.
+			await writeFile(join(tempDir, "claude-owners.lock"), String(process.pid), "utf-8");
+			let seen: boolean | undefined;
+			const result = await withClaudeOwnersLock(
+				async (acquired) => {
+					seen = acquired;
+					return "best-effort";
+				},
+				{ globalDir: tempDir, timeoutMs: 80, pollMs: 20 },
+			);
+			expect(result).toBe("best-effort");
+			expect(seen).toBe(false);
+			// The pre-existing lock is left intact (we never owned it).
+			await expect(stat(join(tempDir, "claude-owners.lock"))).resolves.toBeDefined();
 		});
 	});
 

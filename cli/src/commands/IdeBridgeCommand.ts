@@ -12,6 +12,7 @@ import { isAbsolute } from "node:path";
 import type { LiveSharePatch, LiveSharePayload } from "../core/JolliShareClient.js";
 import type { SkillTableRow } from "../core/SkillsAggregateMarkdown.js";
 import { runWithTrace } from "../core/TraceContext.js";
+import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { buildRefreshParams, computeWatchTargets } from "../daemon/DaemonServer.js";
 import { DaemonWatcher } from "../daemon/DaemonWatcher.js";
 import { recordMemoryEdit } from "../dashboard/ProducerHooks.js";
@@ -1892,6 +1893,25 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			return {
 				entries: await loadTranscript({ source, transcriptPath: stringField(request, "transcriptPath") }),
 			};
+		}
+		case "transcript-repair-state": {
+			// Which of the three sentences spec §9 allows the memory-detail UI to
+			// print. VS Code answers this by calling `transcriptRepairState`
+			// in-process; the JVM host cannot import `cli/src`, so without this
+			// action the whole distinction would be silently VS Code-only — no
+			// compile error, no failing test, just an IntelliJ tab that shows the
+			// plainest sentence forever.
+			//
+			// A summary we cannot find answers `unrepairable`, the MILDEST verdict,
+			// rather than throwing. "Repair may still be possible" is the one wrong
+			// direction to guess in: it invites the user to run a repair that has
+			// nothing to work from, and a memory nobody can look up is no evidence
+			// that local transcripts survive.
+			const { getSummary } = await import("../core/SummaryStore.js");
+			const summary = await getSummary(optionalString(request, "commitHash") ?? "", cwd);
+			if (!summary) return { state: "unrepairable" satisfies TranscriptRepairState };
+			const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+			return { state: await transcriptRepairState(summary, cwd) };
 		}
 		case "compile": {
 			const config = request.config as JolliMemoryConfig | undefined;

@@ -20,6 +20,7 @@
 import { existsSync } from "node:fs";
 import { collectDisplayTopics } from "../core/SummaryTree.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
+import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary } from "../Types.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
@@ -236,6 +237,15 @@ export interface QueryOptions {
 	 * Narrows the DETAIL only — see `buildMemories` for why this is not `scope`.
 	 */
 	readonly detailRepoIdentity?: string;
+	/**
+	 * Memories view: the async-read repair verdict for {@link hash}'s memory —
+	 * which of spec §9's three sentences an EMPTY conversations list prints. Read
+	 * by `readMemoryTranscriptRepairState` (it stats the machine-global Claude
+	 * owners ledger, which this synchronous layer cannot do) and threaded in the
+	 * same way {@link reachableCommits} and the three page models below are.
+	 * Absent leaves the client on the plainest wording.
+	 */
+	readonly transcriptRepairState?: TranscriptRepairState;
 	/**
 	 * The async-read per-repo git reachability sets, keyed by `repo_identity`.
 	 * Absent (or a repo missing from the map) renders every row unfiltered —
@@ -2238,6 +2248,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 						options.hash,
 						options.reachableCommits,
 						options.detailRepoIdentity,
+						options.transcriptRepairState,
 					),
 				};
 			case "settings":

@@ -248,6 +248,18 @@ vi.mock("../../../cli/src/core/SessionTitleResolver.js", () => ({
 	resolveSessionTitle: mockResolveSessionTitle,
 }));
 
+// The predicate's own cases live in the CLI's TranscriptRepair.test.ts. Stubbed
+// here because the real one reads the machine-global `claude-owners.json` and
+// stats every transcript path it names — a per-developer answer this suite must
+// not depend on.
+const { mockTranscriptRepairState } = vi.hoisted(() => ({
+	mockTranscriptRepairState: vi.fn().mockResolvedValue("unrepairable"),
+}));
+
+vi.mock("../../../cli/src/core/TranscriptRepair.js", () => ({
+	transcriptRepairState: mockTranscriptRepairState,
+}));
+
 const { mockDeleteTopicInTree, mockUpdateTopicInTree } = vi.hoisted(() => ({
 	mockDeleteTopicInTree: vi.fn(),
 	mockUpdateTopicInTree: vi.fn(),
@@ -830,6 +842,10 @@ describe("SummaryWebviewPanel", () => {
 			SummaryWebviewPanel as unknown as { commitPanels: Map<string, unknown> }
 		).commitPanels.clear();
 		mockGetTranscriptHashes.mockResolvedValue(new Set<string>());
+		// `clearAllMocks` drops the implementation set at declaration, so the
+		// default verdict is restored here rather than left as `undefined` for
+		// every suite that never touches it.
+		mockTranscriptRepairState.mockResolvedValue("unrepairable");
 		mockReadPlanFromBranch.mockResolvedValue(null);
 		mockLoadConfig.mockResolvedValue({
 			apiKey: "test-key",
@@ -5197,7 +5213,92 @@ describe("SummaryWebviewPanel", () => {
 				expect(postMessage).toHaveBeenCalledWith({
 					command: "conversationsData",
 					items: [],
+					transcriptRepairState: "unrepairable",
 				});
+			});
+
+			// ── the three-state empty copy (spec §9) ─────────────────────────
+			//
+			// The webview picks its empty-state sentence from this field alone, so
+			// a producer that stops attaching it degrades the panel to the plainest
+			// wording forever — silently, with nothing else failing. These are what
+			// fail in that case.
+
+			it("attaches the CLI predicate's state to conversationsData", async () => {
+				mockTranscriptRepairState.mockResolvedValue("repairable");
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => c[0]?.command === "conversationsData",
+				);
+				expect(call?.[0].transcriptRepairState).toBe("repairable");
+				// The rule stays in the CLI: this host forwards the summary it is
+				// showing and its workspace root, and restates nothing.
+				expect(mockTranscriptRepairState).toHaveBeenCalledWith(
+					expect.objectContaining({ commitHash: makeSummary().commitHash }),
+					workspaceRoot,
+				);
+			});
+
+			it("falls back to unrepairable when the panel holds no summary to ask about", async () => {
+				mockTranscriptRepairState.mockResolvedValue("repairable");
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				firstCommitPanel().currentSummary = undefined;
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => c[0]?.command === "conversationsData",
+				);
+				expect(call?.[0].transcriptRepairState).toBe("unrepairable");
+				expect(mockTranscriptRepairState).not.toHaveBeenCalled();
+			});
+
+			it("falls back to unrepairable when the predicate throws", async () => {
+				// The mildest verdict, silently. An unusable answer must never
+				// become the optimistic "repair may still be possible", and it must
+				// never cost the user the conversation rows either.
+				mockTranscriptRepairState.mockRejectedValue(new Error("owners ledger unreadable"));
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => c[0]?.command === "conversationsData",
+				);
+				expect(call?.[0].transcriptRepairState).toBe("unrepairable");
 			});
 		});
 

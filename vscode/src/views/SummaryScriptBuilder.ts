@@ -2268,6 +2268,26 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
   // Cursor CLI (cursor-agent) reuses Cursor's brand mark, same pairing pattern.
   SOURCE_ICON_SVG['cursor-cli'] = SOURCE_ICON_SVG.cursor;
 
+  // Which of the three sentences spec §9 allows the empty Conversations panel to
+  // print. Set from every conversationsData payload; the host derives it from
+  // the CLI's transcriptRepairState predicate, so this side only picks wording.
+  //
+  // Starts undefined and STAYS the mildest verdict for anything it does not
+  // recognise: an unknown or absent state means we cannot claim a repair is
+  // possible, and "repair may still be possible" is the one wrong direction to
+  // guess in — it invites a repair that has nothing to work from.
+  var transcriptRepairState;
+
+  function conversationsEmptyHtml() {
+    var text = 'No conversations were captured for this memory';
+    if (transcriptRepairState === 'repairable') {
+      text = 'Conversation capture is missing but repair may still be possible';
+    } else if (transcriptRepairState === 'repaired') {
+      text = 'Conversation capture was repaired from local transcript history';
+    }
+    return '<p class="conv-empty">' + text + '</p>';
+  }
+
   // Render inline conversation rows from the host's conversationsData payload.
   // Interpolated host-supplied strings (title/source/ids) go through esc(),
   // the same HTML-escape helper used for markdown rendering below.
@@ -2275,7 +2295,7 @@ export function buildScript(options: SummaryScriptOptions = {}): string {
     if (!conversationsBody) return;
     items = items || [];
     if (items.length === 0) {
-      conversationsBody.innerHTML = '<p class="conv-empty">No conversations linked to this memory.</p>';
+      conversationsBody.innerHTML = conversationsEmptyHtml();
       return;
     }
     var html = '';
@@ -2444,6 +2464,10 @@ ${buildSourceLabelScript()}
   window.addEventListener('message', function(event) {
     var msg = event.data;
     if (msg.command === 'conversationsData') {
+      // Latched BEFORE the render, and kept for the detach path below: the last
+      // detach empties the panel long after this message arrived, and the host
+      // sends no second one.
+      transcriptRepairState = msg.transcriptRepairState;
       renderConversations(msg.items || []);
       var cnt = detachCountEl();
       if (cnt) cnt.textContent = String((msg.items || []).length);
@@ -2459,7 +2483,7 @@ ${buildSourceLabelScript()}
         var cntEl = detachCountEl();
         if (cntEl) cntEl.textContent = String(remaining);
         if (remaining === 0) {
-          conversationsBody.innerHTML = '<p class="conv-empty">No conversations linked to this memory.</p>';
+          conversationsBody.innerHTML = conversationsEmptyHtml();
         }
       }
       // The detached conversation's tokens no longer belong to this memory, so

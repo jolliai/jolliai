@@ -139,7 +139,13 @@ import {
 	resolveKbRoot,
 	WIKI_FILE_PATTERN,
 } from "./KnowledgeQuery.js";
-import { buildMemoriesPage, type ReachableCommits, readContextDoc, readConversationEntries } from "./MemoriesQuery.js";
+import {
+	buildMemoriesPage,
+	type ReachableCommits,
+	readContextDoc,
+	readConversationEntries,
+	readMemoryTranscriptRepairState,
+} from "./MemoriesQuery.js";
 import { backupRepoRegistry, classifyRegistryEntry, forgetRepo, type RegistryEntryVerdict } from "./RepoForget.js";
 import { probeRepo } from "./RepoProbe.js";
 import { existingWorktrees, readRepoRegistry, recordedRepoPaths, registerRepo } from "./RepoRegistry.js";
@@ -706,6 +712,19 @@ async function defaultModelBuilder(
 							now,
 						)
 					: undefined;
+			// Which of spec §9's three sentences the memory detail's EMPTY
+			// conversations list prints. Async — it reads the machine-global Claude
+			// owners ledger and stats the transcripts it names — so it is computed
+			// here and threaded through `QueryOptions`, exactly like the reachability
+			// sets above. Without this the page would fall through to the plainest
+			// wording forever, with nothing failing to say so.
+			//
+			// Only the memories view, and only when a memory is actually selected: a
+			// tree render with no `?hash=` has no detail pane to word.
+			const transcriptRepairState =
+				request.view === "memories" && request.hash
+					? await readMemoryTranscriptRepairState(db, request.scope, request.hash, request.detailRepoIdentity)
+					: undefined;
 			// Every view is now served straight from the database. The stats view
 			// used to get one more step here — a display-time LLM call compressing
 			// the Decisions card's text — which is what made this builder async and
@@ -720,6 +739,7 @@ async function defaultModelBuilder(
 				...(graphModel ? { graphModel } : {}),
 				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
+				...(transcriptRepairState ? { transcriptRepairState } : {}),
 			});
 		},
 		{ dbPath },

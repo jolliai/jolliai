@@ -206,7 +206,65 @@ class SummaryHtmlBuilderTest {
         fun `renders empty conversations section when no transcripts`() {
             val html = SummaryHtmlBuilder.buildHtml(makeSummary(), transcriptHashSet = emptySet())
             html shouldContain "All Conversations"
-            html shouldContain "No conversation transcripts"
+            html shouldContain "No conversations were captured for this memory"
+        }
+
+        // ── the three-state empty copy (spec §9) ─────────────────────────
+        //
+        // The old single sentence read as a *not yet*, which is misleading for a
+        // capture that already failed and will never complete on its own. Each
+        // case below fails if the branch collapses back onto one sentence.
+
+        @Test
+        fun `offers repair only when the state says a repair is still possible`() {
+            val html = SummaryHtmlBuilder.buildHtml(
+                makeSummary(),
+                transcriptHashSet = emptySet(),
+                transcriptRepairState = "repairable",
+            )
+            html shouldContain "Conversation capture is missing but repair may still be possible"
+            html shouldNotContain "No conversations were captured for this memory"
+        }
+
+        @Test
+        fun `says so when the capture was already repaired`() {
+            val html = SummaryHtmlBuilder.buildHtml(
+                makeSummary(),
+                transcriptHashSet = emptySet(),
+                transcriptRepairState = "repaired",
+            )
+            html shouldContain "Conversation capture was repaired from local transcript history"
+        }
+
+        @Test
+        fun `degrades to the plainest copy for an unknown or present state`() {
+            // `present` is deliberately in this bucket: a pre-v5 summary reads as
+            // `present` even when nothing was ever captured, so it must not claim
+            // a repair happened or is possible.
+            for (state in listOf(null, "present", "unrepairable", "something-new")) {
+                val html = SummaryHtmlBuilder.buildHtml(
+                    makeSummary(),
+                    transcriptHashSet = emptySet(),
+                    transcriptRepairState = state,
+                )
+                html shouldContain "No conversations were captured for this memory"
+                html shouldNotContain "repair may still be possible"
+                html shouldNotContain "was repaired from"
+            }
+        }
+
+        @Test
+        fun `the state picks the wording, never whether the empty branch shows`() {
+            // A memory WITH transcripts still ships the empty paragraph hidden —
+            // the deferred hydrate flips `hidden` in place — so the state must not
+            // become a second gate on rendering it.
+            val html = SummaryHtmlBuilder.buildHtml(
+                makeSummary(),
+                transcriptHashSet = setOf("abc123"),
+                transcriptRepairState = "repairable",
+            )
+            html shouldContain """id="conversationsEmpty" hidden"""
+            html shouldContain "Conversation capture is missing but repair may still be possible"
         }
     }
 

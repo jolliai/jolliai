@@ -14,6 +14,7 @@
  * talking to a server newer than its own assets.
  */
 
+import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
 import type {
 	LocalAgentToolId,
@@ -959,6 +960,24 @@ export interface MemoryDetail {
 	 * type, so there is no second count here to pick the wrong one from.
 	 */
 	readonly conversations: ReadonlyArray<MemoryConversationRow>;
+	/**
+	 * Which of the three sentences spec §9 allows an EMPTY {@link conversations}
+	 * list to print — `transcriptRepairState` in
+	 * `cli/src/core/TranscriptRepair.ts`, the same predicate VS Code calls
+	 * in-process and IntelliJ reaches over the `transcript-repair-state` bridge
+	 * action, so one memory is never worded three different ways.
+	 *
+	 * OPTIONAL because it costs a filesystem read (the machine-global Claude
+	 * owners ledger, plus a stat per transcript it names) that only the DETAIL
+	 * view pays for, and because a page rendered before this shipped carries no
+	 * such field. `memories.js` treats an absent or unrecognised value as
+	 * `unrepairable`, the plainest wording — never as the optimistic one.
+	 *
+	 * It does NOT decide whether the empty block renders; `conversations` being
+	 * empty still does. `present` is not proof of renderable conversations: a
+	 * pre-v5 summary reads as `present` unconditionally.
+	 */
+	readonly transcriptRepairState?: TranscriptRepairState;
 	/** Plans, notes, references and the skills row — one ordered list, see {@link MemoryContextRow}. */
 	readonly context: ReadonlyArray<MemoryContextRow>;
 	readonly excluded: ReadonlyArray<MemoryExcludedRow>;

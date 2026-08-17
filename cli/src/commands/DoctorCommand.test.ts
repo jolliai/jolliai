@@ -8,9 +8,12 @@
  *     so a not-signed-in user gets actionable guidance
  */
 
+import { mkdtemp, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { JolliMemoryConfig } from "../Types.js";
+import type { CommitSummary, JolliMemoryConfig } from "../Types.js";
 
 // ─── Hoisted mocks ───────────────────────────────────────────────────────────
 
@@ -32,25 +35,48 @@ const h = vi.hoisted(() => ({
 	inspectPlugins: vi.fn(),
 	resolveProjectDir: vi.fn(),
 	runSessionSync: vi.fn(),
+	createStorage: vi.fn(),
+	// Sentinel commit hash the TranscriptRepair.js mock below throws for, so the
+	// `--repair-transcripts` per-candidate error-isolation test can make exactly
+	// one candidate fail without touching any other test's real repair behavior.
+	throwHash: "f".repeat(40),
 }));
 
 vi.mock("../dashboard/SessionSyncRunner.js", () => ({ runSessionSync: h.runSessionSync }));
 
-vi.mock("../core/GitOps.js", () => ({
+vi.mock("../core/GitOps.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/GitOps.js")>()),
 	orphanBranchExists: h.orphanBranchExists,
 	// Backup's default-folder guard probes whether $HOME is a git worktree (git
 	// clean -xdf there would delete every snapshot). The fake HOME is a tmpdir, so
 	// "false" is the honest answer and the snapshot proceeds.
 	execGit: vi.fn(async () => ({ exitCode: 0, stdout: "false", stderr: "" })),
+	// The `--repair-transcripts` tests below build fixtures with a real
+	// FolderStorage over a plain temp dir (not a git worktree) —
+	// resolveStateRoot/getTreeHash/getDiffStats are stubbed to their non-repo-cwd
+	// fallback values so repairSummaryTranscripts (via storeSummary's
+	// flattenSummaryTree) never shells `git` out against a directory that isn't
+	// one. Same rationale as TranscriptRepair.test.ts.
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
+	getTreeHash: vi.fn().mockResolvedValue(null),
+	getDiffStats: vi.fn().mockResolvedValue({ filesChanged: 0, insertions: 0, deletions: 0 }),
 }));
 vi.mock("../core/LlmClient.js", () => ({ resolveLlmCredentialSource: h.resolveLlmCredentialSource }));
-vi.mock("../core/Locks.js", () => ({
+vi.mock("../core/Locks.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/Locks.js")>()),
 	isWorkerLockStale: h.isWorkerLockStale,
 	releaseWorkerLock: h.releaseWorkerLock,
 	// The repo-registry row's dry-run repair pass takes this lock. A plain
 	// pass-through rather than a spy: these tests are about doctor's output, and an
 	// unmocked export throws on the very first check that reaches it.
 	withRepoRegistryLock: async <T>(fn: () => Promise<T>) => fn(),
+	// storeSummary always wraps its write in withRequiredOrphanWriteLock, which
+	// calls these two directly regardless of active storage backend — stubbed
+	// to always-succeed/no-op so the `--repair-transcripts` fixtures (plain temp
+	// dirs, not git worktrees) don't shell out to `git rev-parse
+	// --git-common-dir` to resolve the shared lock directory.
+	acquireOrphanWriteLock: vi.fn().mockResolvedValue(true),
+	releaseOrphanWriteLock: vi.fn().mockResolvedValue(undefined),
 }));
 vi.mock("../core/localagent/BackendRegistry.js", () => ({ getBackend: h.getBackend }));
 vi.mock("../core/RepoProfile.js", () => ({
@@ -65,6 +91,34 @@ vi.mock("../core/SessionTracker.js", () => ({
 	loadConfig: h.loadConfig,
 }));
 vi.mock("../core/SotStorageResolver.js", () => ({ resolveSotBackend: h.resolveSotBackend }));
+// createStorage is the cutover router: on a real cutover repo it points the active
+// storage at SQLite. `runDoctor --repair-transcripts` must establish it itself, so
+// the tests below stand it in for the fixture FolderStorage. Every other export
+// (createFolderStorageAtRoot) stays real.
+vi.mock("../core/StorageFactory.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/StorageFactory.js")>()),
+	createStorage: h.createStorage,
+}));
+vi.mock("../core/TranscriptRepair.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/TranscriptRepair.js")>();
+	return {
+		...actual,
+		// Real behavior for every commit except the sentinel — `runRepairTranscripts`
+		// must isolate one candidate's failure from the rest of the loop, and the
+		// only way to prove that without mocking away the whole engine is to make
+		// exactly one real invocation throw.
+		repairSummaryTranscripts: vi.fn(
+			async (
+				commitHash: string,
+				cwd: string,
+				opts?: { readonly apply?: boolean; readonly globalDir?: string },
+			) => {
+				if (commitHash === h.throwHash) throw new Error("simulated lock contention");
+				return actual.repairSummaryTranscripts(commitHash, cwd, opts);
+			},
+		),
+	};
+});
 vi.mock("../install/DistPathResolver.js", () => ({ traverseDistPaths: h.traverseDistPaths }));
 vi.mock("../install/Installer.js", () => ({ getStatus: h.getStatus, install: h.install }));
 vi.mock("../PluginLoader.js", () => ({ inspectPlugins: h.inspectPlugins }));
@@ -81,8 +135,11 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 	return { ...actual, resolveProjectDir: h.resolveProjectDir };
 });
 
+import { recordClaudeOwners } from "../core/ClaudeOwnership.js";
+import { createFolderStorageAtRoot } from "../core/StorageFactory.js";
+import { getSummary, setActiveStorage, storeSummary } from "../core/SummaryStore.js";
 import { setIsolatedHome } from "../testUtils/isolatedHome.js";
-import { registerDoctorCommand } from "./DoctorCommand.js";
+import { registerDoctorCommand, runRepairTranscripts } from "./DoctorCommand.js";
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -1152,5 +1209,204 @@ describe("doctor --sync-sessions", () => {
 		} finally {
 			process.exitCode = 0;
 		}
+	});
+});
+
+describe("doctor --repair-transcripts", () => {
+	// Storage seam (same as TranscriptRepair.test.ts): a real FolderStorage
+	// rooted at a temp "repo" dir, set as the process-global override so
+	// listSummaries/getSummary/storeSummary inside runRepairTranscripts read and
+	// write it without a real git worktree or the orphan branch. GitOps/Locks
+	// are stubbed at the top of this file for the same non-repo-cwd reason.
+	let globalDir: string;
+	let repo: string;
+	let transcript: string;
+
+	const HASH = "a".repeat(40);
+	const EDGE = { firstSeenAt: "2026-08-17T10:00:00.000Z", firstSeenLine: 0, lastSeenAt: "2026-08-17T10:00:00.000Z" };
+
+	function summary(over: Partial<CommitSummary> = {}): CommitSummary {
+		return {
+			version: 5,
+			commitHash: HASH,
+			commitMessage: "x",
+			commitAuthor: "a",
+			commitDate: "2026-08-17T11:00:00.000Z",
+			branch: "main",
+			generatedAt: "2026-08-17T11:00:05.000Z",
+			topics: [],
+			transcripts: [],
+			...over,
+		};
+	}
+
+	/** Same console.log-capture idiom as `runDoctor()` above, generalised to any callback. */
+	async function captureLog(fn: () => Promise<void>): Promise<string> {
+		const lines: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((...a: unknown[]) => {
+			lines.push(a.map(String).join(" "));
+		});
+		try {
+			await fn();
+		} finally {
+			spy.mockRestore();
+		}
+		return lines.join("\n");
+	}
+
+	beforeEach(async () => {
+		globalDir = await mkdtemp(join(tmpdir(), "jolli-doctor-repair-g-"));
+		repo = await mkdtemp(join(tmpdir(), "jolli-doctor-repair-r-"));
+		transcript = join(globalDir, "s.jsonl");
+		// A real user turn (not just a bare `{cwd, timestamp}` line) — a line with
+		// no `message` object parses to zero entries, which would misreport every
+		// repair here as "no-entries-in-window".
+		await writeFile(
+			transcript,
+			`${JSON.stringify({
+				cwd: repo,
+				timestamp: "2026-08-17T10:00:00.000Z",
+				message: { role: "user", content: "hello" },
+			})}\n`,
+			"utf-8",
+		);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(globalDir);
+		setActiveStorage(createFolderStorageAtRoot(repo));
+		// What the cutover router hands the CLI entry: the same disk-backed fixture
+		// storage. Direct `runRepairTranscripts` unit calls ignore this (they use the
+		// pre-set active storage above); the `runDoctor` dispatch path consumes it.
+		h.createStorage.mockResolvedValue(createFolderStorageAtRoot(repo));
+	});
+
+	afterEach(() => {
+		setActiveStorage(undefined);
+	});
+
+	it("lists repair candidates without writing when --fix is absent", async () => {
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, false));
+
+		expect(out).toContain("would repair");
+		expect((await getSummary(HASH, repo))?.transcripts ?? []).toHaveLength(0);
+	});
+
+	it("repairs and reports per-summary reasons with --fix", async () => {
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		expect(out).toContain("repaired");
+		expect((await getSummary(HASH, repo))?.transcripts).toHaveLength(1);
+	});
+
+	it("reports a clean result when no summary has an empty transcript list", async () => {
+		await storeSummary(summary({ transcripts: ["existing"] }), repo);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		expect(out).toContain("No summaries need transcript repair");
+	});
+
+	it("continues past a candidate whose repair throws, and the totals still add up", async () => {
+		// Two candidates: the default HASH one (which the mock lets through to
+		// the real engine and succeeds) and a second at the sentinel `throwHash`
+		// (which the TranscriptRepair.js mock above throws for, simulating real
+		// orphan-write-lock contention with a concurrently-running QueueWorker).
+		// Without per-candidate error isolation, the throw would abort the loop
+		// before the totals line ever printed and, depending on iteration order,
+		// might also swallow the first candidate's own line.
+		await storeSummary(summary(), repo);
+		await storeSummary(summary({ commitHash: h.throwHash }), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		expect(out).toContain(`${h.throwHash.substring(0, 8)}  error — simulated lock contention`);
+		expect(out).toContain("repaired — 1 entries");
+		expect(out).toContain("Repaired 1 of 2 summaries.");
+		expect(out).toContain("1 errored — see above.");
+		// The surviving candidate's write still landed — one failure must not
+		// have rolled back or blocked an unrelated candidate's own repair.
+		expect((await getSummary(HASH, repo))?.transcripts).toHaveLength(1);
+	});
+
+	it("dispatches --repair-transcripts before the ordinary doctor report, honoring --fix", async () => {
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(globalDir);
+
+		const lines = await runDoctor(["--repair-transcripts", "--fix", "--cwd", repo]);
+		const out = lines.join("\n");
+
+		expect(out).toContain("repaired");
+		expect(out).not.toContain("Jolli Memory Doctor");
+		expect((await getSummary(HASH, repo))?.transcripts).toHaveLength(1);
+	});
+
+	it("establishes routed storage itself, so repair works when nothing pre-set the active storage", async () => {
+		// The real CLI entry never pre-sets active storage — the action handler must
+		// route its own via createStorage(cwd) (which the cutover router points at
+		// SQLite on a cutover repo). Without that, resolveStorage falls back to the
+		// system of record, which is FROZEN after cutover, and the repair reads
+		// nothing while claiming success. Plant the candidate through the fixture
+		// storage, then clear the global so the command is forced to re-establish it.
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+		setActiveStorage(undefined);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(globalDir);
+		// The system-of-record the command wrongly falls back to today is reachable
+		// but empty — post-cutover the orphan branch is frozen and holds nothing the
+		// routed SQLite storage has. So a fallback read finds zero candidates.
+		h.resolveSotBackend.mockResolvedValue({
+			ok: true,
+			state: "cutover",
+			storage: createFolderStorageAtRoot(await mkdtemp(join(tmpdir(), "jolli-doctor-repair-sot-"))),
+		});
+
+		const lines = await runDoctor(["--repair-transcripts", "--fix", "--cwd", repo]);
+
+		expect(lines.join("\n")).toContain("repaired");
+		expect((await getSummary(HASH, repo))?.transcripts).toHaveLength(1);
+	});
+
+	it("does not apply the repair through the CLI when --fix is omitted", async () => {
+		// Distinct from the unit-level "lists ... without writing" test above:
+		// that one calls runRepairTranscripts directly with apply=false, so it
+		// cannot catch a dispatch bug that hardcodes `apply: true` (or any other
+		// constant) instead of threading `options.fix === true` through.
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(globalDir);
+
+		const lines = await runDoctor(["--repair-transcripts", "--cwd", repo]);
+		const out = lines.join("\n");
+
+		expect(out).toContain("would repair");
+		expect((await getSummary(HASH, repo))?.transcripts ?? []).toHaveLength(0);
 	});
 });

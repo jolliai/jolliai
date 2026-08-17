@@ -62,7 +62,7 @@ export interface SessionInfo {
  * Each advances its own high-water mark, so adding one never strands data behind
  * a mark advanced by a dist that did not know it existed.
  */
-export type DiscoveryExtractor = "plans" | "references" | "skills";
+export type DiscoveryExtractor = "plans" | "references" | "skills" | "owners";
 
 export interface TranscriptCursor {
 	readonly transcriptPath: string;
@@ -829,6 +829,18 @@ export interface CommitSummary {
 	 * Release N keeps reading legacy data; Release N+M will make it required.
 	 */
 	readonly transcripts?: ReadonlyArray<string>;
+	/**
+	 * Set by `jolli doctor --repair-transcripts --fix` when this summary's empty
+	 * `transcripts` was refilled from local transcript history. Purely additive —
+	 * no schema bump, matching how `skills` / `excludedContext` shipped.
+	 *
+	 * Two jobs. It is the repair's idempotency key: a summary carrying it is never
+	 * a candidate again, so a repeated run cannot create a second artifact for the
+	 * same evidence window (spec §8.2). And it is what lets the memory-detail UI
+	 * say "repaired from local transcript history" rather than implying the
+	 * conversation was captured live.
+	 */
+	readonly transcriptsRepairedAt?: string;
 	/**
 	 * Marks a summary produced by the historical back-fill flow (`jolli backfill`
 	 * / enable-time catch-up) rather than the live post-commit pipeline. The

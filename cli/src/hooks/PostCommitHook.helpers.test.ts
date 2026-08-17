@@ -138,6 +138,10 @@ vi.mock("../core/GitOps.js", () => ({
 	// via getTranscriptHashes → OrphanBranchStorage.listFiles. Empty listing is
 	// fine here — these tests don't assert on the resulting transcripts array.
 	listFilesInBranch: vi.fn().mockResolvedValue([]),
+	// Identity fake: loadSessionTranscripts keys the Claude ownership ledger
+	// lookup on this. This suite isn't exercising that lookup, so match
+	// QueueWorker.test.ts's convention rather than inventing a second one.
+	resolveStateRoot: vi.fn((cwd: string) => cwd),
 }));
 
 vi.mock("../core/SessionTracker.js", () => ({

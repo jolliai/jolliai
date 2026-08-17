@@ -22,6 +22,10 @@ import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
+import { createStorage } from "../core/StorageFactory.js";
+import { listSummaries, setActiveStorage } from "../core/SummaryStore.js";
+import { getTranscriptIds } from "../core/SummaryTree.js";
+import { repairSummaryTranscripts } from "../core/TranscriptRepair.js";
 import { probeGlobalDaemon } from "../daemon/EnsureGlobalDaemon.js";
 import type { GlobalDaemonHello } from "../daemon/GlobalDaemonProtocol.js";
 import { backupHealthCheck } from "../dashboard/Backup.js";
@@ -1044,6 +1048,71 @@ export async function runSessionSyncNow(): Promise<void> {
 	if (outcome.status === "failed") process.exitCode = 1;
 }
 
+/**
+ * `doctor --repair-transcripts` — offers, or performs, Task 7's bounded repair
+ * for every summary this repo stored with `transcripts: []`.
+ *
+ * List-then-act, mirroring `--recover`: the bare flag reports what it WOULD do
+ * and `--fix` performs it. Repair rewrites a stored memory from local
+ * transcript history that may be days old and is pruned on the agent's own
+ * schedule — never something a diagnostic command applies on its own. Running
+ * the bare flag first lets the user see every candidate's verdict (including
+ * the ones the engine will refuse — no owner proof, a vanished transcript, an
+ * unbounded window) before anything is written.
+ *
+ * The candidate filter mirrors `repairSummaryTranscripts`'s own "already
+ * present" check exactly, so this list and the engine's per-summary verdicts
+ * can never disagree about which summaries are in scope.
+ *
+ * Per-candidate errors are caught, not propagated: this runs over every
+ * candidate in the repo (plausibly hundreds), and `repairSummaryTranscripts`
+ * is not throw-free — under `apply: true` it writes through
+ * `withRequiredOrphanWriteLock`, which throws `OrphanWriteBusyError` on lock
+ * contention with a concurrently-running `QueueWorker`, and a corrupted
+ * on-disk summary or ownership ledger can throw earlier still. Letting one
+ * such failure abort the loop would deny every remaining candidate a verdict
+ * over an error this command is explicitly meant to run past. An error is
+ * reported inline and counted separately from both "repaired" and "skipped"
+ * — it is not an engine verdict (`RepairOutcome.reason` stays the engine's
+ * alone; this runner does not invent a seventh reason for it).
+ */
+export async function runRepairTranscripts(cwd: string, apply: boolean): Promise<void> {
+	const summaries = await listSummaries(Number.MAX_SAFE_INTEGER, cwd);
+	const candidates = summaries.filter(
+		(s) => s.transcriptsRepairedAt === undefined && getTranscriptIds(s).length === 0,
+	);
+	if (candidates.length === 0) {
+		console.log("No summaries need transcript repair.");
+		return;
+	}
+
+	let repaired = 0;
+	let errored = 0;
+	for (const candidate of candidates) {
+		const hash = candidate.commitHash.substring(0, 8);
+		let outcome: Awaited<ReturnType<typeof repairSummaryTranscripts>>;
+		try {
+			outcome = await repairSummaryTranscripts(candidate.commitHash, cwd, { apply });
+		} catch (err) {
+			errored++;
+			console.log(`  ${hash}  error — ${errMsg(err)}`);
+			continue;
+		}
+		if (outcome.repaired) {
+			repaired++;
+			console.log(`  ${hash}  ${apply ? "repaired" : "would repair"} — ${outcome.entries} entries`);
+		} else {
+			console.log(`  ${hash}  skipped — ${outcome.reason}`);
+		}
+	}
+	console.log(
+		(apply
+			? `Repaired ${repaired} of ${candidates.length} summaries.`
+			: `${repaired} of ${candidates.length} summaries can be repaired. Re-run with --fix to apply.`) +
+			(errored > 0 ? ` ${errored} errored — see above.` : ""),
+	);
+}
+
 /** Registers the `doctor` sub-command on the given Commander program. */
 export function registerDoctorCommand(program: Command): void {
 	program
@@ -1066,6 +1135,7 @@ export function registerDoctorCommand(program: Command): void {
 			"--sync-sessions",
 			"Upload pending session statistics now, ignoring the throttle and any 24h backend silence",
 		)
+		.option("--repair-transcripts", "Refill summaries written with no conversation from local transcript history")
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(
 			async (options: {
@@ -1078,6 +1148,7 @@ export function registerDoctorCommand(program: Command): void {
 				schemaLog?: boolean;
 				markMigration?: string;
 				syncSessions?: boolean;
+				repairTranscripts?: boolean;
 			}) => {
 				setLogDir(options.cwd);
 				log.info("Running 'doctor' command");
@@ -1094,6 +1165,16 @@ export function registerDoctorCommand(program: Command): void {
 				}
 				if (options.syncSessions === true) {
 					await runSessionSyncNow();
+					return;
+				}
+				if (options.repairTranscripts === true) {
+					// Route the active storage the way every other summary command does
+					// (PrDescriptionCommand, CompileCommand): createStorage consults the
+					// cutover state and points at SQLite on a cutover repo. Without this
+					// the repair falls back to the frozen system-of-record and silently
+					// reads — or on --fix, tries to write — the wrong backend.
+					setActiveStorage(await createStorage(options.cwd, options.cwd));
+					await runRepairTranscripts(options.cwd, options.fix === true);
 					return;
 				}
 				await runDoctor(

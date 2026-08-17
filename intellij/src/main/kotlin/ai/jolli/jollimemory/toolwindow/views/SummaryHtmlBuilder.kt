@@ -7,6 +7,7 @@ import ai.jolli.jollimemory.core.ModelPricing
 import ai.jolli.jollimemory.core.PlanReference
 import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
+import ai.jolli.jollimemory.core.TranscriptRepairState
 import ai.jolli.jollimemory.core.references.ReferenceCommitRef
 import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
 import ai.jolli.jollimemory.core.references.SourceDisplay
@@ -43,6 +44,11 @@ object SummaryHtmlBuilder {
      * @param isDark Whether to use dark theme colours
      * @param transcriptHashSet Set of commit hashes that have transcript files
      * @param planTranslateSet Set of plan slugs that support translation
+     * @param transcriptRepairState The CLI's repair verdict for this memory
+     *   ([ai.jolli.jollimemory.core.TranscriptRepairState]), which picks the
+     *   empty Conversations sentence. Null — the default, what the FIRST render
+     *   has before `loadDeferredSets` answers, and what a failed fetch yields —
+     *   prints the plainest one; the deferred hydrate corrects it in place.
      */
     fun buildHtml(
         summary: CommitSummary,
@@ -52,6 +58,7 @@ object SummaryHtmlBuilder {
         bridgeScript: String = "",
         readOnly: Boolean = false,
         pageBgHex: String = "#1e1e1e",
+        transcriptRepairState: String? = null,
     ): String {
         val (allTopics, sourceNodes) = collectSortedTopics(summary)
         val stats = SummaryTree.aggregateStats(summary)
@@ -92,7 +99,7 @@ ${buildMemoryPanel(summary, allTopics, topicsHtml, topicsTitle, topicsLabel)}
 ${buildE2ePanel(summary)}
 ${buildAttachmentsPanel(summary.plans, planTranslateSet, sourceNodes, summary.references)}
 ${buildExcludedContextSection(summary)}
-${buildPrivateDrawer(transcriptHashSet)}
+${buildPrivateDrawer(transcriptHashSet, transcriptRepairState)}
 ${buildFooter(summary)}
 </div>
 ${buildShareModal()}
@@ -264,11 +271,16 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
      * populated. See `SummaryPanel.loadDeferredSets` for why the deferred hydration flips
      * `hidden` attributes in place rather than triggering a second `loadHTML`.
      */
-    private fun buildAllConversationsSection(transcriptHashSet: Set<String>): String {
+    private fun buildAllConversationsSection(transcriptHashSet: Set<String>, transcriptRepairState: String?): String {
         val count = transcriptHashSet.size
         val hasTranscripts = count > 0
         val emptyHidden = if (hasTranscripts) " hidden" else ""
         val populatedHidden = if (hasTranscripts) "" else " hidden"
+        // Which of spec §9's three sentences the empty branch carries. The set
+        // being empty is still what decides whether that branch SHOWS — the state
+        // only picks the wording, because `present` is not proof of renderable
+        // conversations (a pre-v5 summary reads as `present` unconditionally).
+        val emptyText = TranscriptRepairState.emptyConversationsText(transcriptRepairState)
         return """
 <div class="private-zone" id="conversationsSection" data-transcript-count="$count">
   <div class="private-zone-watermark">PRIVATE</div>
@@ -276,7 +288,7 @@ ${if (bridgeScript.isNotEmpty()) "<script>$bridgeScript</script>" else ""}
     <div class="section-title">&#x1F4AC; All Conversations</div>
     <button class="action-btn" id="openTranscriptsBtn"$populatedHidden>Manage</button>
   </div>
-  <p class="empty" id="conversationsEmpty"$emptyHidden>No conversation transcripts saved for this commit.</p>
+  <p class="empty" id="conversationsEmpty"$emptyHidden>$emptyText</p>
   <p class="conversations-description" id="conversationsDescription"$populatedHidden>Raw AI conversation transcripts captured during development.</p>
   <p class="conversations-stats" id="conversationsStats"$populatedHidden>
     <span class="stats-loading">Loading stats...</span>
@@ -686,7 +698,7 @@ $listItems
      * `loadHTML`. The `data-transcript-count` attribute lets the JS check the initial
      * count without re-reading the badge.
      */
-    private fun buildPrivateDrawer(transcriptHashSet: Set<String>): String {
+    private fun buildPrivateDrawer(transcriptHashSet: Set<String>, transcriptRepairState: String?): String {
         val count = transcriptHashSet.size
         val countText = "$count session${if (count != 1) "s" else ""}"
         val countHidden = if (count > 0) "" else " hidden"
@@ -699,7 +711,7 @@ $listItems
     <span class="private-count" id="privateCount"$countHidden>$countText</span>
     <span class="attach-arrow">&#x25BC;</span>
   </div>
-  <div class="private-body">${buildAllConversationsSection(transcriptHashSet)}</div>
+  <div class="private-body">${buildAllConversationsSection(transcriptHashSet, transcriptRepairState)}</div>
 </div>"""
     }
 

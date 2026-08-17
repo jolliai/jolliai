@@ -46,6 +46,7 @@ import {
 } from "../core/SummaryTree.js";
 import { estimateSummaryCostUsd } from "../core/TokenCost.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
+import { type TranscriptRepairState, transcriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, StoredTranscript } from "../Types.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
@@ -652,11 +653,23 @@ function buildContextRows(summary: CommitSummary): ReadonlyArray<MemoryContextRo
 	];
 }
 
-/** One memory's full detail, or undefined when `hash` does not resolve within `scope`. */
+/**
+ * One memory's full detail, or undefined when `hash` does not resolve within
+ * `scope`.
+ *
+ * `transcriptRepairState` is passed IN rather than derived here because the
+ * predicate is async (it reads the machine-global Claude owners ledger and stats
+ * the transcripts it names) while this whole query layer is synchronous —
+ * `buildDashboardModel` has hundreds of synchronous call sites. It is threaded
+ * from `defaultModelBuilder` exactly like `reachableCommits` and the settings /
+ * knowledge / graph models, which are async for the same reason.
+ * {@link readMemoryTranscriptRepairState} is what computes it.
+ */
 export function buildMemoryDetail(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	hash: string,
+	transcriptRepairState?: TranscriptRepairState,
 ): MemoryDetail | undefined {
 	// Guard the empty string explicitly: with the prefix predicate below,
 	// `length("")=0` makes `substr(commit_hash,1,0)=""` true for EVERY row (the
@@ -861,6 +874,7 @@ export function buildMemoryDetail(
 		generatedAtMs,
 		...(summary.recap ? { recap: summary.recap } : {}),
 		conversations: buildConversations(db, row.repo_id, fullHash, summary),
+		...(transcriptRepairState ? { transcriptRepairState } : {}),
 		context,
 		excluded,
 		activity,
@@ -893,27 +907,107 @@ export function buildMemories(
 	hash: string | undefined,
 	reachable?: ReachableCommits,
 	detailRepoIdentity?: string,
+	transcriptRepairState?: TranscriptRepairState,
 ): MemoriesModel {
 	const list = buildMemoriesList(db, scope, reachable);
 	if (!hash) return list;
-	// Through `resolveScope`, because the link carries whatever `JD.repoToken`
-	// picked — usually the repo NAME, since that is the readable token. Handing a
-	// name straight to `buildMemoryDetail` resolves to repo id -1 (matches
-	// nothing), so the tree row navigated to a page whose detail pane stayed
-	// empty: the click looked like it did nothing at all.
-	// Always exactly ONE identity: this names the memory's owner, not the page
-	// scope, and a detail pane showing one memory has one owning repo.
+	const selected = buildMemoryDetail(
+		db,
+		resolveDetailScope(db, scope, detailRepoIdentity),
+		hash,
+		transcriptRepairState,
+	);
+	return selected ? { ...list, selected } : list;
+}
+
+/**
+ * Which repositories the DETAIL pane may resolve `hash` in.
+ *
+ * Through `resolveScope`, because the link carries whatever `JD.repoToken`
+ * picked — usually the repo NAME, since that is the readable token. Handing a
+ * name straight to `buildMemoryDetail` resolves to repo id -1 (matches nothing),
+ * so the tree row navigated to a page whose detail pane stayed empty: the click
+ * looked like it did nothing at all.
+ *
+ * Always exactly ONE identity: this names the memory's owner, not the page
+ * scope, and a detail pane showing one memory has one owning repo.
+ *
+ * A token that resolves to no repo means the link is stale (repo removed, or
+ * renamed since the page was rendered). Falls back to the page scope rather than
+ * to a filter that matches nothing — the hash still identifies the memory, and
+ * showing it is strictly better than showing an empty pane.
+ *
+ * Shared with {@link readMemoryTranscriptRepairState} rather than inlined twice:
+ * the two must resolve the SAME memory, or the page would print one memory's
+ * conversations under another's repair verdict.
+ */
+function resolveDetailScope(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	detailRepoIdentity: string | undefined,
+): DashboardScope {
 	const detailScope: DashboardScope = detailRepoIdentity
 		? resolveScope(db, { kind: "repo", repoIdentities: [detailRepoIdentity] })
 		: scope;
-	// A token that resolves to no repo means the link is stale (repo removed, or
-	// renamed since the page was rendered). Fall back to the page scope rather
-	// than to a filter that matches nothing — the hash still identifies the
-	// memory, and showing it is strictly better than showing an empty pane.
 	const detailIds = scopeToRepoIds(db, detailScope).repoIds;
-	const detail = detailIds?.includes(-1) ? scope : detailScope;
-	const selected = buildMemoryDetail(db, detail, hash);
-	return selected ? { ...list, selected } : list;
+	return detailIds?.includes(-1) ? scope : detailScope;
+}
+
+/**
+ * The repair verdict for the memory {@link buildMemories} would select — the
+ * only ASYNC part of the Memories payload, computed by `defaultModelBuilder`
+ * and threaded back in.
+ *
+ * Why it cannot live in `buildMemoryDetail`: the predicate reads the
+ * machine-global Claude owners ledger and stats every transcript it names, while
+ * the whole query layer below `buildDashboardModel` is synchronous. The same
+ * shape `reachableCommits` and the settings / knowledge / graph models already
+ * use.
+ *
+ * The summary is assembled as a TREE, matching `buildMemoryDetail`: an
+ * amend/squash memory keeps its transcripts on the folded children, and the bare
+ * `memories.summary_json` row has `children` emptied — reading it alone would
+ * report a fully-captured consolidation as having no conversations at all.
+ *
+ * Every failure answers `undefined`, which `memories.js` renders as the plainest
+ * sentence. This is a wording detail on a page that must still open: a repo
+ * whose worktree has moved, an unparseable row, or an unreadable ledger must not
+ * take the memory detail down with it, and must not guess the optimistic way.
+ */
+export async function readMemoryTranscriptRepairState(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	hash: string | undefined,
+	detailRepoIdentity?: string,
+): Promise<TranscriptRepairState | undefined> {
+	if (!hash) return undefined;
+	try {
+		const filter = scopeFilter(scopeToRepoIds(db, resolveDetailScope(db, scope, detailRepoIdentity)), "m.repo_id");
+		// Same predicate, ordering and LIMIT as `buildMemoryDetail`'s row query,
+		// so a short hash that resolves to one memory there resolves to the same
+		// one here. `worktree_root` is the cwd the predicate needs: the dashboard
+		// is machine-global, so the server's own cwd names the wrong repository
+		// for every row but one.
+		const row = db
+			.prepare(
+				`SELECT m.repo_id, m.commit_hash, m.summary_json, r.worktree_root
+				   FROM memories m
+				   JOIN repos r ON r.id = m.repo_id
+				  WHERE substr(m.commit_hash, 1, length(?)) = ?${filter.sql}
+				  ORDER BY m.repo_id, m.commit_hash
+				  LIMIT 1`,
+			)
+			.get(hash, hash, ...filter.params) as
+			| { repo_id: number; commit_hash: string; summary_json: string; worktree_root: string | null }
+			| undefined;
+		if (!row?.worktree_root) return undefined;
+		const summary = (assembleMemoryTree(db, row.repo_id, row.commit_hash) ??
+			JSON.parse(row.summary_json)) as CommitSummary;
+		return await transcriptRepairState(summary, row.worktree_root);
+	} catch (err) {
+		log.debug("transcript repair state unavailable for %s: %s", hash, errMsg(err));
+		return undefined;
+	}
 }
 
 /**
