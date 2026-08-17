@@ -402,35 +402,26 @@ describe("repo self-registration", () => {
 		]);
 	});
 
-	it("never resurrects a repo the user disabled — a disabled entry counts as known", async () => {
+	it("rewrites nothing for a known identity whose checkout is already listed", async () => {
+		// A known identity ends the check: no `registerRepo`, so the row is left
+		// exactly as written. It used to matter because rebuilding the row cleared the
+		// registry's own disable stamp; that stamp is gone (the switch lives in each
+		// repo's `profile.json` now), but a stray hook still has no business
+		// restating a name, reordering `worktreeRoot`, or refreshing `enabledAt`.
 		const { identity } = await resolveRepoIdentity("/repo");
-		await writeFile(
-			join(dir, "dashboard-repos.json"),
-			JSON.stringify({
-				version: 1,
-				repos: [
-					{
-						repoIdentity: identity,
-						repoName: "repo",
-						worktreeRoot: "/repo",
-						enabledAt: "t",
-						disabledAt: "2026-07-30T12:00:00Z",
-					},
-				],
-			}),
-		);
+		const row = { repoIdentity: identity, repoName: "hand-named", worktreeRoot: "/repo", enabledAt: "t" };
+		await writeFile(join(dir, "dashboard-repos.json"), JSON.stringify({ version: 1, repos: [row] }));
 
 		await recordSessionFromHook("/repo", sessionInfo(), dbPath);
 
-		expect((await readRepoRegistry(dir)).repos[0].disabledAt).toBe("2026-07-30T12:00:00Z");
+		expect((await readRepoRegistry(dir)).repos).toEqual([row]);
 	});
 
-	it("lists a second clone of a known identity — union-only, disable state untouched", async () => {
-		// Clones share one identity, so "known" used to end the check here and
-		// clone B's worktree never entered the list — making B structurally
-		// invisible to the cutover's source enumeration (never imported, never
-		// fenced, its history stranded). The union must also not double as a
-		// re-enable: this entry stays disabled.
+	it("lists a second clone of a known identity — union-only, the rest of the row untouched", async () => {
+		// Clones share one identity, so "known" used to end the check here and clone
+		// B's worktree never entered the list — making B structurally invisible to the
+		// cutover's source enumeration (never imported, never fenced, its history
+		// stranded). Adding it must stay a pure union.
 		const { identity } = await resolveRepoIdentity("/repo");
 		await writeFile(
 			join(dir, "dashboard-repos.json"),
@@ -443,7 +434,6 @@ describe("repo self-registration", () => {
 						worktreeRoot: "/clone-a",
 						worktrees: ["/clone-a"],
 						enabledAt: "t",
-						disabledAt: "2026-07-30T12:00:00Z",
 					},
 				],
 			}),
@@ -453,8 +443,8 @@ describe("repo self-registration", () => {
 
 		const [entry] = (await readRepoRegistry(dir)).repos;
 		expect(entry.worktrees).toEqual(["/clone-a", "/repo"]);
-		expect(entry.disabledAt).toBe("2026-07-30T12:00:00Z");
 		expect(entry.worktreeRoot).toBe("/clone-a");
+		expect(entry.enabledAt).toBe("t");
 	});
 
 	it("still writes the stats when the registry file is corrupt", async () => {

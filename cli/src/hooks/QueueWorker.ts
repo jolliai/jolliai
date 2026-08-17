@@ -953,7 +953,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// per-VAULT, held across this worker's whole drain, so waiting for that scan
 		// inside the lock window stalls the summary worker of every OTHER repo sharing
 		// the Memory Bank. It needs neither lock: the engine takes its own per-source
-		// locks for the CAS. The 6 h throttle bounds how often a `not-ready` repo pays
+		// locks for the CAS. The throttle window bounds how often a `not-ready` repo pays
 		// the scan at all, but bounding frequency is not the same as bounding who
 		// waits. Never throws, reports nothing.
 		//
@@ -965,7 +965,7 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// re-reads the fence from disk and throws on a frozen branch: the ingest's LLM
 		// work is discarded (the catch above logs it as non-fatal), its queue entries
 		// survive un-deleted, and the next worker redoes it. Cutting over after the
-		// ingest costs one drain's delay on a 6 h-throttled, opportunistic step and
+		// ingest costs one drain's delay on a throttled, opportunistic step and
 		// keeps every write in this run on the provider that matches the repo's state.
 		// A landed summary is the ONLY thing that invalidates the session-start
 		// briefing cache (its key is HEAD), and this is the one process that knows it

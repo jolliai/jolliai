@@ -47,8 +47,7 @@ Path: **`~/.jolli/jollimemory/dashboard-repos.json`** (the machine-global config
       "worktreeRoot": "/abs/path/to/newest/clone",
       "worktrees": ["/abs/path/to/older/clone", "/abs/path/to/newest/clone"],
       "remoteUrl": "https://github.com/owner/name",
-      "enabledAt": "2026-01-01T00:00:00.000Z",
-      "disabledAt": "2026-02-01T00:00:00.000Z"
+      "enabledAt": "2026-01-01T00:00:00.000Z"
     }
   ]
 }
@@ -62,7 +61,7 @@ Field semantics:
 - **`worktrees`** — every main-worktree path ever registered for this identity, **newest last**. Absent on entries written before the field existed; readers fall back to `[worktreeRoot]`. It is kept here rather than in the database because rebuilding a deleted database needs to know where the checkouts are, and that list cannot live only inside the thing being rebuilt.
 - **`remoteUrl`** — present only on the remote-derived branch of identity resolution.
 - **`enabledAt`** — set once, on first registration, and preserved by every later re-registration.
-- **`disabledAt`** — present only while disabled. Rows are **never deleted**, so history stays queryable and re-enabling does not have to re-import.
+- **No disable state.** This file records membership, never whether the user has Jolli switched on. That switch is the repository's own `profile.json` (`manuallyDisabled`), and asking it is what "listing" below does. The registry carried a `disabledAt` for one release: stamped by ONE writer (the `disable` command) and cleared by EVERY registration, so it drifted one way — a repository disabled from an IDE never got the stamp, and a background enable or a page open wiped one that had been set, which is how switched-off repositories kept being re-imported. Rows are still **never deleted**, so history stays queryable and re-enabling does not have to re-import.
 - **`instanceId`** — the dashboard database's own identity stamp, kept here so that an *absent* database can be classified: a stamp matching the mirror's proves deletion, a mismatch is residue. Its presence alone proves nothing, since this file survives the database independently.
 
 **This file is the source; the database's repository table is the projection of it — never the reverse.** The database is a derived read model that bootstrap, gap recovery, or a user may throw away, and rebuilding it for every repository needs a durable answer to "which repositories are enabled, and where are their checkouts". It is machine-global rather than per-repository for the same reason no single repository's memory-bank folder can own the list of all the others — and because that folder is user-retargetable while this list must not move with it.
@@ -118,17 +117,13 @@ Given any directory inside a repository:
    - Rebuild the entry with the derived name, this root as `worktreeRoot`, the unioned checkout list, the remote URL when there is one, and the **existing `enabledAt` if there was one** — otherwise now.
    - Replace the entry for that identity and write.
 
-Because the entry is **rebuilt rather than merged**, a registration **clears `disabledAt`**: re-registering *is* re-enabling, which is exactly what an explicit enable should mean.
+The entry is **rebuilt rather than merged**, but it records membership only, so a registration carries no opinion about whether the user has Jolli switched on — it cannot re-enable anything. That is what makes it safe on the incidental paths (a background enable, a dashboard page open) that used to undo a disable by running it.
 
 ### Extending the checkout list only
 
-A second mutation adds this working directory's main-worktree root to its identity's checkout list and touches **nothing else** — most importantly not `disabledAt`. It returns the existing (or updated) entry, or **null** when the identity is not in the registry at all, since building a full row is registration's job. A checkout already on the list is returned unchanged, with no write at all.
+A second mutation adds this working directory's main-worktree root to its identity's checkout list and touches **nothing else** — a pure union, where registration rebuilds the row. It returns the existing (or updated) entry, or **null** when the identity is not in the registry at all, since building a full row is registration's job. A checkout already on the list is returned unchanged, with no write at all.
 
-This exists because "the identity is already registered" says nothing about whether *this* checkout is listed, and a checkout the list never learns is structurally invisible to a source enumeration that has to visit every clone. A stray hook must be able to fill that gap without being able to undo an explicit disable.
-
-### Disabling
-
-Resolve the working directory to its main-worktree root, derive the identity, and under the lock stamp `disabledAt` on the matching entry, leaving everything else — including the row and its data — in place. Returns the identity, or **null** when the repository was never registered.
+This exists because "the identity is already registered" says nothing about whether *this* checkout is listed, and a checkout the list never learns is structurally invisible to a source enumeration that has to visit every clone. Union-only is still the right shape for a stray hook — it cannot restate a name or reorder the newest checkout — though it is no longer what protects an explicit disable, since nothing in this file can undo one.
 
 ### Reading a repository's checkouts
 
@@ -137,11 +132,19 @@ Two readers over the same list, with deliberately different answers:
 - **Live checkouts, newest first** — take the checkout list (falling back to `[worktreeRoot]` when absent or empty), reverse it, drop paths that no longer exist. **When that leaves nothing, return `[worktreeRoot]` anyway**: a caller that would otherwise sweep zero checkouts is better off trying the recorded path and failing loudly in git.
 - **Is anything still backed by disk** — the same source list, unreversed, asked whether *any* path exists. This is the companion the non-empty fallback makes necessary: a repository whose every path is gone looks identical, through the first reader, to one with a single live checkout.
 
-The registry is **append-only in practice** — nothing prunes it, and disabling has to run from inside the repository it removes, which a deleted directory makes impossible — so dead entries accumulate and every sweep pays for them again.
+The registry is **append-only in practice** — nothing prunes it, and a disable does not touch it at all — so dead entries accumulate and every sweep pays for them again.
 
 ### Listing
 
-"Active" repositories are every entry without a `disabledAt`, read through the forgiving read.
+"Active" repositories are every entry the user has not switched off, decided from each **clone's own** `profile.json` rather than from anything in this file, over the forgiving read.
+
+Three details are load-bearing:
+
+- **Every clone, not any clone.** An entry is one repository IDENTITY while the switch is per clone, so an entry counts as switched off only when EVERY recorded checkout is — otherwise disabling one checkout would silently stop collecting the other's memories.
+- **The non-migrating reader.** The synchronous reader is used deliberately: its asynchronous counterpart persists what it decides, and asking "should I sweep you?" must not write a profile into someone else's repository.
+- **Unreadable means enabled.** A missing or corrupt profile answers "not switched off", so a checkout on an unmounted drive is never mistaken for an opt-out; the live-checkout reader above is what classifies that case.
+
+The importer that consumes this list is handed the **whole** roster instead, not the active subset, because it is also the only writer of the database's own paused column: it skips a switched-off repository's import while still projecting its paused state, and filtering those rows out earlier would leave that column empty forever.
 
 ### The database identity stamp
 
@@ -161,7 +164,7 @@ The **HTTP resume route** also calls full registration, but it cannot introduce 
 
 The last of the five is deliberately narrower than the others:
 
-- It **only fills a gap**. When the identity is already known it never re-registers, because registration clears `disabledAt` and a stray hook must not silently undo a user's disable. When the identity is known but *this* checkout is not in its list, it uses the extension mutation instead.
+- It **only fills a gap**. When the identity is already known it never re-registers: a stray hook has no business restating a display name or reordering the newest checkout. When the identity is known but *this* checkout is not in its list, it uses the extension mutation instead.
 - Its per-process memo of directory → identity is populated **only after registration has settled**. Caching the identity first would short-circuit every later call in the process, so a registration that failed on a transient error would never be retried — permanently, in a long-lived editor host. The identity resolution is the cheap half; the registration is the part worth another attempt.
 - A failed registration is a debug note, not an error: the database write that follows still works, because the writer seeds a placeholder repository row from the identity alone.
 
@@ -210,13 +213,13 @@ These are described here only because they read registry-adjacent state; **no be
 
 | From | Event | To |
 | --- | --- | --- |
-| absent | registration from any of the paths enumerated above | present, `enabledAt` = now, checkout list = `[this root]`, no `disabledAt` |
+| absent | registration from any of the paths enumerated above | present, `enabledAt` = now, checkout list = `[this root]` |
 | present, enabled | registration from another checkout of the same identity | same entry, `worktreeRoot` = this root, checkout list unioned (this root last), `enabledAt` preserved |
-| present, enabled | disable | `disabledAt` stamped; row and data kept |
-| present, disabled | registration (explicit enable / resume) | `disabledAt` **cleared** — the entry is rebuilt |
-| present, disabled | producer write path observes it | **unchanged** — never resurrected |
-| present, any state | this checkout missing from the list, producer write path | checkout appended; nothing else touched |
-| present, any state | every recorded path deleted from disk | **still present** — nothing prunes; live-checkout reads answer "none alive" while the newest-first reader still yields the recorded path |
+| present | disable | **unchanged** — the switch is written to the repository's own profile, never here |
+| present | registration (explicit enable / resume) | entry rebuilt; membership only, so nothing about the switch changes |
+| present | producer write path observes a switched-off repository | **unchanged** — never resurrected, and listing keeps excluding it |
+| present | this checkout missing from the list, producer write path | checkout appended; nothing else touched |
+| present | every recorded path deleted from disk | **still present** — nothing prunes; live-checkout reads answer "none alive" while the newest-first reader still yields the recorded path |
 
 ### The file as a whole
 
@@ -238,7 +241,7 @@ These are described here only because they read registry-adjacent state; **no be
 - **The probe hashes the path it was handed, while registration hashes the resolved main-worktree root.** For a repository with **no usable remote**, probing a linked worktree therefore produces a different identity than the one registration wrote, so `alreadyAdded` reads **false** for a repository that is in fact registered. Remote-backed repositories are unaffected, since their identity does not depend on the path. (Surprising; a real divergence at HEAD — though no user can currently see it, since nothing reaches the probe from the browser.)
 - **The probe and the HTTP enable route have no caller in the shipped page.** Both existed for one folder-browser add flow, deleted with the directory-listing endpoint it walked. Both still route and still act for a token-bearing local caller; the "before it is added" framing describes an interface that no longer exists, and re-adding one means building a front end against endpoints that are already there. (Unreachable from the shipped page; live over the wire.)
 - **The live-checkout reader never returns an empty list**, so "every checkout is gone" and "one checkout, alive" are indistinguishable through it — which is precisely why the second, plain-existence reader exists. Picking the wrong one makes a sweep act on a path that is not there. (Notable.)
-- **Nothing ever prunes this file.** Disabling cannot run for a deleted directory, so dead entries accumulate indefinitely and every sweep re-pays for them. (Notable.)
+- **Nothing ever prunes this file.** No mutation removes an entry, and a disable does not touch this file at all, so dead entries accumulate indefinitely and every sweep re-pays for them. (Notable.)
 - **The lock is best-effort: on a 5-second timeout the read-modify-write proceeds unlocked**, trading a lost-update window for never dropping a registration outright. (Notable.)
 - **The database can hold a repository row the registry has never heard of** — a placeholder with the identity as its name, an empty worktree path and an epoch timestamp, inserted by the producer write path so data is never lost for want of a registry entry. The empty path is a value downstream readers must special-case. (Surprising.)
 - **A configuration/hook-status settings path exists in full and is reached by nothing.** The shipped settings payload comes from a different, configuration-only assembly. (Unreachable at HEAD.)

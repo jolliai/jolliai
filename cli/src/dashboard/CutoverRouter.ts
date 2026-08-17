@@ -64,6 +64,25 @@ export interface CutoverRecord {
 	readonly cutoverVersion: number;
 	readonly committedAt: string;
 	readonly schemaVersion: number;
+	/**
+	 * What the compare found and the switch went ahead anyway: paths on the
+	 * frozen tips that the database does not reproduce, so they stop being
+	 * served here. Absent when there were none — which is every clean cutover,
+	 * so a record written by an older build parses unchanged.
+	 *
+	 * `count` is the exact number of DISTINCT paths (a path several sibling
+	 * clones each fail to reproduce is one finding, not one per clone); `sample`
+	 * is capped (`UNRECONCILED_SAMPLE_CAP` in `CutoverEngine`). The full set is
+	 * not stored anywhere because it does not need to be: the fence FREEZES the
+	 * branch rather than deleting it, so the authoritative copy of every one of
+	 * these paths is still on a tip this same record pins — which is why
+	 * `reportUnreconciled` prints {@link tips} alongside the list, and why the
+	 * paths themselves need carry no source attribution.
+	 */
+	readonly unreconciled?: {
+		readonly count: number;
+		readonly sample: ReadonlyArray<string>;
+	};
 }
 
 export type CutoverRoute =

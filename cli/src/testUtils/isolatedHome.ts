@@ -11,8 +11,8 @@
  * on Windows.
  *
  * That is not hypothetical damage. `dashboard-repos.json` is append-only by
- * design (no TTL, no cap, and `deregisterRepo` must run from inside the repo it
- * removes — impossible once the temp directory is gone), and a remote-less repo
+ * design (no TTL, no cap, and no mutation that removes an entry), and a
+ * remote-less repo
  * gets a `local:<path hash>` identity, so every `mkdtemp` run is a brand-new
  * entry that can never merge with an old one. One `npm run test` on Windows
  * therefore added one permanent, dead registry row per test case that registers

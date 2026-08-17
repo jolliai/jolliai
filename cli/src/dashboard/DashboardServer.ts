@@ -1862,8 +1862,8 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	/**
 	 * Removes a repository from this machine's dashboard — registry entry, rows and
 	 * unprojected events. The counterpart to `handleEnable`, and the only user-facing
-	 * way to reach an entry whose directory is gone (`deregisterRepo` needs to run
-	 * inside the repo, so it cannot name one).
+	 * way to reach an entry whose directory is gone (every `cwd`-addressed path has
+	 * to run inside the repo, so none of them can name one).
 	 *
 	 * Refuses a repository that still exists on disk, and the check is deliberately
 	 * not "did the page offer the control": the control is rendered from a payload
@@ -2045,9 +2045,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	 * everywhere, while a paused one keeps counting in every KPI (the repo picker
 	 * now lists it, marked paused, rather than dropping it).
 	 *
-	 * Re-reads the registry rather than taking the caller's entry: `registerRepo` /
-	 * `deregisterRepo` are the writers, and what has to be projected is the state
-	 * they LANDED (registerRepo clears `disabledAt`, deregisterRepo stamps it).
+	 * Re-reads the registry rather than taking the caller's entry: `registerRepo` is
+	 * the writer, and what has to be projected is the row it LANDED. The paused half
+	 * is not read from the registry at all — `projectRepoRegistryState` asks each
+	 * clone's own `profile.json`, the machine's one disable switch.
 	 *
 	 * The ONE write this process makes to the database, and it is now an ordinary
 	 * one. It used to stand down unless the file was already at this build's schema

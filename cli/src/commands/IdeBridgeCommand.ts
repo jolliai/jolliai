@@ -206,11 +206,13 @@ const MANUALLY_DISABLED_RESULT = { ok: false, manuallyDisabled: true } as const;
  * long-lived server the JVM host already has running, and every backend has the
  * same bare in-memory gate, so the exposure is not specific to one route.
  *
- * `readManualDisableFlag` is the disk-backed, async read, and it answers
- * `userDisabled` — NOT the composite `manuallyDisabled`, which also folds in the
- * cutover fence. Reading the composite would stop the new runtime on exactly
- * the repos whose orphan branch is frozen, i.e. the ones where SQLite is the
- * only place a memory can go.
+ * `readManualDisableFlag` is the disk-backed, async read, and it answers the
+ * single `manuallyDisabled` switch — the retired `userDisabled` is only folded
+ * onto it on read, never consulted for a decision of its own. What must stay
+ * true of that switch is that the cutover fence is NOT folded into it: a
+ * composite (the fence was folded in once) would stop the new runtime on
+ * exactly the repos whose orphan branch is frozen, i.e. the ones where SQLite
+ * is the only place a memory can go.
  *
  * Checked BEFORE the write path takes its orphan-write lock, same as the
  * `repo-hooks` action: a disabled repo should not contend for a lock, and the

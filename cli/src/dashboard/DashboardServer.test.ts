@@ -43,7 +43,6 @@ vi.mock("./RepoRegistry.js", async (importOriginal) => ({
 		worktreeRoot: "/tmp/acme-api",
 		enabledAt: "2026-01-01T00:00:00.000Z",
 	}),
-	deregisterRepo: vi.fn().mockResolvedValue("r1"),
 	readRepoRegistry: vi.fn().mockResolvedValue({ version: 1, repos: [] }),
 }));
 // unlink is wrapped (not replaced) so every other state-file test keeps its

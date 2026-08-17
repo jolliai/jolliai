@@ -196,6 +196,20 @@ export function isAffirmative(answer: string): boolean {
 }
 
 /**
+ * The `[y/N]` counterpart: Enter is NOT a yes.
+ *
+ * Kept beside {@link isAffirmative} so the pair is visible at once — the two differ
+ * only in what an empty answer means, which is the whole point of choosing between
+ * them. Reach for this one wherever the default has to be "change nothing": a
+ * prompt that reverses an explicit decision the user already made cannot treat a
+ * reflexive Enter as consent.
+ */
+export function isExplicitYes(answer: string): boolean {
+	const a = answer.trim().toLowerCase();
+	return a === "y" || a === "yes";
+}
+
+/**
  * Hard cap on `--arg-stdin` payload size. The flag only ever carries a branch
  * name or short keyword query (skill templates pipe a single line via here-doc).
  * 64 KiB is many orders of magnitude above any legitimate input but small

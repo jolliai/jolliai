@@ -2,13 +2,16 @@
  * RepoForget — removing a repo from this machine's dashboard, by IDENTITY.
  *
  * The registry and the `repos` table both used to be append-only in practice,
- * and the reason was not a missing cleanup pass: the only removal entry point,
- * `deregisterRepo`, resolves its target from `cwd`, so a checkout that no longer
- * exists can never be named — and it stamps `disabledAt` rather than removing
- * anything. Entries for deleted directories, renamed local-only repos and
- * fixture checkouts under `%TEMP%` therefore accumulated with no code path able
- * to reach them, kept being shipped to the browser in every page payload, and
- * kept costing every sweep a pass.
+ * and the reason was not a missing cleanup pass: every entry point resolved its
+ * target from `cwd` (`getProjectRootDir` then `resolveRepoIdentity`), so a
+ * checkout that no longer exists could never be named. Entries for deleted
+ * directories, renamed local-only repos and fixture checkouts under `%TEMP%`
+ * therefore accumulated with no code path able to reach them, kept being shipped
+ * to the browser in every page payload, and kept costing every sweep a pass.
+ *
+ * Note this is removal and NOT the disable switch, which lives in each
+ * checkout's own `profile.json` (`manuallyDisabled`) and is recorded nowhere in
+ * this registry — a disabled repo is still a repo the machine has.
  *
  * So this module is the identity-addressed removal, and everything else is a
  * caller: the dashboard's per-row control, the unattended prune of

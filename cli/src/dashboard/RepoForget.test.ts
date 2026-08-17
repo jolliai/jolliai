@@ -409,19 +409,18 @@ describe("classifyRegistryEntry", () => {
 });
 
 describe("surveyRepoRegistry", () => {
-	it("groups every entry, disabled ones included", async () => {
+	it("groups every entry, including ones the active list would drop", async () => {
 		const live = join(dir, "live");
 		mkdirSync(live);
 		writeRegistry([
 			entry({ repoIdentity: "local:live", worktreeRoot: live, worktrees: [live] }),
 			entry({ repoIdentity: "local:temp", worktreeRoot: join(dir, "gone-1") }),
-			// Disabled AND gone: `listActiveRepos` would filter it out, which is why
-			// the survey reads the whole registry.
-			entry({
-				repoIdentity: "https://github.com/a/b",
-				worktreeRoot: join(dir, "gone-2"),
-				disabledAt: "2026-08-02T00:00:00.000Z",
-			}),
+			// Remote-backed and gone, so `dead` rather than `disposable`. The survey
+			// reads the whole registry rather than `listActiveRepos` because that
+			// predicate answers from each checkout's own `profile.json` — a question
+			// this survey never asks, and one a vanished directory cannot answer at
+			// all, so filtering on it would hide the very rows this exists to find.
+			entry({ repoIdentity: "https://github.com/a/b", worktreeRoot: join(dir, "gone-2") }),
 		]);
 
 		const survey = await surveyRepoRegistry({ configDir, tempRoots: [dir], platform: "linux" });

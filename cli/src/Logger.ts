@@ -98,6 +98,20 @@ export function resetLogDir(): void {
  * hook/worker process starts while disabled; and those processes independently
  * gate at their own entry on the async, disk-backed `readManualDisableFlag`
  * (e.g. PostCommitHook, QueueWorker), which is the flag that counts there.
+ *
+ * **A CACHE, never a second flag — and widening who arms it is a review
+ * blocker.** `manuallyDisabled` in `profile.json` is the ONE switch, and it is
+ * PER REPO; this is a single process-wide boolean, so it can only stand in for
+ * that switch in a process serving exactly one repo. The VS Code extension host
+ * is that process, which is why it is the only one that seeds it. Arming it from
+ * the surfaces where the gate is inert would look like it makes "disabled ⇒
+ * nothing on disk" universal and would instead create a second, wrong switch:
+ * every one of those processes has a multi-repo reader in its graph
+ * (`SettingsMutations` iterating a repo's clones, `AutoCutover` and `DbBackfill`
+ * sweeping the whole roster through `isRepoDisabled`), so reading repo B's flag
+ * would mute logging for repo A — silently, and in the direction that loses
+ * evidence. If that property is ever wanted for CLI processes, it needs a
+ * per-repo answer keyed on the active log dir, not this boolean.
  */
 let _manuallyDisabled = false;
 

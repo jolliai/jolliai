@@ -290,7 +290,7 @@ export async function applyRepoRegistryFix(
  *
  * A `fail` with no fixer, and both halves are deliberate. It is a fault rather
  * than a warning because every writer of this file — `registerRepo`,
- * `ensureWorktreeListed`, `deregisterRepo`, the prune — is a read-modify-write
+ * `ensureWorktreeListed`, `removeReposFromRegistry`, the prune — is a read-modify-write
  * over `readRepoRegistryStrict`, so an unreadable registry means no repo can
  * register on this machine until it is dealt with. And there is no fixer because
  * the remedy is the one thing this command must not do unasked: the file has to be

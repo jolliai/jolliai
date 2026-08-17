@@ -30,6 +30,7 @@ import { loadAuthToken } from "../auth/AuthConfig.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getSummaryCount, setActiveStorage } from "../core/SummaryStore.js";
@@ -40,7 +41,7 @@ import { isGitPipelineFullyInstalled } from "../install/GitHookInstaller.js";
 import { install } from "../install/Installer.js";
 import { createLogger, errMsg, setLogDir } from "../Logger.js";
 import { runBackfillFrontDoorStep } from "./BackfillFrontDoorStep.js";
-import { isAffirmative, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
+import { isAffirmative, isExplicitYes, isInsideGitWorkTree, promptText, resolveProjectDir } from "./CliUtils.js";
 import { importDashboardHistory, startForegroundDashboard } from "./DashboardCommand.js";
 import { promptSetup } from "./EnableCommand.js";
 import { canGenerateNow, promptGenerationFix } from "./GenerationFix.js";
@@ -191,8 +192,23 @@ export async function runGuidedFrontDoor(): Promise<void> {
 	// ── Enable axis: offer to enable AFTER identity/provider are settled. ──
 	if (!enabled) {
 		const repoName = basename(cwd);
-		const answer = await promptText(`\n  Enable Jolli Memory in ${repoName}? [Y/n] `);
-		if (!isAffirmative(answer)) {
+		// The DEFAULT encodes what we believe the user wants, so it cannot be the same
+		// for both repos that arrive here. A repo that was never set up wants enabling;
+		// a repo the user switched off themselves wants to stay off — and a disabled
+		// repo has its hooks removed, so `enabled` is false and this prompt is
+		// UNAVOIDABLE for it. With one default, running `jolli` just to read the status
+		// and pressing Enter silently undid an explicit decision (`install` clears the
+		// switch, the repo is registered again, and a cutover attempt follows).
+		//
+		// The sync reader, deliberately: this is a question about wording, and the
+		// async one migrates and persists.
+		const previouslyDisabled = readManualDisableFlagSync(cwd);
+		const answer = await promptText(
+			previouslyDisabled
+				? `\n  You switched Jolli Memory off in ${repoName}. Turn it back on? [y/N] `
+				: `\n  Enable Jolli Memory in ${repoName}? [Y/n] `,
+		);
+		if (!(previouslyDisabled ? isExplicitYes(answer) : isAffirmative(answer))) {
 			console.log("\n  Not enabled. Run `jolli` or `jolli enable` anytime.\n");
 			return; // exitCode stays 0 — a valid choice, not an error.
 		}
@@ -305,12 +321,13 @@ async function importLocalDashboard(cwd: string): Promise<void> {
 	// than left to the importer, so nothing below announces a dashboard this
 	// runtime cannot serve. Same gate as `jolli enable`.
 	if (!canUseDashboardDb()) return;
-	// Throttled, unlike `jolli enable`'s one-shot call: this runs on every bare
-	// `jolli`, and the cutover's containment compare reads every file the frozen
-	// tip lists. `executeDashboard` throttles for exactly this reason, and that
-	// was lost for a while when this switched from calling it to calling the
-	// import directly.
-	await importDashboardHistory(cwd, {}, { throttleCutover: true });
+	// Unthrottled, like every foreground caller. This used to pass a throttle
+	// because a bare `jolli` is typed many times a day and the cutover's
+	// containment compare reads every file the frozen tip lists — but a repo that
+	// cut over short-circuits ahead of that window, so the only runs it ever
+	// suppressed were the retries of an attempt that had failed. That is the one
+	// case where a user standing at a terminal is about to retry anyway.
+	await importDashboardHistory(cwd);
 }
 
 /**

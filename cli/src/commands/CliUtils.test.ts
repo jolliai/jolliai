@@ -222,6 +222,27 @@ describe("CliUtils", () => {
 		});
 	});
 
+	describe("isExplicitYes", () => {
+		it("treats Enter (empty) as NO — the whole difference from isAffirmative", async () => {
+			// The `[y/N]` half of the pair. Callers reach for it where the default has
+			// to be "change nothing", so a reflexive Enter cannot consent to reversing
+			// a decision the user already made.
+			const { isExplicitYes } = await import("./CliUtils.js");
+			expect(isExplicitYes("")).toBe(false);
+			expect(isExplicitYes("   ")).toBe(false);
+		});
+
+		it.each(["y", "Y", "yes", "YES", " Yes "])("treats %j as yes", async (input) => {
+			const { isExplicitYes } = await import("./CliUtils.js");
+			expect(isExplicitYes(input)).toBe(true);
+		});
+
+		it.each(["n", "no", "nope", "x"])("treats %j as no", async (input) => {
+			const { isExplicitYes } = await import("./CliUtils.js");
+			expect(isExplicitYes(input)).toBe(false);
+		});
+	});
+
 	describe("formatShortDate", () => {
 		it("formats a valid ISO date as 'Mon DD'", async () => {
 			const { formatShortDate } = await import("./CliUtils.js");

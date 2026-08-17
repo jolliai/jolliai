@@ -67,7 +67,13 @@ import type {
 	StatsModelUsage,
 } from "./DashboardModel.js";
 import { sessionEventId } from "./DashboardModel.js";
-import { existingWorktrees, hasLiveWorktree, type RegisteredRepo, readRepoCutoverFence } from "./RepoRegistry.js";
+import {
+	existingWorktrees,
+	hasLiveWorktree,
+	isRepoDisabled,
+	type RegisteredRepo,
+	readRepoCutoverFence,
+} from "./RepoRegistry.js";
 import {
 	countMemoriesAbsentFromListing,
 	EMPTY_IMPORT_RESULT,
@@ -366,14 +372,18 @@ export interface DbBackfillResult {
 	/**
 	 * 'bootstrapped' = full import ran; 'recovered' = incremental pass;
 	 * 'skipped' = the repo errored out; 'unavailable' = no registered checkout
-	 * exists on disk, so nothing was attempted (see {@link dbBackfillRepos}).
+	 * exists on disk, so nothing was attempted; 'disabled' = the user has Jolli
+	 * switched off for it, so only its paused state was projected (both in
+	 * {@link dbBackfillRepos}).
 	 *
-	 * The last two are deliberately different words for different facts: a
-	 * 'skipped' repo is a failure to report against the repo, an 'unavailable'
-	 * one is a repo that is not here right now. A caller that prints them the
-	 * same way turns an unmounted network share into "migration failed".
+	 * The last three are deliberately different words for different facts: a
+	 * 'skipped' repo is a failure to report against the repo, an 'unavailable' one
+	 * is a repo that is not here right now, and a 'disabled' one is the user's own
+	 * decision. A caller that prints them the same way turns an unmounted network
+	 * share into "migration failed" — and a caller that counts any of the three as
+	 * WORKED reports imports that never happened.
 	 */
-	readonly mode: "bootstrapped" | "recovered" | "skipped" | "unavailable";
+	readonly mode: "bootstrapped" | "recovered" | "skipped" | "unavailable" | "disabled";
 	readonly eventsApplied: number;
 	/**
 	 * What the session tier saw and did, for the caller's one-line report. Absent on
@@ -1266,31 +1276,52 @@ function repoEnabledEvent(repo: RegisteredRepo): StatsEvent {
 }
 
 /**
- * Projects ONE repo's registry state — enabled or disabled — and nothing else.
+ * Projects ONE repo's state — enabled or disabled — and nothing else.
  *
- * The registry (`repos.json`) and the `repos` table are two stores, and only
- * the projection makes the second agree with the first. Every read surface
- * filters on `repos.disabled_at IS NULL`, so a registry write that is never
- * projected is invisible in both directions: an enabled repo whose row does not
- * exist has no memories, no KPIs and no page (every gated route redirects), and
- * a disabled repo whose `disabled_at` is still NULL keeps counting in every KPI
- * and picker. `jolli enable` gets the projection for free from the full
- * DB backfill it runs; a long-lived server mutating the registry over HTTP does
- * not, and that is exactly the caller this exists for.
+ * The switch itself lives in each clone's `profile.json` (the registry stores no
+ * disable state; see `listActiveRepos`), and the `repos` table is a projection of
+ * it. Only this function makes the second agree with the first. Every read surface
+ * filters on `repos.disabled_at IS NULL`, so an unprojected state is invisible in
+ * both directions: an enabled repo with no row has no memories, no KPIs and no
+ * page (every gated route redirects), while a disabled repo whose `disabled_at` is
+ * still NULL keeps counting in every KPI and picker. That second half is why a
+ * disabled repo must still be projected even though nothing will be imported for
+ * it — dropping it from the sweep entirely would leave the row saying "enabled"
+ * forever.
  *
- * Cheap by construction — two rows, no git, no import — so it is safe to await
- * inside a request handler before answering. The heavier memory import stays
- * `dbBackfillRepo`'s job.
+ * **The timestamp is preserved, never refreshed.** A boolean cannot say when the
+ * user flipped it, so the stamp is minted on the NULL → set transition and left
+ * alone afterwards. Re-minting it would be invisible today (only nullness is read
+ * — `DashboardQuery`'s paused sort and badge) and wrong the moment anything shows
+ * "paused since", since every `jolli dashboard` re-projects and the date would
+ * track the last launch instead of the decision.
+ *
+ * Cheap by construction — one lookup, two rows, no git, no import — so it is safe
+ * to await inside a request handler before answering. The heavier memory import
+ * stays `dbBackfillRepo`'s job.
  */
 export function projectRepoRegistryState(
 	db: DashboardDbHandle,
 	repo: RegisteredRepo,
 	opts: { readonly now?: () => number } = {},
 ): void {
-	const event: StatsEvent = repo.disabledAt
-		? { type: "repo.disabled", repoIdentity: repo.repoIdentity, disabledAt: repo.disabledAt }
+	const now = opts.now ?? Date.now;
+	const event: StatsEvent = isRepoDisabled(repo)
+		? {
+				type: "repo.disabled",
+				repoIdentity: repo.repoIdentity,
+				disabledAt: storedDisabledAt(db, repo.repoIdentity) ?? new Date(now()).toISOString(),
+			}
 		: repoEnabledEvent(repo);
-	applyBatches(db, [event], "bootstrap", opts.now ?? Date.now);
+	applyBatches(db, [event], "bootstrap", now);
+}
+
+/** The `disabled_at` already recorded for this identity, or null when enabled/absent. */
+function storedDisabledAt(db: DashboardDbHandle, repoIdentity: string): string | null {
+	const row = db.prepare("SELECT disabled_at FROM repos WHERE repo_identity = ?").get(repoIdentity) as
+		| { disabled_at?: string | null }
+		| undefined;
+	return row?.disabled_at ?? null;
 }
 
 /**
@@ -2132,10 +2163,10 @@ export async function dbBackfillRepos(
 	// the recorded path rather than returning nothing, so sweeping such an entry
 	// runs `git` against a directory that does not exist: three warnings per repo
 	// per pass (HEAD unreadable → collection failed → prune skipped), on every
-	// `jolli dashboard` launch, forever — nothing prunes the registry, and
-	// `deregisterRepo` cannot reach a deleted directory. It is also not a failure
-	// worth a `mode: "skipped"` result, which the caller prints as "migration
-	// failed": there is no repo left to migrate.
+	// `jolli dashboard` launch, forever — nothing prunes the registry, and no
+	// mutation removes an entry. It is also not a failure worth a `mode: "skipped"`
+	// result, which the caller prints as "migration failed": there is no repo left
+	// to migrate.
 	//
 	// Deliberately NOT deregistration: the same predicate answers "temporarily
 	// unmounted" (network share, external drive, a worktree being recreated), and
@@ -2151,12 +2182,61 @@ export async function dbBackfillRepos(
 	// row lets the caller say it once per run, in the terminal it owns, without
 	// resurrecting the three warnings per repo per pass this replaced.
 	const unavailable: DbBackfillResult[] = [];
+	// A repo the user switched off is dropped from the sweep for the same reason it
+	// keeps a result row: nothing may be imported for it, but its PAUSED STATE still
+	// has to reach the database. Filtering it out further upstream (in
+	// `listActiveRepos`, where the same predicate lives) would leave
+	// `repos.disabled_at` NULL forever, so a repo disabled from the VS Code sidebar
+	// would keep counting in every KPI and reading as enabled on the page — the
+	// second half of the bug this change closes, and the half that has no other
+	// caller to fix it.
+	//
+	// Deliberately UNREPORTED to the terminal, unlike `unavailable`. That one is
+	// printed because "no checkout on disk" is also what an unmounted share looks
+	// like, and the user is still expecting those memories; this one is the user's
+	// own decision, already visible as the paused row on the page they are opening.
+	// Announcing it on every launch would be noise about a state they chose.
+	const disabled: DbBackfillResult[] = [];
+	const pausedRepos: RegisteredRepo[] = [];
 	const live = repos.filter((repo) => {
-		if (hasLiveWorktree(repo)) return true;
-		log.debug("skipping %s -- no registered worktree exists on disk (%s)", repo.repoName, repo.worktreeRoot);
-		unavailable.push({ mode: "unavailable", eventsApplied: 0, repoName: repo.repoName });
-		return false;
+		if (!hasLiveWorktree(repo)) {
+			log.debug("skipping %s -- no registered worktree exists on disk (%s)", repo.repoName, repo.worktreeRoot);
+			unavailable.push({ mode: "unavailable", eventsApplied: 0, repoName: repo.repoName });
+			return false;
+		}
+		if (isRepoDisabled(repo)) {
+			log.debug("skipping %s -- Jolli is switched off in every checkout", repo.repoName);
+			disabled.push({ mode: "disabled", eventsApplied: 0, repoName: repo.repoName });
+			pausedRepos.push(repo);
+			return false;
+		}
+		return true;
 	});
+	// ONE open for the whole paused set, and none at all when it is empty —
+	// `dbBackfillRepos([])` must stay a no-op that cannot bring a database into
+	// existence.
+	let paused: ReadonlyArray<DbBackfillResult> = disabled;
+	if (pausedRepos.length > 0) {
+		try {
+			await withDashboardDb(
+				(db) => {
+					for (const repo of pausedRepos) {
+						projectRepoRegistryState(db, repo, rest.now ? { now: rest.now } : {});
+					}
+				},
+				rest.dbPath ? { dbPath: rest.dbPath } : {},
+			);
+		} catch (err) {
+			// Reported, not swallowed: an unprojected pause is the exact state this
+			// block exists to remove, and the row keeps reading as enabled until some
+			// later run manages it. Downgraded to `skipped` because that is the mode the
+			// caller already prints per repo — `disabled` is deliberately silent, which
+			// is right for success and wrong for this.
+			const error = errMsg(err);
+			log.warn("cannot project paused repos: %s", error);
+			paused = disabled.map((row) => ({ ...row, mode: "skipped" as const, error }));
+		}
+	}
 	// ONE read of each machine-global store for the whole run, hoisted out of the loop
 	// below. Not one of these stores is keyed by repo — Claude by a lossily encoded
 	// path, Codex by DATE, OpenCode / Copilot CLI / Devin / Cursor by nothing at all
@@ -2254,7 +2334,7 @@ export async function dbBackfillRepos(
 	// Appended, not prepended: a caller reading the list in order should see the
 	// repos that were worked on first, and these carry no per-repo detail to
 	// interleave with them.
-	return [...results, ...unavailable];
+	return [...results, ...paused, ...unavailable];
 }
 
 /** Options for {@link dbRescanSessions}. */

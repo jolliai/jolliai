@@ -12,9 +12,9 @@
  *
  *   outside the lock  1. pin every source's orphan tip Tᵢ (reads go through
  *                        `<sha>:<path>`, never a ref name)
- *                     2. full import of every source @Tᵢ (re-runnable)
- *                     3. full per-source compare @Tᵢ — the one moment that
- *                        can prove the database holds everything
+ *                     2. full import of every source @Tᵢ (re-runnable) — THE
+ *                        gate: an import that fails throws and nothing freezes
+ *                     3. full per-source compare @Tᵢ — a REPORT, not a gate
  *   fence             write the fence pair into EVERY source's profile.json
  *                     (any failure means the fence did not go up — stay in
  *                     prepare and retry; entering half-fenced strands clones)
@@ -28,6 +28,35 @@
  * The critical section is a rev-parse per source plus one transaction —
  * milliseconds, far under any writer's budget. Retry is the NORMAL path for
  * an active repo, not an error.
+ *
+ * Step 3 is deliberately NOT a veto, and that is a decision rather than an
+ * omission. It used to be: any single path that would not read back kept the
+ * repo at `uncutover` forever. On a real branch that is not a safety property,
+ * it is a permanent block — a handful of paths the import can NEVER store
+ * (a summary whose embedded `children[]` names a commit with no summary file of
+ * its own, a body rewritten in place after the row was written) are stable and
+ * self-sustaining, so every attempt fails on the same path and the repo can
+ * never leave the legacy branch. The gate that means something is step 2: an
+ * import that hit a real fault THROWS, and nothing downstream of it runs. What
+ * step 3 answers is "what will stop being served after the freeze", which is
+ * information the user needs and not a reason to refuse — the fence FREEZES the
+ * branch rather than deleting it, so those bytes stay recoverable by hand.
+ * The findings are logged and recorded on the `CutoverRecord`.
+ *
+ * The refusals that survive are asked of the IMPORT rather than of the compare:
+ * a source the import stored nothing from did not land, and freezing there
+ * strands the whole repo. Neither is spelled "the compare disagreed on every
+ * path" — a repo holding one dirty summary mismatches 1-of-1 and would be
+ * refused by that spelling, which is the permanent block this design exists to
+ * remove (measured on a real repo). There are two, and they are one rule seen
+ * from two sides rather than a rule plus an escalation:
+ *   - `summaries/` listed, zero summary rows → refuse. The original, unchanged.
+ *     Summaries ARE the memories, so nothing else landing excuses their absence.
+ *   - ANY family listed, zero rows of EVERY kind → refuse. Covers only the
+ *     branch the first cannot see, one carrying no summary at all (reachable:
+ *     ide-bridge `write-plan`). Strictly narrower, so it cannot block a repo
+ *     whose import partially works.
+ * Neither is a per-family veto and neither may become one — see `storedNothing`.
  *
  * One-way rules that must never soften:
  * - After the fence, gap-fill is ONLY `catch-up` (seed's reconciliation would
@@ -51,11 +80,26 @@ import { invalidateSotRouteCache } from "../core/SotStorageResolver.js";
 import { SqliteStorage } from "../core/SqliteStorage.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
+import {
+	type CutoverBlockCode,
+	type CutoverBlockRecord,
+	clearCutoverBlockRow,
+	cutoverBlockWitness,
+	readCutoverBlockRow,
+	writeCutoverBlockRow,
+} from "./CutoverBlock.js";
 import type { CutoverRecord } from "./CutoverRouter.js";
-import { inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
+import {
+	canUseDashboardDb,
+	getDashboardDbPath,
+	inTransaction,
+	withDashboardDb,
+	withReadonlyDashboardDb,
+} from "./DashboardDb.js";
+import { classifyDbFiles } from "./DbDetection.js";
 import { IMPORT_FAMILIES, importTakesPath } from "./ImportablePaths.js";
 import { existingWorktrees, type RegisteredRepo, readRepoRegistry, resolveRepoIdentityForCwd } from "./RepoRegistry.js";
-import { countMemoriesAbsentFromListing, importRepoMemory } from "./SotImport.js";
+import { countMemoriesAbsentFromListing, importRepoMemory, type SotImportResult } from "./SotImport.js";
 
 const log = createLogger("CutoverEngine");
 
@@ -70,18 +114,175 @@ const log = createLogger("CutoverEngine");
  */
 const CAS_LOCK_TIMEOUT_MS = 15_000;
 
+/**
+ * The pinned tip of a source that has NO orphan branch at all.
+ *
+ * A repo that never generated a memory — a fresh `jolli enable`, or one whose
+ * branch was deleted — used to be `not-ready` forever, which is the same
+ * permanent block as a dirty path and worse: there is nothing to migrate, so
+ * there is nothing that could ever make the answer change. It cuts over
+ * instead, and the freeze is not a formality — it is what stops an old runtime
+ * from CREATING the branch afterwards and writing memories nothing reads.
+ *
+ * The empty string rather than null so it survives `Record<string, string>` on
+ * the record and the fence unchanged. Every comparison against a live tip must
+ * fold `resolveCommittish`'s null onto it, or a source with no branch reads as
+ * having moved on the very next check (`null !== ""`).
+ */
+export const NO_ORPHAN_TIP = "";
+
+/**
+ * What a source with no orphan branch is imported FROM.
+ *
+ * Not "skip the import": the import is also what registers the repo's row in
+ * the database, and the CAS's recording transaction looks that row up — so
+ * skipping it made a branch-less repo report `not-ready` from the one step
+ * that runs after the fence is already up. A provider that lists nothing runs
+ * the whole import for zero artifacts, which is the honest shape of "there was
+ * nothing to migrate". `catch-up` never deletes, so it also cannot mistake an
+ * empty listing for a prune instruction.
+ */
+const EMPTY_ORPHAN_STORAGE: StorageProvider = {
+	// No `kind`: it is optional on the interface, and this is not any of the
+	// real backends. Claiming one would be a lie the moment something branches
+	// on it (nothing does today — the import only calls readFile /
+	// batchReadFiles / listFiles).
+	async readFile() {
+		return null;
+	},
+	async batchReadFiles(paths) {
+		return new Map(paths.map((p) => [p, null]));
+	},
+	async listFiles() {
+		return [];
+	},
+	/* v8 ignore start -- the import never writes and never asks; these three exist to satisfy the interface, and writeFiles is loud rather than a silent no-op so a caller that reaches for it cannot believe the write landed */
+	async writeFiles() {
+		throw new Error("no orphan branch: this source is read-only during cutover");
+	},
+	async exists() {
+		return false;
+	},
+	async ensure() {},
+	/* v8 ignore stop */
+};
+
+/**
+ * Does this source's pinned tip list any SUMMARY the import would take?
+ *
+ * The denominator for the original refusal, unchanged. `importTakesPath` is what
+ * makes it honest: a branch holding only `summaries/x.json.bak` lists a path the
+ * import is DESIGNED to ignore, so counting it would refuse a repo whose import
+ * was correct and complete.
+ */
+async function listsSummaries(pinned: StorageProvider): Promise<boolean> {
+	const listed = await pinned.listFiles("summaries/");
+	return listed.some((p) => importTakesPath("summaries/", p));
+}
+
+/**
+ * Does this source's pinned tip list ANY artifact the import would take, in any
+ * of the eight families?
+ *
+ * The denominator for the SECOND refusal, which exists only to cover a branch
+ * {@link listsSummaries} cannot see at all: one carrying no summary. That is a
+ * reachable shape, not a hypothetical — the ide-bridge `write-plan` action calls
+ * `storePlans` directly, with no commit and no summary behind it, so an IDE can
+ * put `plans/` on the branch before anything else exists. Such a source answered
+ * "lists nothing" to the only test there was, so the freeze went ahead however
+ * little the database had taken.
+ *
+ * Short-circuits on the first family that has one, and is only ever reached when
+ * the import already reported storing nothing at all — so the extra `listFiles`
+ * calls are off the normal path entirely.
+ */
+async function listsImportable(pinned: StorageProvider): Promise<boolean> {
+	for (const family of IMPORT_FAMILIES) {
+		const listed = await pinned.listFiles(family);
+		if (listed.some((p) => importTakesPath(family, p))) return true;
+	}
+	return false;
+}
+
+/**
+ * Did the import write NO row of any kind?
+ *
+ * Deliberately the whole-import question, never a per-family one. "The tip lists
+ * notes and the import stored no notes" is a per-family veto, and a per-family
+ * veto is the permanent block this design exists to remove — one un-importable
+ * note would strand the repo forever, with every retry failing on the same file.
+ * What is safe to refuse is an import that landed NOTHING while the branch had
+ * something to give: that is not a partial result, it is a non-result.
+ *
+ * Pairs ONLY with {@link listsImportable}, never with {@link listsSummaries}.
+ * Weakening the summary refusal to this — "nodes is 0 but a plan imported, so
+ * something landed" — would let a repo whose summaries ALL failed freeze on the
+ * strength of one plan file, with every memory it has reported as unreconciled.
+ * The summaries are the memories; one doc is not evidence they arrived.
+ *
+ * `updated` / `skipped` / `pruned` are deliberately absent: they count changes
+ * and non-events, not rows written. A converged re-run legitimately reports
+ * `updated: 0` while having every row already in place.
+ */
+function storedNothing(r: SotImportResult): boolean {
+	return (
+		r.nodes === 0 &&
+		r.transcripts === 0 &&
+		r.docs === 0 &&
+		r.planProgress === 0 &&
+		r.topics === 0 &&
+		r.commitTopics === 0 &&
+		r.aliases === 0 &&
+		r.links === 0
+	);
+}
+
 /** One registered migration source: a clone with its own orphan branch. */
 export interface CutoverSource {
 	/** The clone's main worktree root — where its orphan branch lives. */
 	readonly root: string;
-	/** The pinned orphan tip Tᵢ. */
+	/** The pinned orphan tip Tᵢ, or {@link NO_ORPHAN_TIP} when there is no branch. */
 	readonly tip: string;
 }
 
 export type CutoverOutcome =
-	| { readonly status: "committed"; readonly record: CutoverRecord }
+	| {
+			readonly status: "committed";
+			readonly record: CutoverRecord;
+			/**
+			 * EVERY distinct unreconciled path, uncapped — unlike
+			 * `record.unreconciled.sample`, which stops at
+			 * {@link UNRECONCILED_SAMPLE_CAP}.
+			 *
+			 * Here because this is the only moment the full set exists: the record
+			 * is what survives, and it deliberately stores a sample (see the cap's
+			 * docstring). The recovery instruction the command prints is
+			 * `git show <tip>:<path>`, so a path that reaches neither the output nor
+			 * the record cannot be recovered at all — and pointing the user at
+			 * `debug.log` for the remainder was FALSE, since that line is rendered
+			 * through the same 50-path cap. An interactive report is neither a
+			 * rolling log nor a stored row, so it is the one place the whole list
+			 * belongs.
+			 */
+			readonly unreconciled: ReadonlyArray<string>;
+	  }
 	| { readonly status: "already-cutover" }
-	| { readonly status: "not-ready"; readonly reason: string }
+	| {
+			readonly status: "not-ready";
+			readonly reason: string;
+			/**
+			 * Present only when another identical attempt CANNOT answer differently —
+			 * the two import refusals, never the compare and never a transient fault.
+			 *
+			 * The persisted half of this lives in `repo_state`; see
+			 * {@link ./CutoverBlock} for why a memo is the only form of backoff that
+			 * cannot suppress a retry that would now succeed. Carried out here as well
+			 * because `maybeAutoCutover` logs one line per deferred repo, and
+			 * "deferred, will retry" and "deferred, and nothing will change until an
+			 * input does" are different facts about that repo.
+			 */
+			readonly stable?: CutoverBlockCode;
+	  }
 	| { readonly status: "retry-exhausted"; readonly reason: string };
 
 export interface CutoverOptions {
@@ -94,13 +295,24 @@ export interface CutoverOptions {
 	 * a full orphan fixture. Defaults to {@link compareSourceContainment}.
 	 * MUST implement containment (orphan ⊆ DB), never equality — see header.
 	 */
-	readonly compare?: (orphan: StorageProvider, sqlite: SqliteStorage) => Promise<{ ok: boolean; detail: string }>;
+	readonly compare?: (orphan: StorageProvider, sqlite: SqliteStorage) => Promise<CompareVerdict>;
 	/** Critical-section lock budget; test seam for {@link CAS_LOCK_TIMEOUT_MS}. */
 	readonly lockTimeoutMs?: number;
 }
 
+/** What one source's compare found. `ok` is exactly `unreconciled.length === 0`. */
+export interface CompareVerdict {
+	readonly ok: boolean;
+	/** One line for the user: the FIRST finding, or the count on success. */
+	readonly detail: string;
+	/** How many paths were visited — the denominator the caller judges against. */
+	readonly checked: number;
+	/** Every visited path the database did not reproduce, in compare order. */
+	readonly unreconciled: ReadonlyArray<string>;
+}
+
 /**
- * The default compare: every path the IMPORT WOULD TAKE must read back from the
+ * The default compare: every path the IMPORT WOULD TAKE is read back from the
  * database. Byte-exact for every family except summaries, which use the
  * measured criterion (children are reassembled from CURRENT child rows —
  * fresher than the parent file's stale embedded copies) — shell-equal with an
@@ -111,12 +323,25 @@ export interface CutoverOptions {
  * difference is the whole point — see `ImportablePaths`. The old form demanded
  * the database answer for files the import is designed never to store, which it
  * can never do, on every attempt, forever.
+ *
+ * EVERY finding is collected rather than the first one returned. That is what
+ * makes this a report: the caller no longer refuses on a finding, so "the first
+ * bad path" is not an answer any more — the user needs the whole list of what
+ * stops being served, and the caller needs the count to tell a few dirty paths
+ * apart from a database that answered for nothing. `detail` keeps naming the
+ * first finding, because one line is what a command prints.
  */
 export async function compareSourceContainment(
 	orphan: StorageProvider,
 	sqlite: SqliteStorage,
-): Promise<{ ok: boolean; detail: string }> {
+): Promise<CompareVerdict> {
 	let checked = 0;
+	const unreconciled: string[] = [];
+	let firstDetail = "";
+	const note = (path: string, detail: string): void => {
+		if (firstDetail === "") firstDetail = detail;
+		unreconciled.push(path);
+	};
 	for (const prefix of IMPORT_FAMILIES) {
 		const listed = await orphan.listFiles(prefix);
 		const paths = listed.filter((p) => importTakesPath(prefix, p));
@@ -137,9 +362,12 @@ export async function compareSourceContainment(
 			const b = got.get(path);
 			checked++;
 			if (a === b) continue;
-			if (a == null || b == null) return { ok: false, detail: `${path}: missing from the database` };
+			if (a == null || b == null) {
+				note(path, `${path}: missing from the database`);
+				continue;
+			}
 			if (path.startsWith("summaries/") && summariesEquivalent(a, b)) continue;
-			return { ok: false, detail: `${path}: content differs` };
+			note(path, `${path}: content differs`);
 		}
 		// The two synthesized union views are not importable paths, so the loop
 		// above never yields them. They still have to be compared — by containment,
@@ -151,13 +379,14 @@ export async function compareSourceContainment(
 			if (!listed.includes(view)) continue;
 			checked++;
 			const verdict = await compareUnionView(view, orphan, sqlite, listed);
-			if (!verdict.ok) return verdict;
+			if (!verdict.ok) note(view, verdict.detail);
 		}
 	}
 	// index.json / catalog.json are synthesized views; their entries are
 	// covered by the summaries family above, so they are deliberately not
 	// byte-compared (entry order and stale copies are allowlisted).
-	return { ok: true, detail: `${checked} path(s) contained` };
+	if (unreconciled.length === 0) return { ok: true, detail: `${checked} path(s) contained`, checked, unreconciled };
+	return { ok: false, detail: firstDetail, checked, unreconciled };
 }
 
 /**
@@ -257,6 +486,22 @@ function dropUnbackedTopicEntries(
 		// the stricter one. `kept: 1` keeps a null database side a failure here.
 		return { filtered: indexJson, kept: 1, dropped: [] };
 	}
+}
+
+/**
+ * How many unreconciled paths a log line and the stored record carry.
+ *
+ * The COUNT is always the exact number of DISTINCT paths; only the list is a
+ * sample. A branch can carry hundreds of unreconcilable paths, and neither
+ * `debug.log` nor a `repo_state` row is the right place for all of them — the
+ * frozen branch itself is, and it is still there.
+ */
+const UNRECONCILED_SAMPLE_CAP = 50;
+
+/** `a, b, c … (+N more)` — the bounded rendering of a findings list. */
+function previewPaths(paths: ReadonlyArray<string>): string {
+	if (paths.length <= UNRECONCILED_SAMPLE_CAP) return paths.join(", ");
+	return `${paths.slice(0, UNRECONCILED_SAMPLE_CAP).join(", ")} (+${paths.length - UNRECONCILED_SAMPLE_CAP} more)`;
 }
 
 /** The refined summary criterion: byte-equal with children emptied on both sides, same child set/order. */
@@ -367,11 +612,11 @@ export async function probeCutoverDrift(
 	const { identity } = await resolveRepoIdentityForCwd(cwd);
 	const dbOpts = opts.dbPath ? { dbPath: opts.dbPath } : {};
 	// READ-ONLY, and tolerant of a database this build cannot open. A writable
-	// open runs `migrateDashboardDb`, so a probe would migrate the schema as a
-	// side effect; and on a database a NEWER surface already migrated, every
-	// writable open throws — which `runCutover` guards for and `--probe` did not,
-	// so it stack-traced out of `CutoverCommand`'s uncaught action. An absent or
-	// unreadable database has no cutover record, which is "no drift to report".
+	// open runs `migrateDashboardDb`, so a probe — a diagnostic — would migrate
+	// the schema as a side effect of being asked a question. (A NEWER format is
+	// not one of the cases this tolerates: there is no version gate, so such a
+	// file opens and writes normally — see `DASHBOARD_SCHEMA_VERSION`.) An absent
+	// or unreadable database has no cutover record, which is "no drift to report".
 	let record: CutoverRecord | null;
 	try {
 		record = await withReadonlyDashboardDb((db) => {
@@ -403,7 +648,12 @@ export async function probeCutoverDrift(
 			continue;
 		}
 		const currentTip = await resolveCommittish(ORPHAN_BRANCH, root);
-		if (currentTip === recordedTip) continue;
+		// Same fold as the CAS: a source recorded with NO_ORPHAN_TIP still has no
+		// branch, and `null !== ""` would report drift on every probe forever.
+		// The other direction is real drift and the reason this matters — a branch
+		// that did not exist at cutover and does now was created by a writer that
+		// never saw the fence.
+		if ((currentTip ?? NO_ORPHAN_TIP) === recordedTip) continue;
 		drifted.push({ root, recordedTip, currentTip });
 		log.warn(
 			"cutover drift: %s orphan tip %s != recorded %s — someone bypassed the fence",
@@ -478,6 +728,105 @@ async function collectSources(repo: RegisteredRepo): Promise<string[]> {
 	return [...byCommonDir.keys()].sort().map((key) => byCommonDir.get(key) as string);
 }
 
+/** Pins every source's current orphan tip — step 1, and the witness's other half. */
+async function pinSources(roots: ReadonlyArray<string>): Promise<CutoverSource[]> {
+	const sources: CutoverSource[] = [];
+	for (const root of roots) {
+		// No branch is a legal state to cut over FROM, not a refusal — see
+		// NO_ORPHAN_TIP. Steps 2 and 3 skip such a source; step 4 still checks
+		// it, so a branch that appears mid-run is caught as a moved tip.
+		const tip = await resolveCommittish(ORPHAN_BRANCH, root);
+		sources.push({ root, tip: tip ?? NO_ORPHAN_TIP });
+	}
+	return sources;
+}
+
+/**
+ * Records a refusal another attempt cannot change. Best-effort by contract.
+ *
+ * Looks the repo row up itself rather than taking `runCutover`'s preflight id: the
+ * import that just ran is what REGISTERS that row, so a first-ever cutover has no
+ * id at preflight and would silently never record a block. A failure to store it
+ * must not turn a clean refusal into a throw — the cost is one repeated attempt.
+ */
+async function recordCutoverBlock(
+	identity: string,
+	code: CutoverBlockCode,
+	reason: string,
+	sources: ReadonlyArray<CutoverSource>,
+	dbOpts: { dbPath?: string },
+): Promise<void> {
+	try {
+		await withDashboardDb((db) => {
+			const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
+				| { id: number }
+				| undefined;
+			if (!row) return;
+			writeCutoverBlockRow(db, row.id, {
+				code,
+				reason,
+				witness: cutoverBlockWitness(sources),
+				at: Date.now(),
+			});
+		}, dbOpts);
+	} catch (err) {
+		log.warn("could not record the cutover block for %s: %s", identity, errMsg(err));
+	}
+}
+
+/**
+ * The record for `cwd`, but ONLY while it still applies — otherwise null.
+ *
+ * "Applies" is decided by re-deriving the witness, never by elapsed time: an
+ * orphan tip that moved or a different core version means the refusal has to be
+ * re-earned, so the answer is null and the caller attempts immediately with no
+ * window at all. See {@link ./CutoverBlock} for why that is the only backoff shape
+ * allowed here.
+ *
+ * For CALLERS THAT CHOOSE whether to attempt — `maybeAutoCutover`. `runCutover`
+ * itself never consults this: `jolli cutover` typed by hand is the documented
+ * bypass for every gate in this engine, and a user who is looking at the reason
+ * on screen is exactly who should be able to make it try again.
+ *
+ * Never throws, for the same reason `maybeAutoCutover` does not: a repo whose
+ * block cannot be read is a repo that gets attempted.
+ */
+export async function readCutoverBlock(
+	cwd: string,
+	opts: { readonly dbPath?: string } = {},
+): Promise<CutoverBlockRecord | null> {
+	const dbOpts = opts.dbPath ? { dbPath: opts.dbPath } : {};
+	// A database that is not there yet cannot hold a record, and this runs ahead of
+	// EVERY automatic attempt — so the absence is answered here rather than left to
+	// the catch below, which would log a warning per call on every machine that has
+	// not built one. Same classification the router uses for the same reason.
+	if (!canUseDashboardDb()) return null;
+	if (classifyDbFiles(opts.dbPath ?? getDashboardDbPath()) === "absent") return null;
+	try {
+		const { identity } = await resolveRepoIdentityForCwd(cwd);
+		// The row FIRST, and the witness only if there is one: this runs ahead of
+		// every automatic attempt, and the common case is no record at all — which
+		// one indexed query answers, without forking git for a single tip.
+		const record = await withReadonlyDashboardDb((db) => {
+			const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
+				| { id: number }
+				| undefined;
+			return row ? readCutoverBlockRow(db, row.id) : null;
+		}, dbOpts);
+		if (!record) return null;
+		const registry = await readRepoRegistry();
+		const repo = registry.repos.find((r) => r.repoIdentity === identity);
+		if (!repo) return null;
+		const witness = cutoverBlockWitness(await pinSources(await collectSources(repo)));
+		if (witness === record.witness) return record;
+		log.info("cutover block for %s no longer applies — an input changed since it was recorded", cwd);
+		return null;
+	} catch (err) {
+		log.warn("could not read the cutover block for %s: %s", cwd, errMsg(err));
+		return null;
+	}
+}
+
 /**
  * Runs (or resumes) the cutover for the repo at `cwd`. Re-runnable at every
  * stage: prepare re-imports, a fenced repo re-verifies and finishes the CAS.
@@ -515,16 +864,25 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 	// database no longer refuses a build over its version (see the compatibility
 	// note in `DashboardDb`), so the only errors left are real I/O faults, and those
 	// should propagate.
-	const alreadyCommitted = await withDashboardDb((db) => {
+	// One open answers both questions AND retires any stale block record. Clearing
+	// it HERE — before step 1, not at each of the many non-blocking exits — is what
+	// keeps the invariant to one write site and one clear site: this run is about
+	// to re-derive the answer, so whatever a previous run concluded stops being
+	// this build's claim the moment we get past here. Every outcome except the two
+	// refusals below therefore leaves no record, including a throw, which is the
+	// conservative direction (unknown → attempt again).
+	const preflight = await withDashboardDb((db) => {
 		const row = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
 			| { id: number }
 			| undefined;
-		if (!row) return false;
-		return (
-			db.prepare("SELECT 1 AS ok FROM repo_state WHERE repo_id = ? AND key = 'cutover'").get(row.id) !== undefined
-		);
+		if (!row) return { repoId: null, committed: false };
+		const committed =
+			db.prepare("SELECT 1 AS ok FROM repo_state WHERE repo_id = ? AND key = 'cutover'").get(row.id) !==
+			undefined;
+		if (!committed) clearCutoverBlockRow(db, row.id);
+		return { committed };
 	}, dbOpts);
-	if (alreadyCommitted) return { status: "already-cutover" };
+	if (preflight.committed) return { status: "already-cutover" };
 
 	const roots = await collectSources(repo);
 	if (roots.length === 0) return { status: "not-ready", reason: "no live worktree found for this repo" };
@@ -549,15 +907,17 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		if (fence !== null) fencedRoots.set(root, Date.parse(fence.at));
 	}
 	let sources: CutoverSource[] = [];
+	// Reset at the top of every step 3, never appended across attempts: a retry
+	// re-imports and re-compares from scratch, and carrying the previous
+	// attempt's findings would record paths a later import had already fixed.
+	let unreconciled: string[] = [];
 
 	for (let attempt = 0; attempt <= maxRetries; attempt++) {
-		// 1. Pin every source's tip.
-		sources = [];
-		for (const root of roots) {
-			const tip = await resolveCommittish(ORPHAN_BRANCH, root);
-			if (!tip) return { status: "not-ready", reason: `no orphan branch in ${root}` };
-			sources.push({ root, tip });
-		}
+		// 1. Pin every source's tip. Shared with `readCutoverBlock`'s witness on
+		// purpose: the memo compares what THIS step pinned, so a second spelling of
+		// "the current tips" is a way for the two to disagree and for a block to
+		// outlive its inputs.
+		sources = await pinSources(roots);
 
 		// 2. Import each source at its pinned tip. Seed (with reconciliation)
 		// only before the fence and only for a single-source repo — seed prunes
@@ -575,7 +935,10 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// prune must not run in. One listing plus one count, and it can only
 		// ever refuse to prune (a false positive costs stale rows a later
 		// legitimate seed removes).
-		let seedLegal = fencedRoots.size === 0 && sources.length === 1;
+		// A source with no branch has no listing to reconcile against, so the
+		// question does not arise — and asking it would run `ls-tree` on an empty
+		// committish.
+		let seedLegal = fencedRoots.size === 0 && sources.length === 1 && sources[0].tip !== NO_ORPHAN_TIP;
 		if (seedLegal) {
 			// The shared predicate, not a hand-inlined copy of it: this listing is
 			// compared against database rows the IMPORT wrote, so it has to be the
@@ -619,11 +982,10 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// against the branch that is still the source of truth.
 		//
 		// Deliberate consequence: a protected row that DISAGREES with the frozen
-		// bytes then fails step 3's containment compare, so the run ends
-		// `not-ready` and the repo stays `legacy-fenced`. That is the intended
-		// trade — legacy-fenced writes SQLite and reads the database, so it costs
-		// a stuck cutover and a named path in the reason, where importing anyway
-		// costs the regenerated memory with nothing to recover it from.
+		// bytes is reported by step 3 as unreconciled rather than imported over.
+		// The protection is what makes that the right way round — the database
+		// row is the NEWER one, so the frozen file losing the comparison is the
+		// correct outcome, not a fault to fix by rolling the row back.
 		// Steps 2 and 3 answer `not-ready` rather than throwing. On a RETRY they
 		// run with the fence already up, and both can fail for reasons that have
 		// nothing to do with this repo's readiness — a
@@ -635,9 +997,13 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 		// prevent; they just never covered the two steps the retry re-executes.
 		try {
 			for (const source of sources) {
-				const pinned = new GitRefStorage(source.tip, source.root);
+				// A GitRefStorage on an empty committish would ask git to resolve
+				// `:<path>` and fail every read; the empty provider imports zero
+				// artifacts while still registering the repo row the CAS needs.
+				const pinned =
+					source.tip === NO_ORPHAN_TIP ? EMPTY_ORPHAN_STORAGE : new GitRefStorage(source.tip, source.root);
 				const fenceMs = fencedRoots.get(source.root);
-				await withDashboardDb(
+				const result = await withDashboardDb(
 					(db) =>
 						importRepoMemory(db, {
 							repo,
@@ -650,15 +1016,97 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 						}),
 					dbOpts,
 				);
+				// THE gate — asked of the import, never of the compare. An import that
+				// wrote nothing while the branch lists something to write did not land
+				// (every artifact malformed, a storage backend answering nothing), and
+				// freezing there strands the whole repo. Deliberately NOT "the compare
+				// disagreed on everything": a repo whose single summary is dirty
+				// mismatches 1-of-1, which is the permanent block this whole design
+				// exists to remove.
+				//
+				// TWO tests, and the split is the decision. The first is the original,
+				// unchanged: summaries are the memories, so a branch that lists them
+				// and a database that took none is a failed import no matter what else
+				// landed. Relaxing it to "nodes is 0 but a plan imported" was tried and
+				// is wrong — see `storedNothing`.
+				//
+				// The second exists only for the branch the first cannot SEE: one
+				// carrying no summary at all, which `listsSummaries` answers "lists
+				// nothing" to, so the gate could never fire however little the import
+				// took. Reachable via ide-bridge `write-plan` — see `listsImportable`.
+				// It is strictly narrower than the first (it needs EVERY counter zero),
+				// which is what keeps it from being a per-family veto and from
+				// permanently blocking a repo whose import is partially working.
+				//
+				// Both reasons say "not committing a cutover", NOT "not freezing a
+				// branch": a resume re-runs this step with the fence ALREADY up (see
+				// the resume path above), so on that path the branch is frozen and the
+				// repo sits in legacy-fenced — a WORKING state. What is withheld here
+				// is the CAS, which is true of the fresh and the resumed run alike.
+				//
+				// Both are recorded as a BLOCK, which the two refusals above are the
+				// only outcomes in this engine to earn: they are a function of the
+				// pinned tip and of this build's importer, so the identical attempt
+				// answers identically. See {@link ./CutoverBlock} — including why the
+				// witness is sound only while `storedNothing` counts rows written.
+				if (result.nodes === 0 && (await listsSummaries(pinned))) {
+					const reason =
+						`the import stored no memories from ${source.root} although its orphan tip lists some ` +
+						`(${result.skipped} artifact(s) skipped) — not committing a cutover the database did not take`;
+					await recordCutoverBlock(identity, "no-summary-rows", reason, sources, dbOpts);
+					return { status: "not-ready", reason, stable: "no-summary-rows" };
+				}
+				if (storedNothing(result) && (await listsImportable(pinned))) {
+					const reason =
+						`the import stored nothing from ${source.root} although its orphan tip lists artifacts ` +
+						`(${result.skipped} artifact(s) skipped) — not committing a cutover the database did not take`;
+					await recordCutoverBlock(identity, "stored-nothing", reason, sources, dbOpts);
+					return { status: "not-ready", reason, stable: "stored-nothing" };
+				}
 			}
 
-			// 3. Full compare at the pinned tips (containment — see header).
+			// 3. Full compare at the pinned tips — a REPORT (see header). Findings
+			// are collected across every source, warned about once, and recorded on
+			// the CutoverRecord; they do NOT refuse the switch.
 			const sqlite = new SqliteStorage(identity, opts.dbPath);
+			unreconciled = [];
+			// DISTINCT paths, across every source. Sibling clones of one project
+			// share a repo id and compare against the same database, so a path both
+			// of them carry — most of all the two synthesized union views, which
+			// exist on every clone's branch — is reported once per clone. Without
+			// this the `count` the record calls exact would be a finding tally, the
+			// 50-entry sample would spend its slots on repeats, and `jolli cutover`
+			// would print "2 path(s)" above the same path twice.
+			const seen = new Set<string>();
 			for (const source of sources) {
+				if (source.tip === NO_ORPHAN_TIP) continue;
 				const verdict = await compare(new GitRefStorage(source.tip, source.root), sqlite);
+				// No refusal of any kind here — see the header. Whatever did not read
+				// back is reported, recorded, and stays readable on the frozen
+				// branch; the import above already answered "did this land".
+				//
+				// A loop rather than `push(...verdict.unreconciled)`: the spread
+				// passes every element as an argument, which throws RangeError past
+				// the engine's argument cap. Unlikely at this size, and free to
+				// avoid.
 				if (!verdict.ok) {
-					return { status: "not-ready", reason: `compare failed for ${source.root}: ${verdict.detail}` };
+					for (const path of verdict.unreconciled) {
+						if (seen.has(path)) continue;
+						seen.add(path);
+						unreconciled.push(path);
+					}
 				}
+			}
+			if (unreconciled.length > 0) {
+				// WARN and name them: after the fence these paths are no longer
+				// served, and this line plus the record are the only places that
+				// says so. The branch is frozen rather than deleted, so the bytes
+				// stay recoverable by hand.
+				log.warn(
+					"cutover: %d path(s) do not read back from the database and will not be served after the freeze: %s",
+					unreconciled.length,
+					previewPaths(unreconciled),
+				);
 			}
 		} catch (err) {
 			return { status: "not-ready", reason: importOrCompareFailure(err, fencedRoots.size > 0) };
@@ -739,7 +1187,10 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 			}
 			let moved: string | null = null;
 			for (const source of sources) {
-				const current = await resolveCommittish(ORPHAN_BRANCH, source.root);
+				// Fold null onto the sentinel: a source that had no branch when it
+				// was pinned must compare EQUAL to still having none, and a branch
+				// that appeared since must compare as moved.
+				const current = (await resolveCommittish(ORPHAN_BRANCH, source.root)) ?? NO_ORPHAN_TIP;
 				if (current !== source.tip) {
 					moved = source.root;
 					break;
@@ -780,6 +1231,16 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 							cutoverVersion: version,
 							committedAt: new Date(nowMs).toISOString(),
 							schemaVersion: 1,
+							// Absent when there were none, so a clean cutover's record is
+							// byte-identical to what every earlier build wrote.
+							...(unreconciled.length > 0
+								? {
+										unreconciled: {
+											count: unreconciled.length,
+											sample: unreconciled.slice(0, UNRECONCILED_SAMPLE_CAP),
+										},
+									}
+								: {}),
 						};
 						inTransaction(db, () => {
 							db.prepare(
@@ -814,7 +1275,9 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 				// transitions are announced because a long-lived caller (the daemon
 				// driving `jolli cutover`) has no other signal that the route moved.
 				invalidateSotRouteCache();
-				return { status: "committed", record };
+				// The full list rides alongside the record, never inside it — see the
+				// field's docstring on `CutoverOutcome`.
+				return { status: "committed", record, unreconciled: [...unreconciled] };
 			}
 			log.info("orphan tip moved in %s during attempt %d — retrying (normal for an active repo)", moved, attempt);
 		} finally {

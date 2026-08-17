@@ -24,6 +24,7 @@ vi.mock("./Locks.js", async (importOriginal) => {
 	};
 });
 
+import { setSilentConsole } from "../Logger.js";
 import {
 	readCutoverFence,
 	readManualDisableFlag,
@@ -182,13 +183,15 @@ describe("RepoProfile", () => {
 
 		it("defaults to false when nothing is set", async () => {
 			expect(await readManualDisableFlag(cwd)).toBe(false);
-			expect(await readRepoProfile(cwd)).toEqual({ userDisabled: false, manuallyDisabled: false });
+			// ONE field: the confirmed absence is persisted so hook-path reads stop
+			// enumerating every worktree for a legacy marker.
+			expect(await readRepoProfile(cwd)).toEqual({ manuallyDisabled: false });
 		});
 
 		it("round-trips true/false through profile.json", async () => {
 			await writeManualDisableFlag(cwd, true);
 			expect(await readManualDisableFlag(cwd)).toBe(true);
-			expect(await readRepoProfile(cwd)).toEqual({ userDisabled: true, manuallyDisabled: true });
+			expect(await readRepoProfile(cwd)).toEqual({ manuallyDisabled: true });
 
 			await writeManualDisableFlag(cwd, false);
 			expect(await readManualDisableFlag(cwd)).toBe(false);
@@ -199,7 +202,6 @@ describe("RepoProfile", () => {
 			await writeManualDisableFlag(cwd, true);
 			expect(await readRepoProfile(cwd)).toEqual({
 				backfillDismissed: true,
-				userDisabled: true,
 				manuallyDisabled: true,
 			});
 		});
@@ -284,8 +286,89 @@ describe("RepoProfile", () => {
 			await Promise.all([updateRepoProfile(cwd, { backfillDismissed: true }), writeManualDisableFlag(cwd, true)]);
 			expect(await readRepoProfile(cwd)).toEqual({
 				backfillDismissed: true,
-				userDisabled: true,
 				manuallyDisabled: true,
+			});
+		});
+
+		/**
+		 * The trace's unit of information is `(profilePath, decidedBy, value)` per
+		 * process — not the call. These cases pin that the two signals the trace
+		 * exists for survive the memo (a value CHANGE still emits; writes never
+		 * dedupe) while the steady-state repeat does not, because that repeat is
+		 * what reached IntelliJ's per-`refreshStatus()` bridge read and turned a
+		 * diagnostic into the highest-frequency write this module can produce — in a
+		 * repo the user may have disabled, where the Logger's zero-write gate is
+		 * inert (only the VS Code extension host ever arms it).
+		 *
+		 * Asserted on `console.error` because `enqueueLogWrite` short-circuits under
+		 * `VITEST`: the disk write is unobservable here, the console call is not.
+		 * `setSilentConsole(false)` is what makes it observable at all — the default
+		 * is CLI mode, where info never reaches stderr — and it is restored after,
+		 * since the flag is process-global.
+		 */
+		describe("the read trace", () => {
+			let spy: ReturnType<typeof vi.spyOn>;
+			let emitted: string[];
+			beforeEach(() => {
+				emitted = [];
+				setSilentConsole(false);
+				spy = vi.spyOn(console, "error").mockImplementation((...args: unknown[]) => {
+					emitted.push(String(args[0]));
+				});
+			});
+			afterEach(() => {
+				spy.mockRestore();
+				setSilentConsole(true);
+			});
+			const linesFor = (op: "read" | "write") => emitted.filter((l) => l.includes(`manual-disable ${op} →`));
+
+			it("emits once per process for a settled value, however often it is read", async () => {
+				await writeManualDisableFlag(cwd, true);
+				expect(await readManualDisableFlag(cwd)).toBe(true);
+				expect(await readManualDisableFlag(cwd)).toBe(true);
+				expect(await readManualDisableFlag(cwd)).toBe(true);
+				expect(linesFor("read")).toHaveLength(1);
+			});
+
+			it("re-emits when the value changes inside one process — the read event worth a line", async () => {
+				await writeManualDisableFlag(cwd, true);
+				expect(await readManualDisableFlag(cwd)).toBe(true);
+				await writeManualDisableFlag(cwd, false);
+				expect(await readManualDisableFlag(cwd)).toBe(false);
+				expect(linesFor("read")).toHaveLength(2);
+			});
+
+			it("re-emits when a different FIELD decided the same value — that is the disagreement it explains", async () => {
+				// Fresh repo: the first read decides through the legacy-marker migration
+				// and persists `false`; the second is answered by `manuallyDisabled`.
+				// Same value, different deciding source, so both lines are kept — the
+				// deciding field is exactly what identified the culprit last time.
+				expect(await readManualDisableFlag(cwd)).toBe(false);
+				expect(await readManualDisableFlag(cwd)).toBe(false);
+				const lines = linesFor("read");
+				expect(lines).toHaveLength(2);
+				expect(lines[0]).toContain("by=migrate:legacy-marker");
+				expect(lines[1]).toContain("by=manuallyDisabled");
+			});
+
+			it("never dedupes a WRITE — rare, stack-carrying, and the question is who flipped it", async () => {
+				await writeManualDisableFlag(cwd, true);
+				await writeManualDisableFlag(cwd, true);
+				expect(linesFor("write")).toHaveLength(2);
+			});
+
+			it("keys on the profile path, so one repo's reads cannot silence another's", async () => {
+				const other = mkdtempSync(join(tmpdir(), "jolli-repoprofile-other-"));
+				try {
+					execFileSync("git", ["init", "-q"], { cwd: other });
+					await writeManualDisableFlag(cwd, true);
+					await writeManualDisableFlag(other, true);
+					expect(await readManualDisableFlag(cwd)).toBe(true);
+					expect(await readManualDisableFlag(other)).toBe(true);
+					expect(linesFor("read")).toHaveLength(2);
+				} finally {
+					rmSync(other, { recursive: true, force: true });
+				}
 			});
 		});
 
@@ -426,7 +509,7 @@ describe("RepoProfile", () => {
 	});
 });
 
-describe("three-field disable state (cutover fence)", () => {
+describe("one disable switch, orthogonal to the cutover fence", () => {
 	let cwd: string;
 	beforeEach(() => {
 		cwd = mkdtempSync(join(tmpdir(), "jolli-fence-"));
@@ -436,27 +519,30 @@ describe("three-field disable state (cutover fence)", () => {
 	const profilePath = () => join(cwd, ".jolli", "jollimemory", "profile.json");
 	const disk = () => JSON.parse(readFileSync(profilePath(), "utf-8")) as Record<string, unknown>;
 
-	it("walks all four combinations of userDisabled x cutoverFence", async () => {
-		// neither: everything runs, composite false.
+	it("walks all four combinations of the switch x cutoverFence", async () => {
+		// neither: everything runs.
 		await writeManualDisableFlag(cwd, false);
 		expect(await readManualDisableFlag(cwd)).toBe(false);
 		expect(disk().manuallyDisabled).toBe(false);
-		// fence only: THIS runtime keeps working (reader false) while the
-		// composite stops every old runtime on disk.
+		// fence only: the switch stays FALSE, and the fence write does not touch it
+		// at all. It used to be folded in, to stop old runtimes writing the frozen
+		// branch — but this is the only field they read, and a pre-0.99.11 plugin
+		// reads it as "the user disabled this repo" and uninstalls the whole repo's
+		// hooks and MCP entries. Old runtimes are left running instead, and
+		// probeCutoverDrift catches up whatever they write.
 		await writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
 		expect(await readManualDisableFlag(cwd)).toBe(false);
-		expect(disk().manuallyDisabled).toBe(true);
+		expect(disk().manuallyDisabled).toBe(false);
 		expect(await readCutoverFence(cwd)).toEqual({ reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
-		// fence + user disable: everything stops (userDisabled outranks fence).
+		// fence + user disable: everything stops. Only the user can put it here.
 		await writeManualDisableFlag(cwd, true);
 		expect(await readManualDisableFlag(cwd)).toBe(true);
 		expect(disk().manuallyDisabled).toBe(true);
-		// enable clears ONLY the user's half: the fence survives, so old
-		// runtimes stay stopped while this one resumes.
+		// enable clears the switch; the fence survives (one-way).
 		await writeManualDisableFlag(cwd, false);
 		expect(await readManualDisableFlag(cwd)).toBe(false);
 		expect(await readCutoverFence(cwd)).not.toBeNull();
-		expect(disk().manuallyDisabled).toBe(true);
+		expect(disk().manuallyDisabled).toBe(false);
 		// user disable only (doctor's manual unfence, then disable).
 		await writeCutoverFence(cwd, null);
 		await writeManualDisableFlag(cwd, true);
@@ -464,68 +550,135 @@ describe("three-field disable state (cutover fence)", () => {
 		expect(disk().manuallyDisabled).toBe(true);
 	});
 
-	it("a virgin profile fenced before userDisabled was ever written is not migrated into a permanent user-disable", async () => {
-		// Unlike "walks all four combinations" above (which writes userDisabled
-		// explicitly via writeManualDisableFlag BEFORE ever fencing), this
-		// profile has never had userDisabled touched — the real-world case
-		// where cutover fences a repo before any hook has resolved its
-		// disable state at all.
-		await writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
-		// The fence write itself must resolve and persist userDisabled, so the
-		// composite it derives (`manuallyDisabled: true`, for old runtimes)
-		// is never later misread as a pre-split legacy disable.
-		expect(disk().userDisabled).toBe(false);
-		expect(disk().manuallyDisabled).toBe(true);
+	it("folds a fence-poisoned split profile onto the switch — the dangerous mapping", async () => {
+		// Exactly what a repo fenced by 0.99.11–0.99.13 carries: a composite that
+		// the FENCE turned true, next to the user's own `false`. Taking the composite
+		// here would permanently disable every repo that had cut over, which is why
+		// the retired field wins while it is present.
+		writeFileSync(
+			profilePath(),
+			JSON.stringify({ userDisabled: false, manuallyDisabled: true, cutoverFence: { reason: "r", at: "t" } }),
+		);
 		expect(await readManualDisableFlag(cwd)).toBe(false);
-		expect(disk().userDisabled).toBe(false);
+		expect(disk().manuallyDisabled).toBe(false);
+		// The retired key is gone, so no older runtime can read a stale value from it.
+		expect(disk()).not.toHaveProperty("userDisabled");
+		// The fence itself is untouched — it is one-way, and was never the problem.
+		expect(disk().cutoverFence).toEqual({ reason: "r", at: "t" });
 	});
 
-	it("materializes userDisabled even when the forcing persist loses the lock", async () => {
-		// `writeCutoverFence` forces the split by calling `readManualDisableFlag`,
-		// but that persist is fire-and-forget: `withStrictProfileLock` returns
-		// `{acquired:false}` WITHOUT running fn on a timeout, and the result is
-		// ignored. Lose that one write (a concurrent `backfillDismissed` write
-		// holding the lock is enough) and the fence lands on a profile with
-		// `manuallyDisabled: true` and no `userDisabled` — which the next read
-		// takes for a pre-split legacy disable and folds onto `userDisabled:
-		// true`, permanently stopping SQLite writes too, on a repo the user
-		// never disabled. The fence's own locked write must therefore
-		// materialize the field itself.
-		failNextProfileLock = true;
-		await writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
-		expect(disk().userDisabled).toBe(false);
+	it("folds a real user-disable the same way, and keeps sibling fields", async () => {
+		writeFileSync(
+			profilePath(),
+			JSON.stringify({ userDisabled: true, manuallyDisabled: false, backfillDismissed: true }),
+		);
+		expect(await readManualDisableFlag(cwd)).toBe(true);
 		expect(disk().manuallyDisabled).toBe(true);
-		// The fence is NOT a user disable: this runtime keeps writing SQLite.
-		expect(await readManualDisableFlag(cwd)).toBe(false);
-		expect(disk().userDisabled).toBe(false);
+		expect(disk()).not.toHaveProperty("userDisabled");
+		expect(disk().backfillDismissed).toBe(true);
 	});
 
-	it("does not overwrite a userDisabled value a concurrent writer just persisted", async () => {
-		// Absence-only materialization: an explicit disable that landed between
-		// the forcing read and the fence's locked write must survive.
+	it("re-folds a retired key an older runtime wrote back — the migration is not one-shot", async () => {
+		// A plugin bundle execs its own dist and never passes through `run-hook`'s
+		// version race, so a 0.99.11–0.99.13 writer can reappear after the migration
+		// and re-create the split. Every read has to fold it again.
+		await writeManualDisableFlag(cwd, false);
+		expect(disk()).not.toHaveProperty("userDisabled");
 		writeFileSync(profilePath(), JSON.stringify({ userDisabled: true, manuallyDisabled: true }));
-		await writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
-		expect(disk().userDisabled).toBe(true);
 		expect(await readManualDisableFlag(cwd)).toBe(true);
-	});
-
-	it("migrates a pre-split composite onto userDisabled", async () => {
-		writeFileSync(profilePath(), JSON.stringify({ manuallyDisabled: true }));
-		expect(await readManualDisableFlag(cwd)).toBe(true);
-		expect(disk().userDisabled).toBe(true);
+		expect(disk()).not.toHaveProperty("userDisabled");
 		expect(disk().manuallyDisabled).toBe(true);
 	});
 
-	it("sync reader decides on userDisabled, not the composite", () => {
-		// A fence-only profile: the composite is true (for old runtimes) but
-		// this runtime must keep going.
+	it("a virgin profile fenced before any disable was resolved stays enabled", async () => {
+		// The real-world case: cutover fences a repo before any hook has resolved
+		// its disable state at all. The fence write touches nothing but the fence,
+		// so the switch is still absent afterwards — and absent reads as enabled.
+		await writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" });
+		expect(disk()).not.toHaveProperty("manuallyDisabled");
+		expect(await readManualDisableFlag(cwd)).toBe(false);
+		expect(disk().manuallyDisabled).toBe(false);
+	});
+
+	it("the fence write needs no profile lock dance to settle the switch", async () => {
+		// `writeCutoverFence` used to force the split by calling
+		// `readManualDisableFlag` first, then materialize the field inside its own
+		// locked write, because the composite it wrote was derived FROM the fence and
+		// would otherwise mask an unmigrated legacy marker. With one plain switch
+		// there is nothing to derive, so a lost lock on some other write cannot leave
+		// the disable state half-settled.
+		failNextProfileLock = true;
+		writeFileSync(profilePath(), JSON.stringify({ manuallyDisabled: true }));
+		await expect(
+			writeCutoverFence(cwd, { reason: "cutover to sqlite", at: "2026-08-04T00:00:00Z" }),
+		).rejects.toThrow(/profile lock/);
+		// The switch the user set is untouched by the failed fence write.
+		expect(disk().manuallyDisabled).toBe(true);
+		expect(await readManualDisableFlag(cwd)).toBe(true);
+	});
+
+	it("a concurrent explicit write beats a migration decided before the lock", async () => {
+		// The migration reads unlocked, so an explicit disable can land in between.
+		// The value is re-derived under the lock, so the explicit one wins.
+		writeFileSync(profilePath(), JSON.stringify({ userDisabled: false }));
+		const race = readManualDisableFlag(cwd);
+		await writeManualDisableFlag(cwd, true);
+		await race;
+		expect(await readManualDisableFlag(cwd)).toBe(true);
+		expect(disk().manuallyDisabled).toBe(true);
+	});
+
+	it("adopts a pre-split profile as-is, writing nothing", async () => {
+		// (a)-class: written before the fence existed, so the value can only be the
+		// user's own. Converged already — no write, and no retired key invented.
+		writeFileSync(profilePath(), JSON.stringify({ manuallyDisabled: true }));
+		const before = readFileSync(profilePath(), "utf-8");
+		expect(await readManualDisableFlag(cwd)).toBe(true);
+		expect(readFileSync(profilePath(), "utf-8")).toBe(before);
+	});
+
+	it("sync reader honours the retired key first, then the switch", () => {
+		// A split profile whose composite is fence-poisoned: the retired field is
+		// still the answer, exactly as in the async reader.
 		writeFileSync(
 			profilePath(),
 			JSON.stringify({ userDisabled: false, manuallyDisabled: true, cutoverFence: { reason: "r", at: "t" } }),
 		);
 		expect(readManualDisableFlagSync(cwd)).toBe(false);
-		// Pre-split profile: composite is the migration fallback.
+		// Converged profile: the switch alone.
 		writeFileSync(profilePath(), JSON.stringify({ manuallyDisabled: true }));
 		expect(readManualDisableFlagSync(cwd)).toBe(true);
+	});
+});
+
+/**
+ * Source-shape guard: the SYNC reader must never log.
+ *
+ * Not expressible as a behavioural test — `enqueueLogWrite` short-circuits on
+ * `process.env.VITEST`, so no assertion inside this suite can observe the write
+ * that matters. What matters is on the VS Code extension host: `activate()`
+ * calls `readManualDisableFlagSync` to seed the Logger's zero-write flag, so a
+ * log line emitted INSIDE that call runs while the gate is still open and lands
+ * on disk in a repo the user disabled — the one thing the ordering comment at
+ * that call site exists to prevent. It is also a hot path (every
+ * `StatusStore.refresh()`, plus two file watchers during a live AI session).
+ */
+describe("readManualDisableFlagSync source shape", () => {
+	const source = readFileSync(new URL("./RepoProfile.ts", import.meta.url), "utf-8");
+	const body = source.slice(source.indexOf("export function readManualDisableFlagSync"));
+	const syncBody = body.slice(0, body.indexOf("\n}\n"));
+
+	// CALLS, not mentions: the body deliberately names `traceDisable` in a comment
+	// explaining why it must not call it, and a bare substring match reads that
+	// explanation as the violation it forbids.
+	it("emits no log line — the zero-write gate is not yet armed when it runs", () => {
+		expect(syncBody).not.toContain("traceDisable(");
+		expect(syncBody).not.toContain("log.info(");
+		expect(syncBody).not.toContain("log.warn(");
+	});
+
+	it("the ASYNC reader still traces — the diagnostic has to live somewhere", () => {
+		const asyncBody = source.slice(source.indexOf("export async function readManualDisableFlag("));
+		expect(asyncBody.slice(0, asyncBody.indexOf("\n}\n"))).toContain("traceDisable(");
 	});
 });

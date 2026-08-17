@@ -15,8 +15,8 @@ import { resolveCommittish } from "../core/GitRefStorage.js";
 import { readCutoverFence, writeCutoverFence } from "../core/RepoProfile.js";
 import { ORPHAN_BRANCH } from "../Logger.js";
 import { type RestoreHome, setIsolatedHome } from "../testUtils/isolatedHome.js";
-import { probeCutoverDrift, runCutover } from "./CutoverEngine.js";
-import { resolveCutoverRoute } from "./CutoverRouter.js";
+import { probeCutoverDrift, readCutoverBlock, runCutover } from "./CutoverEngine.js";
+import { type CutoverRecord, resolveCutoverRoute } from "./CutoverRouter.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import { readRepoRegistry, registerRepo } from "./RepoRegistry.js";
 
@@ -105,15 +105,38 @@ afterEach(() => {
 });
 
 describe("runCutover", () => {
-	it("refuses an unregistered repo and a repo without an orphan branch", async () => {
+	it("refuses an unregistered repo", async () => {
 		const stranger = join(dir, "stranger");
 		mkdirSync(stranger, { recursive: true });
 		execSync("git init -q", { cwd: stranger });
 		execSync("git -c user.email=t@t -c user.name=t commit -q --allow-empty -m init", { cwd: stranger });
 		expect((await runCutover(stranger, { dbPath })).status).toBe("not-ready");
-		// Registered, but no orphan branch yet.
-		const result = await runCutover(cwd, { dbPath });
-		expect(result).toMatchObject({ status: "not-ready", reason: expect.stringContaining("no orphan branch") });
+	});
+
+	it("a repo with NO orphan branch cuts over: nothing to migrate is not a reason to wait", async () => {
+		// The old refusal was permanent by construction — with no branch there is
+		// nothing that could ever make the answer change — and the freeze is what
+		// stops an old runtime creating the branch afterwards.
+		const result = await runCutover(cwd, { dbPath, nowMs: 1000 });
+		expect(result.status).toBe("committed");
+		const record = (result as { record: CutoverRecord }).record;
+		expect(Object.values(record.tips)).toEqual([""]);
+		expect(record).not.toHaveProperty("unreconciled");
+		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("cutover");
+		// And the sentinel does not read as drift on the next probe: `null !== ""`
+		// would otherwise report a bypassing writer that does not exist.
+		expect(await probeCutoverDrift(cwd, { dbPath })).toEqual([]);
+	});
+
+	it("a branch CREATED after a no-branch cutover is drift, and its memories are imported", async () => {
+		expect((await runCutover(cwd, { dbPath })).status).toBe("committed");
+		// An old runtime that never saw the fence makes the branch afterwards.
+		await writeOrphanSummary(HASH, "written by a fence-blind writer");
+		const drift = await probeCutoverDrift(cwd, { dbPath });
+		expect(drift).toHaveLength(1);
+		expect(drift[0].recordedTip).toBe("");
+		// Reported AND repaired: the stranded memory is caught up into the DB.
+		expect(await storedMessage(HASH)).toBe("written by a fence-blind writer");
 	});
 
 	it("a database written by a newer build cuts over normally — no version gate left", async () => {
@@ -159,15 +182,233 @@ describe("runCutover", () => {
 		expect(rows).toEqual([{ commit_hash: HASH }]);
 	});
 
-	it("a failing compare stays in prepare: no fence, no CAS", async () => {
+	it("a partial compare finding is RECORDED, not a refusal: the switch commits anyway", async () => {
 		await writeOrphanSummary(HASH, "the memory");
 		const result = await runCutover(cwd, {
 			dbPath,
-			compare: async () => ({ ok: false, detail: "injected mismatch" }),
+			compare: async () => ({
+				ok: false,
+				detail: "summaries/dead.json: content differs",
+				checked: 4,
+				unreconciled: ["summaries/dead.json"],
+			}),
 		});
-		expect(result).toMatchObject({ status: "not-ready", reason: expect.stringContaining("injected mismatch") });
+		// The whole point: dirty data on the branch cannot pin a repo at
+		// `uncutover` forever. It costs a note on the record, not the switch.
+		expect(result.status).toBe("committed");
+		expect((result as { record: CutoverRecord }).record.unreconciled).toEqual({
+			count: 1,
+			sample: ["summaries/dead.json"],
+		});
+		expect(await readCutoverFence(cwd)).not.toBeNull();
+		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("cutover");
+	});
+
+	it("a repo whose ONLY summary is dirty still cuts over — 1-of-1 is not evidence of a failed import", async () => {
+		// The shape that made the ratio-based refusal wrong, and the reason the
+		// gate is asked of the import instead: a small repo with one unreconcilable
+		// path mismatches everything it has.
+		await writeOrphanSummary(HASH, "the memory");
+		const result = await runCutover(cwd, {
+			dbPath,
+			compare: async () => ({
+				ok: false,
+				detail: "summaries/aaa.json: content differs",
+				checked: 1,
+				unreconciled: ["summaries/aaa.json"],
+			}),
+		});
+		expect(result.status).toBe("committed");
+		expect((result as { record: CutoverRecord }).record.unreconciled?.count).toBe(1);
+	});
+
+	it("refuses when the import stored NOTHING although the branch lists memories", async () => {
+		// Every summary on the branch is unparseable, so the import skips all of
+		// them and writes no row. That is an import that did not land — freezing
+		// here would strand the repo — and it is the ONLY refusal left.
+		const { ensureOrphanBranch, writeMultipleFilesToBranch } = await import("../core/GitOps.js");
+		await ensureOrphanBranch(ORPHAN_BRANCH, cwd);
+		await writeMultipleFilesToBranch(
+			ORPHAN_BRANCH,
+			[{ path: `summaries/${HASH}.json`, content: "{ this is not json" }],
+			"add",
+			cwd,
+		);
+		const result = await runCutover(cwd, { dbPath });
+		expect(result).toMatchObject({
+			status: "not-ready",
+			reason: expect.stringContaining("stored no memories"),
+			// Tagged STABLE, which no other `not-ready` answer is: the tip and this
+			// build's importer decide it, so the identical attempt refuses identically.
+			// That tag is what stops the automatic callers repeating the full import —
+			// see `CutoverBlock` — so it is part of this refusal's contract.
+			stable: "no-summary-rows",
+		});
+		expect(await readCutoverBlock(cwd, { dbPath })).toMatchObject({ code: "no-summary-rows" });
 		expect(await readCutoverFence(cwd)).toBeNull();
 		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("uncutover");
+	});
+
+	it("clears a recorded block when the next run gets past the refusal", async () => {
+		// The record is this build's current claim, not history: `runCutover` drops it
+		// before step 1 so exactly one write site and one clear site exist. Without
+		// this, a repo that repaired itself would keep being reported as blocked by
+		// `--status` and by the sweep, and automatic attempts would stay skipped
+		// until something else happened to move the tip.
+		const { ensureOrphanBranch, writeMultipleFilesToBranch } = await import("../core/GitOps.js");
+		await ensureOrphanBranch(ORPHAN_BRANCH, cwd);
+		await writeMultipleFilesToBranch(
+			ORPHAN_BRANCH,
+			[{ path: `summaries/${HASH}.json`, content: "{ this is not json" }],
+			"add",
+			cwd,
+		);
+		expect(await runCutover(cwd, { dbPath })).toMatchObject({ stable: "no-summary-rows" });
+		expect(await readCutoverBlock(cwd, { dbPath })).not.toBeNull();
+
+		await writeOrphanSummary("b".repeat(40), "a summary that imports");
+		expect((await runCutover(cwd, { dbPath })).status).toBe("committed");
+		expect(await readCutoverBlock(cwd, { dbPath })).toBeNull();
+	});
+
+	it("still refuses broken summaries when a plan alongside them imported fine", async () => {
+		// The summary rule must not be weakened into "did ANYTHING land". A repo
+		// whose summaries all fail while one plan imports has landed none of its
+		// memories, and freezing on the strength of that plan would report every
+		// memory it has as unreconciled. This is the case a single whole-import
+		// test would silently let through.
+		const { ensureOrphanBranch, writeMultipleFilesToBranch } = await import("../core/GitOps.js");
+		await ensureOrphanBranch(ORPHAN_BRANCH, cwd);
+		await writeMultipleFilesToBranch(
+			ORPHAN_BRANCH,
+			[
+				{ path: `summaries/${HASH}.json`, content: "{ this is not json" },
+				{ path: "plans/a-plan.md", content: "# Plan" },
+			],
+			"add",
+			cwd,
+		);
+		expect(await runCutover(cwd, { dbPath })).toMatchObject({
+			status: "not-ready",
+			reason: expect.stringContaining("stored no memories"),
+		});
+		expect(await readCutoverFence(cwd)).toBeNull();
+	});
+
+	it("a branch carrying only plans cuts over WITH its plans in the database", async () => {
+		// `ide-bridge write-plan` calls `storePlans` with no commit behind it, so a
+		// branch can hold `plans/` and no summary at all. The summary rule cannot
+		// see such a source — it answers "lists no summaries" — which is why the
+		// second, whole-import rule exists.
+		//
+		// A second rule can only make the gate fire MORE often, so the risk it
+		// carries is OVER-refusal: a plans-only repo whose import works must still
+		// cut over. That is what this pins.
+		const { ensureOrphanBranch, writeMultipleFilesToBranch } = await import("../core/GitOps.js");
+		await ensureOrphanBranch(ORPHAN_BRANCH, cwd);
+		await writeMultipleFilesToBranch(
+			ORPHAN_BRANCH,
+			[{ path: "plans/only-a-plan.md", content: "# Plan" }],
+			"add",
+			cwd,
+		);
+
+		expect((await runCutover(cwd, { dbPath })).status).toBe("committed");
+		// And the plan really landed. `committed` on its own is also what the old,
+		// blind gate answered for a branch the database had taken none of, so the
+		// status alone would not distinguish the fix from the bug.
+		const docs = await withDashboardDb(
+			(db) => (db.prepare("SELECT COUNT(*) AS n FROM context WHERE kind = 'plan'").get() as { n: number }).n,
+			{ dbPath },
+		);
+		expect(docs).toBeGreaterThan(0);
+	});
+
+	it("caps the recorded sample while keeping the count exact", async () => {
+		await writeOrphanSummary(HASH, "the memory");
+		const many = Array.from({ length: 60 }, (_, i) => `summaries/${String(i).padStart(40, "0")}.json`);
+		const result = await runCutover(cwd, {
+			dbPath,
+			compare: async () => ({
+				ok: false,
+				detail: `${many[0]}: content differs`,
+				checked: 200,
+				unreconciled: many,
+			}),
+		});
+		expect(result.status).toBe("committed");
+		const un = (result as { record: CutoverRecord }).record.unreconciled;
+		// The count is the truth; the list is a sample. The full set stays
+		// readable on the frozen branch, which is why it is not stored here.
+		expect(un?.count).toBe(60);
+		expect(un?.sample).toHaveLength(50);
+		expect(un?.sample[0]).toBe(many[0]);
+	});
+
+	it("de-duplicates findings across sibling clones: a path both clones fail is ONE finding", async () => {
+		// Two clones share a repo id and compare against the SAME database, so a
+		// path they both carry is reported once per clone — most of all the two
+		// synthesized union views, which exist on every clone's branch, so this is
+		// the normal case rather than an exotic one. Counting it twice would make
+		// the record's "exact" count a finding tally, spend the 50-entry sample on
+		// repeats, and print the same path twice under a "2 path(s)" heading.
+		await writeOrphanSummary(HASH, "clone one");
+		const clone2 = join(dir, "repo2");
+		mkdirSync(clone2, { recursive: true });
+		execSync("git init -q", { cwd: clone2 });
+		execSync("git config user.email t@t && git config user.name t", { cwd: clone2 });
+		execSync("git commit -q --allow-empty -m init", { cwd: clone2 });
+		const HASH2 = "b".repeat(40);
+		const priorCwd = cwd;
+		cwd = clone2;
+		await writeOrphanSummary(HASH2, "clone two");
+		cwd = priorCwd;
+
+		const { getRepoRegistryPath } = await import("./RepoRegistry.js");
+		const { readFileSync, writeFileSync } = await import("node:fs");
+		const registryPath = getRepoRegistryPath();
+		const registry = JSON.parse(readFileSync(registryPath, "utf-8")) as { repos: Record<string, unknown>[] };
+		registry.repos[0].worktrees = [cwd, clone2];
+		writeFileSync(registryPath, JSON.stringify(registry));
+
+		let calls = 0;
+		const result = await runCutover(cwd, {
+			dbPath,
+			nowMs: 1000,
+			compare: async () => {
+				calls++;
+				// The shared view both clones list, plus one finding of this clone's
+				// own — so the assertion below distinguishes de-duplication from
+				// keeping only the first source's findings.
+				return {
+					ok: false,
+					detail: "topics/index.json: content differs",
+					checked: 2,
+					unreconciled: ["topics/index.json", `summaries/${calls === 1 ? HASH : HASH2}.json`],
+				};
+			},
+		});
+		expect(result.status).toBe("committed");
+		expect(calls).toBe(2);
+		const un = (result as { record: CutoverRecord }).record.unreconciled;
+		// Four findings, three distinct paths.
+		expect(un?.count).toBe(3);
+		expect([...(un?.sample ?? [])].sort()).toEqual(
+			[`summaries/${HASH}.json`, `summaries/${HASH2}.json`, "topics/index.json"].sort(),
+		);
+		// First-seen order is kept, so the shared view leads whichever clone the
+		// stable source ordering visited first.
+		expect(un?.sample[0]).toBe("topics/index.json");
+	});
+
+	it("a clean cutover's record carries no unreconciled key at all", async () => {
+		await writeOrphanSummary(HASH, "the memory");
+		const result = await runCutover(cwd, {
+			dbPath,
+			compare: async () => ({ ok: true, detail: "1 path(s) contained", checked: 1, unreconciled: [] }),
+		});
+		expect(result.status).toBe("committed");
+		expect((result as { record: CutoverRecord }).record).not.toHaveProperty("unreconciled");
 	});
 
 	it("deterministic race: a write between compare and CAS forces a retry, and the frozen tip never moves after commit", async () => {
@@ -183,7 +424,7 @@ describe("runCutover", () => {
 					injected = true;
 					await writeOrphanSummary("b".repeat(40), "raced in after compare");
 				}
-				return { ok: true, detail: "ok" };
+				return { ok: true, detail: "ok", checked: 1, unreconciled: [] };
 			},
 		});
 		expect(result.status).toBe("committed");
@@ -209,7 +450,7 @@ describe("runCutover", () => {
 			compare: async () => {
 				n++;
 				await writeOrphanSummary(String(n).padStart(40, "0"), `always racing ${n}`);
-				return { ok: true, detail: "ok" };
+				return { ok: true, detail: "ok", checked: 1, unreconciled: [] };
 			},
 		});
 		expect(result.status).toBe("retry-exhausted");
@@ -577,9 +818,29 @@ describe("runCutover", () => {
 			expect(verdict.ok).toBe(true);
 		});
 
-		it("still blocks on a file the import WOULD take and the database lacks", async () => {
+		it("still REPORTS a file the import WOULD take and the database lacks", async () => {
 			const verdict = await compare({ "notes/real.md": "kept" }, {});
 			expect(verdict).toMatchObject({ ok: false, detail: "notes/real.md: missing from the database" });
+		});
+
+		it("collects EVERY finding, not just the first, and counts what it visited", async () => {
+			// The whole reason this returns a list: the caller no longer refuses on
+			// a finding, so "the first bad path" stops being a useful answer — the
+			// user needs the full set of what will not be served after the freeze.
+			const verdict = await compare(
+				{
+					"summaries/a.json": '{"commitHash":"a"}',
+					"notes/one.md": "source",
+					"notes/two.md": "source",
+					"notes/kept.md": "same",
+				},
+				{ "notes/two.md": "drifted", "notes/kept.md": "same" },
+			);
+			expect(verdict.ok).toBe(false);
+			expect(verdict.checked).toBe(4);
+			expect([...verdict.unreconciled].sort()).toEqual(["notes/one.md", "notes/two.md", "summaries/a.json"]);
+			// `detail` stays the FIRST finding — one line is what a command prints.
+			expect(verdict.detail).toBe("summaries/a.json: missing from the database");
 		});
 
 		it("ignores nested topic paths, which listTopicPageSlugs also refuses", async () => {
@@ -859,7 +1120,7 @@ describe("runCutover", () => {
 		expect(await storedMessage(HASH)).toBe("regenerated after the fence");
 	});
 
-	it("retry after the fence went up cannot roll a post-fence row back either — it refuses instead", async () => {
+	it("retry after the fence went up cannot roll a post-fence row back — it records and commits", async () => {
 		// A first run that fences and then cannot take the lock: the fence is
 		// one-way, so every later attempt imports an ALREADY-FENCED source, which
 		// is the second unprotected catch-up.
@@ -883,14 +1144,20 @@ describe("runCutover", () => {
 		);
 		await writeOrphanSummary(HASH, "pre-fence body an old client re-pushed");
 
-		// The resume reports the disagreement instead of resolving it by
-		// overwriting the newer side. legacy-fenced is a working state — writes go
-		// to SQLite, reads come from the database — so refusing costs a stuck
-		// cutover, while importing would cost the memory itself.
+		// The resume records the disagreement instead of resolving it by
+		// overwriting the newer side — and then FINISHES. The protection is what
+		// makes the frozen file the loser here: the database row is the newer one,
+		// so the stale bytes on the branch are exactly what "unreconciled" means.
+		// Refusing would have cost a permanently stuck cutover for a file the
+		// user's own regeneration superseded.
 		const resumed = await runCutover(cwd, { dbPath, nowMs: 3000 });
-		expect(resumed).toMatchObject({ status: "not-ready", reason: expect.stringContaining("content differs") });
+		expect(resumed.status).toBe("committed");
+		expect((resumed as { record: CutoverRecord }).record.unreconciled).toEqual({
+			count: 1,
+			sample: [`summaries/${HASH}.json`],
+		});
 		expect(await storedMessage(HASH)).toBe("regenerated after the fence");
-		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("legacy-fenced");
+		expect((await resolveCutoverRoute(cwd, { dbPath })).state).toBe("cutover");
 	});
 
 	it("drift probe on an un-cutover repo (or unknown repo) is an empty answer, not an error", async () => {

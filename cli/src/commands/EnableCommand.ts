@@ -23,7 +23,7 @@ import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } f
 import { track } from "../core/Telemetry.js";
 import { markSkipExitFlush } from "../core/TelemetryCommandHook.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
-import { deregisterRepo, registerRepo } from "../dashboard/RepoRegistry.js";
+import { registerRepo } from "../dashboard/RepoRegistry.js";
 import { capturePluginOnboardingSnapshot } from "../hooks/PluginBootstrapTelemetry.js";
 import { triggerPendingPushRetry } from "../hooks/PushCompensation.js";
 import { isValidSourceTag } from "../install/DistPathResolver.js";
@@ -667,16 +667,12 @@ export function registerDisableCommand(program: Command): void {
 
 			if (result.success) {
 				track("surface_disabled", { reason: "manual" });
-				// Mark the repo disabled in the dashboard registry (kept, not
-				// deleted — its history stays queryable and re-enable restores it).
-				// Best-effort: a registry hiccup must not fail the disable.
-				if (!options.integrationsOnly) {
-					try {
-						await deregisterRepo({ cwd: options.cwd });
-					} catch (err) {
-						log.info("dashboard repo deregistration skipped: %s", errMsg(err));
-					}
-				}
+				// No registry write. `uninstall(persistManualDisable)` above has already
+				// recorded the opt-out in this repo's `profile.json`, which is the one
+				// switch every reader consults — `listActiveRepos` included. The second
+				// record this used to stamp (`disabledAt`) was written here and NOWHERE
+				// else, while every `registerRepo` cleared it, so the dashboard kept
+				// re-adopting repos the user had turned off.
 				console.log(
 					options.integrationsOnly
 						? "\n  Jolli Memory integrations removed (MCP).\n"

@@ -30,6 +30,7 @@ import { getProjectRootDir } from "../core/GitOps.js";
 import { deriveRepoNameFromUrl, getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
 import { withRepoRegistryLock } from "../core/Locks.js";
 import { normalizePathForCompareOn, toForwardSlash } from "../core/PathUtils.js";
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 
@@ -61,8 +62,6 @@ export interface RegisteredRepo {
 	readonly worktrees?: ReadonlyArray<string>;
 	readonly remoteUrl?: string;
 	readonly enabledAt: string;
-	/** Set when the repo is disabled. Rows are kept so history stays queryable. */
-	readonly disabledAt?: string;
 }
 
 /**
@@ -125,12 +124,14 @@ export function existingWorktrees(repo: RegisteredRepo): ReadonlyArray<string> {
  * cannot read that off the returned list, because the fallback makes a repo
  * whose every path is gone look identical to one with a single live checkout.
  *
- * Dead entries are REMOVABLE but not automatically removed: `deregisterRepo`
- * has to run from inside the repo it removes, which a deleted directory makes
- * impossible, so the identity-addressed `forgetRepo` (see `RepoForget.ts`) is
+ * Dead entries are REMOVABLE but not automatically removed: a removal has to
+ * name its target by IDENTITY, which is the one addressing a deleted directory
+ * cannot defeat, so the identity-addressed `forgetRepo` (see `RepoForget.ts`) is
  * what reaches them — automatically for the narrow {@link isDisposableRepo}
- * class, and only on request for everything else. A sweep still meets dead
- * entries in between, so asking this first is how it tells "gone" from "broken".
+ * class, and only on request for everything else. A disable is not one of those
+ * removals and touches this file not at all (see {@link listActiveRepos}). A
+ * sweep still meets dead entries in between, so asking this first is how it
+ * tells "gone" from "broken".
  */
 export function hasLiveWorktree(repo: RegisteredRepo): boolean {
 	return recordedRepoPaths(repo).some((path) => existsSync(path));
@@ -457,8 +458,8 @@ export async function resolveRepoIdentity(worktreeRoot: string): Promise<{ ident
  * is frozen shut: the memory has nowhere to go.
  *
  * Every caller that starts from a cwd rather than a known root must use this.
- * `registerRepo`/`deregisterRepo` below and `ProducerHooks.repoIdentityFor`
- * already did the same two steps by hand; this is that pair, named once.
+ * `registerRepo` below and `ProducerHooks.repoIdentityFor` already did the same
+ * two steps by hand; this is that pair, named once.
  */
 export async function resolveRepoIdentityForCwd(cwd: string): Promise<{ identity: string; remoteUrl?: string }> {
 	return resolveRepoIdentity(await getProjectRootDir(cwd));
@@ -487,9 +488,14 @@ export interface RegisterRepoOptions {
  *
  * Anchored to the MAIN worktree root via `getProjectRootDir`, so enabling Jolli
  * in a linked worktree updates the existing row instead of creating a second
- * identity for the same repository. Re-registering an entry that was disabled
- * clears `disabledAt` — an explicit re-enable is exactly the signal that should
- * reactivate it.
+ * identity for the same repository.
+ *
+ * It records membership only — "this project exists on this machine, at these
+ * checkouts" — and carries no opinion about whether the user has Jolli switched
+ * on. It used to clear a `disabledAt`, which made every incidental registration
+ * (a background `enable --automatic`, a dashboard page open) an implicit
+ * re-enable; the switch now lives only in each clone's `profile.json`, so this
+ * can run freely without undoing anything. See {@link listActiveRepos}.
  */
 export async function registerRepo(opts: RegisterRepoOptions): Promise<RegisteredRepo> {
 	const worktreeRoot = await getProjectRootDir(opts.cwd);
@@ -529,15 +535,17 @@ export async function registerRepo(opts: RegisterRepoOptions): Promise<Registere
 }
 
 /**
- * Adds `cwd`'s main worktree root to its identity's `worktrees` list and
- * touches NOTHING else — most importantly `disabledAt`, which `registerRepo`
- * clears by rebuilding the entry. This is the hook self-registration path for
- * a SECOND clone of an already-known remote: two clones share one identity, so
- * "identity already registered" says nothing about whether THIS checkout is
- * listed, and a checkout the list never learns is structurally invisible to
- * the cutover's source enumeration — its orphan branch would be neither
- * imported nor fenced. A stray hook must be able to fill that gap without
- * being able to undo a `jolli disable`.
+ * Adds `cwd`'s main worktree root to its identity's `worktrees` list and touches
+ * NOTHING else: union-only, where `registerRepo` rebuilds the whole entry. This
+ * is the hook self-registration path for a SECOND clone of an already-known
+ * remote — two clones share one identity, so "identity already registered" says
+ * nothing about whether THIS checkout is listed, and a checkout the list never
+ * learns is structurally invisible to the cutover's source enumeration: its
+ * orphan branch would be neither imported nor fenced.
+ *
+ * Being union-only is still the right shape for a stray hook (it cannot reorder
+ * `worktreeRoot` or restate a name), though it is no longer what protects a
+ * `jolli disable` — nothing in this file can undo one any more.
  */
 export async function ensureWorktreeListed(opts: RegisterRepoOptions): Promise<RegisteredRepo | null> {
 	const worktreeRoot = await getProjectRootDir(opts.cwd);
@@ -547,8 +555,8 @@ export async function ensureWorktreeListed(opts: RegisterRepoOptions): Promise<R
 			const registry = await readRepoRegistryStrict(opts.configDir);
 			const existing = registry.repos.find((r) => r.repoIdentity === identity);
 			// No entry to extend: the identity-unknown case belongs to registerRepo,
-			// which builds the full row. Racing a concurrent deregister here is fine —
-			// a disabled entry still gets the worktree listed (data, not activation).
+			// which builds the full row. A disabled repo still gets its worktree
+			// listed — that is data about where the checkouts are, not activation.
 			if (!existing) return null;
 			const previous =
 				existing.worktrees && existing.worktrees.length > 0 ? existing.worktrees : [existing.worktreeRoot];
@@ -567,39 +575,49 @@ export async function ensureWorktreeListed(opts: RegisterRepoOptions): Promise<R
 }
 
 /**
- * Marks the repo containing `cwd` disabled, keeping its row and its data.
+ * Whether the user has switched Jolli off for this registered project, decided
+ * from each clone's own `profile.json` — the machine's ONE disable switch.
  *
- * Deliberately not a delete: a user who disables Jolli in one repo has not
- * asked to erase that repo's history from their dashboard, and re-enabling
- * should not have to re-import it. Returns the identity it disabled, or null
- * when the repo was never registered.
+ * The registry deliberately stores no disable state of its own. It used to carry
+ * a `disabledAt` stamped by a single writer (`jolli disable`) and cleared by
+ * every {@link registerRepo}, so the two records drifted one way: a repo disabled
+ * from the VS Code sidebar or the ide-bridge never got the stamp at all, and a
+ * background `enable --automatic` wiped one that had been set. Both showed up as
+ * "the repo I turned off is back in my dashboard".
+ *
+ * Three details, each load-bearing:
+ *
+ * - **`every`, not `some`.** A row is one repo IDENTITY (the normalized remote),
+ *   while `profile.json` is per CLONE. Two clones of one project share this row,
+ *   so it stays active while any clone is still on — otherwise disabling one
+ *   checkout would silently stop collecting the other's memories.
+ * - **The SYNC reader.** {@link readManualDisableFlagSync} never migrates and
+ *   never writes; the async one persists its decision. Asking "should I sweep
+ *   you?" must not write a profile into someone else's repo — the same reason
+ *   `DashboardCommand` and `SkillAutoRefresh` take the sync variant.
+ * - **Unreadable means enabled.** The sync reader answers `false` for a missing
+ *   or corrupt profile, so a checkout on an unmounted drive is not mistaken for
+ *   a user opt-out; {@link hasLiveWorktree} reports that case separately.
+ *
+ * Shared with the dashboard's own sweep (`DbBackfill`) on purpose: "which repos
+ * do I import" and "which repos does the database call paused" must not be two
+ * predicates that can disagree.
  */
-export async function deregisterRepo(opts: RegisterRepoOptions): Promise<string | null> {
-	const worktreeRoot = await getProjectRootDir(opts.cwd);
-	const { identity } = await resolveRepoIdentity(worktreeRoot);
-	const now = (opts.now ?? (() => new Date()))().toISOString();
-	return withRepoRegistryLock(
-		async () => {
-			const registry = await readRepoRegistryStrict(opts.configDir);
-			const existing = registry.repos.find((r) => r.repoIdentity === identity);
-			if (!existing) return null;
-			const repos = registry.repos.map((r) => (r.repoIdentity === identity ? { ...r, disabledAt: now } : r));
-			await writeRepoRegistry({ ...registry, version: 1, repos }, opts.configDir);
-			return identity;
-		},
-		{ globalDir: opts.configDir },
-	);
+export function isRepoDisabled(repo: RegisteredRepo): boolean {
+	return existingWorktrees(repo).every((wt) => readManualDisableFlagSync(wt));
 }
 
 /**
  * Removes entries by IDENTITY, returning the identities that were actually
- * present — the half `deregisterRepo` structurally cannot do.
+ * present.
  *
- * `deregisterRepo` resolves its target by asking `cwd` (`getProjectRootDir` then
- * `resolveRepoIdentity`), so a checkout that no longer exists can never be
- * named; and its remedy — stamp `disabledAt` — is the wrong one anyway, since a
- * disabled entry is still an entry. Both survive because they answer different
- * questions: this is "forget it", `deregisterRepo` is `jolli disable`.
+ * By identity and never by `cwd`, because that is the only addressing which
+ * reaches the entries this exists for: resolving a target from a working
+ * directory (`getProjectRootDir` then `resolveRepoIdentity`) structurally cannot
+ * name a checkout that is gone. This is "forget it" — a different question from
+ * `jolli disable`, which records nothing in this file at all (see
+ * {@link isRepoDisabled}), because a disabled repo is still a repo the machine
+ * has.
  *
  * Batched deliberately. The prune sweep has 85 victims on a machine that ran the
  * test suite before HOME isolation became the default, and one lock plus one
@@ -749,7 +767,8 @@ export async function repairRegistryEntries(opts: RegistryRepairOptions = {}): P
 	return opts.dryRun === true ? pass() : withRepoRegistryLock(pass, { globalDir: opts.configDir });
 }
 
-/** Registered repos that are not disabled. */
+/** Registered repos the user has not switched off — see {@link isRepoDisabled}. */
 export async function listActiveRepos(configDir?: string): Promise<ReadonlyArray<RegisteredRepo>> {
-	return (await readRepoRegistry(configDir)).repos.filter((r) => !r.disabledAt);
+	const { repos } = await readRepoRegistry(configDir);
+	return repos.filter((r) => !isRepoDisabled(r));
 }

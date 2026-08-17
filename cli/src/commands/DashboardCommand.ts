@@ -35,7 +35,7 @@ import { getProjectRootDir } from "../core/GitOps.js";
 import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
-import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
+import { autoCutoverAllRepos } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { sourceOfSessionPassKey } from "../dashboard/DashboardCollector.js";
 import { canUseDashboardDb, DASHBOARD_SQLITE_MIN_VERSION, ensureDashboardDbExists } from "../dashboard/DashboardDb.js";
@@ -52,7 +52,7 @@ import {
 	type SessionSourceTotals,
 } from "../dashboard/DbBackfill.js";
 import { pruneDisposableRepos } from "../dashboard/RepoForget.js";
-import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
+import { readRepoRegistry, registerRepo } from "../dashboard/RepoRegistry.js";
 import { type ServerTelemetryHandle, startServerTelemetry } from "../dashboard/ServerTelemetry.js";
 import { createLogger, errMsg } from "../Logger.js";
 
@@ -380,6 +380,86 @@ function resolveSeams(deps: DashboardDeps): ResolvedSeams {
  */
 function outputOf(deps: DashboardDeps): DashboardOutput {
 	return deps.output ?? CONSOLE_OUTPUT;
+}
+
+/**
+ * The whole-machine cutover sweep with the foreground reporting both interactive
+ * callers need, and neither had.
+ *
+ * An attempt is a silent tens-of-seconds step that runs after the last line
+ * either command prints. In `jolli dashboard` it runs after "Press Ctrl+C to
+ * stop", which is an active invitation to interrupt it — and interrupting costs
+ * the two-hour throttle slot as well as the attempt, because the stamp is
+ * written first. So these lines are `notice`, not `log`: they are the only
+ * explanation of a pause the user is looking at right now, and of a state change
+ * that otherwise lands with no output at all.
+ *
+ * **Never throttled, and that is this helper's other job.** Both call sites are
+ * foreground: `jolli enable`, a bare `jolli`, `jolli dashboard`. The throttle is
+ * a failure backoff (see `AUTO_CUTOVER_RETRY_MS`) sized for the per-commit path,
+ * and applying it to a typed command means the user's own retry is the thing it
+ * suppresses — measured in the field as a `jolli dashboard` that silently did
+ * nothing while `jolli cutover`, typed seconds later, cut the repo over. Routing
+ * both callers through one helper is what keeps that decision in one place
+ * rather than as a flag each of them can set differently.
+ *
+ * The heading is written on the FIRST repo that really begins an attempt, never
+ * up front — for the same reason `runHistoryImport` defers its own: on a settled
+ * machine every repo short-circuits on its route and the honest output is
+ * nothing at all. Skips are the sweep's business and go to `debug.log`; a repo
+ * the user switched off does not need announcing on a page they are opening.
+ */
+async function sweepCutoverWithNotice(cwd: string, deps: DashboardDeps): Promise<void> {
+	const output = outputOf(deps);
+	let announced = false;
+	const entries = await autoCutoverAllRepos({
+		...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
+		preferFirst: cwd,
+		onAttemptStart: () => {
+			if (announced) return;
+			announced = true;
+			output.notice(
+				"\n  Checking whether these repositories can switch to SQLite — up to a minute each." +
+					"\n  Leave it running; interrupting also delays the next automatic attempt.\n",
+			);
+		},
+	});
+	// A repo the engine has already refused for a reason no retry can change gets a
+	// line whether or not anything was attempted this time — it is the ONLY place
+	// that state is visible. Nothing else says it: the sweep's own closing line
+	// reads "nothing switched this time", which is what a healthy repo mid-import
+	// also gets, and `--status` says `uncutover`, which is what every not-yet-swept
+	// repo says. It repeats until the user acts, and that is the point; the
+	// alternative shipped as a repo that silently never cut over.
+	for (const entry of entries) {
+		if (!entry.blocked) continue;
+		output.notice(
+			`\n  ! ${entry.repoName} — cannot switch to SQLite: ${entry.blocked.reason}` +
+				"\n    Nothing will change until its orphan branch does. Run `jolli doctor` in that repo," +
+				" or `jolli cutover` there to see the full attempt.\n",
+		);
+	}
+	// `attempted`, never the state: `cutover` is also what a repo that was ALREADY
+	// switched answers, and reporting those would put a line on screen for every
+	// repo on the machine every time the page opens.
+	const tried = entries.filter((e) => e.attempted);
+	if (tried.length === 0) return;
+	for (const entry of tried) {
+		output.notice(
+			entry.state === "cutover"
+				? `  ✓ ${entry.repoName} — now served from SQLite`
+				: `  · ${entry.repoName} — not switched this time`,
+		);
+	}
+	// ONE closing line for the whole sweep rather than one per repo, and only when
+	// something actually moved: the advice is about this machine's long-lived
+	// processes, not about a repository.
+	output.notice(
+		tried.some((e) => e.state === "cutover")
+			? "\n  Restart IDEs and long-running processes so cached storage objects are rebuilt.\n"
+			: "\n  Nothing switched this time; the current setup keeps working." +
+					" Run `jolli cutover --status` in a repo for the reason.\n",
+	);
 }
 
 /** {@link DashboardDeps} with every optional seam filled in. */
@@ -731,12 +811,19 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 			const label = failed === 1 ? "entry" : "entries";
 			output.log(`\n  ${failed} temporary-checkout ${label} could not be removed — see debug.log.`);
 		}
-		const repos = await listActiveRepos(deps.configDir);
+		// The WHOLE roster, not the active subset: `dbBackfillRepos` needs to see the
+		// switched-off repos too, because it is the only caller that projects their
+		// paused state into `repos.disabled_at`. Filter them out here and a repo
+		// disabled from the VS Code sidebar keeps reading as enabled on the page and
+		// counting in every KPI, forever. The prune above is a different question and
+		// runs first regardless — a forgotten entry is gone, not paused.
+		const repos = (await readRepoRegistry(deps.configDir)).repos;
 		// Zero registered repos stays completely silent, header included: there is
 		// no work, and announcing none is worse than saying nothing. The call still
 		// happens — `dbBackfillRepos([])` is a no-op, and skipping it would make this
 		// function's contract depend on the registry, which callers rely on not
-		// doing.
+		// doing. The all-disabled machine is covered further down by `worked`, which
+		// is empty for exactly the same reason.
 		const quiet = repos.length === 0;
 		// Held, not printed: on a steady-state pass the whole block is noise. The
 		// import itself is cursor-gated (see DbBackfill's `sot-import`), so a converged
@@ -774,11 +861,17 @@ async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 				printer.onProgress(progress);
 			},
 		});
-		// A repo whose every registered worktree is gone is not counted with the
-		// ones that were imported: it was never swept, so `results` — never
-		// `repos` — is what this report may count, minus the entries that only say
-		// "not here". Unfiltered it printed "✓ All 0 memories already migrated."
-		const worked = results.filter((r) => r.mode !== "unavailable");
+		// A repo that was never swept is not counted with the ones that were
+		// imported: `results` — never `repos` — is what this report may count, minus
+		// every entry that only says "nothing was attempted". Unfiltered it printed
+		// "✓ All 0 memories already migrated."
+		//
+		// BOTH non-worked modes have to come out, and the second one matters more than
+		// it looks: `worked` gates this whole block (`worked.length === 0` below), sizes
+		// "across N repo(s)", and is the population `printSessionSummary` reports on.
+		// Leaving `disabled` in it makes a machine whose every repo is switched off
+		// print a full ✓ report about repos it deliberately did not touch.
+		const worked = results.filter((r) => r.mode !== "unavailable" && r.mode !== "disabled");
 		const missing = results.filter((r) => r.mode === "unavailable");
 		// ONE line for the whole run, naming the repos. The three warnings per repo
 		// per pass this replaced were the reason it went silent, but silence is not
@@ -1190,36 +1283,35 @@ export function formatSessionBreakdown(bySource: Readonly<Record<string, Session
  * branch, so it is the moment the containment compare is most likely to pass.
  * Without a caller here the engine was only ever reachable by typing `jolli
  * cutover`, and every repo stayed `uncutover` — reads served from the folder
- * layer, `SqliteStorage` never on the path. `maybeAutoCutover` reports nothing
- * and cannot throw, so it cannot turn a successful setup into a failure; the
- * two states short of `cutover` are both workable and converge later.
+ * layer, `SqliteStorage` never on the path. It cannot throw, so it cannot turn
+ * a successful setup into a failure; the two states short of `cutover` are both
+ * workable and converge later. It goes through {@link sweepCutoverWithNotice}
+ * rather than calling into the engine bare — an attempt is a silent
+ * tens-of-seconds step at the very end of setup, and "not throwing" is not the
+ * same as "safe to leave unannounced".
  *
- * **Carries the same disabled-repo gate as {@link executeDashboard}, and for the
- * same two writes.** This used to be reachable only from `jolli enable`, where
- * `install` has already cleared the opt-out by the time it runs — so the gate
- * looked redundant. The guided front door now comes here too, and it does NOT
- * clear anything: a repo whose `userDisabled` is set while its hooks survive (an
- * uninstall that failed after the flag was persisted, which is the documented
- * order) would have had `registerRepo` rebuild its registry entry and clear the
- * `disabledAt` that `jolli disable` set — silently undoing the user's decision
- * on a command they ran to look at status. `runHistoryImport` is deliberately
- * NOT gated: it sweeps every registered repo, so it belongs to the machine
- * rather than to `cwd`, exactly like `opportunisticSnapshot`.
+ * **The disabled-repo gate covers registration only, and its narrowness is the
+ * decision.** This used to be reachable only from `jolli enable`, where `install`
+ * has already cleared the opt-out by the time it runs — so the gate looked
+ * redundant. The guided front door now comes here too, and it does NOT clear
+ * anything: a repo whose disable is set while its hooks survive (an uninstall
+ * that failed after the flag was persisted, which is the documented order) has no
+ * business being added to the roster by a command the user ran to look at status.
+ * The cutover sweep is deliberately OUTSIDE it, alongside `runHistoryImport`:
+ * both are machine-scoped and ask each repo's own profile whether to touch it, so
+ * gating them on `cwd` would let one switched-off repository cancel the sweep for
+ * every other repo on the machine.
  *
- * `throttleCutover` is the caller's policy, not a default, because the two
- * callers are opposites: `jolli enable` runs once and wants the attempt
- * unconditionally, while the front door is a command a user types many times a
- * day and would otherwise pay the containment compare — which reads every file
- * the frozen tip lists — on every one of them.
+ * There is deliberately no per-caller throttle knob. It existed to let the front
+ * door (a bare `jolli`, typed many times a day) skip the containment compare
+ * while `jolli enable` ran it unconditionally — but the throttle is a FAILURE
+ * backoff, so the only thing it ever suppressed here was a user's own retry
+ * after an attempt that did not commit. Both callers are foreground; see
+ * {@link sweepCutoverWithNotice}.
  */
-export async function importDashboardHistory(
-	cwd: string,
-	deps: DashboardDeps = {},
-	options: { readonly throttleCutover?: boolean } = {},
-): Promise<void> {
+export async function importDashboardHistory(cwd: string, deps: DashboardDeps = {}): Promise<void> {
 	if (!canUseDashboardDb()) return;
-	const repoDisabled = readManualDisableFlagSync(cwd);
-	if (repoDisabled) {
+	if (readManualDisableFlagSync(cwd)) {
 		// `notice` for the same reason `executeDashboard` uses it: this is the only
 		// explanation the user gets for a run that succeeded while leaving their
 		// repo out of the database.
@@ -1232,12 +1324,9 @@ export async function importDashboardHistory(
 		}
 	}
 	await runHistoryImport(deps);
-	if (!repoDisabled) {
-		await maybeAutoCutover(cwd, {
-			...(options.throttleCutover ? { throttle: true } : {}),
-			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
-		});
-	}
+	// NOT inside the gate above: the sweep asks every repo's own profile, and `cwd`
+	// being switched off says nothing about the others.
+	await sweepCutoverWithNotice(cwd, deps);
 }
 
 /**
@@ -1252,9 +1341,11 @@ export async function importDashboardHistory(
  *
  * A repo the user has disabled still gets the page — the dashboard is a
  * machine-level view of every registered repo, so one repo's opt-out is no
- * reason to withhold the others' data — but none of this command's writes to
- * THAT repo run. See the `repoDisabled` gate below for which writes those are
- * and why the machine-scoped ones stay.
+ * reason to withhold the others' data — and the `repoDisabled` gate below covers
+ * exactly one write: registering `cwd`. Everything else here is machine-scoped
+ * and asks each repo's own profile for itself (`runHistoryImport`, the cutover
+ * sweep, `opportunisticSnapshot`), so hoisting any of it to `cwd` would let one
+ * switched-off repository stop work that belongs to all the others.
  */
 export async function executeDashboard(
 	page: "stats" | "standup",
@@ -1292,14 +1383,17 @@ export async function executeDashboard(
 
 	const cwd = options.cwd ?? process.cwd();
 
-	// The user's own opt-out for THIS repo, which gates this command's two writes
-	// to it (registration below, the cutover attempt at the end) and nothing else.
-	// The page still opens: the dashboard is machine-level — it aggregates every
-	// registered repo — so being launched from a repo the user turned off is no
-	// reason to withhold the other repos' data. The machine-scoped work stays too:
-	// `ensureDashboardDbExists` above and `opportunisticSnapshot` below belong to
-	// the database, not to `cwd`, and gating them on one repo's switch would mean
-	// a disabled repo silently stops the machine's backups.
+	// The user's own opt-out for THIS repo, which gates exactly one write —
+	// registering `cwd` below — and nothing else. The page still opens: the
+	// dashboard is machine-level, it aggregates every registered repo, so being
+	// launched from a repo the user turned off is no reason to withhold the other
+	// repos' data. The machine-scoped work stays for the same reason, and there are
+	// three pieces of it: `ensureDashboardDbExists` above, `runHistoryImport` and
+	// the cutover sweep below, and `opportunisticSnapshot` last. The first and last
+	// belong to the database rather than to `cwd`; the middle two sweep the roster
+	// and ask each repo's own profile for itself. Gating any of them here would let
+	// one switched-off repository stop the machine's backups, or its imports, or
+	// every other repo's cutover.
 	//
 	// The read-only SYNC reader on purpose. `readManualDisableFlag` migrates a
 	// legacy marker and PERSISTS the decision, and a question asked on the way to
@@ -1317,12 +1411,12 @@ export async function executeDashboard(
 	// Register the current repo when we are inside one; outside a repo the
 	// dashboard still opens with whatever repos are already registered.
 	//
-	// Skipped outright for a disabled repo, because `registerRepo` REBUILDS the
-	// entry and so clears `disabledAt` — the flag `jolli disable` sets through
-	// `deregisterRepo`, and the one `listActiveRepos` filters on. Opening a page
-	// is not an explicit re-enable, so letting it land here would silently undo
-	// the disable and put the repo back into every later history import.
-	// `ensureWorktreeListed` exists for exactly this distinction; see its header.
+	// Still skipped for a disabled repo, though no longer because registration
+	// could undo the disable — the switch lives in `profile.json` now and nothing
+	// in the registry can clear it. It is skipped because opening a page is not a
+	// reason to add a repo the user has switched off to the machine's roster: the
+	// sweep would then read its profile on every launch to conclude, every time,
+	// that it must not be imported.
 	if (!repoDisabled) {
 		try {
 			await registerRepo({ cwd, ...(deps.configDir ? { configDir: deps.configDir } : {}) });
@@ -1362,21 +1456,30 @@ export async function executeDashboard(
 	// import above has just filled the database from the orphan branch, so this is
 	// when the containment compare is most likely to pass.
 	//
-	// THROTTLED, unlike that caller, and the difference is the invocation
-	// frequency rather than the moment: `jolli dashboard` is a reopen command a
-	// user can type many times a day, the import is cursor-gated so a steady-state
-	// reopen fills nothing in, and the engine's compare reads every file the
-	// frozen tip lists. Unthrottled, a repo that keeps answering `not-ready` would
-	// pay that sweep on every launch. Reports nothing and cannot throw.
+	// UNTHROTTLED, like every foreground caller. This one used to throttle, on the
+	// reasoning that `jolli dashboard` is a reopen command typed many times a day
+	// and the engine's compare reads every file the frozen tip lists. What that
+	// missed is what the window actually gates: a repo that cut over never reaches
+	// the throttle at all, so the runs it suppressed were exclusively the retries
+	// after a failed attempt — i.e. the user reopening the dashboard BECAUSE the
+	// repo had not switched. Measured that way in the field: the page opened, this
+	// step was skipped in silence, and `jolli cutover` typed minutes later cut the
+	// repo over on the first try. Cannot throw.
 	//
-	// Skipped for a disabled repo, and this is the write that matters most: it
-	// stamps `cutoverAttemptedAtMs` into that repo's profile and, when the compare
-	// passes, FREEZES its orphan branch — a fence `jolli enable` is forbidden to
-	// clear (only `doctor`'s manual path may). Opening a page must not be able to
-	// leave that behind in a repo the user switched off.
-	if (!repoDisabled) {
-		await maybeAutoCutover(cwd, { throttle: true, ...(deps.dbPath ? { dbPath: deps.dbPath } : {}) });
-	}
+	// Announced, because THIS caller is the one that invited the interruption: the
+	// page is already up and the banner above it said "Press Ctrl+C to stop", and
+	// this runs after the import's last line with nothing on screen to suggest work
+	// is still happening. See {@link sweepCutoverWithNotice}.
+	//
+	// It sweeps the WHOLE roster, like `runHistoryImport` above it, and is therefore
+	// deliberately NOT inside the `repoDisabled` gate that governs registration. The
+	// heaviest write here is per repo — it stamps `cutoverAttemptedAtMs` into that
+	// repo's profile and, when the compare passes, FREEZES its orphan branch behind
+	// a fence `jolli enable` may not clear — so the decision has to be taken per
+	// repo, which is what the sweep's own `isRepoDisabled` check does. Hoisting it
+	// to `cwd` would let one switched-off repository cancel the sweep for every
+	// other repo on this machine.
+	await sweepCutoverWithNotice(cwd, deps);
 	// The "dashboard start" half of the backup schedule (the others are the
 	// post-commit QueueWorker and the machine-global daemon). Internally
 	// day-gated and never throws, so this costs nothing on a normal reopen.

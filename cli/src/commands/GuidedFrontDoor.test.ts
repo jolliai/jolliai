@@ -28,6 +28,7 @@ const h = vi.hoisted(() => ({
 	importDashboardHistory: vi.fn(),
 	startForegroundDashboard: vi.fn(),
 	canUseDashboardDb: vi.fn(),
+	readManualDisableFlagSync: vi.fn(),
 }));
 
 vi.mock("../auth/AuthConfig.js", () => ({ loadAuthToken: h.loadAuthToken, getJolliUrl: h.getJolliUrl }));
@@ -41,6 +42,10 @@ vi.mock("../core/SessionTracker.js", () => ({
 	saveConfigScoped: h.saveConfigScoped,
 	getGlobalConfigDir: h.getGlobalConfigDir,
 }));
+// Read to pick the enable prompt's DEFAULT. Mocked because the real one resolves a
+// git common dir off the (synthetic) cwd, so the wording would otherwise depend on
+// the developer's own machine.
+vi.mock("../core/RepoProfile.js", () => ({ readManualDisableFlagSync: h.readManualDisableFlagSync }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: h.createStorage }));
 vi.mock("../core/SummaryStore.js", () => ({
 	getSummaryCount: h.getSummaryCount,
@@ -105,7 +110,9 @@ describe("GuidedFrontDoor", () => {
 			warns.push(a.map(String).join(" "));
 		});
 
-		// Defaults: signed in via OAuth, enabled, no memories yet, no prior decline.
+		// Defaults: signed in via OAuth, enabled, no memories yet, no prior decline,
+		// and never switched off (so the enable prompt keeps its `[Y/n]` default).
+		h.readManualDisableFlagSync.mockReturnValue(false);
 		h.resolveProjectDir.mockReturnValue("/repo");
 		h.createStorage.mockResolvedValue({});
 		h.getGlobalConfigDir.mockReturnValue("/global/config");
@@ -311,6 +318,33 @@ describe("GuidedFrontDoor", () => {
 		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
 		h.promptText.mockResolvedValue("");
 		await runGuidedFrontDoor();
+		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
+	});
+
+	it("a repo the user switched off gets [y/N], and Enter keeps it off", async () => {
+		// A disabled repo has no hooks, so `enabled` is false and this prompt is
+		// unavoidable for it — someone running `jolli` just to read the status will see
+		// it. With the `[Y/n]` default, a reflexive Enter installed the hooks, cleared
+		// the switch (`clearManualDisableOnSuccess`), re-registered the repo and let a
+		// cutover attempt follow: an explicit decision undone by one keystroke, with
+		// nothing on disk afterwards to tell it apart from a real re-enable.
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
+		h.readManualDisableFlagSync.mockReturnValue(true);
+		h.promptText.mockResolvedValue("");
+		await runGuidedFrontDoor();
+
+		expect(h.promptText).toHaveBeenCalledWith(expect.stringContaining("[y/N]"));
+		expect(h.install).not.toHaveBeenCalled();
+		expect(out()).toContain("Not enabled");
+	});
+
+	it("a repo the user switched off still re-enables on an explicit yes", async () => {
+		// The reversed default must not make re-enabling harder than typing `y`.
+		h.isGitPipelineFullyInstalled.mockResolvedValue(false);
+		h.readManualDisableFlagSync.mockReturnValue(true);
+		h.promptText.mockResolvedValue("y");
+		await runGuidedFrontDoor();
+
 		expect(h.install).toHaveBeenCalledWith("/repo", { source: "cli", clearManualDisableOnSuccess: true });
 	});
 
@@ -810,10 +844,10 @@ describe("GuidedFrontDoor", () => {
 		it("imports after the back-fill step, before Next steps", async () => {
 			await runGuidedFrontDoor();
 
-			// Throttled: a bare `jolli` is typed many times a day, and the cutover's
-			// containment compare reads every file the frozen tip lists. `jolli enable`
-			// is the caller that wants it unconditional, and it passes nothing.
-			expect(h.importDashboardHistory).toHaveBeenCalledWith("/repo", {}, { throttleCutover: true });
+			// Unthrottled, like every foreground caller: the cutover throttle is a
+			// failure backoff, so on a typed command the only run it can suppress is
+			// the user's own retry after an attempt that did not commit.
+			expect(h.importDashboardHistory).toHaveBeenCalledWith("/repo");
 			// Order matters: the import is what picks up whatever the back-fill just wrote.
 			expect(h.runBackfillFrontDoorStep.mock.invocationCallOrder[0]).toBeLessThan(
 				h.importDashboardHistory.mock.invocationCallOrder[0] as number,

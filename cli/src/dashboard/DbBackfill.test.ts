@@ -87,6 +87,10 @@ vi.mock("../core/AntigravitySessionDiscoverer.js", () => ({
 }));
 vi.mock("../core/RepoProfile.js", () => ({
 	readCutoverFence: vi.fn(),
+	// `isRepoDisabled` (via RepoRegistry) asks this for every registered checkout.
+	// Default OFF so the existing cases sweep as before; the paused-repo cases below
+	// flip it per worktree.
+	readManualDisableFlagSync: vi.fn(() => false),
 }));
 // The importer has its own suite (SotImport.test.ts) driven by an in-memory
 // StorageProvider; here we only care that the wiring calls it and that its
@@ -113,7 +117,7 @@ import { scanDevinSessionsOnDisk } from "../core/DevinSessionDiscoverer.js";
 import { execGit, getHeadHash, listFilesInBranch } from "../core/GitOps.js";
 import { scanKimiSessionsOnDisk } from "../core/KimiSessionDiscoverer.js";
 import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js";
-import { readCutoverFence } from "../core/RepoProfile.js";
+import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import {
@@ -177,6 +181,10 @@ const worktreeEvent: WorktreeStatusEvent = {
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "jolli-backfill-"));
 	dbPath = join(dir, "dashboard.db");
+	// Re-armed per test, not left to the factory: `clearMocks` drops call history but
+	// KEEPS an implementation, so a paused-repo case flipping this to `true` would
+	// otherwise switch off every repo in every test that follows it.
+	vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
 	vi.mocked(getHeadHash).mockResolvedValue("head-1");
 	// `checkoutFingerprint` reads `.exitCode`/`.stdout`; an undefined return would
 	// throw inside every backfill. Empty branch-tip output is a valid answer —
@@ -231,6 +239,15 @@ afterEach(() => {
 
 async function query<T>(sql: string, ...params: unknown[]): Promise<T[]> {
 	return withDashboardDb((db) => db.prepare(sql).all(...params) as T[], { dbPath });
+}
+
+/** One repo's `disabled_at`, or null when it is enabled or has no row yet. */
+async function pausedAt(repoIdentity: string): Promise<string | null> {
+	const rows = await query<{ disabled_at: string | null }>(
+		"SELECT disabled_at FROM repos WHERE repo_identity = ?",
+		repoIdentity,
+	);
+	return rows[0]?.disabled_at ?? null;
 }
 
 /** The branch axis's own view of one commit: `commit_branches`, resolved to names. */
@@ -668,6 +685,49 @@ describe("dbBackfillRepos", () => {
 		expect(results[1]).toEqual({ mode: "unavailable", eventsApplied: 0, repoName: "gone" });
 		// Not swept at all: no collector ever saw it.
 		expect(vi.mocked(collectSessionEvents).mock.calls.every((c) => c[0].repoIdentity !== "local:gone")).toBe(true);
+	});
+
+	it("projects a switched-off repo's paused state and imports nothing for it", async () => {
+		// Both halves matter. Nothing may be imported for a repo the user turned off —
+		// and its PAUSED STATE still has to reach the database, because every read
+		// surface filters on `repos.disabled_at IS NULL`. Filtering it out further
+		// upstream leaves that column NULL forever, so a repo disabled from the VS Code
+		// sidebar keeps counting in every KPI and reads as enabled on the page.
+		const off: RegisteredRepo = { ...repo, repoIdentity: "local:off", repoName: "off" };
+		await dbBackfillRepos([off], { dbPath });
+		expect(await pausedAt("local:off")).toBeNull();
+
+		vi.mocked(collectSessionEvents).mockClear();
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		const results = await dbBackfillRepos([off], { dbPath });
+
+		expect(results).toEqual([{ mode: "disabled", eventsApplied: 0, repoName: "off" }]);
+		// Never swept on the paused pass: no collector saw it.
+		expect(vi.mocked(collectSessionEvents)).not.toHaveBeenCalled();
+		expect(await pausedAt("local:off")).toEqual(expect.any(String));
+	});
+
+	it("preserves the paused timestamp across re-projections, and clears it on re-enable", async () => {
+		// A boolean cannot say WHEN the user flipped it, so the stamp is minted on the
+		// NULL → set transition and left alone afterwards. Re-minting it would be
+		// invisible today (only nullness is read) and wrong the moment anything shows
+		// "paused since": every `jolli dashboard` re-projects, so the date would track
+		// the last launch instead of the decision.
+		const off: RegisteredRepo = { ...repo, repoIdentity: "local:off", repoName: "off" };
+		await dbBackfillRepos([off], { dbPath });
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		await dbBackfillRepos([off], { dbPath, now: () => 1_000 });
+		const first = await pausedAt("local:off");
+		expect(first).toEqual(expect.any(String));
+
+		await dbBackfillRepos([off], { dbPath, now: () => 90_000_000 });
+		expect(await pausedAt("local:off")).toBe(first);
+
+		// Re-enabled: the ordinary enabled projection clears the column, so a later
+		// pause mints a fresh stamp rather than resurrecting this one.
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
+		await dbBackfillRepos([off], { dbPath });
+		expect(await pausedAt("local:off")).toBeNull();
 	});
 
 	it("does not scan machine-global stores when no repo has a live checkout", async () => {

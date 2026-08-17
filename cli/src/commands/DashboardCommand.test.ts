@@ -22,7 +22,7 @@ vi.mock("../dashboard/Backup.js", () => ({
 // back to `process.cwd()`): reading its profile, stamping an attempt into it, and
 // possibly running a cutover CAS against a throwaway test database.
 vi.mock("../dashboard/AutoCutover.js", () => ({
-	maybeAutoCutover: vi.fn().mockResolvedValue("skipped"),
+	autoCutoverAllRepos: vi.fn().mockResolvedValue([]),
 }));
 // The history import prunes fixture entries before it reads the registry.
 // Mocked because the real one is a registry read plus `existsSync` over whatever
@@ -41,7 +41,10 @@ vi.mock("../dashboard/RepoRegistry.js", () => ({
 			enabledAt: "t",
 		}),
 	),
-	listActiveRepos: vi.fn(async () => []),
+	// The roster, not `listActiveRepos`: the import hands `dbBackfillRepos` every
+	// registered repo, because that is the only caller that projects a switched-off
+	// repo's paused state into the database.
+	readRepoRegistry: vi.fn(async () => ({ version: 1, repos: [] as RegisteredRepo[] })),
 }));
 vi.mock("../dashboard/DashboardDb.js", async (importOriginal) => {
 	const original = await importOriginal<typeof import("../dashboard/DashboardDb.js")>();
@@ -57,13 +60,13 @@ vi.mock("../core/RepoProfile.js", async (importOriginal) => {
 });
 
 import { readManualDisableFlagSync } from "../core/RepoProfile.js";
-import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
+import { autoCutoverAllRepos } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { DASHBOARD_HEALTH_SERVICE } from "../dashboard/DashboardServer.js";
 import { dbBackfillRepos, type SessionTierSummary } from "../dashboard/DbBackfill.js";
 import { pruneDisposableRepos } from "../dashboard/RepoForget.js";
-import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
+import { readRepoRegistry, registerRepo } from "../dashboard/RepoRegistry.js";
 import {
 	createDeferredWriter,
 	createProgressPrinter,
@@ -154,6 +157,11 @@ function deps(over: Partial<DashboardDeps> = {}): DashboardDeps & {
 	};
 }
 
+/** Arms the machine roster the import sweeps. */
+function registered(repos: RegisteredRepo[]): void {
+	vi.mocked(readRepoRegistry).mockResolvedValue({ version: 1, repos });
+}
+
 beforeEach(() => {
 	configDir = mkdtempSync(join(tmpdir(), "jolli-cmd-"));
 	// clearMocks resets implementations between tests — re-arm the defaults here.
@@ -165,7 +173,7 @@ beforeEach(() => {
 		enabledAt: "t",
 	});
 	vi.mocked(dbBackfillRepos).mockResolvedValue([{ mode: "bootstrapped", eventsApplied: 3, repoName: "jolli" }]);
-	vi.mocked(listActiveRepos).mockResolvedValue([]);
+	vi.mocked(readRepoRegistry).mockResolvedValue({ version: 1, repos: [] });
 	vi.mocked(pruneDisposableRepos).mockResolvedValue([]);
 	// Enabled unless a case says otherwise. Re-armed here for the same reason as
 	// the others: `clearMocks` drops the factory's implementation.
@@ -182,23 +190,25 @@ afterEach(() => {
 
 describe("importDashboardHistory — the disabled repo", () => {
 	it("does not re-register a repo the user disabled", async () => {
-		// `registerRepo` REBUILDS the entry and clears the `disabledAt` that
-		// `jolli disable` set, so running it here silently undoes the user's own
-		// opt-out. Reachable whenever the flag is set while the hooks survive — an
-		// uninstall that failed after the flag was persisted, which is the order
-		// `uninstall` documents — and the front door reaches this on a bare `jolli`.
+		// The registry stores no disable state, so registering means only "this repo
+		// is on the machine's roster" — and a background import is no reason to put
+		// a repo the user switched off back onto it. Reachable whenever the flag is
+		// set while the hooks survive — an uninstall that failed after the flag was
+		// persisted, which is the order `uninstall` documents — and the front door
+		// reaches this on a bare `jolli`.
 		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
 		await importDashboardHistory("/w", deps());
 		expect(registerRepo).not.toHaveBeenCalled();
 	});
 
-	it("does not attempt a cutover on a repo the user disabled", async () => {
-		// The heavier of the two: it stamps `cutoverAttemptedAtMs` into that repo's
-		// profile and, on a passing compare, FREEZES its orphan branch behind a
-		// fence `jolli enable` may not clear.
+	it("STILL runs the cutover sweep when this repo is disabled", async () => {
+		// The gate covers registration and nothing else. The sweep is machine-scoped
+		// and asks each repo's own profile for itself, so hoisting the decision to
+		// `cwd` would let one switched-off repository cancel the cutover for every
+		// other repo on the machine — the whole point of making the sweep plural.
 		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
 		await importDashboardHistory("/w", deps());
-		expect(maybeAutoCutover).not.toHaveBeenCalled();
+		expect(autoCutoverAllRepos).toHaveBeenCalledTimes(1);
 	});
 
 	it("still sweeps every registered repo when this one is disabled", async () => {
@@ -231,14 +241,14 @@ describe("importDashboardHistory — the fixture prune", () => {
 			order.push("prune");
 			return [];
 		});
-		vi.mocked(listActiveRepos).mockImplementation(async () => {
-			order.push("list");
-			return [];
+		vi.mocked(readRepoRegistry).mockImplementation(async () => {
+			order.push("read");
+			return { version: 1, repos: [] };
 		});
 
 		await importDashboardHistory("/w", deps());
 
-		expect(order).toEqual(["prune", "list"]);
+		expect(order).toEqual(["prune", "read"]);
 	});
 
 	it("says on screen how many entries it removed", async () => {
@@ -298,18 +308,167 @@ describe("importDashboardHistory — the fixture prune", () => {
 	});
 });
 
-describe("importDashboardHistory — the cutover throttle", () => {
-	it("is the caller's choice, and off by default", async () => {
-		// `jolli enable` runs once and wants the attempt unconditionally.
+describe("no foreground caller throttles the cutover", () => {
+	// The throttle is a FAILURE backoff — a repo that cut over short-circuits
+	// ahead of it — so on a typed command the only thing it can suppress is the
+	// user's own retry. Both of these used to pass one, and `jolli dashboard`
+	// silently skipping the attempt is what sent a real user to `jolli cutover`.
+	// It is now the TYPE that guarantees this: `AutoCutoverSweepOptions` has no
+	// `throttle` field at all, so a foreground caller cannot ask for one even by
+	// mistake. These two assert the weaker thing a test still can — that no key
+	// smuggling a backoff reaches the sweep — and exist mainly to fail loudly if
+	// someone re-adds the option to the interface.
+	it("does not on the import path — `jolli enable` and the front door", async () => {
 		await importDashboardHistory("/w", deps());
-		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.not.objectContaining({ throttle: true }));
+		const [opts] = vi.mocked(autoCutoverAllRepos).mock.calls[0] ?? [];
+		expect(Object.keys(opts ?? {})).not.toContain("throttle");
 	});
 
-	it("throttles when the caller asks", async () => {
-		// The front door does: a bare `jolli` is typed many times a day, and the
-		// containment compare reads every file the frozen tip lists.
-		await importDashboardHistory("/w", deps(), { throttleCutover: true });
-		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.objectContaining({ throttle: true }));
+	it("does not on `jolli dashboard`, which is where it was measured", async () => {
+		await executeDashboard("stats", {}, deps());
+		const [opts] = vi.mocked(autoCutoverAllRepos).mock.calls[0] ?? [];
+		expect(Object.keys(opts ?? {})).not.toContain("throttle");
+	});
+
+	it("hands the sweep `cwd` to try first", async () => {
+		// Ordering only — the sweep covers the whole roster either way. The user is
+		// standing in this repo, so an interrupted pass has already tried the one
+		// they were most likely waiting on.
+		await importDashboardHistory("/w", deps());
+		expect(autoCutoverAllRepos).toHaveBeenCalledWith(expect.objectContaining({ preferFirst: "/w" }));
+	});
+});
+
+/**
+ * The attempt is a silent tens-of-seconds step at the very end of both commands,
+ * and in `jolli dashboard` it runs after a banner that says "Press Ctrl+C to
+ * stop". Interrupting it costs the two-hour throttle slot as well as the attempt,
+ * so the announcement is the whole mitigation — and it has to be tied to work
+ * ACTUALLY starting, or it becomes a line on every run that nobody reads.
+ */
+describe("the cutover sweep is announced", () => {
+	type SweepEntry = Awaited<ReturnType<typeof autoCutoverAllRepos>>[number];
+
+	/** A sweep in which each named repo really begins an attempt and lands in `state`. */
+	function sweepOf(...entries: Array<{ repoName: string; state: SweepEntry["state"] }>): void {
+		vi.mocked(autoCutoverAllRepos).mockImplementation(async (opts) => {
+			for (const e of entries) opts?.onAttemptStart?.(e.repoName);
+			return entries.map((e) => ({
+				repoName: e.repoName,
+				root: `/${e.repoName}`,
+				state: e.state,
+				attempted: true,
+			}));
+		});
+	}
+
+	const printed = (): string => vi.mocked(console.log).mock.calls.flat().join("\n");
+
+	it("warns not to interrupt, before the wait rather than after it", async () => {
+		sweepOf({ repoName: "jolliai", state: "cutover" });
+		await importDashboardHistory("/w", deps());
+		expect(printed()).toContain("Leave it running");
+	});
+
+	it("warns ONCE however many repos it attempts", async () => {
+		// The heading is per sweep, not per repo — N copies of a two-line banner is
+		// how a warning becomes something the user scrolls past.
+		sweepOf(
+			{ repoName: "one", state: "cutover" },
+			{ repoName: "two", state: "cutover" },
+			{ repoName: "three", state: "uncutover" },
+		);
+		await importDashboardHistory("/w", deps());
+		expect(printed().match(/Leave it running/g)).toHaveLength(1);
+	});
+
+	it("names each repo and its outcome", async () => {
+		sweepOf({ repoName: "one", state: "cutover" }, { repoName: "two", state: "uncutover" });
+		await importDashboardHistory("/w", deps());
+		expect(printed()).toContain("one — now served from SQLite");
+		expect(printed()).toContain("two — not switched this time");
+	});
+
+	it("gives the restart advice once, and only when something moved", async () => {
+		sweepOf({ repoName: "one", state: "cutover" }, { repoName: "two", state: "cutover" });
+		await importDashboardHistory("/w", deps());
+		expect(printed().match(/Restart IDEs/g)).toHaveLength(1);
+	});
+
+	it("says a sweep that switched nothing is not a failure, and where to look", async () => {
+		// The case most likely to read as broken: the user waited and has nothing on
+		// screen to show for it.
+		sweepOf({ repoName: "one", state: "uncutover" });
+		await importDashboardHistory("/w", deps());
+		expect(printed()).not.toContain("Restart IDEs");
+		expect(printed()).toContain("Nothing switched this time");
+		expect(printed()).toContain("jolli cutover --status");
+	});
+
+	it("stays silent when no repo began an attempt", async () => {
+		// The common case on a settled machine: every repo short-circuits on its
+		// route. This is why the heading hangs off `onAttemptStart` rather than being
+		// printed before the call.
+		vi.mocked(autoCutoverAllRepos).mockResolvedValue([
+			{ repoName: "one", root: "/one", state: "cutover", attempted: false },
+		]);
+		await importDashboardHistory("/w", deps());
+		expect(printed()).not.toContain("Leave it running");
+		expect(printed()).not.toContain("Restart IDEs");
+		expect(printed()).not.toContain("Nothing switched this time");
+	});
+
+	it("announces on the dashboard too — the caller that invited the Ctrl+C", async () => {
+		sweepOf({ repoName: "jolliai", state: "cutover" });
+		await executeDashboard("stats", {}, deps());
+		expect(printed()).toContain("Leave it running");
+	});
+
+	/**
+	 * A repo the engine has refused on grounds no retry can change is the one
+	 * "nothing happened" that the user has to act on, and this is the only place
+	 * it surfaces: the closing line says "nothing switched this time" (which a
+	 * healthy repo also gets) and `--status` says `uncutover` (which every
+	 * not-yet-swept repo says).
+	 */
+	describe("a blocked repo", () => {
+		const BLOCKED: SweepEntry = {
+			repoName: "stuck",
+			root: "/stuck",
+			state: "skipped",
+			attempted: false,
+			blocked: {
+				code: "no-summary-rows",
+				reason: "the import stored no memories from /stuck although its orphan tip lists some",
+				witness: "1.0.0|/stuck@abc",
+				at: 1_770_000_000_000,
+			},
+		};
+
+		it("is named with its reason and a repair, even though nothing was attempted", async () => {
+			vi.mocked(autoCutoverAllRepos).mockResolvedValue([BLOCKED]);
+			await importDashboardHistory("/w", deps());
+			expect(printed()).toContain("stuck — cannot switch to SQLite");
+			expect(printed()).toContain("stored no memories");
+			expect(printed()).toContain("jolli doctor");
+			// Not dressed up as work in progress: nothing ran, so the wait banner and
+			// the per-attempt outcome lines must stay away.
+			expect(printed()).not.toContain("Leave it running");
+			expect(printed()).not.toContain("not switched this time");
+		});
+
+		it("is reported alongside the repos that did move", async () => {
+			// One blocked repo must not swallow the sweep's normal report, and a repo
+			// that switched must not swallow the warning.
+			vi.mocked(autoCutoverAllRepos).mockImplementation(async (opts) => {
+				opts?.onAttemptStart?.("healthy");
+				return [BLOCKED, { repoName: "healthy", root: "/healthy", state: "cutover", attempted: true }];
+			});
+			await importDashboardHistory("/w", deps());
+			expect(printed()).toContain("stuck — cannot switch to SQLite");
+			expect(printed()).toContain("healthy — now served from SQLite");
+			expect(printed()).toContain("Restart IDEs");
+		});
 	});
 });
 
@@ -346,16 +505,14 @@ describe("importDashboardHistory", () => {
 		// A repo whose every recorded worktree is gone is dropped before the sweep
 		// and returns no result, so there is nothing this report may claim about it.
 		// Counting the registry instead printed "✓ All 0 memories already migrated."
-		vi.mocked(listActiveRepos).mockResolvedValue([
-			{ repoIdentity: "r", repoName: "jolli", worktreeRoot: "/gone", enabledAt: "t" },
-		]);
+		registered([{ repoIdentity: "r", repoName: "jolli", worktreeRoot: "/gone", enabledAt: "t" }]);
 		vi.mocked(dbBackfillRepos).mockResolvedValue([]);
 		await importDashboardHistory("/w", deps());
 		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).not.toMatch(/migrated/i);
 	});
 
 	it("counts the repos that were swept, not the ones that were registered", async () => {
-		vi.mocked(listActiveRepos).mockResolvedValue([
+		registered([
 			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
 			{ repoIdentity: "r2", repoName: "b", worktreeRoot: "/b", enabledAt: "t" },
 			{ repoIdentity: "r3", repoName: "gone", worktreeRoot: "/gone", enabledAt: "t" },
@@ -373,7 +530,7 @@ describe("importDashboardHistory", () => {
 		// `debug`, which CLI mode keeps off the terminal, so an unmounted share
 		// silently stopped importing. It is NOT a migration failure — that wording
 		// belongs to `skipped`, and this repo may be back on the next launch.
-		vi.mocked(listActiveRepos).mockResolvedValue([
+		registered([
 			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
 			{ repoIdentity: "r2", repoName: "on-a-nas", worktreeRoot: "/mnt/nas/x", enabledAt: "t" },
 		]);
@@ -395,9 +552,7 @@ describe("importDashboardHistory", () => {
 		// (test fixtures from before the isolatedHome fix). Printed in full they
 		// buried the result line under them, and "repo, repo, repo" identifies
 		// nothing anyway. Nothing prunes that file, so the count only grows.
-		vi.mocked(listActiveRepos).mockResolvedValue([
-			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
-		]);
+		registered([{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" }]);
 		const dead = ["repo", "repo", "repo", "frepo", "bare-fenced", "trepo"].map((repoName, i) => ({
 			mode: "unavailable",
 			eventsApplied: 0,
@@ -414,12 +569,35 @@ describe("importDashboardHistory", () => {
 		expect(out).toContain("Skipped 6 repo(s) with no checkout on disk (repo, frepo, bare-fenced, +1 more)");
 	});
 
+	it("stays silent when every registered repo is switched off, and says nothing about it", async () => {
+		// The paused rows exist so the sweep can project `repos.disabled_at`, NOT so a
+		// report can count them: they gate this whole block (`worked.length === 0`),
+		// size "across N repo(s)", and are the population `printSessionSummary` speaks
+		// for. Leave them in `worked` and a machine whose every repo is off prints a
+		// full ✓ report about repos it deliberately did not touch.
+		//
+		// Unlike `unavailable`, they are not announced either. An unmounted share is
+		// something the user is still waiting on; this is their own decision, already
+		// visible as the paused row on the page they are opening.
+		registered([
+			{ repoIdentity: "r1", repoName: "off-a", worktreeRoot: "/a", enabledAt: "t" },
+			{ repoIdentity: "r2", repoName: "off-b", worktreeRoot: "/b", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			{ mode: "disabled", eventsApplied: 0, repoName: "off-a" },
+			{ mode: "disabled", eventsApplied: 0, repoName: "off-b" },
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+		await importDashboardHistory("/w", deps());
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(out).not.toMatch(/migrated/i);
+		expect(out).not.toContain("across");
+		expect(out).not.toMatch(/off-a|off-b/);
+	});
+
 	it("stays silent about migration when every registered repo is unavailable", async () => {
 		// `results` is no longer empty in this case, so the quiet rule has to read
 		// past the unavailable rows or it prints "✓ All 0 memories already migrated."
-		vi.mocked(listActiveRepos).mockResolvedValue([
-			{ repoIdentity: "r1", repoName: "gone", worktreeRoot: "/gone", enabledAt: "t" },
-		]);
+		registered([{ repoIdentity: "r1", repoName: "gone", worktreeRoot: "/gone", enabledAt: "t" }]);
 		vi.mocked(dbBackfillRepos).mockResolvedValue([
 			{ mode: "unavailable", eventsApplied: 0, repoName: "gone" },
 		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
@@ -788,15 +966,15 @@ describe("executeDashboard", () => {
 		await expect(run).resolves.toBe(true);
 	});
 
-	it("attempts a THROTTLED auto-cutover after the import", async () => {
-		// The import is what makes the compare likely to pass, so the attempt belongs
-		// after it — but this is a reopen command, so it must not pay the compare on
-		// every launch the way the one-shot import entry point does.
+	it("sweeps the cutover unthrottled, AFTER the import", async () => {
+		// Ordering is the load-bearing half: the import is what fills the database
+		// from the branch, which is what makes the containment compare likely to
+		// pass, so an attempt ahead of it would mostly measure the old state.
 		const d = deps();
 		await executeDashboard("stats", { cwd: "/w" }, d);
-		expect(maybeAutoCutover).toHaveBeenCalledWith("/w", expect.objectContaining({ throttle: true }));
+		expect(autoCutoverAllRepos).toHaveBeenCalledWith(expect.objectContaining({ preferFirst: "/w" }));
 		expect(vi.mocked(dbBackfillRepos).mock.invocationCallOrder[0]).toBeLessThan(
-			vi.mocked(maybeAutoCutover).mock.invocationCallOrder[0] as number,
+			vi.mocked(autoCutoverAllRepos).mock.invocationCallOrder[0] as number,
 		);
 	});
 
@@ -808,7 +986,7 @@ describe("executeDashboard", () => {
 		});
 		await expect(executeDashboard("stats", {}, d)).resolves.toBe(false);
 		expect(dbBackfillRepos).not.toHaveBeenCalled();
-		expect(maybeAutoCutover).not.toHaveBeenCalled();
+		expect(autoCutoverAllRepos).not.toHaveBeenCalled();
 		expect(d.waited).toBe(0);
 	});
 
@@ -818,11 +996,15 @@ describe("executeDashboard", () => {
 		await expect(executeDashboard("stats", { cwd: "/w" }, d)).resolves.toBe(true);
 		// The page is machine-level, so it still opens with the other repos' data.
 		expect(d.opened).toHaveLength(1);
-		// `registerRepo` rebuilds the entry and would clear the `disabledAt` that
-		// `jolli disable` set — a page open is not an explicit re-enable.
+		// `registerRepo` would add this repo back to the machine's roster — and a
+		// page open is not an explicit re-enable.
 		expect(registerRepo).not.toHaveBeenCalled();
-		// And the fence this would leave behind is one `jolli enable` may not clear.
-		expect(maybeAutoCutover).not.toHaveBeenCalled();
+		// The cutover sweep DOES still run, and that is the point of it being plural:
+		// it asks each repo's own profile for itself, so the fence it may leave behind
+		// is never left in a repo the user switched off — while the OTHER repos on the
+		// machine still get their switch. Hoisting the decision to `cwd` is what used
+		// to let one opt-out cancel the whole machine's cutover.
+		expect(autoCutoverAllRepos).toHaveBeenCalledTimes(1);
 	});
 
 	it("still takes the machine snapshot when the launching repo is disabled", async () => {

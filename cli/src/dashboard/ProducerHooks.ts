@@ -61,12 +61,16 @@ const identityCache = new Map<string, string>();
  * user action: work in a repo and it appears.
  *
  * Guarded on "not already known" rather than calling `registerRepo`
- * unconditionally: that helper clears `disabledAt`, which is right for an
- * explicit `jolli enable` but would let a stray hook silently undo a
- * `jolli disable`. So a repo the user turned off stays off, and only a genuinely
- * missing entry is filled in. A known identity whose `worktrees` list lacks
- * THIS checkout (a second clone of the same remote) goes through the
- * union-only `ensureWorktreeListed` instead, which cannot touch `disabledAt`.
+ * unconditionally: that helper REBUILDS the row, so a stray hook would restate the
+ * display name and move `worktreeRoot` to whichever checkout happened to commit.
+ * Only a genuinely missing entry is filled in. A known identity whose `worktrees`
+ * list lacks THIS checkout (a second clone of the same remote) goes through the
+ * union-only `ensureWorktreeListed` instead.
+ *
+ * Neither path can re-enable anything any more: the registry records membership
+ * only, and the disable switch lives in each clone's `profile.json` (see
+ * `listActiveRepos`). It used to be able to — `registerRepo` cleared a `disabledAt`
+ * that a disable had stamped — which is the guard's original reason for existing.
  */
 async function repoIdentityFor(cwd: string, configDir?: string): Promise<string> {
 	const cached = identityCache.get(cwd);

@@ -350,9 +350,10 @@ export async function applySettings(
 
 /**
  * Reconciles BOTH Claude and Gemini agent hooks to `settings` across EVERY
- * registered repo (skipping dashboard-disabled repos via `listActiveRepos`, and
- * any clone the user `jolli disable`d via `readManualDisableFlag`), then each
- * clone's worktrees. Granular per-agent install/remove (not a full `install()`),
+ * registered repo, then each clone's worktrees. Two filters, same switch at two
+ * granularities: `listActiveRepos` drops a row whose EVERY clone is switched off,
+ * and the per-clone check below drops the individual clones of a row that is still
+ * active because a sibling clone is on. Granular per-agent install/remove (not a full `install()`),
  * the same body as VS Code's `syncHooks`, wrapped in the all-repos loop — so it
  * always drives both hooks to the config-desired state (idempotent), which is
  * why a flip of either agent runs the whole sweep. Failures are collected, never
@@ -365,9 +366,10 @@ export async function syncAllReposHooks(
 	const failures: HookSyncFailure[] = [];
 	for (const repo of await listActiveRepos(configDir)) {
 		for (const cloneRoot of existingWorktrees(repo)) {
-			// Per-clone user opt-out (`jolli disable`) — independent of the dashboard
-			// registry's `disabledAt`. Skip: re-installing a hook the user disabled
-			// would silently undo their opt-out.
+			// Per-clone opt-out. `listActiveRepos` can only answer for the identity as
+			// a whole (a row survives while ANY clone is on), so the clones of a
+			// surviving row still have to be asked one by one. Skip: re-installing a
+			// hook the user disabled would silently undo their opt-out.
 			if (await readManualDisableFlag(cloneRoot)) continue;
 			let worktrees: ReadonlyArray<string>;
 			try {

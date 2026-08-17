@@ -447,11 +447,18 @@ describe("syncAllReposHooks", () => {
 		expect(existsSync(join(plain, ".claude", "settings.local.json"))).toBe(true);
 	});
 
-	it("skips a repo the dashboard has disabled (disabledAt set)", async () => {
+	it("skips only the switched-off clone of a row that is still active", async () => {
+		// The complement of the case below, and the reason BOTH filters exist. One row
+		// per identity, one profile per clone: the row survives `listActiveRepos`
+		// because clone B is on, so the per-clone check is the only thing that can keep
+		// clone A's hooks from being reinstalled under the user.
 		const configDir = mkdtempSync(join(dir, "cfg-"));
 		writeFileSync(join(configDir, "config.json"), "{}");
-		const repo = mkdtempSync(join(dir, "repo-"));
-		execFileSync("git", ["init", "-q"], { cwd: repo });
+		const off = mkdtempSync(join(dir, "clone-off-"));
+		const on = mkdtempSync(join(dir, "clone-on-"));
+		execFileSync("git", ["init", "-q"], { cwd: off });
+		execFileSync("git", ["init", "-q"], { cwd: on });
+		await writeManualDisableFlag(off, true);
 		writeFileSync(
 			join(configDir, "dashboard-repos.json"),
 			JSON.stringify({
@@ -460,20 +467,20 @@ describe("syncAllReposHooks", () => {
 					{
 						repoIdentity: "id-1",
 						repoName: "repo",
-						worktreeRoot: repo,
+						worktreeRoot: on,
+						worktrees: [off, on],
 						enabledAt: "2026-01-01T00:00:00.000Z",
-						disabledAt: "2026-01-02T00:00:00.000Z",
 					},
 				],
 			}),
 		);
 		const failures = await syncAllReposHooks({ claudeEnabled: true, geminiEnabled: true }, configDir);
 		expect(failures).toEqual([]);
-		// listActiveRepos filters out the disabled row, so no hook was written.
-		expect(existsSync(join(repo, ".claude", "settings.local.json"))).toBe(false);
+		expect(existsSync(join(off, ".claude", "settings.local.json"))).toBe(false);
+		expect(existsSync(join(on, ".claude", "settings.local.json"))).toBe(true);
 	});
 
-	it("skips a clone the user has manually disabled", async () => {
+	it("skips a repo whose only clone the user has switched off", async () => {
 		const configDir = mkdtempSync(join(dir, "cfg-"));
 		writeFileSync(join(configDir, "config.json"), "{}");
 		const repo = mkdtempSync(join(dir, "repo-"));

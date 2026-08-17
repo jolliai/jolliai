@@ -16,17 +16,24 @@ vi.mock("../core/GitRemoteUtils.js", () => ({
 				?.replace(/\.git$/, "") ?? "",
 	),
 }));
+// The disable switch itself is `RepoProfile`'s (and tested there). Mocked here so
+// a case can put a recorded checkout on either side of it without materialising a
+// real repo on disk — every path in this suite is synthetic.
+vi.mock("../core/RepoProfile.js", () => ({
+	readManualDisableFlagSync: vi.fn(() => false),
+}));
 
 import { getProjectRootDir } from "../core/GitOps.js";
 import { getCanonicalRepoUrl } from "../core/GitRemoteUtils.js";
+import { readManualDisableFlagSync } from "../core/RepoProfile.js";
 import {
-	deregisterRepo,
 	deriveRepoName,
 	ensureWorktreeListed,
 	existingWorktrees,
 	getRepoRegistryPath,
 	hasLiveWorktree,
 	isDisposableRepo,
+	isRepoDisabled,
 	listActiveRepos,
 	type RegisteredRepo,
 	readRegistryInstanceId,
@@ -47,6 +54,7 @@ beforeEach(() => {
 	configDir = mkdtempSync(join(tmpdir(), "jolli-reg-"));
 	vi.mocked(getProjectRootDir).mockResolvedValue("/home/dev/jolli");
 	vi.mocked(getCanonicalRepoUrl).mockResolvedValue("https://github.com/jolliai/jolliai");
+	vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
 });
 
 afterEach(() => {
@@ -99,7 +107,7 @@ describe("deriveRepoName", () => {
 	});
 });
 
-describe("registerRepo / listActiveRepos / deregisterRepo", () => {
+describe("registerRepo / listActiveRepos", () => {
 	it("registers the repo with mode 0600 and lists it as active", async () => {
 		const entry = await registerRepo({ cwd: "/home/dev/jolli/sub", configDir, now: () => new Date(0) });
 		expect(entry).toEqual({
@@ -124,20 +132,44 @@ describe("registerRepo / listActiveRepos / deregisterRepo", () => {
 		expect(registry.repos[0].enabledAt).toBe("1970-01-01T00:00:00.000Z");
 	});
 
-	it("deregister marks disabled without deleting; re-register reactivates", async () => {
+	it("the repo's own profile decides active, not the registry — and the row is kept either way", async () => {
 		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
-		const identity = await deregisterRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(1000) });
-		expect(identity).toBe("https://github.com/jolliai/jolliai");
-		expect(await listActiveRepos(configDir)).toEqual([]);
-		const registry = await readRepoRegistry(configDir);
-		expect(registry.repos[0].disabledAt).toBe("1970-01-01T00:00:01.000Z");
+		expect(await listActiveRepos(configDir)).toHaveLength(1);
 
+		// The user switches Jolli off in the repo. Nothing writes the registry —
+		// this is exactly the path (VS Code sidebar, ide-bridge) that never did.
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		expect(await listActiveRepos(configDir)).toEqual([]);
+		// The row survives, so history stays queryable and re-enabling re-imports
+		// nothing.
+		expect((await readRepoRegistry(configDir)).repos).toHaveLength(1);
+
+		// And a registration — a background `enable --automatic`, a dashboard page
+		// open — can no longer resurrect it. That was the whole bug: one writer
+		// stamped the registry, every registerRepo cleared it.
 		await registerRepo({ cwd: "/home/dev/jolli", configDir });
+		expect(await listActiveRepos(configDir)).toEqual([]);
+
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
 		expect(await listActiveRepos(configDir)).toHaveLength(1);
 	});
 
-	it("deregistering an unknown repo returns null and writes nothing", async () => {
-		expect(await deregisterRepo({ cwd: "/home/dev/jolli", configDir })).toBeNull();
+	it("stays active while ANY clone of the identity is still switched on", async () => {
+		// One row per identity, one profile per clone: `every`, not `some`. A repo
+		// disabled in one checkout must not stop the other's memories arriving.
+		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
+		vi.mocked(getProjectRootDir).mockResolvedValue("/home/dev/jolli-2");
+		await registerRepo({ cwd: "/home/dev/jolli-2", configDir, now: () => new Date(0) });
+		const [entry] = (await readRepoRegistry(configDir)).repos;
+		expect(entry.worktrees).toEqual(["/home/dev/jolli", "/home/dev/jolli-2"]);
+
+		vi.mocked(readManualDisableFlagSync).mockImplementation((wt: string) => wt === "/home/dev/jolli");
+		expect(isRepoDisabled(entry)).toBe(false);
+		expect(await listActiveRepos(configDir)).toHaveLength(1);
+
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		expect(isRepoDisabled(entry)).toBe(true);
+		expect(await listActiveRepos(configDir)).toEqual([]);
 	});
 });
 
@@ -267,17 +299,16 @@ describe("multiple checkouts of one project (§10.2)", () => {
 		expect(existingWorktrees(repo)).toEqual(["/legacy"]);
 	});
 
-	it("ensureWorktreeListed unions a second clone WITHOUT reactivating a disabled repo", async () => {
-		// The hook self-registration path for clone B of a known remote: it must
-		// make B visible to the cutover's source enumeration, but a stray hook
-		// must not be able to undo a `jolli disable` the way registerRepo would.
+	it("ensureWorktreeListed unions a second clone of a switched-off repo without reactivating it", async () => {
+		// The hook self-registration path for clone B of a known remote: it must make
+		// B visible to the cutover's source enumeration even while the user has Jolli
+		// off, because an unlisted checkout's orphan branch is neither imported nor
+		// fenced. Listing a checkout is data about where it lives, not activation.
 		await registerRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(0) });
-		await deregisterRepo({ cwd: "/home/dev/jolli", configDir, now: () => new Date(1_000) });
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
 		vi.mocked(getProjectRootDir).mockResolvedValueOnce("/home/dev/jolli-2");
 		const entry = await ensureWorktreeListed({ cwd: "/home/dev/jolli-2", configDir });
 		expect(entry?.worktrees).toEqual(["/home/dev/jolli", "/home/dev/jolli-2"]);
-		// Still disabled — union-only.
-		expect(entry?.disabledAt).toBe(new Date(1_000).toISOString());
 		expect(await listActiveRepos(configDir)).toHaveLength(0);
 	});
 
@@ -729,7 +760,6 @@ describe("a registry the writers could not read", () => {
 		vi.mocked(getProjectRootDir).mockResolvedValue("/home/dev/other");
 		await expect(registerRepo({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
 		await expect(stampRegistryInstanceId("id-2", configDir)).rejects.toThrow();
-		await expect(deregisterRepo({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
 		await expect(ensureWorktreeListed({ cwd: "/home/dev/other", configDir })).rejects.toThrow();
 		// The damaged file is still there to be repaired, not overwritten.
 		expect(readFileSync(getRepoRegistryPath(configDir), "utf-8")).toBe("{ truncated");

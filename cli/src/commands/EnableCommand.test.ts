@@ -53,7 +53,6 @@ const h = vi.hoisted(() => ({
 	isInteractive: vi.fn(),
 	resolveProjectDir: vi.fn(),
 	registerRepo: vi.fn(),
-	deregisterRepo: vi.fn(),
 	canUseDashboardDb: vi.fn(),
 	importDashboardHistory: vi.fn(),
 }));
@@ -81,7 +80,7 @@ vi.mock("../hooks/PluginBootstrapTelemetry.js", () => ({
 vi.mock("../hooks/PushCompensation.js", () => ({ triggerPendingPushRetry: h.triggerPendingPushRetry }));
 vi.mock("../install/DistPathResolver.js", () => ({ isValidSourceTag: h.isValidSourceTag }));
 vi.mock("../install/Installer.js", () => ({ install: h.install, uninstall: h.uninstall }));
-vi.mock("../dashboard/RepoRegistry.js", () => ({ registerRepo: h.registerRepo, deregisterRepo: h.deregisterRepo }));
+vi.mock("../dashboard/RepoRegistry.js", () => ({ registerRepo: h.registerRepo }));
 vi.mock("../dashboard/DashboardDb.js", () => ({ canUseDashboardDb: h.canUseDashboardDb }));
 vi.mock("./DashboardCommand.js", () => ({ importDashboardHistory: h.importDashboardHistory }));
 vi.mock("./CliUtils.js", async (importOriginal) => {
@@ -532,7 +531,6 @@ describe("EnableCommand — dashboard registration and history import", () => {
 			worktreeRoot: "/repo",
 			enabledAt: "2026-07-30T00:00:00Z",
 		});
-		h.deregisterRepo.mockResolvedValue("id-1");
 		h.canUseDashboardDb.mockReturnValue(true);
 		h.importDashboardHistory.mockResolvedValue(undefined);
 		h.isInteractive.mockReturnValue(false);
@@ -579,25 +577,22 @@ describe("EnableCommand — dashboard registration and history import", () => {
 		expect(h.importDashboardHistory).not.toHaveBeenCalled();
 	});
 
-	it("marks the repo disabled in the dashboard registry on disable", async () => {
+	it("records the disable in the repo's profile and writes NOTHING to the registry", async () => {
+		// One switch. `uninstall(persistManualDisable)` writes `profile.json`, which is
+		// what every reader — `listActiveRepos` included — consults. The registry used
+		// to get a second stamp here and NOWHERE else, while every `registerRepo`
+		// cleared it, so a disabled repo kept coming back into the dashboard.
 		await runDisable();
 
-		expect(h.deregisterRepo).toHaveBeenCalledWith({ cwd: "/repo" });
+		expect(h.uninstall).toHaveBeenCalledWith("/repo", expect.objectContaining({ persistManualDisable: true }));
+		expect(h.registerRepo).not.toHaveBeenCalled();
 	});
 
-	it("does not touch the dashboard registry on integrations-only disable", async () => {
+	it("does not persist the opt-out on an integrations-only disable", async () => {
 		await runDisable("--integrations-only");
 
-		expect(h.deregisterRepo).not.toHaveBeenCalled();
-	});
-
-	it("keeps disable green when deregistration fails", async () => {
-		h.deregisterRepo.mockRejectedValue(new Error("registry unwritable"));
-
-		await runDisable();
-
-		expect(process.exitCode ?? 0).toBe(0);
-		expect(h.uninstall).toHaveBeenCalled();
+		expect(h.uninstall).toHaveBeenCalledWith("/repo", expect.objectContaining({ persistManualDisable: false }));
+		expect(h.registerRepo).not.toHaveBeenCalled();
 	});
 });
 

@@ -79,12 +79,15 @@ class RepoProfileBridgeTest {
         RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe false
     }
 
-    // ── The cutover split: userDisabled is the axis, manuallyDisabled is derived ──
-    // `manuallyDisabled` is recomputed on every write as `userDisabled OR a cutover
-    // fence is present`, so a merely-FENCED repo carries manuallyDisabled=true while
-    // the user disabled nothing. Reading the composite would show the DisabledPanel
-    // and skip auto-install for that repo. The CLI's readManualDisableFlagSync
-    // prefers `userDisabled`; this mirror must too.
+    // ── One switch, plus the retired field that still outranks it ──
+    // `manuallyDisabled` is the repo's one switch. `userDisabled` shipped in
+    // 0.99.11 – 0.99.13 as the truth half of a three-field split, alongside a
+    // `manuallyDisabled` recomputed as `userDisabled OR a cutover fence is present` —
+    // so a profile from that generation can hold manuallyDisabled=true while the user
+    // disabled nothing. Preferring the composite there shows the DisabledPanel and
+    // skips auto-install for a merely-FENCED repo. The CLI folds the retired field
+    // away on its first async read but keeps preferring it while present, because an
+    // older plugin bundle can re-create it at any time; this mirror must match.
 
     @Test
     fun `userDisabled=false wins over a fence-derived manuallyDisabled=true`() {
@@ -101,12 +104,23 @@ class RepoProfileBridgeTest {
     }
 
     @Test
-    fun `a pre-split profile still honours the composite as the migration fallback`() {
-        // Pre-split profile written by an OLD runtime, then fenced: the composite is
-        // all there is, so it is honoured — this is the migration fallback, and the
-        // reason the composite read cannot simply be deleted.
+    fun `the one switch alone is honoured, with no retired field beside it`() {
+        // What a converged profile looks like — and what a pre-split runtime wrote too.
+        // Both arrive here as the switch alone, which is the ordinary case rather than
+        // a fallback.
         writeProfileJson("""{"manuallyDisabled":true}""")
         RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe true
+        RepoProfileBridge.readExplicitManualDisable(repo.absolutePath) shouldBe true
+    }
+
+    @Test
+    fun `a fence alone never reads as disabled`() {
+        // Freezing the orphan branch is a routing decision, not a user opt-out. A
+        // converged profile carries no disable field at all, so the answer must be
+        // "undecided" rather than "disabled".
+        writeProfileJson("""{"cutoverFence":{"reason":"cutover","at":"t"},"cutoverAttemptedAtMs":1}""")
+        RepoProfileBridge.readManuallyDisabledFromDisk(repo.absolutePath) shouldBe false
+        RepoProfileBridge.readExplicitManualDisable(repo.absolutePath) shouldBe null
     }
 
     @Test

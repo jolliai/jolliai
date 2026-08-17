@@ -116,14 +116,18 @@ object RepoProfileBridge {
      * The disable axis, in the CLI's own precedence order — see
      * [readManualDisableFlagSync in RepoProfile.ts].
      *
-     * `userDisabled` FIRST, and `manuallyDisabled` only when it is absent. The
-     * two are not synonyms since the cutover split them: `manuallyDisabled` is a
-     * DERIVED composite (`userDisabled OR a cutover fence is present`), recomputed
-     * on every write and never authored by hand. Reading it as the answer means a
-     * repo that was merely fenced — a normal, non-user-initiated cutover state —
-     * reads back as "the user disabled this", so IntelliJ shows the DisabledPanel
-     * and skips auto-install for a repo nobody disabled. The composite survives
-     * only as the migration fallback for a profile written before the split.
+     * `manuallyDisabled` is the repo's ONE switch. `userDisabled` is the retired
+     * field of the three-field split that shipped in 0.99.11 – 0.99.13; the CLI no
+     * longer writes it and folds it away on the first read, but while a profile
+     * still carries it, it WINS — and this mirror has to honour that for the same
+     * reason the CLI does. A profile from that generation can hold a fence-derived
+     * `manuallyDisabled: true` next to `userDisabled: false`, so preferring the
+     * composite would read a merely-FROZEN repo (a normal cutover state nobody
+     * chose) as "the user disabled this" — IntelliJ would show the DisabledPanel
+     * and skip auto-install for a repo nobody disabled.
+     *
+     * The order is therefore not a legacy quirk to tidy up: an older runtime whose
+     * plugin bundle execs its own `dist/` can re-create the split at any time.
      *
      * Returns null for "undecided" (absent or malformed), so the caller falls back
      * rather than inventing a decision.
@@ -162,8 +166,8 @@ object RepoProfileBridge {
         if (profileFile != null && profileFile.isFile) {
             try {
                 val parsed = JsonParser.parseString(profileFile.readText(Charsets.UTF_8))
-                // userDisabled first, composite only as the pre-split fallback —
-                // see [readUserDisabled] for why the two are not interchangeable.
+                // The retired `userDisabled` first, the one switch second — see
+                // [readUserDisabled] for why that order is load-bearing.
                 val flag = readUserDisabled(parsed?.asJsonObject)
                 if (flag != null) {
                     return flag
