@@ -120,7 +120,11 @@ window.JD = window.JD || {};
 			apiKey: sum.apiKeyMasked || "",
 			jolliApiKey: sum.jolliApiKeyMasked || "",
 			localAgentTool: sum.localAgentTool || "claude-code",
-			localAgentModel: sum.localAgentModel || "",
+			// No `|| ""` fallback: the server sends the EFFECTIVE id, and "" matches
+			// no option, so it would leave the form holding a value the picker never
+			// shows. `localAgentCard` resolves an unusable value to the marked
+			// default instead.
+			localAgentModel: sum.localAgentModel,
 			localFolder: mb.localFolder || "",
 			compileExcludeFolders: mb.compileExcludeFolders || "",
 			syncTranscripts: mb.syncTranscripts === true,
@@ -458,15 +462,29 @@ window.JD = window.JD || {};
 		var options = tools.map((t) => opt(t.id, t.label, current)).join("");
 		// Model row only for a tool jollimemory pins a model for. Keyed lookup, not
 		// a "claude-code" string test: the server sends the map so the set of pinned
-		// tools stays a server-side fact. An empty stored value selects the default
-		// entry, which is why the fallback is DEFAULT_LOCAL_AGENT_MODEL's id.
+		// tools stays a server-side fact.
 		var models = (sum.localAgentModels || {})[current] || [];
+		// What is DISPLAYED must be what gets SUBMITTED. `opt()` marks selected by
+		// strict equality, so a value matching no option (an empty string from a
+		// payload without the field, or a model belonging to the tool we just
+		// switched away from) selects nothing and the browser silently shows the
+		// FIRST option — which is Haiku, since the list is ordered to match the
+		// Anthropic picker and the default sits in the middle. The form would still
+		// hold the old value, and the save would land on something the user never
+		// saw. Resolve to the server-marked default instead, and write it back so
+		// state and display agree.
+		var selected = f.localAgentModel;
+		if (models.length > 0 && !models.some((m) => m.id === selected)) {
+			var fallback = models.find((m) => m.isDefault) || models[0];
+			selected = fallback.id;
+			f.localAgentModel = selected;
+		}
 		var modelRow =
 			models.length === 0
 				? ""
 				: '<div class="set-row"><label class="set-label" for="localAgentModel">Model</label>' +
 					'<select class="set-input" id="localAgentModel" data-field="localAgentModel">' +
-					models.map((m) => opt(m.id, m.label, f.localAgentModel)).join("") +
+					models.map((m) => opt(m.id, m.label, selected)).join("") +
 					"</select></div>";
 		return (
 			'<div class="set-row"><label class="set-label" for="localAgentTool">Agent tool</label>' +

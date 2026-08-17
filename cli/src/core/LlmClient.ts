@@ -28,6 +28,7 @@ import {
 import { resolveLocalAgentModel } from "./localagent/ToolMeta.js";
 import {
 	type LocalAgentBackend,
+	LocalAgentModelRefusedError,
 	type LocalAgentOutcome,
 	LocalAgentSetupError,
 	LocalAgentTransientError,
@@ -696,15 +697,19 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		//
 		// Deliberately NOT persisted: unlike an unsupported flag, an entitlement can
 		// be granted later, and the next call should ask for the pinned model again.
-		// Deliberately only for `LocalAgentSetupError` — auth and transient failures
-		// are not about the model, and retrying them un-pinned would double the cost
-		// of every outage.
+		// And deliberately only for `LocalAgentModelRefusedError` — see the narrowing
+		// note at the catch for why the broader setup class is far too expensive.
 		let attempt: { outcome: LocalAgentOutcome; disabledFlagIds: ReadonlySet<string> };
 		let effectiveModel = localModel;
 		try {
 			attempt = await runOnce(localModel);
 		} catch (err) {
-			if (!localModel || !(err instanceof LocalAgentSetupError)) throw err;
+			// Narrow on purpose. Retrying on ANY setup error would push a ~400 KB
+			// prompt through the entire flag-degradation ladder a SECOND time — up
+			// to 8 full spawns for one summary that was never going to succeed —
+			// over failures (unparseable envelope, bad TMPDIR, a crash) that have
+			// nothing to do with the model we pinned.
+			if (!localModel || !(err instanceof LocalAgentModelRefusedError)) throw err;
 			log.warn(
 				'Local agent %s refused model "%s" (%s); retrying once on the tool\'s own model.',
 				tool,

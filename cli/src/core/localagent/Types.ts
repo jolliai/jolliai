@@ -52,10 +52,11 @@ export interface LocalAgentOutcome {
 	 * Optional because only Claude Code does today (`modelUsage`); codex, cursor,
 	 * opencode and kimi emit no model field, so their outcomes leave this unset.
 	 *
-	 * Load-bearing for metadata honesty: no local-agent tool is sent a model (see
-	 * `LlmClient.callLocalAgent`), so without this the stored `model` would be the
-	 * jollimemory-side alias — a value nothing in the call ever used. `LlmClient`
-	 * prefers this when present and falls back to the alias when absent.
+	 * Load-bearing for metadata honesty: a pinned model is a REQUEST, not a receipt,
+	 * and the four unpinned tools are sent no model at all — so without this the
+	 * stored `model` would be a jollimemory-side value the run may never have used.
+	 * `LlmClient` prefers this when present and falls back to the pinned value, or
+	 * to the config alias, when absent.
 	 */
 	readonly model?: string;
 }
@@ -124,6 +125,29 @@ export class LocalAgentSetupError extends Error {
 	constructor(message: string) {
 		super(message);
 		this.name = "LocalAgentSetupError";
+	}
+}
+
+/**
+ * The tool ran, but REFUSED the model it was told to use — an entitlement the
+ * subscription lacks, or an alias the CLI has retired.
+ *
+ * A subclass of the setup error rather than a sibling, so every existing
+ * `instanceof LocalAgentSetupError` classification keeps working. It exists so
+ * `LlmClient` can retry ONCE without the pin for this case ALONE: retrying on
+ * any setup error would re-run a ~400 KB prompt through the whole flag
+ * degradation ladder a second time (up to 8 full spawns for one doomed summary)
+ * for failures — an unparseable envelope, a bad TMPDIR — that have nothing to do
+ * with the model.
+ *
+ * Declared AFTER its parent on purpose: `extends` is evaluated eagerly and class
+ * bindings are not hoisted, so putting it first is a module-evaluation TDZ error,
+ * not a lint nit.
+ */
+export class LocalAgentModelRefusedError extends LocalAgentSetupError {
+	constructor(message: string) {
+		super(message);
+		this.name = "LocalAgentModelRefusedError";
 	}
 }
 

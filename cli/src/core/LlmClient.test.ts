@@ -25,6 +25,7 @@ import { loadUnsupportedFlagIds } from "./localagent/OptionalFlags.js";
 import {
 	LocalAgentAuthError,
 	type LocalAgentBackend,
+	LocalAgentModelRefusedError,
 	type LocalAgentRequest,
 	LocalAgentSetupError,
 	LocalAgentTransientError,
@@ -2513,7 +2514,9 @@ describe("callLlm — local-agent model pinning", () => {
 			parseResult: (_stdout, requestedModel) => {
 				calls++;
 				if (requestedModel) {
-					throw new LocalAgentSetupError("Claude Code returned an error (status 404): selected model");
+					throw new LocalAgentModelRefusedError(
+						"Claude Code returned an error (status 404): There's an issue with the selected model (opus).",
+					);
 				}
 				return {
 					text: "SUMMARY",
@@ -2554,6 +2557,26 @@ describe("callLlm — local-agent model pinning", () => {
 		});
 
 		await expect(call({ localAgentModel: "opus" })).rejects.toThrow(LocalAgentAuthError);
+		expect(calls).toBe(1);
+	});
+
+	it("does not retry a setup failure that is not about the model", async () => {
+		// The narrowing that keeps this affordable: a generic setup error would
+		// otherwise push a ~400 KB prompt through the whole flag-degradation ladder
+		// a SECOND time — up to 8 full spawns for a summary that cannot succeed.
+		let calls = 0;
+		registerBackend({
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.212" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => {
+				calls++;
+				throw new LocalAgentSetupError("Could not parse Claude Code output as JSON");
+			},
+			isPresent: () => true,
+		});
+
+		await expect(call({ localAgentModel: "opus" })).rejects.toThrow(LocalAgentSetupError);
 		expect(calls).toBe(1);
 	});
 

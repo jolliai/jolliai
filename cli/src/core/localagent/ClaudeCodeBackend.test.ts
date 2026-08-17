@@ -3,7 +3,12 @@ import { fileURLToPath } from "node:url";
 import { describe, expect, it, vi } from "vitest";
 import { ClaudeCodeBackend } from "./ClaudeCodeBackend.js";
 import * as resolver from "./ExecutableResolver.js";
-import { LocalAgentAuthError, LocalAgentSetupError, LocalAgentTransientError } from "./Types.js";
+import {
+	LocalAgentAuthError,
+	LocalAgentModelRefusedError,
+	LocalAgentSetupError,
+	LocalAgentTransientError,
+} from "./Types.js";
 
 const successFixture = readFileSync(
 	fileURLToPath(new URL("./fixtures/claude-print-success.json", import.meta.url)),
@@ -69,6 +74,23 @@ describe("ClaudeCodeBackend.parseResult", () => {
 			result: "Service Unavailable",
 		});
 		expect(() => backend.parseResult(json)).toThrowError(LocalAgentTransientError);
+	});
+
+	it("classifies a 404 as a MODEL refusal, not a generic setup error", () => {
+		// Measured: `--model bogus` answers exit 1 with this envelope. The narrower
+		// class is what lets LlmClient retry once un-pinned for this case ALONE —
+		// a generic setup error must not, or one doomed summary re-runs a ~400 KB
+		// prompt through the whole flag-degradation ladder a second time.
+		const json = JSON.stringify({
+			type: "result",
+			is_error: true,
+			api_error_status: 404,
+			result: "There's an issue with the selected model (bogus-model-xyz).",
+		});
+		expect(() => backend.parseResult(json)).toThrowError(LocalAgentModelRefusedError);
+		// Still a setup error to every existing classifier — the subclass exists to
+		// narrow one retry decision, not to reclassify the failure.
+		expect(() => backend.parseResult(json)).toThrowError(LocalAgentSetupError);
 	});
 
 	it("throws setup error on is_error with a non-transient/non-auth status", () => {
@@ -198,6 +220,21 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(backend.parseResult(json, "sonnet").model).toBe("claude-opus-5[1m]");
 	});
 
+	it("never lets the alias outrank a heavier turn, so the mismatch check stays falsifiable", () => {
+		// The tie-break must not creep back into a preference: if it did, this
+		// returns the haiku helper and LlmClient can no longer detect that sonnet
+		// answered. Same shape as the test above, stated as the invariant.
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-haiku-4-5": { inputTokens: 100 },
+				"claude-opus-4-8": { inputTokens: 101 },
+			},
+		});
+		expect(backend.parseResult(json, "haiku").model).toBe("claude-opus-4-8");
+	});
+
 	it("prefers the heavier match when two entries both name the requested model", () => {
 		const json = JSON.stringify({
 			is_error: false,
@@ -210,19 +247,22 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(backend.parseResult(json, "sonnet").model).toBe("claude-sonnet-5");
 	});
 
-	it("keeps the matching entry even when a later helper turn is far heavier", () => {
-		// Order matters here: the match arrives FIRST, so the guard that refuses to
-		// demote an already-matched entry is what carries it. Without that, a helper
-		// turn with a big cached prompt would displace the model we asked for.
+	it("names the ANSWERING turn even when the requested alias ran only the helper", () => {
+		// The case that makes the whole heuristic honest, and the one an
+		// alias-first rule got backwards: `haiku` is pinned, claude answers with
+		// sonnet, and its un-suppressible helper turn happens to be haiku. Naming
+		// the helper here would record a sonnet-written summary as haiku AND
+		// silence LlmClient's mismatch warning, because that warning reads this
+		// very value — the verifier and the verified would share one heuristic.
 		const json = JSON.stringify({
 			is_error: false,
 			result: "OK",
 			modelUsage: {
-				"claude-sonnet-5": { inputTokens: 1, cacheReadInputTokens: 0 },
-				"claude-haiku-4-5": { inputTokens: 9000, cacheReadInputTokens: 9000 },
+				"claude-haiku-4-5-20251001": { inputTokens: 523, cacheReadInputTokens: 0 },
+				"claude-sonnet-5": { inputTokens: 10, cacheReadInputTokens: 91593 },
 			},
 		});
-		expect(backend.parseResult(json, "sonnet").model).toBe("claude-sonnet-5");
+		expect(backend.parseResult(json, "haiku").model).toBe("claude-sonnet-5");
 	});
 
 	it("keeps the heaviest turn when no entry matches and the heavier one came first", () => {
@@ -239,16 +279,22 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(backend.parseResult(json).model).toBe("claude-opus-4-8");
 	});
 
-	it("matches the alias case-insensitively", () => {
+	it("breaks a weight tie with the requested alias, case-insensitively", () => {
+		// An older CLI reports `outputTokens` only, so every weight is 0 and the
+		// heuristic has nothing to rank on. There — and ONLY there — the requested
+		// alias is a better answer than whichever key came first.
 		const json = JSON.stringify({
 			is_error: false,
 			result: "OK",
 			modelUsage: {
-				"claude-haiku-4-5": { inputTokens: 900 },
-				"Claude-Sonnet-5": { inputTokens: 1 },
+				"claude-haiku-4-5": { outputTokens: 900 },
+				"Claude-Sonnet-5": { outputTokens: 1 },
 			},
 		});
 		expect(backend.parseResult(json, "SONNET").model).toBe("Claude-Sonnet-5");
+		// Without a request there is nothing to break the tie with, so the first
+		// key stands — a guess, but a deterministic one.
+		expect(backend.parseResult(json).model).toBe("claude-haiku-4-5");
 	});
 
 	it("leaves model unset when the envelope names none, so the caller can fall back", () => {

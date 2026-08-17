@@ -90,8 +90,8 @@ const MODEL = {
 			localAgentModel: "haiku",
 			localAgentModels: {
 				"claude-code": [
-					{ id: "sonnet", label: "Sonnet (default)" },
-					{ id: "haiku", label: "Haiku - cheapest" },
+					{ id: "haiku", label: "Haiku — fastest" },
+					{ id: "sonnet", label: "Sonnet — balanced (default)", isDefault: true },
 					{ id: "inherit", label: "Use Claude Code's own setting" },
 				],
 			},
@@ -268,7 +268,7 @@ describe("settings.js local-agent model picker", () => {
 		const html = summaryHtml();
 		expect(html).toContain('id="localAgentModel"');
 		expect(html).toContain('data-field="localAgentModel"');
-		expect(html).toContain("Haiku - cheapest");
+		expect(html).toContain("Haiku — fastest");
 		// The stored value is what must come back selected — a picker that always
 		// showed the first option would silently misreport the machine's setting.
 		expect(html).toMatch(/value="haiku"[^>]*selected/);
@@ -290,6 +290,26 @@ describe("settings.js local-agent model picker", () => {
 		});
 		expect(html).toContain('id="localAgentTool"');
 		expect(html).not.toContain('id="localAgentModel"');
+	});
+
+	it("selects the marked default when the payload's model is unusable, not the first option", () => {
+		// The trap: `opt()` marks selected by strict equality, so a value matching
+		// no option selects NOTHING and the browser shows the first one — which is
+		// Haiku, because the list is ordered to match the Anthropic picker and the
+		// default sits in the middle. Displayed and submitted would disagree.
+		const html = summaryHtml({ localAgentModel: "" });
+		expect(html).toMatch(/value="sonnet"[^>]*selected/);
+		expect(html).not.toMatch(/value="haiku"[^>]*selected/);
+	});
+
+	it("falls back to the first option when no entry is marked default", () => {
+		// An older server sends the list without the marker; showing SOMETHING
+		// selected still beats letting the browser and the form state disagree.
+		const html = summaryHtml({
+			localAgentModel: "gone",
+			localAgentModels: { "claude-code": [{ id: "haiku", label: "Haiku — fastest" }] },
+		});
+		expect(html).toMatch(/value="haiku"[^>]*selected/);
 	});
 
 	it("hides the row when the payload carries no model map at all", () => {

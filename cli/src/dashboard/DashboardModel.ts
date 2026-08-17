@@ -513,7 +513,11 @@ export interface SettingsSummary {
 	readonly localAgentTool: LocalAgentToolId;
 	/** Local-agent tools this build knows about, for the picker. */
 	readonly localAgentTools: ReadonlyArray<{ readonly id: LocalAgentToolId; readonly label: string }>;
-	/** Stored `localAgentModel`, or "" for the default. */
+	/**
+	 * The EFFECTIVE model id — never `""`. The default is stored as an absent
+	 * config value, and an id this build does not recognise resolves to the
+	 * default too, so the picker always has an option to select.
+	 */
 	readonly localAgentModel: string;
 	/**
 	 * Model choices per tool id, for the model picker. Keyed by tool rather than
@@ -523,7 +527,9 @@ export interface SettingsSummary {
 	 * switch. A tool jollimemory does not pin a model for is absent from the map,
 	 * which is what hides the row.
 	 */
-	readonly localAgentModels: Readonly<Record<string, ReadonlyArray<{ readonly id: string; readonly label: string }>>>;
+	readonly localAgentModels: Readonly<
+		Record<string, ReadonlyArray<{ readonly id: string; readonly label: string; readonly isDefault?: boolean }>>
+	>;
 }
 
 /** The Memory Bank tab's own fields. `missingSummaries` is fetched lazily (slow). */

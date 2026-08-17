@@ -5,6 +5,7 @@ import {
 	type Invocation,
 	LocalAgentAuthError,
 	type LocalAgentBackend,
+	LocalAgentModelRefusedError,
 	type LocalAgentOutcome,
 	type LocalAgentRequest,
 	LocalAgentSetupError,
@@ -50,18 +51,24 @@ interface ClaudePrintEnvelope {
  * when the real answer is short that helper OUT-PRODUCES it. Picking the
  * highest-output entry therefore named haiku for a sonnet run.
  *
- * So `requested` — the alias this invocation actually put in `--model` — wins over
- * any heuristic: an entry naming it is the turn we asked for, by construction.
- * That matters twice over, because `LlmClient` compares this value against the
- * request to detect a model that was not honoured; a heuristic that picks the
- * helper turn would fire that warning on every short-output action and train
- * everyone to ignore it.
+ * The answering turn is identified by TOTAL INPUT, not by output and NOT by the
+ * requested alias: it is the turn carrying the conversation prompt and its cache
+ * (measured, sonnet 1 + 3289 cached against the helper's 523 + 0), while the
+ * output column gets this exactly backwards. Every prompt this project sends is
+ * thousands of tokens, so the answering turn always outweighs the helper.
  *
- * With no `requested` (the `inherit` choice, which sends no model flag) there is
- * nothing to match, so fall back to the highest TOTAL INPUT rather than the
- * highest output: the answering turn is the one carrying the conversation cache
- * (measured, sonnet 1 + 3289 cached against the helper's 523 + 0), which the
- * output column gets exactly backwards.
+ * `requested` is ONLY a tie-breaker, and that restraint is the point. `LlmClient`
+ * compares this value against the request to detect a model that was not
+ * honoured, so preferring the requested alias outright would close a loop and
+ * make the check tautological — it could then only fire when the alias appeared
+ * nowhere at all. The scenario that exposes it: pin `haiku`, claude answers with
+ * sonnet, and the un-suppressible helper turn runs haiku. Alias-first names the
+ * HELPER, so nothing warns and a sonnet-written summary is recorded as haiku —
+ * exactly the "stored metadata is not allowed to guess" rule, inverted.
+ *
+ * The tie-break still earns its place: an older CLI reports `outputTokens` only,
+ * leaving every weight at 0, and there the requested alias is a better answer
+ * than whichever key happened to come first.
  */
 function pickModel(modelUsage: ClaudePrintEnvelope["modelUsage"], requested?: string): string | undefined {
 	const needle = requested?.trim().toLowerCase() ?? "";
@@ -71,18 +78,11 @@ function pickModel(modelUsage: ClaudePrintEnvelope["modelUsage"], requested?: st
 	for (const [id, usage] of Object.entries(modelUsage ?? {})) {
 		const weight = (usage?.inputTokens ?? 0) + (usage?.cacheReadInputTokens ?? 0);
 		const matched = needle !== "" && id.toLowerCase().includes(needle);
-		// An entry naming the requested model is never displaced by one that does
-		// not, however much the other turn consumed. Among equals, heaviest input.
-		if (bestMatched && !matched) continue;
-		if (matched && !bestMatched) {
+		// Heaviest input wins outright; the requested alias only breaks a tie.
+		if (weight > bestWeight || (weight === bestWeight && matched && !bestMatched)) {
 			best = id;
 			bestWeight = weight;
-			bestMatched = true;
-			continue;
-		}
-		if (weight > bestWeight) {
-			best = id;
-			bestWeight = weight;
+			bestMatched = matched;
 		}
 	}
 	return best;
@@ -233,6 +233,14 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 			const msg = `Claude Code returned an error (status ${status}): ${detail}`;
 			if (status === 401 || status === 403) throw new LocalAgentAuthError(msg);
 			if (status === 429 || (status >= 500 && status < 600)) throw new LocalAgentTransientError(msg);
+			// 404 from this envelope means the model, not the route: measured,
+			// `--model bogus` answers `{"api_error_status":404,"result":"There's an
+			// issue with the selected model (…)"}`. Classified by STATUS, never by
+			// that phrasing — the wording is not a contract, the status is what the
+			// other branches here already key on. Narrowing it out of the generic
+			// setup error is what lets LlmClient retry un-pinned for this case and
+			// this case only.
+			if (status === 404) throw new LocalAgentModelRefusedError(msg);
 			// A not-signed-in failure in print+json mode surfaces as an is_error
 			// envelope, sometimes WITHOUT an HTTP status (a local "run `claude` to
 			// log in" rather than a proxied 401). Detect the stable auth phrasings

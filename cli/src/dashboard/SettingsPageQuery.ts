@@ -19,7 +19,12 @@
 
 import { getProjectRootDir } from "../core/GitOps.js";
 import { extractRepoName, resolveMemoryBankState } from "../core/KBPathResolver.js";
-import { effectiveLocalAgentModel, LOCAL_AGENT_TOOLS, localAgentToolModels } from "../core/localagent/ToolMeta.js";
+import {
+	DEFAULT_LOCAL_AGENT_MODEL,
+	effectiveLocalAgentModel,
+	LOCAL_AGENT_TOOLS,
+	localAgentToolModels,
+} from "../core/localagent/ToolMeta.js";
 import { describeMemoryBank } from "../core/MemoryBankStatusText.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
@@ -74,12 +79,22 @@ function localAgentTools(): ReadonlyArray<{ readonly id: LocalAgentToolId; reado
 	}));
 }
 
-/** Model choices per tool id, omitting the tools jollimemory does not pin one for. */
-function localAgentModels(): Readonly<Record<string, ReadonlyArray<{ id: string; label: string }>>> {
-	const out: Record<string, ReadonlyArray<{ id: string; label: string }>> = {};
+/**
+ * Model choices per tool id, omitting the tools jollimemory does not pin one for.
+ *
+ * Each list marks its default explicitly rather than leaving the page to infer it
+ * from position: the options are ordered to match the Anthropic model picker,
+ * which puts the default in the MIDDLE, so "the first one" is now Haiku.
+ */
+function localAgentModels(): Readonly<
+	Record<string, ReadonlyArray<{ id: string; label: string; isDefault?: boolean }>>
+> {
+	const out: Record<string, ReadonlyArray<{ id: string; label: string; isDefault?: boolean }>> = {};
 	for (const id of Object.keys(LOCAL_AGENT_TOOLS) as LocalAgentToolId[]) {
 		const models = localAgentToolModels(id);
-		if (models.length > 0) out[id] = models;
+		if (models.length > 0) {
+			out[id] = models.map((m) => (m.id === DEFAULT_LOCAL_AGENT_MODEL ? { ...m, isDefault: true } : m));
+		}
 	}
 	return out;
 }
