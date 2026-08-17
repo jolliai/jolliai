@@ -9,6 +9,7 @@ import ai.jolli.jollimemory.core.SummaryTree
 import ai.jolli.jollimemory.core.TopicCategory
 import ai.jolli.jollimemory.core.references.ReferenceCommitRef
 import ai.jolli.jollimemory.toolwindow.CommitMemoryFormat
+import ai.jolli.jollimemory.core.references.SourceDisplay
 import ai.jolli.jollimemory.core.references.SourceId
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.ViewTopicWithDate
 import ai.jolli.jollimemory.toolwindow.views.SummaryUtils.categoryClass
@@ -737,15 +738,19 @@ $items
 
     // ── Reference helpers ──────────────────────────────────────────────────
 
-    private val SOURCE_TITLES = mapOf(
-        SourceId.linear to "Linear",
-        SourceId.jira to "Jira",
-        SourceId.github to "GitHub",
-        SourceId.notion to "Notion",
-        SourceId.slack to "Slack",
-    )
-
-    private val SOURCE_ORDER = listOf(SourceId.linear, SourceId.jira, SourceId.github, SourceId.notion, SourceId.slack)
+    /**
+     * The display order for grouped references.
+     *
+     * `SourceId.entries` — the enum's own declaration order — rather than a
+     * hand-written list, and that is a correctness measure, not tidiness:
+     * [referencesBySourceOrder] renders by walking this, so a source missing
+     * from it is not merely sorted last, it is DROPPED from the section with
+     * nothing to say so. The hand-written five (linear / jira / github /
+     * notion / slack) silently hid every reference from the other ten sources
+     * the CLI ships. Derived from the enum, a new [SourceId] cannot be
+     * forgotten here.
+     */
+    private val SOURCE_ORDER: List<SourceId> = SourceId.entries
 
     /** Strips the `<source>:` prefix from archivedKey for DOM id use. */
     private fun stripSourcePrefix(archivedKey: String, source: SourceId): String {
@@ -753,7 +758,7 @@ $items
         return if (archivedKey.startsWith(prefix)) archivedKey.removePrefix(prefix) else archivedKey
     }
 
-    /** Orders references by source (linear -> jira -> github -> notion), preserving within-source order. */
+    /** Groups references by source in [SOURCE_ORDER], preserving within-source order. */
     private fun referencesBySourceOrder(references: List<ReferenceCommitRef>): List<ReferenceCommitRef> {
         val bySource = mutableMapOf<SourceId, MutableList<ReferenceCommitRef>>()
         for (r in references) bySource.getOrPut(r.source) { mutableListOf() }.add(r)
@@ -762,7 +767,12 @@ $items
 
     /** Renders a single reference row matching VS Code's buildReferenceRow. */
     private fun buildReferenceRow(e: ReferenceCommitRef): String {
-        val sourceLabel = SOURCE_TITLES[e.source] ?: e.source.name
+        // The CLI's `SOURCE_META` label, via the one Kotlin mirror of it, rather
+        // than a second five-entry map here — this string is what the row's
+        // "Open in <Source>" / "Remove <Source> Reference" buttons read, and a
+        // local map that fell behind printed the bare enum name ("monday",
+        // "zoom_doc") next to the sidebar's "monday.com" and "Zoom Doc".
+        val sourceLabel = SourceDisplay.of(e.source).label
         val domKey = stripSourcePrefix(e.archivedKey, e.source)
         // A reference may be linkless (Slack thread with no permalink / workspace URL) —
         // omit the "Open in <source>" button entirely when there's no url to open.

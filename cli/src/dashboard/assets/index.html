@@ -91,17 +91,46 @@
 	<div class="tip" id="tip"></div>
 	<!--
 	  The Memories page's Context viewer. Same layer rules as the sheet above.
-	  Its body is a read-only <pre>, filled with textContent — the document is
-	  markdown an agent wrote, and this page has no renderer for it.
+
+	  Its body is a SANDBOXED iframe onto /context-viewer, not markup this page
+	  builds: the document is markdown an agent wrote, and this page inlines the
+	  mutation token, so rendered HTML must never share an origin with it. The
+	  `sandbox` attribute (no allow-same-origin) is what enforces that — the same
+	  model the Knowledge page's wiki frame uses. It used to be a read-only <pre>
+	  of the raw markdown source for want of a renderer; the frame is the renderer.
 	-->
 	<div class="overlay" id="ovContext" role="dialog" aria-modal="true" aria-labelledby="ctxTitle">
-		<div class="sheet">
+		<!--
+		  `sheet-fill` because the body below is an iframe, which has no intrinsic
+		  height for a content-sized sheet to grow to. The Conversation sheet
+		  deliberately does NOT carry it: its body is real DOM, so a short
+		  conversation still gets a short dialog.
+		-->
+		<div class="sheet sheet-fill">
+			<button class="sheet-close" type="button" id="ctxDismiss" aria-label="Close">✕</button>
 			<h3 id="ctxTitle">Context</h3>
 			<div class="sub" id="ctxSub"></div>
-			<pre id="ctxBody" class="ctx-body"></pre>
+			<iframe id="ctxFrame" class="ctx-frame" sandbox="allow-scripts" title="Context document"></iframe>
 			<div class="row">
 				<div class="spacer"></div>
 				<button class="cta ghost" type="button" id="ctxClose">Close</button>
+			</div>
+		</div>
+	</div>
+	<!--
+	  The Memories page's Conversation viewer. Plain DOM, no frame: a transcript
+	  entry is rendered as TEXT (the editor's ConversationDetailsPanel does the
+	  same), so there is no agent-authored HTML here to isolate.
+	-->
+	<div class="overlay" id="ovConversation" role="dialog" aria-modal="true" aria-labelledby="convTitle">
+		<div class="sheet">
+			<button class="sheet-close" type="button" id="convDismiss" aria-label="Close">✕</button>
+			<h3 id="convTitle">Conversation</h3>
+			<div class="sub" id="convSub"></div>
+			<div id="convBody" class="conv-body"></div>
+			<div class="row">
+				<div class="spacer"></div>
+				<button class="cta ghost" type="button" id="convClose">Close</button>
 			</div>
 		</div>
 	</div>

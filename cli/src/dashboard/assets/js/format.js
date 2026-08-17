@@ -51,13 +51,34 @@ window.JD = window.JD || {};
 	 * did cost is accuracy: it admitted spellings no browser reads as https, which
 	 * can only ever be that dead link.
 	 */
-	JD.safeHrefAttr = (url) => {
+	JD.safeHref = (url) => {
 		var raw = String(url == null ? "" : url).trim();
 		var probe = raw
 			.replace(/[\t\n\r]/g, "")
 			.replace(/^[\u0000-\u0020]+/, "")
 			.toLowerCase();
-		return /^(https?:|mailto:)/.test(probe) ? JD.esc(raw) : null;
+		return /^(https?:|mailto:)/.test(probe) ? raw : null;
+	};
+
+	/**
+	 * The same decision, escaped for an HTML attribute.
+	 *
+	 * The two are split because one caller asks the QUESTION without wanting the
+	 * markup answer: the Context viewer's link bridge (`wireContextNav` in
+	 * memories.js) uses this to reject a url before it considers navigating, where
+	 * an HTML-escaped string would be wrong.
+	 *
+	 * That caller does NOT then open this function's return value, and the reason
+	 * belongs here so nobody "simplifies" it back: `window.open` is a sink CodeQL
+	 * tracks, this function is assigned onto the global `JD` in another asset file,
+	 * and no static analysis can tie the call to the allowlist above — so the
+	 * scanner sees an unguarded redirect and flags it (it did). The bridge
+	 * therefore re-parses with `new URL` inline and opens the PARSER's output. This
+	 * check is the intent; that one guards the navigation.
+	 */
+	JD.safeHrefAttr = (url) => {
+		var raw = JD.safeHref(url);
+		return raw === null ? null : JD.esc(raw);
 	};
 
 	/* Markdown rendering for LLM-written prose (topic trigger/decisions/

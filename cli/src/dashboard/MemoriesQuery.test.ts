@@ -11,6 +11,7 @@ import {
 	buildMemoriesPage,
 	buildMemoryDetail,
 	readContextDoc,
+	readConversationEntries,
 } from "./MemoriesQuery.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
@@ -636,10 +637,14 @@ describe("MemoriesQuery", () => {
 					kind: "reference",
 					// Leads with the nativeId: linear is a tracker whose key a reader recognizes.
 					title: "ACME-1 — Add rate limiting",
+					// The badge's letter and brand hue come from this — unconditional on a
+					// reference row, including the keyless one below, which is precisely
+					// the case whose `contextKey` prefix could not have stood in for it.
+					source: "linear",
 					meta: "ACME-1 (Linear)",
 					url: "https://linear.app/x",
 				},
-				{ kind: "reference", title: "42 — PR #42", meta: "42 (GitHub)" },
+				{ kind: "reference", title: "42 — PR #42", source: "github", meta: "42 (GitHub)" },
 			]);
 			expect(detail?.excluded).toEqual([{ title: "Unrelated ticket", reason: "different feature area" }]);
 
@@ -684,6 +689,65 @@ describe("MemoriesQuery", () => {
 				]),
 			);
 			expect(detail?.activityUncoveredSources).toEqual([]);
+		});
+
+		it("counts one MCP server reached under two registrations as one activity row", async () => {
+			// A Claude plugin's MCP entry is namespaced `plugin_<plugin>_<server>` by
+			// the host; the same server registered in the repo's own `.mcp.json`
+			// arrives bare. Jolli's own is registered BOTH ways on a normal install,
+			// so without the fold this payload carries `jollimemory` twice — once
+			// under each alias, each with half the calls. The MCPs card already
+			// merges them; this is the same rule on the memory-detail payload.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "Recalling prior work",
+				messageCount: 2,
+				tools: [
+					{ toolName: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 4 },
+					{
+						toolName: "plugin_jolli_jollimemory.recall",
+						kind: "mcp",
+						server: "plugin_jolli_jollimemory",
+						calls: 6,
+					},
+				],
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.activity).toEqual([{ label: "jollimemory", kind: "mcp", calls: 10 }]);
+		});
+
+		it("leaves a skill or builtin named like a plugin registration alone", async () => {
+			// The fold is guarded on `kind = 'mcp'` for the same reason the MCPs
+			// card's skill list keeps its raw column: `plugin_…` is an alias an MCP
+			// host prepended, while a skill or builtin name is one somebody chose.
+			// Renaming `plugin_manager_sync` to `sync` would silently merge it with
+			// any unrelated skill of that name.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "Running skills",
+				messageCount: 2,
+				tools: [
+					{ toolName: "plugin_manager_sync", kind: "skill", calls: 2 },
+					{ toolName: "plugin_manager_probe", kind: "builtin", calls: 1 },
+				],
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.activity).toEqual(
+				expect.arrayContaining([
+					{ label: "plugin_manager_sync", kind: "skill", calls: 2 },
+					{ label: "plugin_manager_probe", kind: "builtin", calls: 1 },
+				]),
+			);
 		});
 
 		it("orders conversations by the summary's transcripts[], not by query order", async () => {
@@ -1074,6 +1138,211 @@ describe("MemoriesQuery", () => {
 			const wrongKind = await withDashboardDb((db) => readContextDoc(db, "repo-1", "note", "p1"), { dbPath });
 			const wrongKey = await withDashboardDb((db) => readContextDoc(db, "repo-1", "plan", "nope"), { dbPath });
 			expect([wrongRepo, wrongKind, wrongKey]).toEqual([undefined, undefined, undefined]);
+		});
+	});
+
+	/**
+	 * The Conversation viewer's read — the browser counterpart to the editor's
+	 * read-only ConversationDetailsPanel.
+	 */
+	describe("readConversationEntries", () => {
+		const read = (source: string, sessionId: string, hash = "a".repeat(40), repo = "repo-1") =>
+			withDashboardDb((db) => readConversationEntries(db, repo, hash, source, sessionId), { dbPath });
+
+		it("returns the archived turns for one session", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: rate limit");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-a",
+				title: "live title",
+				archivedTitle: "Add the rate limiter",
+				messageCount: 2,
+				entries: [
+					{ role: "human", content: "add a limiter" },
+					{ role: "assistant", content: "done" },
+				],
+			});
+
+			const doc = await read("claude", "sess-a");
+			expect(doc?.title).toBe("Add the rate limiter");
+			expect(doc?.source).toBe("claude");
+			expect(doc?.messageCount).toBe(2);
+			expect(doc?.truncated).toBe(false);
+			expect(doc?.entries).toEqual([
+				{ role: "human", content: "add a limiter" },
+				{ role: "assistant", content: "done" },
+			]);
+		});
+
+		it("falls back to the live sessions title, exactly as the row does", async () => {
+			// The middle rung of the row's three-step precedence, and the only one the
+			// dialog can get wrong on its own: an archive written before titles were
+			// stored has none, so dropping this rung renamed the conversation the
+			// moment it was opened — the tree said "live title", the dialog said
+			// "add a limiter".
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: rate limit");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-a",
+				title: "live title",
+				// No archivedTitle: the pre-title archive this rung exists for.
+				messageCount: 2,
+				entries: [
+					{ role: "human", content: "add a limiter" },
+					{ role: "assistant", content: "done" },
+				],
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "a".repeat(40)), { dbPath });
+			const doc = await read("claude", "sess-a");
+			expect(doc?.title).toBe("live title");
+			// Asserted against the row rather than against the literal: what this
+			// protects is the two agreeing, not either one's own wording.
+			expect(doc?.title).toBe(detail?.conversations[0]?.title);
+		});
+
+		it("derives a title from the turns when neither the archive nor sessions has one", async () => {
+			// The last rung, and the one that used to answer for the middle one too.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: rate limit");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-a",
+				title: "live title",
+				messageCount: 2,
+				entries: [
+					{ role: "human", content: "add a limiter" },
+					{ role: "assistant", content: "done" },
+				],
+			});
+			// A blank live title is not a title — the same `.trim()` gate the row uses,
+			// which is why this falls through rather than showing an empty heading.
+			await withDashboardDb((db) => db.prepare("UPDATE sessions SET title = '  '").run(), { dbPath });
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, "a".repeat(40)), { dbPath });
+			const doc = await read("claude", "sess-a");
+			expect(doc?.title).toBe("add a limiter");
+			expect(doc?.title).toBe(detail?.conversations[0]?.title);
+		});
+
+		it("reassembles a session sliced across an amend chain", async () => {
+			// The case `groupArchivedSessions` exists for: one session filed once per
+			// commit in the chain, which used to render as N separate conversations.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: rate limit");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-a",
+				title: "t",
+				messageCount: 3,
+				extraSliceHashes: ["b".repeat(40), "c".repeat(40)],
+			});
+
+			const doc = await read("claude", "sess-a");
+			// One conversation, not three — and the empty slices contribute nothing.
+			expect(doc?.entries).toHaveLength(3);
+			expect(doc?.messageCount).toBe(3);
+		});
+
+		it("caps a very long conversation and says so", async () => {
+			// A deliberate divergence from the editor, which reads the same archive
+			// in-process. A silent prefix would read as the whole conversation.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: long");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-long",
+				title: "t",
+				messageCount: 450,
+				entries: Array.from({ length: 450 }, (_, i) => ({
+					role: (i % 2 === 0 ? "human" : "assistant") as "human" | "assistant",
+					content: `turn ${i}`,
+				})),
+			});
+
+			const doc = await read("claude", "sess-long");
+			expect(doc?.entries).toHaveLength(400);
+			// The FULL count, so the viewer can say what it is not showing.
+			expect(doc?.messageCount).toBe(450);
+			expect(doc?.truncated).toBe(true);
+			// Dropped turns are readable from the two counts; nothing was CUT, and
+			// saying otherwise is what made the viewer describe the wrong cap.
+			expect(doc?.clippedEntries).toBe(0);
+		});
+
+		it("clips one enormous turn and flags it, rather than serving it whole", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: big turn");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-big",
+				title: "t",
+				messageCount: 3,
+				entries: [
+					{ role: "assistant", content: "x".repeat(25_000) },
+					{ role: "human", content: "short" },
+					{ role: "assistant", content: "y".repeat(25_000) },
+				],
+			});
+
+			const doc = await read("claude", "sess-big");
+			expect(doc?.entries[0]?.content).toHaveLength(20_000);
+			expect(doc?.truncated).toBe(true);
+			// The count, not just the flag. This cap leaves no trace in
+			// `messageCount` / `entries.length` — both say 3 — so without it the
+			// viewer can only phrase the OTHER cap, and announces "the first 3 of 3
+			// turns" while 10,000 characters go unmentioned.
+			expect(doc?.clippedEntries).toBe(2);
+			expect(doc?.messageCount).toBe(doc?.entries.length);
+		});
+
+		it("resolves a source-less archived session through the claude default", async () => {
+			// `archivedSessionKey` defaults a source-less stored session to "claude",
+			// and the row carries that same defaulted value — so what the client sends
+			// back IS the key. Re-deriving it would be a second place to drift.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: old memory");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-old",
+				title: "t",
+				messageCount: 1,
+			});
+			await withDashboardDb(
+				(db) => {
+					// An archive written before the source was recorded.
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+						id: number;
+					};
+					const blob = deflateSync(
+						Buffer.from(JSON.stringify({ sessions: [{ sessionId: "sess-old", entries: [] }] })),
+					);
+					db.prepare("UPDATE transcripts SET sessions_blob = ? WHERE repo_id = ?").run(blob, repoId);
+				},
+				{ dbPath },
+			);
+
+			expect((await read("claude", "sess-old"))?.sessionId).toBe("sess-old");
+		});
+
+		it("returns undefined for an unknown repo, memory or session rather than throwing", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: rate limit");
+			await seedLinkedSession(dbPath, "repo-1", "a".repeat(40), {
+				source: "claude",
+				sessionId: "sess-a",
+				title: "t",
+				messageCount: 1,
+			});
+
+			expect(await read("claude", "sess-a", "a".repeat(40), "repo-2")).toBeUndefined();
+			expect(await read("claude", "sess-a", "d".repeat(40))).toBeUndefined();
+			expect(await read("claude", "nope")).toBeUndefined();
+			// The source is half the key: the right session under the wrong agent is
+			// not a match.
+			expect(await read("codex", "sess-a")).toBeUndefined();
 		});
 	});
 });

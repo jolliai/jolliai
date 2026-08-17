@@ -50,6 +50,7 @@ import type { CommitSummary, StoredTranscript } from "../Types.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import {
 	type ContextDoc,
+	type ConversationDoc,
 	type DashboardScope,
 	MEMORIES_PAGE_SIZE,
 	type MemoriesModel,
@@ -65,6 +66,7 @@ import {
 } from "./DashboardModel.js";
 import {
 	commitCategoryLabels,
+	mcpFoldedIdentifierSql,
 	resolveScope,
 	scopeFilter,
 	scopeToRepoIds,
@@ -381,12 +383,21 @@ function linkedSessionCoverage(
  * query position after the named ones rather than being dropped, since a row the
  * link table has is still a real conversation.
  */
-function buildConversations(
+/**
+ * A memory's stored transcripts, inflated and ordered the way the summary names
+ * them — the input `groupArchivedSessions` takes.
+ *
+ * Extracted because two readers need the identical list and the ordering is not
+ * incidental: it decides which slice's `StoredSession` wins first-seen, and so
+ * which title a session carries. A viewer that re-read the blobs in query order
+ * could title a conversation differently from the row that opened it.
+ */
+function readMemoryTranscripts(
 	db: DashboardDbHandle,
 	repoId: number,
 	hash: string,
 	summary: CommitSummary,
-): ReadonlyArray<MemoryConversationRow> {
+): Array<readonly [string, StoredTranscript]> {
 	const blobs = db
 		.prepare(
 			`SELECT mt.transcript_id, t.sessions_blob
@@ -421,8 +432,21 @@ function buildConversations(
 			log.warn("transcript %s unreadable for the memories view: %s", b.transcript_id, errMsg(err));
 		}
 	}
+	return transcripts;
+}
 
-	const nativeTitles = new Map(
+/**
+ * The live `sessions.title` for every session one memory's transcripts name,
+ * keyed by `archivedSessionKey`'s `${source}:${sessionId}`.
+ *
+ * Shared by {@link buildConversations} and {@link readConversationEntries} —
+ * the row and the dialog it opens must agree on a title, and the middle rung of
+ * that three-step fallback is the one only this query can supply. Keeping it in
+ * one place is what stops the two drifting: a row titled from `sessions` while
+ * the dialog re-derived a first-user-message title read as two conversations.
+ */
+function readNativeSessionTitles(db: DashboardDbHandle, repoId: number, hash: string): ReadonlyMap<string, string> {
+	return new Map(
 		(
 			db
 				.prepare(
@@ -440,6 +464,17 @@ function buildConversations(
 			.filter((r) => (r.title ?? "").trim().length > 0)
 			.map((r) => [`${r.source}:${r.session_id}`, r.title as string]),
 	);
+}
+
+function buildConversations(
+	db: DashboardDbHandle,
+	repoId: number,
+	hash: string,
+	summary: CommitSummary,
+): ReadonlyArray<MemoryConversationRow> {
+	const transcripts = readMemoryTranscripts(db, repoId, hash, summary);
+
+	const nativeTitles = readNativeSessionTitles(db, repoId, hash);
 
 	const { order, grouped } = groupArchivedSessions(transcripts);
 	return order.map((key) => {
@@ -457,6 +492,25 @@ function buildConversations(
 		};
 	});
 }
+
+/**
+ * The two identifier columns this page's activity rows are grouped by, with a
+ * plugin registration alias folded away — the same merge the MCPs card makes,
+ * so one server reached two ways is one row on both surfaces.
+ *
+ * The GUARDED form, unlike `DashboardQuery.ts`'s `TOOL_KEY_SQL` /
+ * `SERVER_KEY_SQL`: those sit behind a `t.kind = 'mcp'` WHERE clause, while this
+ * query deliberately returns every kind in one pass (its rows carry `kind` for
+ * the client to badge). Folding unconditionally would rename a skill or a
+ * builtin that happens to start `plugin_`.
+ *
+ * Worth having even though the client does not render `detail.activity` today:
+ * the field still travels in every selected-memory payload, so without the fold
+ * the same MCP server sits in it twice — `jollimemory` and
+ * `plugin_jolli_jollimemory` — waiting for whoever renders it next.
+ */
+const ACTIVITY_TOOL_KEY_SQL = mcpFoldedIdentifierSql("stu.tool_name", "stu.kind");
+const ACTIVITY_SERVER_KEY_SQL = mcpFoldedIdentifierSql("stu.server", "stu.kind");
 
 function buildActivity(
 	db: DashboardDbHandle,
@@ -476,7 +530,8 @@ function buildActivity(
 	// the same fan-out; this is the same table relation, one query later.
 	const rows = db
 		.prepare(
-			`SELECT stu.tool_name, stu.kind, stu.server, SUM(stu.calls) AS calls
+			`SELECT ${ACTIVITY_TOOL_KEY_SQL} AS tool_name, stu.kind, ${ACTIVITY_SERVER_KEY_SQL} AS server,
+			        SUM(stu.calls) AS calls
 			   FROM (SELECT DISTINCT s.event_id
 			           FROM memory_transcripts mt
 			           JOIN transcript_sessions ts
@@ -486,7 +541,7 @@ function buildActivity(
 			             ON s.repo_id = ts.repo_id AND s.source = ts.source AND s.session_id = ts.session_id
 			          WHERE mt.repo_id = ? AND mt.commit_hash = ?) se
 			   JOIN session_tool_use stu ON stu.session_event_id = se.event_id
-			  GROUP BY stu.kind, stu.tool_name, stu.server`,
+			  GROUP BY stu.kind, ${ACTIVITY_TOOL_KEY_SQL}, ${ACTIVITY_SERVER_KEY_SQL}`,
 		)
 		.all(repoId, hash) as ReadonlyArray<{ tool_name: string; kind: string; server: string | null; calls: number }>;
 	const activity: MemoryActivityRow[] = rows.map((r) => ({
@@ -572,6 +627,12 @@ function buildContextRows(summary: CommitSummary): ReadonlyArray<MemoryContextRo
 			return {
 				kind: "reference" as const,
 				title: referenceDisplayTitle(r),
+				// Unconditional, unlike the three optional fields below: the badge
+				// needs it for EVERY reference, including one whose source has left
+				// the registry (which is precisely when `contextKey` is absent, so
+				// the key's prefix cannot stand in). An unknown id lands on the
+				// neutral fallback client-side rather than on no badge at all.
+				source: r.source,
 				...(key ? { contextKey: key } : {}),
 				...(meta ? { meta } : {}),
 				...(r.url ? { url: r.url } : {}),
@@ -887,6 +948,94 @@ export function readContextDoc(
 		.get(repoId, kind, contextKey) as { title: string | null; body_md: string } | undefined;
 	if (!row) return undefined;
 	return { kind, title: row.title ?? contextKey, bodyMd: row.body_md };
+}
+
+/**
+ * How much of one archived conversation `/api/conversation` will serve.
+ *
+ * The editor reads the same archive in-process and shows all of it; this crosses
+ * HTTP into a modal, and an agent session can carry thousands of turns of
+ * unbounded text. Generous enough that a normal conversation is never clipped,
+ * and {@link ConversationDoc.truncated} says so when one is — a viewer showing a
+ * silent prefix would read as the whole conversation.
+ */
+const CONVERSATION_ENTRY_LIMIT = 400;
+const CONVERSATION_CONTENT_LIMIT = 20_000;
+
+/**
+ * One archived conversation's turns, for the Memories page's Conversation
+ * viewer — the read behind `/api/conversation`.
+ *
+ * Resolves the session exactly as {@link buildConversations} does, through the
+ * same {@link readMemoryTranscripts} + `groupArchivedSessions` pair, so the
+ * dialog shows the conversation the clicked row named. The lookup key is a plain
+ * string compare against the group map: `archivedSessionKey` is
+ * `${source}:${sessionId}` with a `"claude"` default for a source-less stored
+ * session, and the row already carries that same defaulted source — so what the
+ * client sends back IS the key, and re-deriving it here would only add a second
+ * place for the default to drift.
+ *
+ * Returns undefined for an unknown repo or session rather than throwing, so the
+ * route can answer 404 without special-casing — the same contract
+ * {@link readContextDoc} has.
+ */
+export function readConversationEntries(
+	db: DashboardDbHandle,
+	repoToken: string,
+	hash: string,
+	source: string,
+	sessionId: string,
+): ConversationDoc | undefined {
+	const { repoIds } = scopeToRepoIds(db, resolveScope(db, { kind: "repo", repoIdentities: [repoToken] }));
+	const repoId = repoIds?.[0];
+	if (repoId == null) return undefined;
+
+	// The TREE, matching buildMemoryDetail and readSkillsDoc: the row that opened
+	// this dialog was built from the assembled tree, so reading the bare row could
+	// resolve a different transcript set than the row's own count line claims.
+	const memory = db
+		.prepare("SELECT summary_json FROM memories WHERE repo_id = ? AND commit_hash = ? LIMIT 1")
+		.get(repoId, hash) as { summary_json: string } | undefined;
+	if (!memory) return undefined;
+	const summary = (assembleMemoryTree(db, repoId, hash) ?? JSON.parse(memory.summary_json)) as CommitSummary;
+
+	const key = `${source}:${sessionId}`;
+	const { grouped } = groupArchivedSessions(readMemoryTranscripts(db, repoId, hash, summary));
+	const group = grouped.get(key);
+	if (!group) return undefined;
+
+	const total = group.entries.length;
+	// Counted, not just flagged: the viewer has to name which of the two caps bit,
+	// and clipping is the one that leaves no trace in the counts it can see.
+	let clippedEntries = 0;
+	const entries = group.entries.slice(0, CONVERSATION_ENTRY_LIMIT).map((e) => {
+		const clipped = e.content.length > CONVERSATION_CONTENT_LIMIT;
+		if (clipped) clippedEntries += 1;
+		return {
+			role: e.role,
+			content: clipped ? e.content.slice(0, CONVERSATION_CONTENT_LIMIT) : e.content,
+			...(e.timestamp ? { timestamp: e.timestamp } : {}),
+		};
+	});
+
+	return {
+		// The row's precedence, all three rungs of it: the archived title first
+		// (see buildConversations for why it outranks anything re-derived here),
+		// then the live `sessions` row, and only then a title derived from the
+		// turns. Dropping the middle rung is not a smaller version of the same
+		// answer — it renames the conversation the moment the dialog opens, for
+		// exactly the memories whose archive predates the title being stored.
+		title:
+			group.session.title ??
+			readNativeSessionTitles(db, repoId, hash).get(key) ??
+			firstUserMessageTitleFromEntries(group.entries),
+		source: group.session.source ?? "claude",
+		sessionId: group.session.sessionId,
+		messageCount: total,
+		entries,
+		truncated: total > CONVERSATION_ENTRY_LIMIT || clippedEntries > 0,
+		clippedEntries,
+	};
 }
 
 /**

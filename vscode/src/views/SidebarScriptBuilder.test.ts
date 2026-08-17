@@ -2650,7 +2650,7 @@ describe("SidebarScriptBuilder", () => {
 			expect(body).toContain("SOURCE_META[s]");
 			expect(body).not.toContain("'linear'");
 			expect(body).not.toContain("'github'");
-			// The injected table (single ./SourceLabels.ts source of truth) still
+			// The injected table (single core/references/SourceLabels.ts source of truth) still
 			// carries all four known sources + their letters.
 			expect(js).toContain('"linear":{"label":"Linear","letter":"L"');
 			expect(js).toContain('"jira":{"label":"Jira","letter":"J"');

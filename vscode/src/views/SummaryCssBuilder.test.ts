@@ -6,7 +6,7 @@ vi.mock("../services/PrCommentService.js", () => ({
 }));
 
 import { buildCss } from "./SummaryCssBuilder.js";
-import { getSourceMeta, NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 
 describe("buildCss — per-source reference badge hues", () => {
 	// .t-ref used to hardcode #5e6ad2 — Linear's SOURCE_META colour — as a KIND

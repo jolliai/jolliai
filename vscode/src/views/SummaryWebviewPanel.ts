@@ -112,7 +112,7 @@ import { listOrgMembers } from "../services/JolliShareService.js";
 import { BindingChooserWebviewPanel } from "./BindingChooserWebviewPanel.js";
 import { resolveBindingViaChooser } from "./BindingResolver.js";
 import { loadBranchSummaries } from "./BranchSummaryLoader.js";
-import { getSourceMeta, SOURCE_META } from "./SourceLabels.js";
+import { getSourceMeta, SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";
 import {
 	buildE2eTestSection,

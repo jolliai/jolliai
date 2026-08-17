@@ -437,9 +437,27 @@ window.JD = window.JD || {};
 				   `sessions.json` or a log line. The whole attribute is omitted rather
 				   than filled with a placeholder when the archive carries no id: an
 				   absent tooltip says nothing, where `Session unknown` says something
-				   false about the session. */
-				'<div class="gd-row"' +
-				(c.sessionId ? ' title="Session ' + esc(c.sessionId) + '"' : "") +
+				   false about the session.
+
+				   That id is now load-bearing twice over: it is also what OPENS the row.
+				   The archive key is `source:sessionId`, so a row without one cannot be
+				   looked up and stays inert — the same rule a Context row applies to a
+				   missing `contextKey`, and for the same reason: better a plain label
+				   than a button that always 404s. There is no trailing "Open →" here
+				   either; `.gd-row-open`'s hover state and `role="button"` are the
+				   affordance, exactly as in the editor. */
+				'<div class="gd-row' +
+				(c.sessionId ? " gd-row-open" : "") +
+				'"' +
+				(c.sessionId
+					? ' role="button" tabindex="0" data-session="' +
+						esc(c.sessionId) +
+						'" data-source="' +
+						esc(c.source || "") +
+						'" title="Session ' +
+						esc(c.sessionId) +
+						'"'
+					: "") +
 				">" +
 				/* The row leads with the AGENT's brand mark rather than a generic
 				   speech bubble — the same row VS Code's memory detail renders and
@@ -476,7 +494,12 @@ window.JD = window.JD || {};
 	/* Per-kind row furniture, mirroring the editor's CONTEXT_ROW_KINDS table
 	   (vscode/src/views/ContextRowKinds.ts) — same badge letters, same singular
 	   labels. A kind the server adds later falls back to its own initial rather
-	   than being mislabelled as one of these. */
+	   than being mislabelled as one of these.
+
+	   `reference`'s `R` is the FALLBACK letter only, for a row that arrived with
+	   no source: a real reference is badged by its source instead
+	   (`JD.contextBadge`), as the editor does. `label` is still this table's for
+	   every kind — it titles the viewer dialog. */
 	const CONTEXT_KIND_META = {
 		plan: { letter: "P", label: "Plan" },
 		note: { letter: "N", label: "Note" },
@@ -497,7 +520,13 @@ window.JD = window.JD || {};
 	   are archived documents in the dashboard database, and the skills row's
 	   table is rendered on demand from the summary. A row without one (a
 	   reference whose source has left the registry) renders inert instead of as
-	   a button that would always 404. */
+	   a button that would always 404.
+
+	   That openness is signalled by `.gd-row-open` alone — pointer cursor, accent
+	   hover border, focus ring — and NOT by a trailing "Open →". The editor's
+	   rows carry no such label either, and the text sat in the same slot the
+	   reference `meta` line wants; the row is a `role="button"`, which is what
+	   actually announces it. */
 	function contextSection(detail) {
 		var esc = JD.esc;
 		var rows = detail.context.map((c) => {
@@ -519,14 +548,21 @@ window.JD = window.JD || {};
 						esc(c.contextKey) +
 						'"'
 					: "") +
-				'><span class="mem-ctx-badge mem-ctx-badge--' +
-				esc(c.kind) +
-				'">' +
-				esc(meta.letter) +
-				'</span><span class="mem-row-title">' +
+				">" +
+				/* Badged by SOURCE for a reference, by kind for everything else —
+				   `JD.contextBadge` owns that split, off the server-inlined
+				   `SOURCE_META`. `meta.letter` is the kind letter it falls back to. */
+				JD.contextBadge(c.kind, c.source, meta.letter) +
+				/* Title and sub-line stack in one column, as the editor's `.r-main`
+				   does. They shared a line before, which read well for a tracker's
+				   `ENG-1234 (Linear)` and badly for the rest of what this slot
+				   carries — `<slug>.md`, `<id>.md`, the skills totals — where the two
+				   fought for width and one always ellipsised. */
+				'<div class="mem-row-main"><span class="mem-row-title">' +
 				esc(c.title) +
 				"</span>" +
 				(c.meta ? '<span class="mem-row-meta mem-ctx-sub">' + esc(c.meta) + "</span>" : "") +
+				"</div>" +
 				(href
 					? '<a class="mem-ctx-link" href="' +
 						href +
@@ -534,7 +570,6 @@ window.JD = window.JD || {};
 						memoryIcon("link") +
 						"</a>"
 					: "") +
-				(openable ? '<span class="mem-row-meta">Open →</span>' : "") +
 				"</div>"
 			);
 		});
@@ -683,7 +718,9 @@ window.JD = window.JD || {};
 		var esc = JD.esc;
 		var detail = model.memories && model.memories.selected;
 		if (!detail) {
-			return '<div class="gd-empty">Pick a memory on the left — this pane shows its full detail: conversations, context, and what it decided.</div>';
+			// `mem-empty-pane` is what earns the centred 120px treatment — see the
+			// rule in main.css. A section's own empty state must NOT carry it.
+			return '<div class="gd-empty mem-empty-pane">Pick a memory on the left — this pane shows its full detail: conversations, context, and what it decided.</div>';
 		}
 		var meta =
 			'<span>' +
@@ -765,58 +802,295 @@ window.JD = window.JD || {};
 	}
 
 	/* The Context viewer. One shared dialog for every plan/note on the page —
-	   the body is fetched on click rather than shipped with the detail payload,
+	   the body is loaded on click rather than shipped with the detail payload,
 	   because a memory can carry several full markdown files the reader usually
-	   never opens. Rendered as preformatted text, not HTML: this page has no
-	   markdown renderer, and inventing one that injects a document written by an
-	   agent into the DOM is not a corner worth cutting. */
+	   never opens.
+
+	   The body is a SANDBOXED frame onto /context-viewer, which renders the
+	   markdown server-side with the vendored `marked`. It used to be raw source
+	   in a <pre>, because the alternative on the table was injecting an
+	   agent-written document into THIS document — which inlines the mutation
+	   token. The frame is what makes rendering safe: no `allow-same-origin`, so
+	   the rendered HTML sits in an opaque origin and cannot reach the token, the
+	   model, or the DOM. Same arrangement as the Knowledge page's wiki frame.
+
+	   Header text comes from the clicked ROW rather than from a second fetch —
+	   the title is already in the detail payload, so asking the server again
+	   would be a round trip for a string the page is holding. */
 	function openContextDialog(detail, kind, key) {
 		var overlay = document.getElementById("ovContext");
 		var title = document.getElementById("ctxTitle");
 		var sub = document.getElementById("ctxSub");
-		var body = document.getElementById("ctxBody");
-		if (!overlay || !title || !sub || !body) return;
-		title.textContent = contextKindMeta(kind).label;
-		sub.textContent = "Loading…";
-		body.textContent = "";
-		overlay.classList.add("open");
-		var url =
-			"/api/context?repo=" +
+		var frame = document.getElementById("ctxFrame");
+		if (!overlay || !title || !sub || !frame) return;
+		var row = (detail.context || []).filter((c) => c.kind === kind && c.contextKey === key)[0];
+		title.textContent = (row && row.title) || contextKindMeta(kind).label;
+		sub.textContent = contextKindMeta(kind).label;
+		frame.src =
+			"/context-viewer?repo=" +
 			encodeURIComponent(detail.repoIdentity) +
 			"&kind=" +
 			encodeURIComponent(kind) +
 			"&key=" +
-			encodeURIComponent(key);
+			encodeURIComponent(key) +
+			"&theme=" +
+			encodeURIComponent(JD.currentTheme());
+		overlay.classList.add("open");
+	}
+
+	/* Closing resets the frame. Without it the previous document stays loaded and
+	   is what the reader sees for the instant before the next one arrives —
+	   briefly showing one memory's plan under another's title. */
+	function closeContextDialog() {
+		var overlay = document.getElementById("ovContext");
+		var frame = document.getElementById("ctxFrame");
+		if (overlay) overlay.classList.remove("open");
+		if (frame) frame.src = "about:blank";
+	}
+
+	/* The framed document hands its upstream links up here: it is sandboxed, so a
+	   click inside it can navigate nothing on its own (see CONTEXT_LINK_SCRIPT).
+
+	   Two checks before `window.open`, and both are load-bearing. The SOURCE check
+	   is what makes this different from the Knowledge page's equivalent handler —
+	   that one's payload is a hex-validated commit hash going to a same-origin
+	   path, while this one's is a URL going to `window.open`, so any frame on the
+	   page (or an embedder) could otherwise aim it. The SCHEME check is
+	   `JD.safeHref`'s, since the href came out of a document an agent wrote.
+	   Registered once, remove-then-add, so repeated renders do not stack. */
+	function wireContextNav() {
+		if (JD._ctxNavHandler) window.removeEventListener("message", JD._ctxNavHandler);
+		JD._ctxNavHandler = function (ev) {
+			var d = ev && ev.data;
+			if (!d || d.type !== "jolli-context-nav" || typeof d.href !== "string") return;
+			var frame = document.getElementById("ctxFrame");
+			if (!frame || !ev.source || ev.source !== frame.contentWindow) return;
+			if (!JD.safeHref(d.href)) return;
+			/* Parsed and re-serialised here, INLINE, rather than opening the string
+			   `JD.safeHref` just approved.
+
+			   Two reasons, and the second is why the apparent duplication stays.
+			   First, it is a real second gate on the one irreversible step in this
+			   path: `d.href` arrives over postMessage from a document an agent wrote,
+			   and `new URL` decides the scheme the way the navigation itself will,
+			   rather than by matching the string. Opening `u.href` — the parser's own
+			   output — also means no spelling the parser normalises away can reach
+			   `window.open`.
+			   Second, CodeQL flagged this sink (`js/client-side-unvalidated-url-redirect`)
+			   with `JD.safeHref` already in front of it, and was right to: that
+			   function is assigned onto the global `JD` object in another asset file,
+			   so no static analysis can tie the call to its allowlist. A sanitizer the
+			   scanner cannot see is one a future reader cannot rely on either. Keep
+			   this check inline and literal; moving it into a helper re-opens the
+			   finding even though the runtime behaviour would be identical.
+
+			   http/https only, which is NARROWER than `JD.safeHref` (it also allows
+			   `mailto:`) and deliberately matches the frame side: CONTEXT_LINK_SCRIPT
+			   only bridges `^https?:` anchors and strips every other scheme to a
+			   plain span, so nothing else can arrive here in the first place. The two
+			   allowlists are one decision spelled in two places, and this is the one
+			   that guards the navigation. */
+			var u;
+			try {
+				u = new URL(d.href, window.location.origin);
+			} catch {
+				return;
+			}
+			if (u.protocol !== "https:" && u.protocol !== "http:") return;
+			window.open(u.href, "_blank", "noreferrer");
+		};
+		window.addEventListener("message", JD._ctxNavHandler);
+	}
+
+	/* The Conversation viewer — the browser's read-only counterpart to the
+	   editor's ConversationDetailsPanel, which is likewise forced read-only when
+	   opened from a memory (an archived slice has no live cursor to edit against).
+	   So: no edit, no delete, no detach; the same three affordances the editor
+	   withholds there.
+
+	   Every turn's body is set with `textContent`, matching that panel exactly.
+	   A transcript is not markdown — rendering it would invent structure the
+	   agent never wrote — which is also why this needs no sandboxed frame, unlike
+	   the Context viewer above. */
+	function roleLabel(role) {
+		return role === "human" ? "You" : "Assistant";
+	}
+
+	function conversationTime(iso, timeZone) {
+		if (!iso) return "";
+		var ms = Date.parse(iso);
+		return Number.isNaN(ms) ? "" : JD.weekdayDate(ms, timeZone);
+	}
+
+	function renderConversationEntries(doc, timeZone) {
+		var body = document.getElementById("convBody");
+		if (!body) return;
+		body.replaceChildren();
+		if (!doc.entries.length) {
+			var empty = document.createElement("div");
+			empty.className = "gd-empty";
+			// The editor's exact string, so the same archive reads the same either way.
+			empty.textContent = "No conversation entries to display.";
+			body.appendChild(empty);
+			return;
+		}
+		doc.entries.forEach((entry) => {
+			var row = document.createElement("div");
+			row.className = "conv-entry";
+			row.setAttribute("data-role", entry.role);
+
+			var head = document.createElement("div");
+			head.className = "conv-entry-head";
+			var role = document.createElement("span");
+			role.className = "conv-role";
+			role.textContent = roleLabel(entry.role);
+			head.appendChild(role);
+			var time = document.createElement("span");
+			time.className = "conv-time";
+			time.textContent = conversationTime(entry.timestamp, timeZone);
+			head.appendChild(time);
+			row.appendChild(head);
+
+			var text = document.createElement("div");
+			text.className = "conv-text";
+			text.textContent = entry.content;
+			row.appendChild(text);
+			body.appendChild(row);
+		});
+		if (doc.truncated) {
+			/* Said out loud, never silent: the server caps a very long conversation
+			   and a prefix shown without a word reads as the whole thing.
+
+			   TWO independent caps, and the sentence has to name the one that bit.
+			   CONVERSATION_ENTRY_LIMIT drops whole turns; CONVERSATION_CONTENT_LIMIT
+			   cuts the body of a single turn and leaves both counts intact. Phrasing
+			   the second as the first announced "showing the first 12 of 12 turns" —
+			   numbers that say nothing is missing — while the cut characters went
+			   unmentioned, which is what a reader would actually have wanted to know.
+
+			   `truncated` stays the gate rather than the wording: the server is what
+			   knows whether anything was withheld, so a cap it grows later still
+			   produces a note here even before this list learns to describe it. */
+			var dropped = (doc.messageCount || 0) - doc.entries.length;
+			var clipped = doc.clippedEntries || 0;
+			var said = [];
+			if (dropped > 0) {
+				said.push("showing the first " + doc.entries.length + " of " + doc.messageCount + " turns");
+			}
+			if (clipped > 0) said.push(clipped === 1 ? "one turn's text cut short" : clipped + " turns' text cut short");
+			var note = document.createElement("p");
+			note.className = "conv-note";
+			note.textContent = "Trimmed for this view" + (said.length ? ": " + said.join("; ") : "") + ".";
+			body.appendChild(note);
+		}
+	}
+
+	/* Which conversation the dialog is currently showing. One overlay serves every
+	   row, so the fetch below has to prove it is still the one being awaited before
+	   it writes: open A, open B, and A's slower response would otherwise land on
+	   B's dialog — title, subtitle and every turn — with nothing on screen saying
+	   the wrong conversation is being read. A counter rather than an
+	   AbortController because the losing response is not worth cancelling, only
+	   worth ignoring, and a closed-then-reopened dialog must invalidate the old
+	   request too (which this does: every open takes a new number). */
+	var convRequest = 0;
+
+	function openConversationDialog(detail, source, sessionId, timeZone) {
+		var overlay = document.getElementById("ovConversation");
+		var title = document.getElementById("convTitle");
+		var sub = document.getElementById("convSub");
+		var body = document.getElementById("convBody");
+		if (!overlay || !title || !sub || !body) return;
+		var row = (detail.conversations || []).filter((c) => c.source === source && c.sessionId === sessionId)[0];
+		var request = ++convRequest;
+		title.textContent = (row && row.title) || "Conversation";
+		sub.textContent = "Loading…";
+		body.replaceChildren();
+		overlay.classList.add("open");
+		var url =
+			"/api/conversation?repo=" +
+			encodeURIComponent(detail.repoIdentity) +
+			"&hash=" +
+			encodeURIComponent(detail.commitHash) +
+			"&source=" +
+			encodeURIComponent(source) +
+			"&session=" +
+			encodeURIComponent(sessionId);
 		fetch(url)
 			.then((res) => (res.ok ? res.json() : Promise.reject(new Error(String(res.status)))))
 			.then((doc) => {
-				title.textContent = doc.title;
-				sub.textContent = contextKindMeta(doc.kind).label;
-				body.textContent = doc.bodyMd;
+				if (request !== convRequest) return;
+				title.textContent = doc.title || "Conversation";
+				sub.textContent = JD.sourceLabel(doc.source) + " · " + doc.messageCount + " msgs";
+				renderConversationEntries(doc, timeZone);
 			})
 			.catch((err) => {
+				/* Guarded on the same terms as the success path, and for a sharper
+				   reason: an abandoned request that 404s would otherwise paint its
+				   failure over a conversation that loaded fine. */
+				if (request !== convRequest) return;
 				/* Never leave the dialog on "Loading…". The status is part of the
-				   message on purpose: a server started before this endpoint existed
-				   answers the same 404 as a genuinely missing document, and "restart
-				   the dashboard" is the fix for one and not the other. */
+				   message on purpose: a dashboard started before this endpoint existed
+				   answers the same 404 as a genuinely missing conversation, and
+				   "restart" is the fix for one and not the other. */
 				sub.textContent =
-					"Could not load this document (" +
+					"Could not load this conversation (" +
 					(err && err.message ? "HTTP " + err.message : "request failed") +
 					"). If the dashboard has been running a while, restart it — this viewer needs a current server.";
 			});
+	}
+
+	function wireConversationRows(model) {
+		var detail = model.memories && model.memories.selected;
+		if (!detail) return;
+		var overlay = document.getElementById("ovConversation");
+		// Two buttons, one behaviour: the footer "Close" and the corner ✕.
+		["convClose", "convDismiss"].forEach((id) => {
+			var btn = document.getElementById(id);
+			if (btn) btn.onclick = () => overlay.classList.remove("open");
+		});
+		if (overlay) {
+			overlay.onclick = (e) => {
+				if (e.target === overlay) overlay.classList.remove("open");
+			};
+		}
+		document.querySelectorAll("[data-session]").forEach((row) => {
+			var open = () =>
+				openConversationDialog(
+					detail,
+					row.getAttribute("data-source"),
+					row.getAttribute("data-session"),
+					model.timeZone,
+				);
+			row.onclick = open;
+			// Same keyboard contract as a Context row. No nested link to exempt here:
+			// a conversation row has no upstream anchor, only the whole-row button.
+			row.onkeydown = (e) => {
+				if (e.key === "Enter" || e.key === " ") {
+					e.preventDefault();
+					open();
+				}
+			};
+		});
 	}
 
 	function wireContextRows(model) {
 		var detail = model.memories && model.memories.selected;
 		if (!detail) return;
 		var overlay = document.getElementById("ovContext");
-		var close = document.getElementById("ctxClose");
-		if (close) close.onclick = () => overlay.classList.remove("open");
+		// All three exits — footer "Close", corner ✕, backdrop — go through
+		// closeContextDialog, which also blanks the frame. A bare
+		// `classList.remove` would leave the last document loaded behind it.
+		["ctxClose", "ctxDismiss"].forEach((id) => {
+			var btn = document.getElementById(id);
+			if (btn) btn.onclick = closeContextDialog;
+		});
 		if (overlay) {
 			overlay.onclick = (e) => {
-				if (e.target === overlay) overlay.classList.remove("open");
+				if (e.target === overlay) closeContextDialog();
 			};
 		}
+		wireContextNav();
 		document.querySelectorAll("[data-context-key]").forEach((row) => {
 			var open = () =>
 				openContextDialog(detail, row.getAttribute("data-context-kind"), row.getAttribute("data-context-key"));
@@ -848,6 +1122,7 @@ window.JD = window.JD || {};
 
 	function wireDetail(model) {
 		wireContextRows(model);
+		wireConversationRows(model);
 		var copy = document.getElementById("memRecallCopy");
 		var detail = model.memories && model.memories.selected;
 		if (!copy || !detail) return;

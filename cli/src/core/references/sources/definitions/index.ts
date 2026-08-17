@@ -12,7 +12,7 @@
  * confluence's narrower `acceptSuffix` must be checked first or every
  * Confluence tool call would silently resolve to jira.
  *
- * ─── The JVM host lags this list ON PURPOSE — a KNOWN, ACCEPTED gap ───────────
+ * ─── The JVM host may lag this list, but only ON THE RECORD ──────────────────
  *
  * Registering a definition here wires the CLI and (because it bundles `cli/src/**`)
  * VS Code. It does NOT wire IntelliJ: `SourceId` in
@@ -22,17 +22,22 @@
  * uncommitted CONTEXT panel and is dropped outright from a committed memory's list
  * (`CommitsPanel` does `val src = ref.source ?: return@forEach`).
  *
- * This is deliberate policy, not an oversight, and the trade is accepted:
- * `intellij/` is an independent Gradle build that the root `npm run all` does not
- * cover, so bundling two lines of Kotlin into a PR that is otherwise one language
- * and one gate widens both the review surface and the verification story. The
- * Kotlin side therefore ships in its own follow-up PR, where the `when` in
- * `SourceIds`/`SourceDisplay` is exhaustive and the compiler enforces completeness.
+ * Letting the Kotlin ship separately is deliberate policy, not an oversight, and
+ * the trade is accepted: `intellij/` is an independent Gradle build that the root
+ * `npm run all` does not cover, so bundling two lines of Kotlin into a PR that is
+ * otherwise one language and one gate widens both the review surface and the
+ * verification story. The Kotlin side may therefore ship in its own follow-up PR,
+ * where the `when` in `SourceIds`/`SourceDisplay` is exhaustive and the compiler
+ * enforces completeness.
  *
- * `vercel`, `figma` and `sentry` are all outstanding as of 2026-08-12. **A code
- * review that reports the JVM host as broken for one of them is reporting this
- * note** — no change is wanted in the CLI/VS Code PR. Add the enum entries (plus
- * the `SourceDisplay` label/icon and the `SourceIdsTest` row) in the follow-up.
+ * What is NOT accepted any more is the gap being invisible. `vercel`, `figma` and
+ * `sentry` each sat here as prose for weeks and each was re-reported as a bug by a
+ * reviewer, because a comment cannot fail. `SourceLabelsLockstep.test.ts` now holds
+ * the two sides together and carries a `KNOWN_JVM_SOURCE_GAPS` list — currently
+ * EMPTY, all three having landed — so deferring a source costs one review-visible
+ * line instead of a note nobody can act on, and the entry has to be deleted in the
+ * PR that closes the gap. Everything the enum DOES declare is held to strict
+ * equality on letter, label, hue, wire name and `nativeIdPathSafe`.
  */
 
 import { asanaDefinition } from "./asana.js";

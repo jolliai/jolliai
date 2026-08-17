@@ -1067,6 +1067,75 @@ window.JD = window.JD || {};
 		);
 	};
 
+	/* The theme a sandboxed frame must be told about, because it cannot read it.
+	   Every framed viewer has its OWN opaque origin and inherits nothing from this
+	   page, so it falls back to `prefers-color-scheme` — which is the wrong answer
+	   whenever the reader has forced a theme via `data-theme` (main.css keys on
+	   both). Frames therefore carry it in the query string.
+
+	   Shared rather than per-page: the Graph page had this privately, and the
+	   Context viewer needs the identical answer. Two copies of "what theme is
+	   this" is how one frame ends up light inside a dark page. */
+	JD.currentTheme = () => {
+		var dt = document.documentElement.getAttribute("data-theme");
+		if (dt === "light" || dt === "dark") return dt;
+		return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+	};
+
+	/* One CONTEXT row's badge — the counterpart to `JD.sourceBadge` above, for
+	   reference SOURCES rather than agents.
+
+	   A reference is badged by its source (Linear indigo `L`, Jira blue `J`,
+	   Sentry purple `S`), every other kind by its kind (`P`/`N`/`S` on the tinted
+	   per-kind hues in main.css). Before this, the page keyed on the kind alone
+	   and every reference was one identical amber `R`, while the editor showed a
+	   distinct badge per source for the same memory.
+
+	   The table is `SOURCE_META`, inlined by the server (assembleDashboardHtml) —
+	   NOT a copy here, unlike the agent marks above, which are markup and cannot
+	   come from a TS constant. Letter and colour are both constants, so there is
+	   nothing left to keep in step. An unknown source degrades exactly as
+	   `getSourceMeta` does on the other surfaces: the id's initial on the neutral
+	   hue, which is also what a page served without the injection falls back to.
+
+	   The colour is an inline `background` rather than a generated CSS rule
+	   because main.css is a static file with no per-source rule generator; the
+	   `src-<id>` class token still ships so a rule can target one later. Written
+	   with the same sanitizer the editor's CSS generator uses, since a source id
+	   is a plain string from disk — a space would inject a second class. */
+	function contextSourceMeta(source) {
+		var table = window.__JOLLI_SOURCE_META__ || {};
+		var id = String(source || "");
+		var meta = table.meta && Object.prototype.hasOwnProperty.call(table.meta, id) ? table.meta[id] : null;
+		if (meta) return { letter: meta.letter, color: meta.color, label: meta.label };
+		return {
+			letter: id.slice(0, 1).toUpperCase(),
+			color: table.neutral || "#6e7681",
+			label: id,
+		};
+	}
+
+	JD.contextBadge = (kind, source, kindLetter) => {
+		var k = String(kind || "");
+		if (k !== "reference" || !source) {
+			return '<span class="mem-ctx-badge mem-ctx-badge--' + JD.esc(k) + '">' + JD.esc(kindLetter || "") + "</span>";
+		}
+		var meta = contextSourceMeta(source);
+		return (
+			'<span class="mem-ctx-badge mem-ctx-badge--reference ' +
+			JD.esc("src-" + String(source).replace(/[^A-Za-z0-9_-]/g, "-")) +
+			'" style="background:' +
+			JD.esc(meta.color) +
+			';color:#fff" title="' +
+			JD.esc(meta.label) +
+			'" aria-label="' +
+			JD.esc(meta.label) +
+			'">' +
+			JD.esc(meta.letter) +
+			"</span>"
+		);
+	};
+
 	/* Category → colour, shared because TWO pages paint the same category chip:
 	   the stats page's Memory Activity rows and the standup board's columns, which
 	   are required to show the same commits with the same labels. It lives here

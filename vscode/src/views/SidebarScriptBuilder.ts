@@ -22,7 +22,7 @@
 import { backfillListRendererSource, COLD_START_CAP } from "./BackfillListRenderer.js";
 import { buildContextMenuGuardScript } from "./ContextMenuGuard.js";
 import { CONTEXT_ROW_KINDS } from "./ContextRowKinds.js";
-import { SOURCE_META, SOURCE_TITLES } from "./SourceLabels.js";
+import { SOURCE_META, SOURCE_TITLES } from "../../../cli/src/core/references/SourceLabels.js";
 import {
 	SONNET_CACHE_WRITE_PER_TOKEN,
 	SONNET_INPUT_PER_TOKEN,
@@ -37,11 +37,11 @@ export function buildSidebarScript(): string {
 
   // Source display labels (Linear / Jira / GitHub / Notion) — injected from host
   // so webview JS doesn't hardcode the source list. Keep in lockstep with
-  // ./SourceLabels.ts SOURCE_TITLES.
+  // core/references/SourceLabels.ts SOURCE_TITLES.
   const SOURCE_TITLES = ${JSON.stringify(SOURCE_TITLES)};
 
   // Per-source badge letter / codicon / color, injected from the single
-  // ./SourceLabels.ts SOURCE_META table so webview JS never hardcodes a
+  // core/references/SourceLabels.ts SOURCE_META table so webview JS never hardcodes a
   // per-source letter switch. A source id missing from this table (a
   // phase-2 config-registered source) falls back to its own first letter
   // uppercased at each lookup site below.

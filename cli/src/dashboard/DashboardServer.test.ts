@@ -69,6 +69,7 @@ vi.mock("../core/LlmClient.js", async (orig) => ({
 import * as gitOps from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
@@ -789,6 +790,19 @@ describe("assembleDashboardHtml", () => {
 	it("inlines the labels even with no mutation token", () => {
 		expect(assembleDashboardHtml(assetsDir, "{}")).toContain("__JOLLI_SOURCE_LABELS__");
 		expect(assembleDashboardHtml(assetsDir, "{}")).not.toContain("__JOLLI_DASHBOARD_TOKEN__");
+	});
+
+	// The REFERENCE-source half, for `JD.contextBadge`. Same rule as the labels
+	// above and asserted the same way — against the constant, because the whole
+	// point is that adding a source to SOURCE_META reaches the dashboard without
+	// anyone editing an asset file. The neutral fallback rides along rather than
+	// being re-typed client-side.
+	it("inlines the reference source metadata ahead of the app scripts", () => {
+		const html = assembleDashboardHtml(assetsDir, "{}");
+		expect(html).toContain(
+			`window.__JOLLI_SOURCE_META__ = ${JSON.stringify({ meta: SOURCE_META, neutral: NEUTRAL_SOURCE_COLOR })}`,
+		);
+		expect(html.indexOf("__JOLLI_SOURCE_META__")).toBeLessThan(html.indexOf("/* main.js */"));
 	});
 });
 
@@ -1863,6 +1877,147 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((await get(port, "/api/context?repo=repo-1&kind=reference&key=p1")).status).toBe(404);
 		expect((await get(port, "/api/context?repo=repo-1&kind=nonsense&key=p1")).status).toBe(400);
 		expect((await get(port, "/api/context?kind=plan&key=p1")).status).toBe(400);
+	});
+
+	/**
+	 * The Context dialog's frame. Same read as `/api/context`, rendered instead of
+	 * returned — the dialog used to show raw markdown source because injecting an
+	 * agent-written document into the token-bearing page was the only alternative
+	 * on the table. The sandbox is what makes rendering it safe.
+	 */
+	it("renders one context body as a sandboxed markdown document over /context-viewer", async () => {
+		const dbPath = join(dir, "context-viewer.db");
+		const configDir = join(dir, "config-ctxview");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO context (repo_id, kind, context_key, title, body_md, created_at_ms)
+					 VALUES (?, 'plan', 'p1', 'The plan', '# Heading\n\n| a | b |\n| - | - |\n| 1 | 2 |', 1)`,
+				).run(id);
+			},
+			{ dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		const ok = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1");
+		expect(ok.status).toBe(200);
+		// The sandbox is the isolation, not the CSP's frame-ancestors — see
+		// sendViewerHtml. Without it the rendered HTML shares an origin with the
+		// page holding the mutation token.
+		expect(ok.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
+		const html = await ok.text();
+		// The renderer is inlined, and the body reaches it as a JS string rather
+		// than as pre-rendered markup.
+		expect(html).toContain("marked");
+		expect(html).toContain("window.marked.parse");
+		expect(html).toContain("# Heading");
+		// The link bridge: a sandboxed frame cannot navigate on its own.
+		expect(html).toContain("jolli-context-nav");
+
+		// The theme rides in so the frame matches the dialog around it; the
+		// dashboard honours an explicit data-theme, not just prefers-color-scheme.
+		const dark = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1&theme=dark");
+		expect(await dark.text()).toContain('data-theme="dark"');
+		// A closed set — it is interpolated as a bare attribute value.
+		const bogus = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1&theme=' onload=x");
+		expect(await bogus.text()).not.toContain("onload");
+
+		// A framed message document, not a bare error: this renders inside the
+		// dialog, where a browser error page would be the only thing the user sees.
+		const missing = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=nope");
+		expect(missing.status).toBe(404);
+		expect(await missing.text()).toContain("could not be found");
+		expect((await get(port, "/context-viewer?repo=repo-1&kind=nonsense&key=p1")).status).toBe(400);
+		expect((await get(port, "/context-viewer?kind=plan&key=p1")).status).toBe(400);
+
+		// The run above took the GRAPH fallback, which is the source-run path — the
+		// test assets have no `vendor/`. The shipped path is the dashboard copy, and
+		// it is the one that matters: only the CLI's own dist carries `graph-assets/`
+		// at all, so on `vscode/dist` and the three plugin bundles a viewer resolving
+		// `marked` from the graph tree would 500, exactly as /wiki-viewer already
+		// does there. Prove the dashboard copy wins by making it distinguishable.
+		const stagedAssets = writeTestAssets(join(dir, "staged"));
+		mkdirSync(join(stagedAssets, "vendor"), { recursive: true });
+		writeFileSync(
+			join(stagedAssets, "vendor", "marked.min.js"),
+			'window.marked={parse:function(s){return "STAGED_COPY:"+s}};',
+		);
+		const stagedPort = await listen(createDashboardServer({ port: 0, assetsDir: stagedAssets, dbPath, configDir }));
+		const staged = await get(stagedPort, "/context-viewer?repo=repo-1&kind=plan&key=p1");
+		expect(staged.status).toBe(200);
+		expect(await staged.text()).toContain("STAGED_COPY");
+	});
+
+	it("answers a failed read with a framed message, not the outer handler's plain text", async () => {
+		// Every other exit from this route is a framed document, because what
+		// receives it is an iframe inside the Context dialog. Left to the outer
+		// handler, a database failure renders there as a bare unstyled line the
+		// reader cannot scroll away from — and 500, not 404: "could not be found"
+		// would send them looking for a document that is still on disk.
+		const dbPath = join(dir, "context-viewer-broken.db");
+		const configDir = join(dir, "config-ctxview-broken");
+		writeFileSync(dbPath, "this is not a database");
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1");
+		expect(res.status).toBe(500);
+		expect(res.headers.get("content-security-policy")).toContain("sandbox allow-scripts");
+		expect(await res.text()).toContain("could not be read");
+	});
+
+	// The Conversation dialog's read. JSON rather than a framed viewer: a
+	// transcript turn is rendered as TEXT on both surfaces, so there is no
+	// agent-authored HTML here to isolate.
+	it("400s and 404s a bad /api/conversation request", async () => {
+		const dbPath = join(dir, "conversation.db");
+		const configDir = join(dir, "config-conv");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		// All four params are required — a partial request is a bad request, not an
+		// empty 200 that would read as "this conversation has no turns".
+		for (const query of [
+			"repo=repo-1&hash=abc&source=claude",
+			"repo=repo-1&hash=abc&session=s1",
+			"repo=repo-1&source=claude&session=s1",
+			"hash=abc&source=claude&session=s1",
+		]) {
+			expect((await get(port, `/api/conversation?${query}`)).status, query).toBe(400);
+		}
+		expect((await get(port, "/api/conversation?repo=repo-1&hash=abc&source=claude&session=nope")).status).toBe(404);
 	});
 });
 

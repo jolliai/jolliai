@@ -66,6 +66,7 @@ import {
 	scopeFilter,
 	scopeToRepoIds,
 	splitDecisionBullets,
+	stripPluginPrefixSql,
 } from "./DashboardScopeUtil.js";
 import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
 import { volumeReachable } from "./RepoForget.js";
@@ -1716,6 +1717,35 @@ function toolUsageWhere(
 const TOOL_LIST_KIND: Readonly<Record<ToolUsageList, string>> = { skill: "skill", tool: "mcp", server: "mcp" };
 
 /**
+ * The MCP server a row is grouped under, plugin alias folded away.
+ *
+ * Unguarded {@link stripPluginPrefixSql} rather than `mcpFoldedIdentifierSql`:
+ * every query reading these two constants pins `t.kind = ?` to
+ * {@link TOOL_LIST_KIND}, so the rows are MCP by construction. The memory-detail
+ * activity query in `MemoriesQuery.ts` mixes kinds and takes the guarded form.
+ */
+const SERVER_KEY_SQL = stripPluginPrefixSql("t.server");
+
+/** The tool a row is grouped under — same fold, because the name embeds the server. */
+const TOOL_KEY_SQL = stripPluginPrefixSql("t.tool_name");
+
+/**
+ * What identifies a row in each list.
+ *
+ * `skill` deliberately keeps the RAW column. The fold exists for MCP
+ * identifiers, where `plugin_…` is a registration alias the host prepended; a
+ * skill name is a name the user chose, so a skill that happened to start with
+ * `plugin_` would be silently renamed by a rule that has nothing to do with it.
+ * Claude's own plugin skills are namespaced `jolli:init`, not `plugin_jolli_…`,
+ * so there is no duplicate to merge on that list in the first place.
+ */
+const TOOL_LIST_KEY: Readonly<Record<ToolUsageList, string>> = {
+	skill: "t.tool_name",
+	tool: TOOL_KEY_SQL,
+	server: SERVER_KEY_SQL,
+};
+
+/**
  * `ORDER BY` per list — the ranking, and the tiebreak that makes it pageable.
  *
  * A ranked list must be ordered by the figure its rows PRINT, or the card
@@ -1738,10 +1768,18 @@ const TOOL_LIST_KIND: Readonly<Record<ToolUsageList, string>> = { skill: "skill"
  * SQLite's own row order for ties, which was good enough while every row was
  * read exactly once.
  */
+/*
+ * The trailing name is the OUTPUT alias, not `t.<column>`. Two of the three
+ * lists now group by an expression rather than by a bare column (see
+ * {@link TOOL_LIST_KEY}), and ordering by the raw column there would tiebreak on
+ * a value the row is no longer keyed by — so two aliases folded into one row
+ * could still order by whichever raw spelling SQLite reached first, which is
+ * exactly the unstable order this tiebreak exists to prevent.
+ */
 const TOOL_LIST_ORDER: Readonly<Record<ToolUsageList, string>> = {
-	skill: "session_count DESC, call_count DESC, t.tool_name ASC",
-	tool: "call_count DESC, session_count DESC, t.tool_name ASC",
-	server: "call_count DESC, session_count DESC, t.server ASC",
+	skill: "session_count DESC, call_count DESC, tool_name ASC",
+	tool: "call_count DESC, session_count DESC, tool_name ASC",
+	server: "call_count DESC, session_count DESC, server ASC",
 };
 
 /**
@@ -1759,7 +1797,7 @@ function toolListTotals(
 	where: { sql: string; params: unknown[] },
 	list: ToolUsageList,
 ): { totalCount: number; callsTotal: number } {
-	const keyColumn = list === "server" ? "t.server" : "t.tool_name";
+	const keyColumn = TOOL_LIST_KEY[list];
 	const row = db
 		.prepare(
 			`SELECT COUNT(DISTINCT ${keyColumn}) AS row_count,
@@ -1796,7 +1834,7 @@ function toolRowAgents(
 	const byKey = new Map<string, ToolUsageAgentShare[]>();
 	// `IN ()` is a syntax error, and an empty page has nothing to attribute.
 	if (keys.length === 0) return byKey;
-	const keyColumn = list === "server" ? "t.server" : "t.tool_name";
+	const keyColumn = TOOL_LIST_KEY[list];
 	const rows = db
 		.prepare(
 			`SELECT ${keyColumn} AS row_key, s.source,
@@ -1834,13 +1872,13 @@ function toolNameRowsPage(
 			// is the same bucket the old `(kind, tool_name)` grouping produced, and
 			// COUNT(DISTINCT) over the whole group is the same number as the sum of
 			// its per-source counts (a session has exactly one source).
-			`SELECT t.tool_name,
+			`SELECT ${TOOL_LIST_KEY[list]} AS tool_name,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
 			        COALESCE(SUM(t.calls), 0) AS call_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE ${where.sql} AND t.kind = ?
-			  GROUP BY t.tool_name
+			  GROUP BY ${TOOL_LIST_KEY[list]}
 			  ORDER BY ${TOOL_LIST_ORDER[list]}
 			  LIMIT ? OFFSET ?`,
 		)
@@ -1886,15 +1924,19 @@ function serverRowsPage(
 ): McpServerRow[] {
 	const rows = db
 		.prepare(
-			`SELECT t.server,
+			// `tool_count` counts the FOLDED tool key, not `t.tool_name`. The name
+			// embeds the server (`<server>.<tool>`), so a server reached under two
+			// registrations carries two spellings of each of its tools — counting the
+			// raw column would report a merged 5-tool server as having 10.
+			`SELECT ${SERVER_KEY_SQL} AS server,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
 			        COALESCE(SUM(t.calls), 0) AS call_count,
-			        COUNT(DISTINCT t.tool_name) AS tool_count
+			        COUNT(DISTINCT ${TOOL_KEY_SQL}) AS tool_count
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE ${where.sql}
 			    AND t.kind = 'mcp' AND t.server IS NOT NULL
-			  GROUP BY t.server
+			  GROUP BY ${SERVER_KEY_SQL}
 			  ORDER BY ${TOOL_LIST_ORDER.server}
 			  LIMIT ? OFFSET ?`,
 		)

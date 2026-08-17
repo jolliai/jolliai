@@ -6,7 +6,7 @@
  */
 
 import { buildPrSectionCss } from "../services/PrCommentService.js";
-import { NEUTRAL_SOURCE_COLOR, SOURCE_META, sourceClassToken } from "./SourceLabels.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META, sourceClassToken } from "../../../cli/src/core/references/SourceLabels.js";
 
 /** Returns the full CSS stylesheet for the Notion-like Clean design. */
 export function buildCss(): string {

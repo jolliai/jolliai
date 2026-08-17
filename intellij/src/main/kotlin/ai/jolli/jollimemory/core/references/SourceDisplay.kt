@@ -9,10 +9,20 @@ import java.awt.Color
  * rows so tag letters and colors don't drift between PlansPanel, CommitsPanel and
  * hover popups.
  *
- * **Byte-for-byte mirror of VSCode's `SOURCE_META` in
- * `vscode/src/views/SourceLabels.ts`** — letters and hex colors come from that
- * file. When adding a source, edit both. `NEUTRAL_SOURCE_COLOR` (`#6e7681`)
- * is VSCode's fallback color for the same purpose.
+ * **Byte-for-byte mirror of the CLI's `SOURCE_META` in
+ * `cli/src/core/references/SourceLabels.ts`** — letters and hex colors come from
+ * that file. When adding a source, edit both. `NEUTRAL_SOURCE_COLOR`
+ * (`#6e7681`) is that table's fallback color for the same purpose. (It lived at
+ * `vscode/src/views/SourceLabels.ts` until the dashboard became a second
+ * consumer — same filename, new home, and no shim at the old path.)
+ *
+ * The mirror is ENFORCED, not asked for: `SourceLabelsLockstep.test.ts` in the
+ * CLI suite parses this file and fails when a `SOURCE_META` entry has no [Style]
+ * here, when a letter/label/hex disagrees, or when [SourceId] is missing an id
+ * the CLI ships. It runs in `npm run all`, so drift fails in the PR that causes
+ * it rather than on a user's screen — which matters because the failure is
+ * otherwise silent: Gson decodes an unknown source to null and `CommitsPanel`
+ * SKIPS such a reference row entirely.
  *
  * `unknown()` is what every consumer must fall back to for a source the enum
  * doesn't cover yet — reference rows for a future CLI-side source render with a
@@ -36,6 +46,17 @@ object SourceDisplay {
 	private val MONDAY = Style("M", JBColor(0xFF3D57, 0xFF3D57), "monday.com")
 	private val ZOOM_DOC = Style("Z", JBColor(0x2D8CFF, 0x2D8CFF), "Zoom Doc")
 	private val ZOOM_MEETING = Style("Z", JBColor(0x2D8CFF, 0x2D8CFF), "Zoom Meeting")
+	// Vercel's mark is monochrome black, and GitHub's neutral gray is the precedent for a
+	// colorless brand here. Deliberately NOT pure `#000000`: this hue is painted as a filled
+	// chip behind a white letter, so on IntelliJ's Darcula panel pure black would render the
+	// chip invisible and leave a bare floating letter. Same reasoning, and the same value, as
+	// the CLI table's own comment.
+	private val VERCEL = Style("V", JBColor(0x4D4D4D, 0x4D4D4D), "Vercel")
+	// Figma's mark is multicolour; `#F24E1E` is its red, the most recognizable single hue.
+	private val FIGMA = Style("F", JBColor(0xF24E1E, 0xF24E1E), "Figma")
+	// Sentry's brand purple. The letter collides with Slack's "S", as Zoom's two collide on
+	// "Z" and Jolli's on "J" — accepted for the same reason: the badge colors differ.
+	private val SENTRY = Style("S", JBColor(0x6559C6, 0x6559C6), "Sentry")
 
 	/** Neutral fallback (VSCode's `NEUTRAL_SOURCE_COLOR = "#6e7681"`). */
 	private val UNKNOWN = Style("R", JBColor(0x6E7681, 0x6E7681), "Reference")
@@ -53,6 +74,9 @@ object SourceDisplay {
 		SourceId.monday -> MONDAY
 		SourceId.zoom_doc -> ZOOM_DOC
 		SourceId.zoom_meeting -> ZOOM_MEETING
+		SourceId.vercel -> VERCEL
+		SourceId.figma -> FIGMA
+		SourceId.sentry -> SENTRY
 		null -> UNKNOWN
 	}
 

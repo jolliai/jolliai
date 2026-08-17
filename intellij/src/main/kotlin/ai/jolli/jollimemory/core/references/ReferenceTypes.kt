@@ -41,6 +41,9 @@ enum class SourceId {
 	monday,
 	@SerializedName("zoom-doc") zoom_doc,
 	@SerializedName("zoom-meeting") zoom_meeting,
+	vercel,
+	figma,
+	sentry,
 }
 
 /** Wire-name helpers for [SourceId] (Gson otherwise encodes enum names verbatim). */
@@ -81,13 +84,15 @@ object SourceIds {
 	 *
 	 * For sources whose native id is filesystem-safe and globally unique
 	 * within the source (linear / jira / notion / slack / jollimemory /
-	 * confluence / asana / monday / zoom-doc / zoom-meeting): identity.
+	 * confluence / asana / monday / zoom-doc / zoom-meeting / vercel /
+	 * figma): identity.
 	 *
 	 * For sources whose native id is collision-prone or unsafe (github's
-	 * `<owner>/<repo>#<n>`, context7's `/<org>/<project>` — both declared
-	 * `nativeIdPathSafe: false` in the CLI): replace `[^\w.-]` with `-`
-	 * then append an 8-hex sha256 suffix over the RAW bareKey so two
-	 * different tuples cannot land at the same file stem.
+	 * `<owner>/<repo>#<n>`, context7's `/<org>/<project>`, sentry's
+	 * `<host>/<issueId>` — all declared `nativeIdPathSafe: false` in the
+	 * CLI): replace `[^\w.-]` with `-` then append an 8-hex sha256 suffix
+	 * over the RAW bareKey so two different tuples cannot land at the same
+	 * file stem.
 	 *
 	 * LOCKSTEP with the CLI writer. This function IS the read side of that
 	 * lockstep — [FolderStorageReader] and [SummaryReader] both call it, so
@@ -108,9 +113,17 @@ object SourceIds {
 	/**
 	 * Sources declared `nativeIdPathSafe: false` in the CLI's source
 	 * definitions under `cli/src/core/references/sources/definitions/`.
-	 * Currently: github (`owner/repo#n`) and context7 (`/org/project`).
+	 * Currently: github (`owner/repo#n`), context7 (`/org/project`) and
+	 * sentry (`<host>/<issueId>`).
+	 *
+	 * Membership is not a judgement call made here — it mirrors that one
+	 * declaration, and getting it wrong is silent in the worst direction: a
+	 * source omitted from this set reads the identity stem while the CLI
+	 * wrote the sanitized+sha8 one, so every archived body of that source
+	 * comes back null. `SourceLabelsLockstep.test.ts` in the CLI suite pins
+	 * the two lists together.
 	 */
-	private val PATH_UNSAFE_SOURCES: Set<SourceId> = setOf(SourceId.github, SourceId.context7)
+	private val PATH_UNSAFE_SOURCES: Set<SourceId> = setOf(SourceId.github, SourceId.context7, SourceId.sentry)
 
 	/** True for sources whose native id is filesystem-unsafe (contains `/`, `#`, etc.). */
 	fun isPathUnsafe(source: SourceId): Boolean = source in PATH_UNSAFE_SOURCES

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildNextMemoryCss } from "./NextMemoryCssBuilder.js";
-import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "./SourceLabels.js";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "../../../cli/src/core/references/SourceLabels.js";
 
 describe("buildNextMemoryCss — unknown-source fallback", () => {
 	// Same invariant the sidebar suite pins, asserted independently here: both

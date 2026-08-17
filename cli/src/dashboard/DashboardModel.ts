@@ -700,6 +700,20 @@ export interface MemoryContextRow {
 	readonly meta?: string;
 	/** Upstream URL, for a reference whose source has a navigable page. */
 	readonly url?: string;
+	/**
+	 * The reference's source id (`linear`, `jira`, `sentry`, …) — present ONLY on
+	 * `kind: "reference"` rows, where it selects the badge's letter and brand
+	 * colour from `SOURCE_META`.
+	 *
+	 * It earns its place by the rule above (nothing lands here the client does not
+	 * use): without it every reference rendered as one identical amber `R`,
+	 * because the row's kind is all the client had to key on, while the editor
+	 * showed a distinct badge per source for the same memory. Not recoverable
+	 * from the other fields — `contextKey` carries the source as a prefix but is
+	 * absent exactly when a source has left the registry, and `meta` names the
+	 * source only for the three trackers `labelLeadsWithNativeId` covers.
+	 */
+	readonly source?: string;
 }
 
 /**
@@ -712,6 +726,58 @@ export interface ContextDoc {
 	readonly kind: MemoryContextKind;
 	readonly title: string;
 	readonly bodyMd: string;
+}
+
+/** One turn of an archived conversation, as served by `/api/conversation`. */
+export interface ConversationEntry {
+	readonly role: "human" | "assistant";
+	readonly content: string;
+	/** ISO timestamp when the transcript recorded one; absent for sources that do not. */
+	readonly timestamp?: string;
+}
+
+/**
+ * One archived conversation's turns, served by `/api/conversation` for the
+ * Conversations viewer — the browser counterpart of the editor's read-only
+ * `ConversationDetailsPanel`.
+ *
+ * Read-only, like that panel is when opened from a memory: an archived slice has
+ * no live cursor to edit against, so there is no overlay to write back to and
+ * nothing here carries an index or an identity for one.
+ */
+export interface ConversationDoc {
+	readonly title: string;
+	readonly source: string;
+	readonly sessionId: string;
+	/** Turns in the archive, BEFORE any cap — so the viewer can say what it is not showing. */
+	readonly messageCount: number;
+	readonly entries: ReadonlyArray<ConversationEntry>;
+	/**
+	 * True when the cap dropped turns, or clipped a turn's content.
+	 *
+	 * A deliberate divergence from the editor, which reads the same archive
+	 * in-process and shows all of it: this crosses HTTP, and one agent session can
+	 * carry thousands of turns of unbounded text. Surfacing the fact is the point
+	 * — a viewer that silently showed a prefix would read as the whole
+	 * conversation.
+	 *
+	 * The viewer's GATE, not its wording: this says something was withheld, and
+	 * {@link ConversationDoc.clippedEntries} plus the entries/count gap say which.
+	 */
+	readonly truncated: boolean;
+	/**
+	 * How many of the SERVED turns had their body cut at
+	 * `CONVERSATION_CONTENT_LIMIT`.
+	 *
+	 * The two ways this endpoint withholds text are independent, and a viewer that
+	 * only knew `truncated` had to guess: it phrased everything as dropped turns,
+	 * so a 12-turn conversation carrying one enormous turn was announced as
+	 * "showing the first 12 of 12 turns" — a sentence whose own numbers say
+	 * nothing is missing — while the cut characters went unmentioned. Dropped
+	 * turns need no field (`messageCount` minus `entries.length` is the count);
+	 * clipping leaves no trace in either number, so it needs this one.
+	 */
+	readonly clippedEntries: number;
 }
 
 /** One context item the relevance ranker judged unrelated and soft-excluded. */

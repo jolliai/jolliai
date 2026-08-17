@@ -41,7 +41,7 @@ import { log } from "../util/Logger.js";
 import { ConversationDetailsPanel } from "./ConversationDetailsPanel.js";
 import { SIDEBAR_EMPTY_STRINGS } from "./SidebarEmptyMessages.js";
 import { buildSidebarHtml } from "./SidebarHtmlBuilder.js";
-import { SOURCE_META } from "./SourceLabels.js";
+import { SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 import type {
 	BackfillCandidate,
 	BackfillResultRow,

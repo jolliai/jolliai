@@ -53,7 +53,16 @@ function setup(commitHash: string | undefined, opts?: { rows?: string[]; owner?:
 		createElement: element,
 		body: element(),
 	};
-	const win = { JD: {}, document: doc, addEventListener: () => undefined } as Record<string, unknown>;
+	// `removeEventListener` as well as `addEventListener`: the page registers its
+	// postMessage handlers remove-then-add so repeated renders cannot stack them
+	// (knowledge.js and graph.js do the same), and this harness renders twice into
+	// ONE window — which is exactly the second-render path that calls it.
+	const win = {
+		JD: {},
+		document: doc,
+		addEventListener: () => undefined,
+		removeEventListener: () => undefined,
+	} as Record<string, unknown>;
 	for (const file of ["format.js", "shell.js", "charts.js", "memories.js"]) {
 		const src = readFileSync(new URL(`./assets/js/${file}`, import.meta.url), "utf8");
 		new Function("window", "document", src)(win, doc);

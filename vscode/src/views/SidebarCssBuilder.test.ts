@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSidebarCss } from "./SidebarCssBuilder";
-import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "./SourceLabels.js";
+import { getSourceMeta, NEUTRAL_SOURCE_COLOR } from "../../../cli/src/core/references/SourceLabels.js";
 
 describe("SidebarCssBuilder", () => {
 	it("returns CSS string", () => {

@@ -26,7 +26,7 @@ import {
 } from "../util/FormatUtils.js";
 import { SKILLS_GROUP_ID, type SerializedTreeItem } from "../views/SidebarMessages.js";
 import { treeItemToSerialized } from "../views/SidebarSerialize.js";
-import { getSourceMeta } from "../views/SourceLabels.js";
+import { getSourceMeta } from "../../../cli/src/core/references/SourceLabels.js";
 
 // ─── Tree item types ────────────────────────────────────────────────────────
 
@@ -479,7 +479,7 @@ function buildNoteTooltip(note: NoteInfo): vscode.MarkdownString {
 // ─── Reference label / tooltip helpers ──────────────────────────────────────
 
 function buildReferenceIconKey(source: SourceId): string {
-	// Per-source codicon id, from the single SOURCE_META table (SourceLabels.ts).
+	// Per-source codicon id, from the single SOURCE_META table (core/references/SourceLabels.ts).
 	// Notion references are pages, not tickets — `file-text` matches the
 	// product mental model. Linear / Jira / GitHub all surface as issues —
 	// the `issues` stacked-circles glyph reads as "issue" more clearly than

@@ -838,7 +838,16 @@ body {
     border: 1px solid var(--border); border-radius: 10px; background: var(--page);
   }
   .mem-read-inner { width: min(100%, 768px); margin: 0 auto; padding: 32px 40px 48px; display: flex; flex-direction: column; gap: 14px; }
-  .mem-detail .gd-empty { max-width: 420px; margin: 120px auto; font-size: 14px; text-align: center; }
+  /* The WHOLE-PANE placeholder ("Pick a memory on the left"), which is centred
+     down the empty reading pane — hence the 120px.
+
+     Scoped to its own class rather than to `.mem-detail .gd-empty`, which is
+     what it used to be: that also matched every SECTION's empty state, so a
+     memory with no context rendered "None." with 120px of blank above and
+     below it, and a memory with neither context nor conversations produced two
+     such voids in a row. Section empties are one muted line and want the base
+     `.gd-empty` rule. */
+  .mem-detail .mem-empty-pane { max-width: 420px; margin: 120px auto; font-size: 14px; text-align: center; }
   .mem-icon {
     width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.8;
     stroke-linecap: round; stroke-linejoin: round;
@@ -904,10 +913,25 @@ body {
   .mem-ctx-badge--note { background: color-mix(in srgb, #16a34a 14%, transparent); color: #16a34a; }
   .mem-ctx-badge--reference { background: color-mix(in srgb, #d97706 16%, transparent); color: #b45309; }
   .mem-ctx-badge--skills { background: color-mix(in srgb, #7c3aed 14%, transparent); color: #7c3aed; }
-  /* The sub-line shares the row rather than wrapping under the title: these rows
-     are single-height, and the meta is a qualifier (`ENG-1234 (Linear)`), not a
-     second title. `min-width: 0` lets it shrink before the title does. */
-  .mem-ctx-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  /* Title over sub-line, mirroring the editor's `.r-main` > `.r-title` +
+     `.r-sub` (SummaryHtmlBuilder's buildReferenceRow / buildPlansAndNotesSection).
+
+     The sub-line used to share the row, on the argument that the meta is a
+     qualifier rather than a second title. That holds for `ENG-1234 (Linear)` and
+     breaks for everything else it also carries: a plan's `<slug>.md`, a note's
+     `<id>.md` and the skills aggregate are all long enough to fight the title for
+     width, so one of the two ellipsised on a normal-width pane. Stacking gives
+     each its own line and matches the editor, which is where a reader compares.
+
+     `min-width: 0` on the column is what lets the ellipsis work at all — a flex
+     item defaults to `min-width: auto` and refuses to shrink below its content,
+     so the title would push the actions off the row instead of truncating. */
+  .mem-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+  /* `.mem-row-title` carries `flex: 1` for the single-line rows it also serves
+     (conversations). Inside this COLUMN that would stretch it vertically, so it
+     is neutralised here rather than removed there. */
+  .mem-row-main .mem-row-title { flex: none; width: 100%; }
+  .mem-ctx-sub { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
   .mem-ctx-link { display: inline-flex; align-items: center; color: var(--muted); }
   .mem-ctx-link:hover { color: var(--accent); }
   .mem-ctx-link .mem-icon { width: 14px; height: 14px; }
@@ -1265,16 +1289,69 @@ body {
      is what actually lets it scroll — a flex item's default `min-height: auto`
      refuses to shrink below its content, so the sheet would grow past the cap. */
   .sheet {
+    position: relative;
     background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 12px;
     width: min(960px, 100%); max-height: 100%; padding: 18px; display: flex; flex-direction: column;
   }
-  .sheet h3 { margin: 0 0 2px; font-size: 14px; }
-  .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; }
-  .ctx-body {
-    flex: 0 1 auto; min-height: 0; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6;
-    color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
+  /* The header text reserves the corner the ✕ below sits in — a plan title is
+     whatever the agent named the file, so it is long far more often than not. */
+  .sheet h3 { margin: 0 0 2px; padding-right: 34px; font-size: 14px; }
+  .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; padding-right: 34px; }
+  /* Corner ✕, matching the Settings modal's `.set-modal-close` (same box, hue and
+     hover plate) so both dialog families dismiss the same way. The footer's
+     "Close" button stays: this is the affordance a reader looks for after
+     scrolling a long document, where that button is off-screen.
+     Absolutely positioned rather than folded into a header row, because the
+     sheet is a flex COLUMN whose growth rules (`.sheet-fill`, `.ctx-frame`)
+     divide the height between its children — a header would take a share of
+     that for a control needing none. */
+  .sheet-close {
+    position: absolute; top: 12px; right: 12px; z-index: 1;
+    appearance: none; border: 0; background: transparent; cursor: pointer;
+    color: var(--muted); font-size: 16px; line-height: 1; width: 30px; height: 30px;
+    display: grid; place-items: center; border-radius: 8px;
   }
+  .sheet-close:hover { background: var(--lock-bg); color: var(--ink); }
+  .sheet-close:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+  /* A sheet that FILLS the overlay rather than being sized by its content.
+     Needed by any sheet whose body is an iframe, and the note above about a
+     short document keeping a small dialog does not survive that change: a
+     replaced element has no intrinsic content height (an iframe's default is
+     150px, whatever the document inside), so `max-height` alone left the Context
+     viewer a ~320px letterbox no matter how long the plan was.
+     Measuring the frame to size it is not available and never will be: the
+     document is served into an opaque origin precisely so this page cannot reach
+     into it, so `contentDocument.scrollHeight` is a security error, not an
+     oversight. Filling is the honest answer — a short document simply leaves
+     white space below itself, inside its own scroll box. */
+  .sheet-fill { height: 100%; }
+  /* The Context viewer's frame. `flex: 1 1 auto` where the old <pre> used
+     `0 1 auto`: a <pre> was sized by its own text and only needed permission to
+     shrink, while an iframe would otherwise sit at that 150px default. Paired
+     with `.sheet-fill` above, `flex-grow` is what actually gives it the height.
+     `min-height: 0` still does the same job it does on the sheet — and NOT a
+     pixel floor, which would push the sheet past the overlay in a short window.
+     Scrolling belongs to the framed document, so there is no `overflow` here. */
+  .ctx-frame {
+    flex: 1 1 auto; min-height: 0; width: 100%; border: 1px solid var(--grid);
+    border-radius: 8px; background: var(--page);
+  }
+  /* The Conversation viewer's list. Plain DOM (see index.html), so unlike the
+     frame above this one owns its own scrolling. */
+  .conv-body { flex: 1 1 auto; min-height: 0; overflow: auto; }
+  /* Mirrors the editor's ConversationDetailsHtmlBuilder: the human turn carries a
+     tinted plate and the assistant turn none, so the alternation is readable
+     without a badge on every row. */
+  .conv-entry { padding: 8px 10px; margin-bottom: 6px; border-radius: 6px; }
+  .conv-entry[data-role="human"] { background: var(--page); }
+  .conv-entry-head {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+    font-size: 11px; color: var(--muted);
+  }
+  .conv-role { font-weight: 600; }
+  .conv-time { margin-left: auto; }
+  .conv-text { white-space: pre-wrap; word-break: break-word; font-size: 12px; line-height: 1.6; color: var(--ink-2); }
+  .conv-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
   .sheet .row { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
 
   /* ---------- popover ---------- */

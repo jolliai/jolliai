@@ -12,7 +12,7 @@
  * the memory-detail bar (SummaryHtmlBuilder buildTokenMeter); all three token
  * bars now share the same exact-width, no-bucket approach.
  */
-import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 
 export function buildNextMemoryCss(): string {
 	return [
@@ -104,7 +104,7 @@ export function buildNextMemoryCss(): string {
 		// aggregate row renders in both panels and a hue split would read as two
 		// different kinds.
 		".mem-ctx-badge--skill     { background: #b180d7; }",
-		// Per-source colors generated from the single ./SourceLabels.ts
+		// Per-source colors generated from the single core/references/SourceLabels.ts
 		// SOURCE_META table so a new source's color lives in one place.
 		...Object.entries(SOURCE_META).map(([id, meta]) => `.mem-ctx-badge--${id} { background: ${meta.color}; }`),
 		`.mem-ctx-badge--reference { background: ${NEUTRAL_SOURCE_COLOR}; }`,

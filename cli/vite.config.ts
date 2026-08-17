@@ -63,9 +63,25 @@ const copyGraphAssets = {
 // The dashboard runtime (HTML/CSS/JS) follows the exact same model as the
 // graph viz above: authored assets under src/dashboard/assets/ are minified
 // into dist/dashboard-assets/, read at runtime by DashboardServer relative to
-// the bundle (resolveDashboardAssetsDir). No vendor/ tier — every file is ours.
+// the bundle (resolveDashboardAssetsDir).
 const dashboardAssetsSrc = resolve(__dirname, "src/dashboard/assets");
 const dashboardAssetsDest = resolve(__dirname, "dist/dashboard-assets");
+
+// One vendored file joins them at build time: `marked`, for /context-viewer.
+// It is NOT duplicated in git — the graph viz's copy stays the only one in the
+// tree, and this step places it where every downstream surface can reach it.
+//
+// That indirection is the whole point. Only the CLI's own dist ships
+// `graph-assets/`; `vscode/dist` and the three plugin bundles copy
+// `dashboard-assets/` alone, so a viewer that resolved `marked` from the graph
+// tree would 500 on four surfaces out of five — exactly as /wiki-viewer and
+// /graph-viewer already do there. Copying it here means the existing
+// copy-dashboard-assets step downstream carries it for free.
+//
+// Not minified: it is already a minified vendor bundle, and re-minifying an
+// unfamiliar one only risks changing it. Same reason `shouldMinifyGraphAsset`
+// skips everything under `vendor/`.
+const markedVendorSrc = resolve(__dirname, "src/graph/assets/vendor/marked.min.js");
 
 const copyDashboardAssets = {
 	name: "copy-dashboard-assets",
@@ -84,6 +100,9 @@ const copyDashboardAssets = {
 				cpSync(abs, out);
 			}
 		}
+		const markedOut = join(dashboardAssetsDest, "vendor", "marked.min.js");
+		mkdirSync(dirname(markedOut), { recursive: true });
+		cpSync(markedVendorSrc, markedOut);
 	},
 };
 

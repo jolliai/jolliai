@@ -33,12 +33,9 @@ window.JD = window.JD || {};
 		return available[0].kb;
 	}
 
-	function currentTheme() {
-		var dt = document.documentElement.getAttribute("data-theme");
-		if (dt === "light" || dt === "dark") return dt;
-		return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
-	}
-
+	// Was a private copy here; it moved to `JD.currentTheme` when the Context
+	// viewer needed the same answer. Two frames disagreeing about the page's
+	// theme is exactly the bug one shared reader prevents.
 	function render(model) {
 		var available = availableRepos(model);
 		if (!available.length) {
@@ -49,7 +46,7 @@ window.JD = window.JD || {};
 			return;
 		}
 		var kb = initialKb(available);
-		var src = "/graph-viewer?kb=" + encodeURIComponent(kb) + "&theme=" + currentTheme();
+		var src = "/graph-viewer?kb=" + encodeURIComponent(kb) + "&theme=" + JD.currentTheme();
 		document.getElementById("app").innerHTML =
 			'<section class="graph-page"><iframe class="graph-frame" sandbox="allow-scripts" ' +
 			'title="Knowledge graph" src="' +

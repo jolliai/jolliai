@@ -20,13 +20,13 @@
  * exact-width, no-bucket approach so sub-10% segments never disappear.
  */
 import { CONTEXT_ROW_KINDS } from "./ContextRowKinds.js";
-import { SOURCE_META } from "./SourceLabels.js";
+import { SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 
 export function buildNextMemoryScript(): string {
 	return `
   const vscode = acquireVsCodeApi();
 
-  // Per-source badge letter, injected from the single ./SourceLabels.ts
+  // Per-source badge letter, injected from the single core/references/SourceLabels.ts
   // SOURCE_META table (mirrors SidebarScriptBuilder's own injection) so this
   // standalone panel script never hardcodes a per-source letter switch. A
   // source id missing from this table falls back to its own first letter

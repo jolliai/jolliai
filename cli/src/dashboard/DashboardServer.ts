@@ -96,6 +96,7 @@ import { getProjectRootDir, listReachableCommits, readLocalGitIdentity } from ".
 import { escapeForInlineScript } from "../core/InlineScript.js";
 import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
 import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
@@ -138,7 +139,7 @@ import {
 	resolveKbRoot,
 	WIKI_FILE_PATTERN,
 } from "./KnowledgeQuery.js";
-import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
+import { buildMemoriesPage, type ReachableCommits, readContextDoc, readConversationEntries } from "./MemoriesQuery.js";
 import { backupRepoRegistry, classifyRegistryEntry, forgetRepo, type RegistryEntryVerdict } from "./RepoForget.js";
 import { probeRepo } from "./RepoProbe.js";
 import { existingWorktrees, readRepoRegistry, recordedRepoPaths, registerRepo } from "./RepoRegistry.js";
@@ -243,6 +244,15 @@ export function resolveDashboardAssetsDir(baseDir: string = HERE): string {
  * away, and a label map that drifts is the cheap half of the same bug. Always
  * inlined (unlike the token): it is a fixed, non-secret table, and a page that
  * skipped it would silently print raw transcript tags.
+ *
+ * `window.__JOLLI_SOURCE_META__` does the same for REFERENCE sources, and here
+ * the whole badge is a constant — letter and brand colour both — so nothing is
+ * left behind in the page the way the agent marks are. The neutral fallback
+ * rides along in the same object rather than being re-typed client-side, which
+ * is what the constant's own docstring asks of every consumer. Without this the
+ * page had only the row's KIND to key on, so a Linear ticket, a Jira issue and a
+ * Sentry issue all rendered as one identical amber `R` while the editor showed
+ * three distinct badges for the same memory.
  */
 export function assembleDashboardHtml(assetsDir: string, modelJson: string, token?: string): string {
 	const read = (...p: string[]) => readFileSync(join(assetsDir, ...p), "utf8");
@@ -256,6 +266,9 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
 	const scripts =
 		tokenScript +
 		`<script>window.__JOLLI_SOURCE_LABELS__ = ${escapeForInlineScript(JSON.stringify(TRANSCRIPT_SOURCE_LABELS))};</script>\n` +
+		`<script>window.__JOLLI_SOURCE_META__ = ${escapeForInlineScript(
+			JSON.stringify({ meta: SOURCE_META, neutral: NEUTRAL_SOURCE_COLOR }),
+		)};</script>\n` +
 		`<script>window.__JOLLI_DASHBOARD__ = ${escapeForInlineScript(modelJson)};</script>\n` +
 		DASHBOARD_SCRIPT_FILES.map((f) => `<script>\n${read("js", f)}\n</script>`).join("\n");
 	const marker = /<!-- scripts:start -->[\s\S]*?<!-- scripts:end -->/;
@@ -266,14 +279,27 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
 // ── Framed viewer documents (Knowledge / Graph iframes) ─────────────────────
 
 /**
- * Minimal readable styling for the `/wiki-viewer` document. It renders in a
- * sandboxed iframe with its own (opaque) origin, so it inherits none of the
- * dashboard theme — hence a self-contained neutral stylesheet.
+ * Minimal readable styling for the framed viewer documents — `/wiki-viewer`,
+ * `/context-viewer`, and the plain message document. Each renders in a sandboxed
+ * iframe with its own (opaque) origin, so it inherits none of the dashboard
+ * theme — hence a self-contained neutral stylesheet.
+ *
+ * "Inherits none of the theme" is also why it honours an explicit
+ * `<html data-theme>`, not just `prefers-color-scheme`. The dashboard's own
+ * palette keys on both (`main.css`: `:root[data-theme="dark"]` beside the media
+ * query), so a reader who forced light or dark would otherwise get a frame in
+ * the opposite scheme. The wiki and graph frames fill a whole pane and mostly
+ * got away with that; `/context-viewer` sits INSIDE a themed modal, where a
+ * white page in a dark dialog is impossible to miss. The `:where(:not(…))` guard
+ * is the same idiom `main.css` uses, so an explicit `light` still wins on a
+ * dark-preferring OS. A document that passes no theme keeps the old
+ * media-query-only behaviour exactly.
  */
-const WIKI_VIEWER_CSS = `
+const FRAMED_VIEWER_CSS = `
 :root { color-scheme: light dark; }
 body { margin: 0; padding: 24px 40px; font: 14px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #1a1d21; background: #fff; }
-@media (prefers-color-scheme: dark) { body { color: #d6dae0; background: #16181c; } }
+@media (prefers-color-scheme: dark) { :root:where(:not([data-theme="light"])) body { color: #d6dae0; background: #16181c; } }
+:root[data-theme="dark"] body { color: #d6dae0; background: #16181c; }
 /* Fill the reading pane's width (left-aligned) — a narrow centred column left
    large blank margins in the wide detail pane. Cap only on very wide viewports. */
 .md { max-width: 1200px; margin: 0; }
@@ -365,7 +391,7 @@ function buildWikiViewerHtml(graphAssetsDir: string, bodyMd: string, detailRepo:
 	return (
 		`<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
 		`<meta name="viewport" content="width=device-width, initial-scale=1" />` +
-		`<style>${WIKI_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
+		`<style>${FRAMED_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
 		`<script>\n${marked}\n</script>` +
 		`<script>window.__JOLLI_WIKI_DETAIL_REPO__ = ${safeRepo};</script>` +
 		`<script>document.getElementById("md").innerHTML = window.marked.parse(${safe});</script>` +
@@ -379,7 +405,106 @@ function viewerMessageHtml(message: string): string {
 	// `message` is one of a few fixed strings, never user input — safe to inline.
 	return (
 		`<!doctype html><html lang="en"><head><meta charset="utf-8" />` +
-		`<style>${WIKI_VIEWER_CSS}</style></head><body><p class="viewer-msg">${message}</p></body></html>`
+		`<style>${FRAMED_VIEWER_CSS}</style></head><body><p class="viewer-msg">${message}</p></body></html>`
+	);
+}
+
+/**
+ * The vendored `marked` bundle, read from the DASHBOARD assets with the graph
+ * assets as the fallback — deliberately in that order, and it is the whole
+ * reason `/context-viewer` is not simply a copy of `/wiki-viewer`.
+ *
+ * Only the CLI's own dist ships `graph-assets/`. `vscode/dist` and all three
+ * plugin bundles stage `dashboard-assets/` alone (their build scripts copy that
+ * one tree), so `resolveGraphAssetsDir()` THROWS on every non-CLI surface —
+ * which is why `/wiki-viewer` and `/graph-viewer` already answer 500 there. The
+ * Context dialog, by contrast, works on those surfaces today because it was pure
+ * client-side markup; routing its body through a graph-asset-dependent viewer
+ * would have converted a working dialog into a 500 on four surfaces out of five.
+ * So the CLI build copies this one file into `dist/dashboard-assets/vendor/`,
+ * which the existing copy step then carries downstream for free.
+ *
+ * The graph fallback is what covers a run from SOURCE (`npm run cli --
+ * dashboard`): `cli/src/dashboard/assets/` has no `vendor/`, the file is only
+ * placed there by the build, and the source tree's graph vendor copy is the
+ * original.
+ *
+ * Returns undefined rather than throwing when neither exists. This file is
+ * needed by ONE route, so a missing copy must degrade to that route showing a
+ * message — not to `resolveDashboardAssetsDir` refusing the whole dashboard at
+ * the door, which is why it is deliberately NOT in that probe's list (adding it
+ * there would also fail every source run, since the source tree never has it).
+ */
+function resolveMarkedJs(dashboardAssetsDir: string): string | undefined {
+	const dashboardCopy = join(dashboardAssetsDir, "vendor", "marked.min.js");
+	if (existsSync(dashboardCopy)) return readFileSync(dashboardCopy, "utf8");
+	try {
+		const graphCopy = join(resolveGraphAssetsDir(), "vendor", "marked.min.js");
+		if (existsSync(graphCopy)) return readFileSync(graphCopy, "utf8");
+	} catch (err) {
+		// resolveGraphAssetsDir throws when the viz tree is absent — the normal
+		// case on every non-CLI surface, not an error worth more than a debug line.
+		log.debug("no graph assets for the markdown renderer: %s", errMsg(err));
+	}
+	return undefined;
+}
+
+/**
+ * Runs after `marked` renders `#md` in `/context-viewer`. The wiki script's
+ * mirror image, because the link populations are opposite: a context document
+ * (a plan, a note, an archived Linear/Sentry reference) carries ABSOLUTE
+ * upstream URLs, where the wiki's are all repo-relative.
+ *
+ * A sandboxed frame has no `allow-popups` and cannot navigate the top page, so a
+ * plain anchor click does NOTHING here — silently, and worse than the raw
+ * markdown it replaced, where at least the URL was visible as text. So an
+ * http(s) anchor keeps its visible href (status-bar preview) but hands the click
+ * to the parent, which re-checks the scheme before opening it. Relative links
+ * lose their anchor: there is no repo-relative target inside this frame.
+ *
+ * Self-contained, no user data — inlined verbatim (unlike the document body).
+ */
+export const CONTEXT_LINK_SCRIPT =
+	'(function(){var md=document.getElementById("md");if(!md)return;' +
+	'Array.prototype.forEach.call(md.querySelectorAll("a[href]"),function(a){' +
+	'var href=a.getAttribute("href")||"";' +
+	// Mirrors JD.safeHrefAttr's probe: strip the bytes the URL parser ignores
+	// before reading a scheme, so `java\nscript:` cannot slip through as "relative".
+	'var probe=href.replace(/[\\t\\n\\r]/g,"").replace(/^[\\u0000-\\u0020]+/,"").toLowerCase();' +
+	"if(/^https?:/.test(probe)){" +
+	'a.addEventListener("click",function(e){e.preventDefault();' +
+	'window.parent.postMessage({type:"jolli-context-nav",href:href},"*");});' +
+	"return;}" +
+	// Anything else (relative, mailto-less, or an unreadable scheme) is dead in
+	// this frame — keep the text, drop the anchor.
+	'var s=document.createElement("span");s.textContent=a.textContent;' +
+	"if(a.parentNode)a.parentNode.replaceChild(s,a);" +
+	"});})();";
+
+/**
+ * A self-contained `/context-viewer` document: the vendored `marked` inlined,
+ * plus one script that renders the context body into `#md`. Served ONLY into a
+ * `sandbox="allow-scripts"` iframe (no `allow-same-origin`) — that opaque origin
+ * is what isolates the rendered HTML from the token-bearing parent page, which
+ * is the reason this content was rendered as literal `<pre>` text before rather
+ * than being injected into the dashboard's own DOM.
+ *
+ * `theme` stamps `<html data-theme>` so the frame matches the dialog around it;
+ * see {@link FRAMED_VIEWER_CSS}. Already validated to `light`/`dark` by the
+ * route, and interpolated as a bare attribute value, so it must stay a closed
+ * set rather than becoming a passthrough.
+ */
+function buildContextViewerHtml(markedJs: string, bodyMd: string, theme: "light" | "dark" | undefined): string {
+	const safe = escapeForInlineScript(JSON.stringify(bodyMd));
+	const themeAttr = theme ? ` data-theme="${theme}"` : "";
+	return (
+		`<!doctype html><html lang="en"${themeAttr}><head><meta charset="utf-8" />` +
+		`<meta name="viewport" content="width=device-width, initial-scale=1" />` +
+		`<style>${FRAMED_VIEWER_CSS}</style></head><body><article id="md" class="md"></article>` +
+		`<script>\n${markedJs}\n</script>` +
+		`<script>document.getElementById("md").innerHTML = window.marked.parse(${safe});</script>` +
+		`<script>${CONTEXT_LINK_SCRIPT}</script>` +
+		`</body></html>`
 	);
 }
 
@@ -1182,6 +1307,69 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
+		// The Memories page's Context viewer: one archived plan / note / reference
+		// body rendered by the vendored `marked` into a SANDBOXED self-contained
+		// document, shown inside the Context dialog's iframe. Same isolation model
+		// as `/wiki-viewer` and the same reason — the parent page carries the
+		// mutation token, and these documents were written by an agent.
+		//
+		// It reads `readContextDoc`, exactly as `/api/context` does; that JSON route
+		// stays as the machine-readable form of the same read.
+		if (url.pathname === "/context-viewer") {
+			const repo = url.searchParams.get("repo") ?? "";
+			const kindParam = url.searchParams.get("kind") ?? "";
+			const key = url.searchParams.get("key") ?? "";
+			const themeParam = url.searchParams.get("theme");
+			const kind = CONTEXT_DOC_KINDS.find((k) => k === kindParam);
+			if (!repo || !key || !kind) {
+				sendText(res, 400, `repo, kind (${CONTEXT_DOC_KINDS.join("|")}) and key are required`);
+				return;
+			}
+			// A closed set, never a passthrough: it is interpolated as a bare
+			// attribute value in `buildContextViewerHtml`. An absent or unrecognised
+			// value means "no explicit theme", which leaves the media query in charge.
+			const theme = themeParam === "light" || themeParam === "dark" ? themeParam : undefined;
+			// Caught here rather than left to the outer handler, which answers a
+			// failed request with plain text. Every other exit from this route is a
+			// framed document, because what receives it is an iframe inside the
+			// Context dialog: an unstyled "500 internal error" renders there as a bare
+			// line of text in the middle of the page, in a frame the reader cannot
+			// scroll away from, saying nothing about what to do.
+			let doc: Awaited<ReturnType<typeof readContextDoc>>;
+			try {
+				doc = await withReadonlyDashboardDb((db) => readContextDoc(db, repo, kind, key), {
+					...(options.dbPath ? { dbPath: options.dbPath } : {}),
+				});
+			} catch (err) {
+				// Same rule as `/api/context`: log the detail, tell the reader only
+				// that the read failed. 500 and not 404 — "could not be found" would
+				// send them looking for a document that is still there.
+				log.warn("context viewer read failed: %s", errMsg(err));
+				sendViewerHtml(res, 500, viewerMessageHtml("This document could not be read — try again."));
+				return;
+			}
+			if (!doc) {
+				sendViewerHtml(res, 404, viewerMessageHtml("This document could not be found."));
+				return;
+			}
+			assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
+			const markedJs = resolveMarkedJs(assetsDir);
+			if (markedJs === undefined) {
+				// A 200 with guidance, not a 500: the document was found and the rest of
+				// the dashboard is fine — only this renderer is missing from the install.
+				sendViewerHtml(
+					res,
+					200,
+					viewerMessageHtml(
+						"The markdown renderer is missing from this install — reinstall to view documents.",
+					),
+				);
+				return;
+			}
+			sendViewerHtml(res, 200, buildContextViewerHtml(markedJs, doc.bodyMd, theme));
+			return;
+		}
+
 		// The Knowledge page's per-file iframe: one wiki markdown rendered by the
 		// vendored `marked` into a SANDBOXED self-contained document. A public GET
 		// like the pages (no token); the `sandbox="allow-scripts"` attribute on the
@@ -1433,6 +1621,43 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				// only that the read failed.
 				log.warn("context read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that document" });
+			}
+			return;
+		}
+
+		// One archived conversation's turns, for the Memories page's Conversation
+		// viewer. Deliberately NOT folded into the memory detail payload, for the
+		// same reason as `/api/context`: a memory can link several conversations of
+		// thousands of turns each, and the reader opens at most one.
+		//
+		// JSON, not a framed viewer — unlike a context document, a transcript turn
+		// is rendered as TEXT (the editor's ConversationDetailsPanel does the same),
+		// so there is no agent-authored HTML here to isolate. A read like every
+		// other GET here — no token.
+		if (url.pathname === "/api/conversation") {
+			const repo = url.searchParams.get("repo") ?? "";
+			const hash = url.searchParams.get("hash") ?? "";
+			const source = url.searchParams.get("source") ?? "";
+			const session = url.searchParams.get("session") ?? "";
+			if (!repo || !hash || !source || !session) {
+				sendJson(res, 400, { error: "repo, hash, source and session are required" });
+				return;
+			}
+			try {
+				const doc = await withReadonlyDashboardDb(
+					(db) => readConversationEntries(db, repo, hash, source, session),
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				if (!doc) {
+					sendJson(res, 404, { error: "not found" });
+					return;
+				}
+				sendJson(res, 200, doc);
+			} catch (err) {
+				// Same rule as the other read routes: log the detail, tell the client
+				// only that the read failed.
+				log.warn("conversation read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that conversation" });
 			}
 			return;
 		}

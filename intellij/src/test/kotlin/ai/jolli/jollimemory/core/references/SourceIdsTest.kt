@@ -50,9 +50,11 @@ class SourceIdsTest {
         @Test
         fun `path-safe sources round-trip as identity`() {
             // linear / jira / notion / slack / jollimemory / confluence / asana /
-            // monday / zoom-doc / zoom-meeting — everything declared
-            // `nativeIdPathSafe: true` in the CLI. Adding a new one? Add it to
-            // both this test and the CLI source definition in the same PR.
+            // monday / zoom-doc / zoom-meeting / vercel / figma — everything
+            // declared `nativeIdPathSafe: true` in the CLI. Adding a new one? Add
+            // it to both this test and the CLI source definition in the same PR.
+            // The CLI's `SourceLabelsLockstep.test.ts` pins the SET; this pins the
+            // BEHAVIOUR of each member against a real-shaped id.
             SourceIds.pathKey(SourceId.linear, "PROJ-1234-abc12345") shouldBe "PROJ-1234-abc12345"
             SourceIds.pathKey(SourceId.jira, "KAN-4-abc12345") shouldBe "KAN-4-abc12345"
             SourceIds.pathKey(SourceId.notion, "abc123def456-abc12345") shouldBe "abc123def456-abc12345"
@@ -63,6 +65,26 @@ class SourceIdsTest {
             SourceIds.pathKey(SourceId.monday, "9000000-abc12345") shouldBe "9000000-abc12345"
             SourceIds.pathKey(SourceId.zoom_doc, "doc-1-abc12345") shouldBe "doc-1-abc12345"
             SourceIds.pathKey(SourceId.zoom_meeting, "1234567890-abc12345") shouldBe "1234567890-abc12345"
+            // A Vercel deployment id and a Figma file key are both bare
+            // alphanumerics — the CLI's `require` patterns pin them to exactly that,
+            // which is why both declare `nativeIdPathSafe: true`.
+            SourceIds.pathKey(SourceId.vercel, "dpl_9RmvfLQzHVt-abc12345") shouldBe "dpl_9RmvfLQzHVt-abc12345"
+            SourceIds.pathKey(SourceId.figma, "kQ7ZmR2xTb1-abc12345") shouldBe "kQ7ZmR2xTb1-abc12345"
+        }
+
+        @Test
+        fun `sentry folds the host separator and appends an 8-hex suffix`() {
+            // A Sentry nativeId is `<hostname>/<issueId>` — `nativeIdPathSafe: false`
+            // for github's reason, and with the same second benefit: the sha8 keeps
+            // two hosts' same-numbered issues apart. Omitting sentry from
+            // `PATH_UNSAFE_SOURCES` would read `<host>/<id>` as a file stem, so every
+            // archived Sentry body would come back null.
+            val stem = SourceIds.pathKey(SourceId.sentry, "acme.sentry.io/7665509682-abc12345")
+            stem shouldNotContain "/"
+            stem shouldMatch Regex("^[\\w.-]+$")
+            stem shouldMatch Regex("^.+-[0-9a-f]{8}$")
+            val other = SourceIds.pathKey(SourceId.sentry, "other.sentry.io/7665509682-abc12345")
+            stem shouldNotBe other
         }
 
         @Test

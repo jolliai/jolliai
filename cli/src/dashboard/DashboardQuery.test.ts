@@ -1051,6 +1051,111 @@ describe("buildDashboardModel — tool usage", () => {
 		]);
 	});
 
+	/**
+	 * One server reached through two registrations is one server.
+	 *
+	 * A Claude plugin's MCP entry is namespaced `plugin_<plugin>_<server>` by the
+	 * host, while the repo's own `.mcp.json` registers it bare — and Jolli ships
+	 * both, so a normal install produced two rows for one server: split call
+	 * volume, and an inflated "N servers" total.
+	 */
+	it("folds a plugin-namespaced MCP server onto its bare registration", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("s1", [
+					{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 17 },
+					{
+						name: "plugin_jolli_jollimemory.recall",
+						kind: "mcp",
+						server: "plugin_jolli_jollimemory",
+						calls: 7,
+					},
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		expect(result?.servers).toEqual([
+			// `tools: 1`, not 2 — the tool name embeds the server, so both spellings
+			// of `recall` fold too. Counting the raw column here reported a merged
+			// 5-tool server as having 10.
+			{ server: "jollimemory", sessions: 1, calls: 24, tools: 1, agents: [{ source: "claude", calls: 24 }] },
+		]);
+		// The header line's totals come from their own query and must agree.
+		expect(result?.serversTotal).toBe(1);
+		expect(result?.serverCallsTotal).toBe(24);
+		// The by-tool split folds on the same rule.
+		expect(result?.mcpTools).toEqual([
+			{
+				name: "jollimemory.recall",
+				kind: "mcp",
+				sessions: 1,
+				calls: 24,
+				agents: [{ source: "claude", calls: 24 }],
+			},
+		]);
+	});
+
+	/**
+	 * The exact boundary of the fold, driven through the real query.
+	 *
+	 * `plugin_<plugin>_<server>` is ambiguous by construction — underscores are
+	 * legal in both halves — so the rule takes the FIRST segment as the plugin
+	 * name. Everything below is what that costs and what it protects: a name it
+	 * cannot split confidently is left un-merged (visible, harmless) rather than
+	 * merged into the wrong server (silent, wrong).
+	 */
+	it("folds only what it can split with certainty", async () => {
+		const cases: ReadonlyArray<{ server: string; expect: string; why: string }> = [
+			{ server: "plugin_jolli_jollimemory", expect: "jollimemory", why: "the real duplicate" },
+			{ server: "plugin_a_b", expect: "b", why: "plugin a, server b" },
+			// The cost: an underscore in the PLUGIN name makes the split wrong, so it
+			// under-strips and this server simply stays separate.
+			{ server: "plugin_my_plugin_linear", expect: "plugin_linear", why: "underscore in the plugin name" },
+			// Guards on the prefix itself. `_` is literal in a GLOB pattern (only
+			// `*`, `?` and `[` are wildcards), which is what keeps `pluginX_a_b` out
+			// — the job the LIKE form needed an ESCAPE clause for.
+			{ server: "plugin", expect: "plugin", why: "no segment after the prefix" },
+			{ server: "pluginX_a_b", expect: "pluginX_a_b", why: "the prefix requires its underscore" },
+			{ server: "notaplugin_x", expect: "notaplugin_x", why: "prefix must be at the start" },
+			{ server: "jollimemory", expect: "jollimemory", why: "a bare server is untouched" },
+			// The other half of that operator choice, and the sharper one: SQLite's
+			// LIKE is case-INSENSITIVE for ASCII, so the LIKE form claimed this real
+			// name and folded it to `Api` — silently merging a server with any
+			// unrelated `Api`, which is the mis-attribution the conservative split
+			// above exists to avoid. GLOB takes no collating sequence.
+			{ server: "Plugin_Manager_Api", expect: "Plugin_Manager_Api", why: "the prefix is case-sensitive" },
+		];
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith(
+					"s1",
+					cases.map((c) => ({ name: `${c.server}.thing`, kind: "mcp" as const, server: c.server, calls: 1 })),
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const result = await usage();
+		const got = (result?.servers ?? []).map((s) => s.server).sort();
+		// `plugin_jolli_jollimemory` and `jollimemory` collapse into one row, so the
+		// eight inputs yield seven servers. Code-unit order, so `P` (0x50) leads and
+		// `X` (0x58) precedes `_` (0x5F) — this is JS `.sort()`, not the query's own
+		// ranking.
+		expect(got).toEqual([
+			"Plugin_Manager_Api",
+			"b",
+			"jollimemory",
+			"notaplugin_x",
+			"plugin",
+			"pluginX_a_b",
+			"plugin_linear",
+		]);
+		// No call is invented or lost by the regrouping.
+		expect(result?.serverCallsTotal).toBe(cases.length);
+	});
+
 	it("splits the same MCP rows by individual tool, ranked by call volume", async () => {
 		await applySummaryEvents(
 			[

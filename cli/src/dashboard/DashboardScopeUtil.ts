@@ -1,6 +1,6 @@
 /**
- * Scope-resolution and decision-text helpers shared by `DashboardQuery.ts` and
- * `MemoriesQuery.ts`.
+ * Scope-resolution, decision-text and MCP-identifier helpers shared by
+ * `DashboardQuery.ts` and `MemoriesQuery.ts`.
  *
  * Split out rather than left in `DashboardQuery.ts` (which both used to
  * import from) because that created an import cycle: `DashboardQuery.ts`
@@ -205,4 +205,80 @@ function resolveToken(
 	// Left as-is on purpose: it then resolves to a key matching nothing, rather
 	// than being silently dropped and widening the scope.
 	return token;
+}
+
+/**
+ * Strips a host's plugin-registration prefix off an MCP identifier, so ONE
+ * server reached two ways counts once.
+ *
+ * A server registered by a Claude plugin is namespaced `plugin_<plugin>_<server>`
+ * by the host, while the same server registered in the repo's own `.mcp.json`
+ * arrives bare. Jolli's own is registered both ways on a normal install — the
+ * plugin bundles an `.mcp.json` and `jolli enable` writes one — so the MCPs card
+ * showed `jollimemory` and `plugin_jolli_jollimemory` as two servers, splitting
+ * one server's call volume across two rows and inflating the "N servers" total.
+ *
+ * Applied at READ time and to BOTH identifier columns, which is not an
+ * implementation detail:
+ *
+ *   - Read, not write, so rows already in `session_tool_use` merge. Normalizing
+ *     in `classifyToolName` would only fix sessions recorded after the change,
+ *     and leaves the stored row a literal record of what the host reported —
+ *     which is what it is for.
+ *   - `tool_name` too, because `mcpTool` folds the server into it
+ *     (`<server>.<tool>`). Merging only `server` would count
+ *     `jollimemory.recall` and `plugin_jolli_jollimemory.recall` as two distinct
+ *     tools, so the merged row would claim "10 tools" for a server with 5. Both
+ *     columns carry the alias as a leading prefix, so one expression serves both.
+ *
+ * The prefix is ambiguous by construction — `plugin_<plugin>_<server>` with
+ * underscores legal in either half, so `plugin_a_b_c` cannot be split with
+ * certainty — and this takes the first segment after `plugin_` as the plugin
+ * name. A plugin whose own name contains an underscore therefore under-strips
+ * (`plugin_my_plugin_linear` → `plugin_linear`), which leaves that server
+ * un-merged rather than merging it into the wrong one. That is the safe
+ * direction, and it is why this cannot be tightened into an allowlist without
+ * giving up every other plugin-provided server: the same duplicate arises for
+ * any of them, and the host's format is the only thing they share.
+ *
+ * SQLite's `substr` is 1-based; `'plugin_'` is 7 bytes, so `substr(col, 8)` is
+ * the remainder and `8 + instr(...)` lands one past its first underscore.
+ *
+ * The prefix test is `GLOB`, never `LIKE`. SQLite's `LIKE` is case-INSENSITIVE
+ * for ASCII by default, so `LIKE 'plugin\_%'` also claims `Plugin_Manager_Api` —
+ * a server whose real name simply starts that way — and folds it to `Api`,
+ * silently merging it with any unrelated `Api` server. That is exactly the
+ * mis-attribution the deliberate under-stripping above exists to avoid, handed
+ * back by the operator rather than by the rule. `GLOB` is always
+ * case-sensitive and takes no collating sequence, and it needs no `ESCAPE`
+ * clause here because `_` is a literal in GLOB patterns (only `*`, `?` and `[`
+ * are wildcards) — so the pattern reads as what it matches.
+ *
+ * Lives here, not in `DashboardQuery.ts`, because the memory-detail activity
+ * query in `MemoriesQuery.ts` groups on the same two columns and must fold them
+ * the same way — and that module cannot import from `DashboardQuery.ts`
+ * (the cycle this file exists to break). Use {@link mcpFoldedIdentifierSql}
+ * from any query whose rows are NOT already restricted to `kind = 'mcp'`.
+ */
+export function stripPluginPrefixSql(col: string): string {
+	return (
+		`CASE WHEN ${col} GLOB 'plugin_*' AND instr(substr(${col}, 8), '_') > 0` +
+		` THEN substr(${col}, 8 + instr(substr(${col}, 8), '_')) ELSE ${col} END`
+	);
+}
+
+/**
+ * {@link stripPluginPrefixSql} applied to MCP rows ONLY, for a query whose
+ * result set mixes `session_tool_use.kind` values.
+ *
+ * The guard is the same decision `DashboardQuery.ts`'s skill list makes by
+ * keeping its raw column: `plugin_…` is a registration alias an MCP host
+ * prepended, so folding it is meaningful only for an identifier that host
+ * produced. A skill name and a builtin tool name are names somebody chose, and
+ * one that happens to start `plugin_` would be silently renamed by a rule that
+ * has nothing to do with it. Queries already pinned to `kind = 'mcp'` by their
+ * WHERE clause call {@link stripPluginPrefixSql} directly instead.
+ */
+export function mcpFoldedIdentifierSql(col: string, kindCol: string): string {
+	return `CASE WHEN ${kindCol} = 'mcp' THEN ${stripPluginPrefixSql(col)} ELSE ${col} END`;
 }

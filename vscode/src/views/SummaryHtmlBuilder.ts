@@ -34,7 +34,7 @@ import { buildSkillsSummaryLabel } from "../../../cli/src/core/SkillsAggregateMa
 import { formatMemoryRefIdWithHashFallback } from "../../../cli/src/core/MemoryRefId.js";
 import { estimateSummaryCostUsd, type SummaryCostMode } from "../../../cli/src/core/TokenCost.js";
 import { annotatePlans } from "../util/PlanGrouping.js";
-import { getSourceMeta, sourceClassToken } from "./SourceLabels.js";
+import { getSourceMeta, sourceClassToken } from "../../../cli/src/core/references/SourceLabels.js";
 import { buildCss } from "./SummaryCssBuilder.js";
 import { buildScript } from "./SummaryScriptBuilder.js";
 import { buildSummaryErrorBanner } from "./SummaryErrorBanner.js";

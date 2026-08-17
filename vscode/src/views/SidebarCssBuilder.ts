@@ -5,14 +5,14 @@
  * Uses VSCode theme variables for automatic light/dark theming.
  * Mostly a pure string template — the one exception is the per-source
  * `.mem-ctx-badge--<source>` color rules, generated from the single
- * ./SourceLabels.ts SOURCE_META table so a new source's color lives in one
+ * core/references/SourceLabels.ts SOURCE_META table so a new source's color lives in one
  * place. NOTE: buildSidebarCss's return value is a single template literal —
  * no unescaped backtick anywhere in it (including inside comments), or the
  * literal terminates early and breaks the whole file's parsing. The
  * generated-rules expression below uses plain string concatenation for the
  * same reason.
  */
-import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "./SourceLabels.js";
+import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../../../cli/src/core/references/SourceLabels.js";
 
 export function buildSidebarCss(): string {
 	return `
