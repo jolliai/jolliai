@@ -120,6 +120,7 @@ window.JD = window.JD || {};
 			apiKey: sum.apiKeyMasked || "",
 			jolliApiKey: sum.jolliApiKeyMasked || "",
 			localAgentTool: sum.localAgentTool || "claude-code",
+			localAgentModel: sum.localAgentModel || "",
 			localFolder: mb.localFolder || "",
 			compileExcludeFolders: mb.compileExcludeFolders || "",
 			syncTranscripts: mb.syncTranscripts === true,
@@ -455,11 +456,24 @@ window.JD = window.JD || {};
 		var tools = sum.localAgentTools || [];
 		var current = f.localAgentTool || "claude-code";
 		var options = tools.map((t) => opt(t.id, t.label, current)).join("");
+		// Model row only for a tool jollimemory pins a model for. Keyed lookup, not
+		// a "claude-code" string test: the server sends the map so the set of pinned
+		// tools stays a server-side fact. An empty stored value selects the default
+		// entry, which is why the fallback is DEFAULT_LOCAL_AGENT_MODEL's id.
+		var models = (sum.localAgentModels || {})[current] || [];
+		var modelRow =
+			models.length === 0
+				? ""
+				: '<div class="set-row"><label class="set-label" for="localAgentModel">Model</label>' +
+					'<select class="set-input" id="localAgentModel" data-field="localAgentModel">' +
+					models.map((m) => opt(m.id, m.label, f.localAgentModel)).join("") +
+					"</select></div>";
 		return (
 			'<div class="set-row"><label class="set-label" for="localAgentTool">Agent tool</label>' +
 			'<select class="set-input" id="localAgentTool" data-field="localAgentTool">' +
 			options +
 			"</select></div>" +
+			modelRow +
 			'<div class="set-row set-row-inline"><button type="button" class="cta ghost sm" data-action="probe"' +
 			(state.busy === "probe" ? " disabled" : "") +
 			">" +
@@ -718,6 +732,7 @@ window.JD = window.JD || {};
 			apiKey: f.apiKey,
 			jolliApiKey: f.jolliApiKey,
 			localAgentTool: f.localAgentTool,
+			localAgentModel: f.localAgentModel,
 			localFolder: f.localFolder,
 			compileExcludeFolders: f.compileExcludeFolders,
 			syncTranscripts: f.syncTranscripts === true,
@@ -750,7 +765,13 @@ window.JD = window.JD || {};
 
 		Array.prototype.forEach.call(document.querySelectorAll("#" + MOUNT + " [data-field]"), (el) => {
 			var field = el.getAttribute("data-field");
-			var rerender = field === "aiProvider";
+			// The Agent tool re-renders too: the Model row is derived from the
+			// selected tool, so without this it keeps showing the previous tool's
+			// options — offering models for a tool that pins none, or hiding the
+			// row for one that does — until an unrelated provider toggle happens
+			// to re-render. This is the whole reason localAgentModels is keyed by
+			// tool rather than scoped to the stored one.
+			var rerender = field === "aiProvider" || field === "localAgentTool";
 			var isFolder = field === "localFolder";
 			el.onchange = () => {
 				captureField(el);

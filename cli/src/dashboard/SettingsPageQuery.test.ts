@@ -55,6 +55,13 @@ describe("buildSettingsPageModel", () => {
 		expect(m.summary.apiKeyMasked).toBe("");
 		expect(m.summary.localAgentTool).toBe("claude-code");
 		expect(m.summary.localAgentTools.some((t) => t.id === "claude-code")).toBe(true);
+		// The EFFECTIVE model, not the stored one: the default is stored as absent,
+		// and a picker rendered from "" would have nothing selected.
+		expect(m.summary.localAgentModel).toBe("sonnet");
+		// Keyed by tool because switching the picker is a client-side state change
+		// that never refetches this payload. Only pinned tools appear.
+		expect(m.summary.localAgentModels["claude-code"]?.length).toBeGreaterThan(0);
+		expect(m.summary.localAgentModels.codex).toBeUndefined();
 		expect(m.others.dcoSignoff).toBe(false);
 		expect(m.memoryBank.compileExcludeFolders).toBe("");
 		expect(m.memoryBank.syncTranscripts).toBe(false);
@@ -96,6 +103,9 @@ describe("buildSettingsPageModel", () => {
 		expect(m.summary.aiProvider).toBe("local-agent");
 		expect(m.summary.localAgentTool).toBe("codex");
 		expect(m.summary.model).toBe("opus");
+		// `model` is the Anthropic-API setting and must NOT leak into the
+		// local-agent picker — different namespaces, deliberately separate fields.
+		expect(m.summary.localAgentModel).toBe("sonnet");
 		expect(m.summary.maxTokens).toBe(4096);
 		expect(m.summary.apiKeyMasked).toBe("sk-ant-abcde****mnop");
 	});
@@ -157,5 +167,26 @@ describe("buildSettingsPageModel", () => {
 		expect(m.memoryBank.state).toBeDefined();
 		expect(m.memoryBank.state?.severity).toBe("warn");
 		expect(m.memoryBank.repoLabel).toBeTruthy();
+	});
+});
+
+describe("buildSettingsPageModel — local-agent model", () => {
+	it("echoes an explicitly stored model", async () => {
+		const configDir = writeConfig({ aiProvider: "local-agent", localAgentModel: "haiku" });
+		const m = await buildSettingsPageModel(configDir, undefined);
+		expect(m.summary.localAgentModel).toBe("haiku");
+	});
+
+	it("treats a blank stored model as the default", async () => {
+		// A hand-edited or half-written config must not leave the picker unselected.
+		const configDir = writeConfig({ aiProvider: "local-agent", localAgentModel: "   " });
+		const m = await buildSettingsPageModel(configDir, undefined);
+		expect(m.summary.localAgentModel).toBe("sonnet");
+	});
+
+	it("carries the inherit escape hatch in the offered choices", async () => {
+		const configDir = writeConfig({});
+		const m = await buildSettingsPageModel(configDir, undefined);
+		expect(m.summary.localAgentModels["claude-code"]?.map((x) => x.id)).toContain("inherit");
 	});
 });

@@ -26,7 +26,11 @@ import {
 } from "../../../cli/src/core/JolliApiUtils.js";
 import { resolveMemoryBankState } from "../../../cli/src/core/KBPathResolver.js";
 import { isLocalAgentUsable, localAgentOverrideFrom } from "../../../cli/src/core/localagent/DetectAgents.js";
-import { LOCAL_AGENT_TOOLS } from "../../../cli/src/core/localagent/ToolMeta.js";
+import {
+	effectiveLocalAgentModel,
+	LOCAL_AGENT_TOOLS,
+	normalizeStoredLocalAgentModel,
+} from "../../../cli/src/core/localagent/ToolMeta.js";
 import {
 	describeMemoryBank,
 	type MemoryBankDisplay,
@@ -63,6 +67,8 @@ interface SettingsPayload {
 	readonly maxTokens: number | null;
 	readonly aiProvider: "anthropic" | "jolli" | "local-agent";
 	readonly localAgentTool?: LocalAgentToolId;
+	/** Model id from the pinned tool's own list; "" / the default is stored as unset. */
+	readonly localAgentModel?: string;
 	readonly jolliApiKey: string;
 	readonly claudeEnabled: boolean;
 	readonly codexEnabled: boolean;
@@ -645,6 +651,9 @@ export class SettingsWebviewPanel {
 			maxTokens: config.maxTokens ?? null,
 			aiProvider: this.resolveProvider(config),
 			localAgentTool: config.localAgentTool ?? "claude-code",
+			// The EFFECTIVE value — see effectiveLocalAgentModel for why an unknown
+			// stored id must render as the default rather than as itself.
+			localAgentModel: effectiveLocalAgentModel(config.localAgentModel),
 			jolliApiKey: maskedJolliApiKey,
 			claudeEnabled: config.claudeEnabled !== false,
 			codexEnabled: config.codexEnabled !== false,
@@ -811,6 +820,10 @@ export class SettingsWebviewPanel {
 			maxTokens: settings.maxTokens ?? undefined,
 			aiProvider: settings.aiProvider,
 			localAgentTool: settings.localAgentTool ?? "claude-code",
+			// Shared with the dashboard and `configure --set` rather than restated
+			// here: what a submitted model means on disk is a product rule, and the
+			// three surfaces had each answered it differently.
+			localAgentModel: normalizeStoredLocalAgentModel(settings.localAgentModel),
 			jolliApiKey:
 				resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
 			// The site the status surfaces report has to follow the key being saved

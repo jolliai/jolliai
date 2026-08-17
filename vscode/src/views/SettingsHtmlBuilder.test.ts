@@ -244,3 +244,72 @@ describe("SettingsHtmlBuilder", () => {
 		expect(html).not.toContain("Push to Jolli only");
 	});
 });
+
+describe("SettingsHtmlBuilder — local-agent model picker", () => {
+	const html = buildSettingsHtml("nonce123");
+
+	it("renders the model row, hidden until a pinned tool is selected", () => {
+		// Hidden in the markup rather than absent: the script toggles it as the
+		// tool picker changes, and an initially-visible row would flash for the
+		// unpinned tools on every panel open.
+		expect(html).toContain('class="settings-row hidden" id="localAgentModelRow"');
+		// `id="localAgentModelRow"` CONTAINS `id="localAgentModel"`, so asserting
+		// the bare id would be satisfied by the row above and would still pass with
+		// the <select> deleted. Match the tag.
+		expect(html).toContain('<select id="localAgentModel">');
+	});
+
+	it("tags every model option with the tool it belongs to", () => {
+		// The document is built once while the tool picker changes client-side, so
+		// data-tool is what lets the script filter the shared list.
+		expect(html).toMatch(/<option value="haiku" data-tool="claude-code">/);
+		expect(html).toMatch(/<option value="inherit" data-tool="claude-code">/);
+	});
+
+	it("marks the default option, since the list order no longer identifies it", () => {
+		// The options are ordered to match the Anthropic model picker, which puts
+		// Sonnet in the MIDDLE. The row's fallback reads this attribute — picking
+		// the first visible option instead would land on Haiku and quietly
+		// downgrade the machine on a tool switch.
+		expect(html).toMatch(/<option value="sonnet" data-tool="claude-code" data-default="true">/);
+		expect(html.match(/data-default="true"/g)).toHaveLength(1);
+	});
+
+	it("renders the model options in the same order and wording as the Anthropic picker", () => {
+		// Two pickers a few rows apart that name the same three model families
+		// differently read as two different settings.
+		const anthropic = /<select id="model">([\s\S]*?)<\/select>/.exec(html)?.[1] ?? "";
+		const local = /<select id="localAgentModel">([\s\S]*?)<\/select>/.exec(html)?.[1] ?? "";
+		const labels = (block: string) => [...block.matchAll(/>([^<]+)<\/option>/g)].map((m) => m[1].trim());
+		const anthropicLabels = labels(anthropic);
+		expect(anthropicLabels.length).toBe(3);
+		// The local list is the Anthropic list plus the inherit escape hatch, which
+		// has no Anthropic counterpart and keeps its own wording.
+		expect(labels(local).slice(0, 3)).toEqual(anthropicLabels);
+		expect(labels(local).at(-1)).toContain("own setting");
+	});
+
+	it("contributes no options for a tool with no pinned models", () => {
+		for (const tool of ["codex", "cursor-agent", "opencode", "kimi"]) {
+			expect(html).not.toContain(`data-tool="${tool}"`);
+		}
+	});
+
+	it("hides every conditional block with the .hidden class, never the `hidden` attribute", () => {
+		// A shipped regression this pins: the model row was given .settings-row for
+		// its spacing while still using the `hidden` ATTRIBUTE. An author-stylesheet
+		// `display: flex` beats the UA's `[hidden] { display: none }`, so the row
+		// stayed on screen for a tool that pins no model — visually broken while
+		// every fake-DOM test passed, because a fake DOM has no stylesheet to
+		// resolve. Only a shape check on the markup can see it.
+		expect(html).not.toMatch(/<[^>]*\shidden\s*>/);
+	});
+
+	it("escapes model labels rather than interpolating them raw", () => {
+		// The labels are project constants today, but they reach the document
+		// through interpolation — escaping is what keeps that true if one ever
+		// grows an apostrophe or an angle bracket.
+		expect(html).toContain("Use Claude Code&#39;s own setting");
+		expect(html).not.toContain("Use Claude Code's own setting");
+	});
+});

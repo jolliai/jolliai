@@ -608,7 +608,32 @@ describe("SettingsWebviewPanel", () => {
 						openCodeEnabled: false,
 						excludePatterns: "dist, node_modules",
 						compileExcludeFolders: "archive, tmp-*",
+						// The default is stored as absent, so the payload has to carry
+						// the EFFECTIVE value — a picker rendered from "" would show
+						// nothing selected and then submit a cleared field.
+						localAgentModel: "sonnet",
 					}),
+				}),
+			);
+		});
+
+		it("sends the stored local-agent model when one is configured", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({
+				aiProvider: "local-agent",
+				localAgentTool: "claude-code",
+				localAgentModel: "haiku",
+				claudeEnabled: true,
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ localAgentModel: "haiku" }),
 				}),
 			);
 		});
@@ -783,6 +808,71 @@ describe("SettingsWebviewPanel", () => {
 				expect.objectContaining({ aiProvider: "local-agent", localAgentTool: "claude-code" }),
 				expect.any(String),
 			);
+		});
+
+		/** Applies a minimal local-agent submission carrying `localAgentModel`. */
+		async function applyWithModel(
+			localAgentModel: string | undefined,
+			dispatch: Awaited<ReturnType<typeof setupWithLoadedConfig>>,
+		): Promise<void> {
+			dispatch({
+				command: "applySettings",
+				settings: {
+					apiKey: "",
+					model: "sonnet",
+					maxTokens: null,
+					aiProvider: "local-agent",
+					localAgentTool: "claude-code",
+					...(localAgentModel !== undefined ? { localAgentModel } : {}),
+					jolliApiKey: "",
+					claudeEnabled: true,
+					codexEnabled: true,
+					geminiEnabled: true,
+					excludePatterns: "",
+				},
+				maskedApiKey: "",
+				maskedJolliApiKey: "",
+			});
+			await flushPromises();
+		}
+
+		const savedModel = (): unknown =>
+			(mockSaveConfigScoped.mock.calls.at(-1)?.[0] as Record<string, unknown>).localAgentModel;
+
+		it("persists an explicitly chosen local-agent model", async () => {
+			await applyWithModel("haiku", await setupWithLoadedConfig());
+			expect(savedModel()).toBe("haiku");
+		});
+
+		it("stores the default as unset, so a default install keeps a minimal config", async () => {
+			// The page submits the EFFECTIVE value, so without this every save that
+			// touched an unrelated setting would write "sonnet" into config.json.
+			await applyWithModel("sonnet", await setupWithLoadedConfig());
+			expect(savedModel()).toBeUndefined();
+		});
+
+		it("clears the field for an empty or absent submission", async () => {
+			await applyWithModel("", await setupWithLoadedConfig());
+			expect(savedModel()).toBeUndefined();
+
+			// An older webview that predates the picker sends no field at all.
+			await applyWithModel(undefined, await setupWithLoadedConfig());
+			expect(savedModel()).toBeUndefined();
+		});
+
+		it("drops a model id no pinned tool offers instead of persisting it", async () => {
+			// This arrives from a webview message, and an id the agent CLI does not
+			// recognise makes it exit before running — i.e. every generation on the
+			// machine failing, not just this save being wrong. Falling back to the
+			// default is the safe outcome; failing the whole save is not warranted
+			// for a value the dropdown cannot legitimately produce.
+			await applyWithModel("claude-opus-5[1m]", await setupWithLoadedConfig());
+			expect(savedModel()).toBeUndefined();
+		});
+
+		it("trims whitespace around a submitted model", async () => {
+			await applyWithModel("  opus  ", await setupWithLoadedConfig());
+			expect(savedModel()).toBe("opus");
 		});
 
 		it("preserves original jolli API key when masked value is unchanged", async () => {

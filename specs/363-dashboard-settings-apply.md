@@ -46,6 +46,8 @@ The modal's placement, its rail, its close band, its action bar and everything e
 | Whether a product key is present | Given explicitly, so the page never has to infer it from a mask's length. |
 | The product site **host** | Derived from the stored site URL. **Never** by decoding the key — that is what keeps this path clear of the clear-text-logging gate. |
 | The local-agent tool registry list | Identifier plus display label per tool, so the picker's options are generated rather than written into the page. |
+| The local-agent model choices | Keyed **by tool identifier**, omitting the tools the product pins no model for. Keyed rather than scoped to the stored tool because switching the tool is a page-side change that never refetches this payload. |
+| The effective local-agent model | The value the picker should show, not the raw stored one: the default is stored as absent, and an identifier this build does not recognise resolves to the default too — otherwise the page would display one model while holding another. |
 | The launch repository's Memory Bank verdict and name | A severity plus one line of text for the repository the **server was launched in**, not the repository the page is scoped to. Absent when that directory is not a project. |
 | The missing-memory count | Lazily fetched on first entry to the Memory Bank section, not part of the payload. |
 | The machine-wide push list | Lazily fetched on first entry to the Sync section, not part of the payload. |
@@ -64,6 +66,7 @@ Every field below lands in the machine-global configuration inside **one** trans
 | The provider key | Empty clears it. An untouched key arrives as its own mask and is resolved back to the stored value (below). |
 | The product key | Same rules. |
 | The local-agent tool | Validated against the tool registry before it is written. |
+| The local-agent model | Normalised, **not** validated. Accepted knowing the cost: a submission carrying an identifier this build does not know — or omitting the field entirely, which a page left open across an upgrade does — saves successfully while silently resetting a stored choice to the default. That is the same "an absent field clears the stored value" rule this endpoint applies to every other field (the page always submits all of them), and the alternative was worse: rejecting the submission blocks the user from saving anything at all, including the setting that would repair it. Reporting the reset back to the page was considered and deferred — it needs a notice channel in the response that no field has today. Concretely: the default and any identifier no pinned tool offers are stored as absent, anything else verbatim. Deliberately not rejected the way the tool is — a tool identifier decides which binary runs, while a model identifier is a dropdown value the runtime clamps at read time anyway, so refusing the submission would block a user whose stored value came from a newer build from saving anything at all, including the setting that would fix it. |
 | The Memory Bank folder | Trimmed; empty removes the field. Validated but never created (below). |
 | The compile-exclusion list | Split on commas, trimmed, empties dropped. An empty input persists as an **empty list**, not as a removed field. |
 | The transcript-sync flag | Boolean. |

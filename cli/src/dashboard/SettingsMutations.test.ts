@@ -47,6 +47,7 @@ function baseInput(over: Partial<SettingsApplyInput> = {}): SettingsApplyInput {
 		apiKey: "",
 		jolliApiKey: "",
 		localAgentTool: "claude-code",
+		localAgentModel: "",
 		localFolder: "",
 		compileExcludeFolders: "",
 		syncTranscripts: false,
@@ -126,6 +127,20 @@ describe("parseSettingsApplyInput", () => {
 		expect(parseSettingsApplyInput(rawBody({ localAgentTool: "" })).localAgentTool).toBe("claude-code");
 	});
 
+	it("carries localAgentModel through without rejecting an unrecognised id", () => {
+		// Deliberately NOT the localAgentTool treatment. A tool id decides which
+		// binary runs, so a bad one must stop the save; a model id is a dropdown
+		// value the runtime clamps at read time anyway, and refusing the whole
+		// submission over one would block a user whose stored value came from a
+		// newer build from saving anything at all — including the setting that
+		// would fix it. Normalisation happens on the way to disk instead.
+		expect(parseSettingsApplyInput(rawBody({ localAgentModel: "claude-opus-5[1m]" })).localAgentModel).toBe(
+			"claude-opus-5[1m]",
+		);
+		expect(parseSettingsApplyInput(rawBody({ localAgentModel: "" })).localAgentModel).toBe("");
+		expect(parseSettingsApplyInput(rawBody({ localAgentModel: "haiku" })).localAgentModel).toBe("haiku");
+	});
+
 	it("rejects a submission with every agent disabled", () => {
 		const allOff = Object.fromEntries(
 			[
@@ -166,6 +181,31 @@ describe("applySettings", () => {
 		expect(config.compileExcludeFolders).toEqual(["archive", "tmp-*"]);
 		expect(config.excludePatterns).toEqual(["*.lock"]);
 		expect(config.dcoSignoff).toBe(true);
+	});
+
+	it("stores localAgentModel only when it differs from the default", async () => {
+		// The page always submits the EFFECTIVE value, so a default install would
+		// otherwise write "sonnet" into config.json on the first save that touched
+		// any unrelated setting.
+		const d = configDirWith({});
+		await applySettings(baseInput({ localAgentModel: "sonnet" }), d);
+		expect(readConfig(d).localAgentModel).toBeUndefined();
+
+		await applySettings(baseInput({ localAgentModel: "" }), d);
+		expect(readConfig(d).localAgentModel).toBeUndefined();
+
+		await applySettings(baseInput({ localAgentModel: "haiku" }), d);
+		expect(readConfig(d).localAgentModel).toBe("haiku");
+
+		// And switching back to the default CLEARS it rather than leaving the old
+		// pick in place — the field is written unconditionally for this reason.
+		await applySettings(baseInput({ localAgentModel: "sonnet" }), d);
+		expect(readConfig(d).localAgentModel).toBeUndefined();
+
+		// An id no pinned tool offers is dropped to the default on the way to disk
+		// rather than persisted — the save succeeds, and the stale value is gone.
+		await applySettings(baseInput({ localAgentModel: "claude-opus-5[1m]" }), d);
+		expect(readConfig(d).localAgentModel).toBeUndefined();
 	});
 
 	it("keeps a stored key when the submission equals its mask", async () => {

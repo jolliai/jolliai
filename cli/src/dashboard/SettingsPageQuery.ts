@@ -19,7 +19,7 @@
 
 import { getProjectRootDir } from "../core/GitOps.js";
 import { extractRepoName, resolveMemoryBankState } from "../core/KBPathResolver.js";
-import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
+import { effectiveLocalAgentModel, LOCAL_AGENT_TOOLS, localAgentToolModels } from "../core/localagent/ToolMeta.js";
 import { describeMemoryBank } from "../core/MemoryBankStatusText.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
@@ -74,6 +74,16 @@ function localAgentTools(): ReadonlyArray<{ readonly id: LocalAgentToolId; reado
 	}));
 }
 
+/** Model choices per tool id, omitting the tools jollimemory does not pin one for. */
+function localAgentModels(): Readonly<Record<string, ReadonlyArray<{ id: string; label: string }>>> {
+	const out: Record<string, ReadonlyArray<{ id: string; label: string }>> = {};
+	for (const id of Object.keys(LOCAL_AGENT_TOOLS) as LocalAgentToolId[]) {
+		const models = localAgentToolModels(id);
+		if (models.length > 0) out[id] = models;
+	}
+	return out;
+}
+
 /**
  * Builds the Settings payload. `launchCwd` is the server's own repo root
  * (`process.cwd()` in production) — it drives ONLY the Memory Bank state line
@@ -118,6 +128,12 @@ export async function buildSettingsPageModel(
 			...(jolliSiteLabel(config) ? { jolliSiteLabel: jolliSiteLabel(config) } : {}),
 			localAgentTool: config.localAgentTool ?? "claude-code",
 			localAgentTools: localAgentTools(),
+			// The EFFECTIVE value, resolved by the shared helper rather than by a
+			// local `|| DEFAULT`: an id this build does not know has to render as
+			// the default too, or the page shows one model while holding another
+			// and every later save is rejected for a field nobody edited.
+			localAgentModel: effectiveLocalAgentModel(config.localAgentModel),
+			localAgentModels: localAgentModels(),
 		},
 		memoryBank: {
 			...(config.localFolder ? { localFolder: config.localFolder } : {}),

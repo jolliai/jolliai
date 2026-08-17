@@ -1,6 +1,10 @@
 import { describe, expect, it, vi } from "vitest";
 import { ALLOWED_JOLLI_HOSTS } from "../../../cli/src/core/JolliApiUtils.js";
-import { LOCAL_AGENT_TOOLS } from "../../../cli/src/core/localagent/ToolMeta.js";
+import {
+	DEFAULT_LOCAL_AGENT_MODEL,
+	LOCAL_AGENT_TOOLS,
+	localAgentToolModels,
+} from "../../../cli/src/core/localagent/ToolMeta.js";
 import { buildSettingsScript } from "./SettingsScriptBuilder.js";
 
 // ── Minimal fake-DOM harness for behaviorally executing the generated script ──
@@ -31,8 +35,10 @@ interface FakeElement {
 	checked: boolean;
 	disabled: boolean;
 	readonly selectedIndex: number;
-	readonly options: ReadonlyArray<{ readonly value: string; readonly textContent: string }>;
+	readonly options: ReadonlyArray<FakeOption>;
 	readonly classList: FakeClassList;
+	/** Mirrors the real `hidden` property the model row is toggled through. */
+	hidden: boolean;
 	addEventListener(type: string, cb: Listener): void;
 	fire(type: string): void;
 }
@@ -56,11 +62,36 @@ function createClassList(): FakeClassList {
 	};
 }
 
-function createElement(optionValues?: readonly string[], labels?: Record<string, string>): FakeElement {
+/**
+ * An `<option>` as the script sees it. `getAttribute` / `hidden` / `disabled` are
+ * real here rather than stubs: the model picker filters by `data-tool` and hides
+ * AND disables the options that belong to another tool, so a fake that dropped
+ * any of the three would let a broken filter pass.
+ */
+interface FakeOption {
+	readonly value: string;
+	readonly textContent: string;
+	hidden: boolean;
+	disabled: boolean;
+	getAttribute(name: string): string | null;
+}
+
+function createElement(
+	optionValues?: readonly string[],
+	labels?: Record<string, string>,
+	attrs?: Record<string, Record<string, string>>,
+): FakeElement {
 	const listeners: Record<string, Listener[]> = {};
 	let currentValue = optionValues?.[0] ?? "";
-	const options = (optionValues ?? []).map((v) => ({ value: v, textContent: labels?.[v] ?? v }));
+	const options: FakeOption[] = (optionValues ?? []).map((v) => ({
+		value: v,
+		textContent: labels?.[v] ?? v,
+		hidden: false,
+		disabled: false,
+		getAttribute: (name: string) => attrs?.[v]?.[name] ?? null,
+	}));
 	return {
+		hidden: false,
 		get value() {
 			return currentValue;
 		},
@@ -85,9 +116,14 @@ function createElement(optionValues?: readonly string[], labels?: Record<string,
 	};
 }
 
+/** Option id planted under a non-pinned tool, so the filter's negative arm is real. */
+const FOREIGN_TOOL_MODEL = "__foreign-tool-model__";
+
 interface ScriptHandles {
 	readonly aiProviderSelect: FakeElement;
 	readonly localAgentToolSelect: FakeElement;
+	readonly localAgentModelSelect: FakeElement;
+	readonly localAgentModelRow: FakeElement;
 	readonly localAgentStatus: FakeElement;
 	readonly applyBtn: FakeElement;
 	readonly posted: ReadonlyArray<Record<string, unknown>>;
@@ -125,8 +161,35 @@ function runScript(scriptSource: string): ScriptHandles {
 
 	elements.set("aiProvider", createElement(["anthropic", "jolli", "local-agent"]));
 	elements.set("localAgentTool", createElement(toolIds, toolLabels));
+	// The model picker carries EVERY pinned tool's options at once, each tagged
+	// with the tool it belongs to — exactly what SettingsHtmlBuilder emits, since
+	// the document is built once while the tool picker changes client-side.
+	const modelValues: string[] = [];
+	const modelLabels: Record<string, string> = {};
+	const modelAttrs: Record<string, Record<string, string>> = {};
+	for (const id of toolIds) {
+		for (const m of localAgentToolModels(id as keyof typeof LOCAL_AGENT_TOOLS)) {
+			modelValues.push(m.id);
+			modelLabels[m.id] = m.label;
+			modelAttrs[m.id] = { "data-tool": id };
+			if (m.id === DEFAULT_LOCAL_AGENT_MODEL) modelAttrs[m.id]["data-default"] = "true";
+		}
+	}
+	// One SYNTHETIC option belonging to a tool that pins nothing today. Without it
+	// every option in the list carries data-tool="claude-code", `mine` is always
+	// true, and the filter assertions below reduce to `expect(false).toBe(false)`
+	// — i.e. they assert FakeOption's initial state and would pass with the whole
+	// hide/disable pass deleted. The negative half of the filter is the entire
+	// reason data-tool exists, so it has to be exercised even while only one tool
+	// declares models.
+	modelValues.push(FOREIGN_TOOL_MODEL);
+	modelLabels[FOREIGN_TOOL_MODEL] = "A model belonging to another tool";
+	modelAttrs[FOREIGN_TOOL_MODEL] = { "data-tool": "codex" };
+	elements.set("localAgentModel", createElement(modelValues, modelLabels, modelAttrs));
 	const aiProviderSelect = get("aiProvider");
 	const localAgentToolSelect = get("localAgentTool");
+	const localAgentModelSelect = get("localAgentModel");
+	const localAgentModelRow = get("localAgentModelRow");
 	const localAgentStatus = get("localAgentStatus");
 	const applyBtn = get("applyBtn");
 
@@ -157,6 +220,8 @@ function runScript(scriptSource: string): ScriptHandles {
 	return {
 		aiProviderSelect,
 		localAgentToolSelect,
+		localAgentModelSelect,
+		localAgentModelRow,
 		localAgentStatus,
 		applyBtn,
 		posted,
@@ -481,7 +546,7 @@ describe("SettingsScriptBuilder", () => {
 
 		it("probes on tool-select change, on switching the provider to local-agent, and on panel open", () => {
 			expect(script).toMatch(
-				/localAgentToolSelect\.addEventListener\('change', function\(\) {\s*checkDirty\(\); clearSaveFeedback\(\); probeLocalAgent\(\);/,
+				/localAgentToolSelect\.addEventListener\('change', function\(\) {\s*syncLocalAgentModelRow\(\); checkDirty\(\); clearSaveFeedback\(\); probeLocalAgent\(\);/,
 			);
 			expect(script).toMatch(
 				/aiProviderSelect\.addEventListener\('change', function\(\) {[\s\S]*if \(aiProviderSelect\.value === 'local-agent'\) probeLocalAgent\(\);/,
@@ -838,5 +903,128 @@ describe("SettingsScriptBuilder", () => {
 			expect(script).toContain("memoryBankStateText.textContent = display.text");
 			expect(script).not.toContain("memoryBankStateText.innerHTML");
 		});
+	});
+});
+
+/**
+ * The local-agent model picker. The row is filtered client-side because the
+ * document carries every pinned tool's options at once (built once server-side,
+ * while the tool picker changes here), so these cases are all about the filter
+ * staying in step with the tool.
+ */
+describe("local-agent model picker", () => {
+	const script = buildSettingsScript();
+
+	it("shows the row for a pinned tool and enables only that tool's options", () => {
+		const h = runScript(script);
+		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
+
+		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(false);
+		let hiddenCount = 0;
+		for (const o of h.localAgentModelSelect.options) {
+			const mine = o.getAttribute("data-tool") === "claude-code";
+			expect(o.hidden).toBe(!mine);
+			// Disabled as well as hidden: a hidden-but-enabled option stays
+			// keyboard-selectable in some renderers, which would submit a model the
+			// chosen tool never offered.
+			expect(o.disabled).toBe(!mine);
+			if (!mine) hiddenCount++;
+		}
+		// Proves the loop above actually saw a foreign option, so the assertions
+		// were not all `expect(false).toBe(false)`.
+		expect(hiddenCount).toBeGreaterThan(0);
+	});
+
+	it("hides the row for a tool with no pinned models", () => {
+		const h = runScript(script);
+		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
+		h.selectTool("codex");
+
+		// The synthetic foreign option means "codex" is not vacuously empty here —
+		// the row hides because the script counts VISIBLE options, and a tool with
+		// exactly one option would keep it open.
+		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(false);
+		expect(h.localAgentModelSelect.value).toBe(FOREIGN_TOOL_MODEL);
+	});
+
+	it("hides the row for a tool that contributes no options at all", () => {
+		const h = runScript(script);
+		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
+		h.selectTool("opencode");
+
+		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(true);
+	});
+
+	it("restores the row when switching back to a pinned tool", () => {
+		const h = runScript(script);
+		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
+		h.selectTool("codex");
+		h.selectTool("claude-code");
+
+		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(false);
+	});
+
+	it("selects the stored model on load", () => {
+		const h = runScript(script);
+		loadSettings(h, {
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			localAgentModel: "haiku",
+		});
+
+		expect(h.localAgentModelSelect.value).toBe("haiku");
+	});
+
+	it("falls back to the tool's DEFAULT option when the stored model is not one of its own", () => {
+		// config.json is shared across versions and surfaces, so the stored value
+		// can name a model this tool does not offer. Leaving it selected would
+		// submit something the server has to reject.
+		//
+		// The default is deliberately NOT first in the list (the order matches the
+		// Anthropic model picker), so this also pins that the fallback reads
+		// `data-default` rather than position — picking the first option would land
+		// on Haiku and quietly downgrade the machine.
+		const h = runScript(script);
+		loadSettings(h, {
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			localAgentModel: "some-model-from-the-future",
+		});
+
+		expect(h.localAgentModelSelect.value).toBe("sonnet");
+	});
+
+	it("submits the selected model with the settings", () => {
+		const h = runScript(script);
+		loadSettings(h, {
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			localAgentModel: "haiku",
+		});
+		h.receive({ command: "localAgentProbeResult", tool: "claude-code", available: true });
+		h.localAgentModelSelect.value = "opus";
+		h.localAgentModelSelect.fire("change");
+		h.applyBtn.fire("click");
+
+		const apply = h.posted.find((m) => m.command === "applySettings");
+		expect((apply?.settings as Record<string, unknown>).localAgentModel).toBe("opus");
+	});
+
+	it("marks the form dirty when only the model changed", () => {
+		// The model is a real setting, so an edit to it alone has to enable Apply —
+		// a dirty check that forgot the field would silently discard the change.
+		const h = runScript(script);
+		loadSettings(h, {
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			localAgentModel: "sonnet",
+		});
+		h.receive({ command: "localAgentProbeResult", tool: "claude-code", available: true });
+		expect(h.applyBtn.disabled).toBe(true);
+
+		h.localAgentModelSelect.value = "haiku";
+		h.localAgentModelSelect.fire("change");
+
+		expect(h.applyBtn.disabled).toBe(false);
 	});
 });

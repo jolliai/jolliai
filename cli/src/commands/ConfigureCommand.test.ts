@@ -233,6 +233,32 @@ describe("ConfigureCommand — settable keys", () => {
 		}
 	});
 
+	it("accepts every localAgentModel id the registry offers", async () => {
+		for (const model of ["sonnet", "haiku", "opus", "inherit"]) {
+			mockSaveConfig.mockClear();
+			await runConfigure(["--set", `localAgentModel=${model}`]);
+			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentModel: model }));
+		}
+	});
+
+	it("rejects a localAgentModel the agent CLI would not recognise", async () => {
+		// This is the ONLY entry point where a free-form model string can reach the
+		// `--model` flag (both Settings panels are dropdowns), and an id the CLI
+		// refuses makes it exit 404 before running — i.e. every generation on the
+		// machine failing, not just this save being wrong.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		try {
+			await runConfigure(["--set", "localAgentModel=claude-opus-5[1m]"]);
+			expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("sonnet"));
+			expect(process.exitCode).toBe(1);
+			expect(mockSaveConfig).not.toHaveBeenCalled();
+		} finally {
+			errorSpy.mockRestore();
+			process.exitCode = prevExitCode;
+		}
+	});
+
 	it("rejects localAgentTool values that aren't in the allowlist", async () => {
 		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
 		const prevExitCode = process.exitCode;

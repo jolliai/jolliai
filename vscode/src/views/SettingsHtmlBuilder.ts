@@ -14,7 +14,11 @@
  *   5. Others        — exclude patterns
  */
 
-import { LOCAL_AGENT_TOOLS } from "../../../cli/src/core/localagent/ToolMeta.js";
+import {
+	DEFAULT_LOCAL_AGENT_MODEL,
+	LOCAL_AGENT_TOOLS,
+	localAgentToolModels,
+} from "../../../cli/src/core/localagent/ToolMeta.js";
 import { GLOBAL_INSTRUCTIONS_PROMPT } from "../../../cli/src/install/GlobalInstructionsInstaller.js";
 import { buildSettingsCss } from "./SettingsCssBuilder.js";
 import { buildSettingsScript } from "./SettingsScriptBuilder.js";
@@ -23,6 +27,44 @@ import { buildSettingsScript } from "./SettingsScriptBuilder.js";
 const LOCAL_AGENT_TOOL_OPTIONS = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>)
 	.map((id) => `<option value="${id}">${LOCAL_AGENT_TOOLS[id].label}</option>`)
 	.join("\n          ");
+
+/**
+ * `<option>` tags for the model dropdown, carrying EVERY pinned tool's choices at
+ * once, each tagged with the tool it belongs to.
+ *
+ * One static list rather than one per tool because this document is built once
+ * and the tool picker changes client-side; `syncLocalAgentModelRow` shows or
+ * hides each option by its `data-tool`. A tool that pins no model contributes
+ * nothing, which is what leaves the row empty and hidden for it.
+ */
+const LOCAL_AGENT_MODEL_OPTIONS = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>)
+	.flatMap((id) =>
+		localAgentToolModels(id).map(
+			(m) =>
+				// `data-default` rather than position: the list is ordered to match the
+				// Anthropic picker, so the default is no longer first and the row's
+				// fallback must not infer it from order.
+				`<option value="${m.id}" data-tool="${id}"${m.id === DEFAULT_LOCAL_AGENT_MODEL ? ' data-default="true"' : ""}>${escapeHtml(m.label)}</option>`,
+		),
+	)
+	.join("\n          ");
+
+/**
+ * Minimal HTML escape for the model labels built above.
+ *
+ * Both quote forms are escaped even though these labels land in text content:
+ * the same helper is the obvious one to reach for when a label moves into an
+ * attribute, and matching the dashboard's `esc()` keeps the two surfaces
+ * producing the same bytes for the same label.
+ */
+function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;")
+		.replace(/'/g, "&#39;");
+}
 
 /**
  * Builds the full HTML document for the Settings webview.
@@ -163,10 +205,27 @@ export function buildSettingsHtml(nonce: string): string {
 
       <!-- Shown only when provider is local-agent. Uses subscription OAuth of the chosen tool; no API key needed. -->
       <div class="card-panel hidden" data-card="local-agent">
-        <label class="settings-label" for="localAgentTool">Agent tool</label>
-        <select id="localAgentTool">
-          ${LOCAL_AGENT_TOOL_OPTIONS}
-        </select>
+        <!-- Both controls are .settings-row like every other field in this panel:
+             without it a bare label + select still sit on one line, but get none of
+             the row gap, so the two stack flush against each other. -->
+        <div class="settings-row">
+          <label class="settings-label" for="localAgentTool">Agent tool</label>
+          <select id="localAgentTool">
+            ${LOCAL_AGENT_TOOL_OPTIONS}
+          </select>
+        </div>
+        <!-- Shown only for a tool jollimemory pins a model for; see
+             syncLocalAgentModelRow. Hidden via the .hidden CLASS, never the
+             bare hidden ATTRIBUTE: this row is also .settings-row (display:flex),
+             and an author-stylesheet display beats the UA sheet's [hidden] rule,
+             so the attribute alone leaves the row on screen for a tool that pins
+             no model. That is exactly what .hidden's !important exists for. -->
+        <div class="settings-row hidden" id="localAgentModelRow">
+          <label class="settings-label" for="localAgentModel">Model</label>
+          <select id="localAgentModel">
+            ${LOCAL_AGENT_MODEL_OPTIONS}
+          </select>
+        </div>
         <p class="local-agent-status" id="localAgentStatus"></p>
         <p class="section-hint">Uses your local agent's own login (subscription/BYOK). Sign in with that tool's CLI if prompted.</p>
       </div>

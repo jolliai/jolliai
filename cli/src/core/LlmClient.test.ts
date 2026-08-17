@@ -1365,6 +1365,7 @@ describe("LlmClient", () => {
 					aiProvider: "local-agent",
 					localAgentTool: "claude-code",
 					localAgentPath: "/custom/claude",
+					localAgentModel: "haiku",
 				}),
 			).toEqual({
 				apiKey: "sk-ant-x",
@@ -1372,6 +1373,7 @@ describe("LlmClient", () => {
 				aiProvider: "local-agent",
 				localAgentTool: "claude-code",
 				localAgentPath: "/custom/claude",
+				localAgentModel: "haiku",
 			});
 		});
 
@@ -1382,6 +1384,7 @@ describe("LlmClient", () => {
 				aiProvider: undefined,
 				localAgentTool: undefined,
 				localAgentPath: undefined,
+				localAgentModel: undefined,
 			});
 		});
 	});
@@ -1684,14 +1687,17 @@ describe("callLlm — local-agent", () => {
 		);
 	});
 
-	// NO local-agent tool receives a resolved model id — every one of them runs
-	// whatever model its own CLI is configured with, and an empty model tells the
-	// backend to emit no model flag at all. This is deliberate parity with the
-	// Settings UI, whose local-agent card offers an "Agent tool" picker and NO
-	// model picker: honouring a jollimemory-side model choice for one tool only
-	// (claude-code used to be special-cased here) made the product claim a
-	// selection the user was never given.
-	it.each(["claude-code", "codex", "cursor-agent", "opencode", "kimi"] as const)(
+	// The four UNPINNED tools still receive no model id — each runs whatever its
+	// own CLI is configured with, and an empty model tells the backend to emit no
+	// model flag at all. Their model-name spaces are not ones jollimemory knows,
+	// and none of them reports the model it ran, so a pinned model there would be
+	// an unverifiable claim. claude-code is deliberately absent from this list:
+	// see "callLlm — local-agent model pinning" at the end of this file.
+	//
+	// `options.model` is set on every case so the assertion cannot pass merely
+	// because nothing was configured — an alias reaching one of these would be the
+	// regression.
+	it.each(["codex", "cursor-agent", "opencode", "kimi"] as const)(
 		"passes an empty model to %s so the tool's own configured default is used",
 		async (toolId) => {
 			let seenModel: string | undefined;
@@ -1719,6 +1725,8 @@ describe("callLlm — local-agent", () => {
 				params: { commitMessage: "m", topicsSummary: "t" },
 				aiProvider: "local-agent",
 				localAgentTool: toolId,
+				model: "opus",
+				localAgentModel: "haiku",
 				__localAgentRun: async () => "ignored-by-stub",
 			});
 
@@ -2254,5 +2262,323 @@ describe("callLlm — local-agent", () => {
 			// Clean up for real — the mocked rmSync above swallowed the actual removal.
 			fsActual.rmSync?.(realCwd, { recursive: true, force: true });
 		});
+	});
+});
+
+/**
+ * Model pinning — the reason this provider stopped inheriting the developer's
+ * interactive model choice. Every case below is about one of three things: what
+ * argv the tool is handed, what the parser is told to look for, and whether a
+ * request that was not honoured becomes visible.
+ */
+describe("callLlm — local-agent model pinning", () => {
+	/** Records the request each stage saw, so a test can assert on argv and parser input. */
+	function recordingStub(
+		id: string,
+		seen: { req?: LocalAgentRequest; requestedModel?: string },
+		outcomeModel?: string,
+	): LocalAgentBackend {
+		return {
+			id,
+			discoverExecutable: async () => ({ file: `/x/${id}`, version: "2.1.212" }),
+			buildInvocation: (_exe, req) => {
+				seen.req = req;
+				return {
+					file: `/x/${id}`,
+					// Mirrors the real backend's conditional so a test can assert on
+					// the vector rather than only on the request object.
+					args: req.model ? ["--model", req.model] : [],
+					stdin: "P",
+					env: {},
+					cwd: "/tmp",
+				};
+			},
+			parseResult: (_stdout, requestedModel) => {
+				seen.requestedModel = requestedModel;
+				return {
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+					...(outcomeModel !== undefined && { model: outcomeModel }),
+				};
+			},
+			isPresent: () => true,
+		};
+	}
+
+	/**
+	 * Asserts NEITHER verification warning fired.
+	 *
+	 * Both messages have to be named explicitly: "Local-agent model mismatch" and
+	 * "Local-agent ran a long-context variant" share no substring, so a single
+	 * `stringContaining` can only ever see one of them — which is how these
+	 * negative assertions originally passed while the branch they guarded was free
+	 * to fire on every call.
+	 */
+	function expectNoModelWarning() {
+		for (const phrase of ["Local-agent model mismatch", "Local-agent ran a long-context variant"]) {
+			expect(mockLogWarn).not.toHaveBeenCalledWith(
+				expect.stringContaining(phrase),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+				expect.anything(),
+			);
+		}
+	}
+
+	function call(over: Record<string, unknown> = {}) {
+		return callLlm({
+			action: "recap",
+			params: { branch: "main", summaries: "x" },
+			aiProvider: "local-agent",
+			localAgentTool: "claude-code",
+			__localAgentRun: async () => "ignored-by-stub",
+			...over,
+		});
+	}
+
+	it("pins the default model for claude-code when nothing is configured", async () => {
+		// The headline behaviour: an unconfigured install stops riding whatever the
+		// developer selected for interactive work.
+		const seen: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("claude-code", seen));
+
+		await call();
+
+		expect(seen.req?.model).toBe("sonnet");
+	});
+
+	it("honours a configured model", async () => {
+		const seen: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("claude-code", seen));
+
+		await call({ localAgentModel: "haiku" });
+
+		expect(seen.req?.model).toBe("haiku");
+	});
+
+	it("sends no model for the inherit choice, reproducing the pre-pinning behaviour", async () => {
+		const seen: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("claude-code", seen));
+
+		await call({ localAgentModel: "inherit" });
+
+		expect(seen.req?.model).toBe("");
+	});
+
+	it("falls back to the default for a model id this build does not know", async () => {
+		// config.json is shared across versions; passing an unknown id through
+		// would send `--model <garbage>` and fail every generation on the machine.
+		const seen: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("claude-code", seen));
+
+		await call({ localAgentModel: "claude-future-9" });
+
+		expect(seen.req?.model).toBe("sonnet");
+	});
+
+	it("sends no model to a tool that is not pinned, whatever is configured", async () => {
+		// The four unpinned tools keep deferring to their own configuration — a
+		// claude-code alias must never reach a codex invocation.
+		const seen: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("codex", seen));
+
+		await call({ localAgentTool: "codex", localAgentModel: "haiku" });
+
+		expect(seen.req?.model).toBe("");
+	});
+
+	it("hands the requested model to the parser, and undefined when none was sent", async () => {
+		// The parser needs it to pick the answering turn out of a multi-model usage
+		// report; "" would read as a real request and match nothing.
+		const pinned: { requestedModel?: string } = {};
+		registerBackend(recordingStub("claude-code", pinned));
+		await call({ localAgentModel: "opus" });
+		expect(pinned.requestedModel).toBe("opus");
+
+		const inherited: { requestedModel?: string } = {};
+		registerBackend(recordingStub("claude-code", inherited));
+		await call({ localAgentModel: "inherit" });
+		expect(inherited.requestedModel).toBeUndefined();
+	});
+
+	it("warns when the tool ran a different model than the one requested", async () => {
+		// A silently upgraded model is exactly as expensive as never having asked,
+		// so the mismatch has to be visible rather than merely paid for.
+		registerBackend(recordingStub("claude-code", {}, "claude-opus-4-8"));
+
+		await call({ localAgentModel: "sonnet" });
+
+		expect(mockLogWarn).toHaveBeenCalledWith(
+			expect.stringContaining("Local-agent model mismatch"),
+			"recap",
+			"claude-code",
+			"sonnet",
+			"claude-opus-4-8",
+		);
+	});
+
+	it("stays silent when the reported model matches the requested alias", async () => {
+		// Containment, not equality: the request is an alias, the report is a full
+		// id. A warning here would fire on every single successful call.
+		registerBackend(recordingStub("claude-code", {}, "claude-sonnet-5"));
+
+		await call({ localAgentModel: "sonnet" });
+
+		expectNoModelWarning();
+	});
+
+	it("does not mistake a plain model id for a long-context tier", async () => {
+		// Pins the `[1m]` regex from the other side. Without this, replacing that
+		// test with `true` would make the long-context warning fire on every
+		// successful pinned call and nothing would notice — the negative
+		// assertions cannot see it unless they name it, because the two warning
+		// messages share no substring.
+		registerBackend(recordingStub("claude-code", {}, "claude-sonnet-5"));
+
+		await call({ localAgentModel: "sonnet" });
+
+		expect(mockLogWarn).not.toHaveBeenCalledWith(
+			expect.stringContaining("long-context"),
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+			expect.anything(),
+		);
+	});
+
+	it("warns separately when the family matched but a long-context tier ran", async () => {
+		// The `[1m]` SKU is priced above the base model and an alias is not supposed
+		// to be able to reach it — if this ever fires, that assumption has broken.
+		registerBackend(recordingStub("claude-code", {}, "claude-sonnet-5[1m]"));
+
+		await call({ localAgentModel: "sonnet" });
+
+		expect(mockLogWarn).toHaveBeenCalledWith(
+			expect.stringContaining("long-context variant"),
+			"recap",
+			"claude-code",
+			"sonnet",
+			"claude-sonnet-5[1m]",
+		);
+	});
+
+	it("checks nothing when no model was pinned, since there is no claim to verify", async () => {
+		// `inherit` means the tool's own choice is correct by definition.
+		registerBackend(recordingStub("claude-code", {}, "claude-opus-5[1m]"));
+
+		await call({ localAgentModel: "inherit" });
+
+		expectNoModelWarning();
+	});
+
+	it("checks nothing when the tool reports no model of its own", async () => {
+		// codex, cursor-agent, opencode and kimi name no model, so there is nothing
+		// to compare — and they are never pinned in the first place.
+		registerBackend(recordingStub("claude-code", {}));
+
+		await call({ localAgentModel: "haiku" });
+
+		expectNoModelWarning();
+	});
+
+	it("records the pinned model when the tool reports none, rather than the config alias", async () => {
+		// `model` (the Anthropic-API setting) is a different namespace and never
+		// reaches this provider, so it must not stand in for what actually ran.
+		registerBackend(recordingStub("claude-code", {}));
+
+		const result = await call({ localAgentModel: "haiku", model: "opus" });
+
+		expect(result.model).toBe("haiku");
+	});
+
+	it("retries once on the tool's own model when the tool refuses the pinned one", async () => {
+		// The realistic trigger is entitlement, not corruption: the picker offers
+		// Opus and a subscription without Opus answers 404 for every call. The
+		// degradation loop cannot catch it — the runner RESOLVES a nonzero exit
+		// that produced stdout, so the throw happens in parseResult, downstream.
+		const seen: string[] = [];
+		let calls = 0;
+		registerBackend({
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.212" }),
+			buildInvocation: (_exe, req) => {
+				seen.push(req.model);
+				return { file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" };
+			},
+			parseResult: (_stdout, requestedModel) => {
+				calls++;
+				if (requestedModel) {
+					throw new LocalAgentSetupError("Claude Code returned an error (status 404): selected model");
+				}
+				return {
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+					model: "claude-opus-5[1m]",
+				};
+			},
+			isPresent: () => true,
+		});
+
+		const result = await call({ localAgentModel: "opus" });
+
+		expect(seen).toEqual(["opus", ""]);
+		expect(calls).toBe(2);
+		expect(result.text).toBe("SUMMARY");
+		// The retry withdrew the request, so neither warning may blame the tool for
+		// running something else — we are the ones who stopped asking.
+		expectNoModelWarning();
+	});
+
+	it("does not retry a refusal that was not about the model", async () => {
+		// Auth and transient failures are not about argv; retrying them un-pinned
+		// would double the cost of every outage and hide the real cause.
+		let calls = 0;
+		registerBackend({
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.212" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => {
+				calls++;
+				throw new LocalAgentAuthError("Not logged in");
+			},
+			isPresent: () => true,
+		});
+
+		await expect(call({ localAgentModel: "opus" })).rejects.toThrow(LocalAgentAuthError);
+		expect(calls).toBe(1);
+	});
+
+	it("does not retry when nothing was pinned, since there is no pin to withdraw", async () => {
+		let calls = 0;
+		registerBackend({
+			id: "claude-code",
+			discoverExecutable: async () => ({ file: "/x/claude", version: "2.1.212" }),
+			buildInvocation: () => ({ file: "/x/claude", args: [], stdin: "P", env: {}, cwd: "/tmp" }),
+			parseResult: () => {
+				calls++;
+				throw new LocalAgentSetupError("something unrelated to the model");
+			},
+			isPresent: () => true,
+		});
+
+		await expect(call({ localAgentModel: "inherit" })).rejects.toThrow(LocalAgentSetupError);
+		expect(calls).toBe(1);
+	});
+
+	it("prefers the model the tool reported over the pinned one", async () => {
+		registerBackend(recordingStub("claude-code", {}, "claude-haiku-4-5-20251001"));
+
+		const result = await call({ localAgentModel: "haiku" });
+
+		expect(result.model).toBe("claude-haiku-4-5-20251001");
 	});
 });

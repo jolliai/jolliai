@@ -28,6 +28,8 @@ export function buildSettingsScript(): string {
   const maxTokensInput = document.getElementById('maxTokens');
   const aiProviderSelect = document.getElementById('aiProvider');
   const localAgentToolSelect = document.getElementById('localAgentTool');
+  const localAgentModelSelect = document.getElementById('localAgentModel');
+  const localAgentModelRow = document.getElementById('localAgentModelRow');
   const localAgentStatus = document.getElementById('localAgentStatus');
   // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
   const jolliApiKeyInput = document.getElementById('jolliApiKey');
@@ -446,6 +448,7 @@ export function buildSettingsScript(): string {
       maxTokens: maxTokensInput.value,
       aiProvider: aiProviderSelect.value,
       localAgentTool: localAgentToolSelect.value,
+      localAgentModel: localAgentModelSelect ? localAgentModelSelect.value : '',
       jolliApiKey: getActiveJolliApiKeyValue(),
       claudeEnabled: claudeEnabledInput.checked,
       codexEnabled: codexEnabledInput.checked,
@@ -476,6 +479,7 @@ export function buildSettingsScript(): string {
       maxTokensInput.value !== initialState.maxTokens ||
       aiProviderSelect.value !== initialState.aiProvider ||
       localAgentToolSelect.value !== initialState.localAgentTool ||
+      (localAgentModelSelect && localAgentModelSelect.value !== initialState.localAgentModel) ||
       getActiveJolliApiKeyValue() !== initialState.jolliApiKey ||
       claudeEnabledInput.checked !== initialState.claudeEnabled ||
       codexEnabledInput.checked !== initialState.codexEnabled ||
@@ -506,6 +510,50 @@ export function buildSettingsScript(): string {
   // === null) never blocks — only a confirmed-unavailable result does.
   function localAgentBlocks() {
     return aiProviderSelect.value === 'local-agent' && localAgentAvailable === false;
+  }
+
+  // Shows the model row only for a tool jollimemory pins a model for, and limits
+  // the dropdown to THAT tool's options.
+  //
+  // The document carries every pinned tool's options at once (it is built once,
+  // server-side, while the tool picker changes here), so each option is tagged
+  // with data-tool and filtered by hiding + disabling. Disabling matters on its
+  // own: a hidden-but-enabled option is still selectable by keyboard in some
+  // renderers, which would submit a model the chosen tool never offered.
+  //
+  // Called from three places, and all three are needed: on panel load (the stored
+  // tool decides the initial row), on tool change, and on provider change (the
+  // whole card is hidden for the other providers, so the row must be correct by
+  // the time it reappears).
+  function syncLocalAgentModelRow() {
+    if (!localAgentModelSelect || !localAgentModelRow) return;
+    var tool = localAgentToolSelect.value;
+    var visible = 0;
+    var selectedStillVisible = false;
+    var firstVisibleValue = null;
+    var defaultVisibleValue = null;
+    for (var i = 0; i < localAgentModelSelect.options.length; i++) {
+      var o = localAgentModelSelect.options[i];
+      var mine = o.getAttribute('data-tool') === tool;
+      o.hidden = !mine;
+      o.disabled = !mine;
+      if (mine) {
+        visible++;
+        if (firstVisibleValue === null) firstVisibleValue = o.value;
+        if (defaultVisibleValue === null && o.getAttribute('data-default')) defaultVisibleValue = o.value;
+        if (o.value === localAgentModelSelect.value) selectedStillVisible = true;
+      }
+    }
+    localAgentModelRow.classList.toggle('hidden', visible === 0);
+    // After a tool switch the previously-selected model may belong to the old
+    // tool. Fall back to the option MARKED default, never to the first one: the
+    // list is ordered to match the Anthropic model picker a few rows up, so the
+    // default sits in the middle and position carries no meaning. First-visible
+    // survives only for a tool that somehow marks none.
+    if (visible > 0 && !selectedStillVisible) {
+      var fallback = defaultVisibleValue !== null ? defaultVisibleValue : firstVisibleValue;
+      if (fallback !== null) localAgentModelSelect.value = fallback;
+    }
   }
 
   // Looks up a tool's display label by <option value>, never by selectedIndex:
@@ -604,10 +652,13 @@ export function buildSettingsScript(): string {
   });
   modelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
   localAgentToolSelect.addEventListener('change', function() {
-    checkDirty(); clearSaveFeedback(); probeLocalAgent();
+    syncLocalAgentModelRow(); checkDirty(); clearSaveFeedback(); probeLocalAgent();
   });
+  if (localAgentModelSelect) {
+    localAgentModelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+  }
   aiProviderSelect.addEventListener('change', function() {
-    checkDirty(); clearSaveFeedback(); syncProviderCard();
+    checkDirty(); clearSaveFeedback(); syncProviderCard(); syncLocalAgentModelRow();
     // Re-verify when switching TO local-agent (a stale/never-probed result
     // must not silently pass); switching away is handled by checkDirty()'s
     // updateApplyBtn() call above, since localAgentBlocks() reads the live
@@ -709,6 +760,7 @@ export function buildSettingsScript(): string {
         maxTokens: maxVal.length > 0 ? Number(maxVal) : null,
         aiProvider: aiProviderSelect.value,
         localAgentTool: localAgentToolSelect.value,
+        localAgentModel: localAgentModelSelect ? localAgentModelSelect.value : '',
         jolliApiKey: getActiveJolliApiKeyValue().trim(),
         claudeEnabled: claudeEnabledInput.checked,
         codexEnabled: codexEnabledInput.checked,
@@ -826,6 +878,15 @@ export function buildSettingsScript(): string {
         maxTokensInput.value = msg.settings.maxTokens != null ? String(msg.settings.maxTokens) : '';
         aiProviderSelect.value = msg.settings.aiProvider || 'anthropic';
         localAgentToolSelect.value = msg.settings.localAgentTool || 'claude-code';
+        // Assign THEN filter, and the order is load-bearing: assigning a stored
+        // model that belongs to a different tool (or no longer exists) leaves the
+        // select holding a value this tool cannot accept, and the sync is what
+        // corrects it to the tool's own default. Filtering first would instead
+        // leave the bad value in place.
+        if (localAgentModelSelect && msg.settings.localAgentModel) {
+          localAgentModelSelect.value = msg.settings.localAgentModel;
+        }
+        syncLocalAgentModelRow();
         jolliApiKeyInput.value = msg.maskedJolliApiKey;
         jolliApiKeyNoKeyInput.value = msg.maskedJolliApiKey;
         claudeEnabledInput.checked = msg.settings.claudeEnabled;

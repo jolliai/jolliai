@@ -332,6 +332,13 @@ export async function runBackfill(opts: BackfillOptions): Promise<BackfillReport
 		aiProvider: config.aiProvider,
 		localAgentTool: config.localAgentTool,
 		localAgentPath: config.localAgentPath,
+		// The one hand-built LlmConfig in the repo — every other caller spreads
+		// `llmCredentials(config)`. Each field here is optional, so a forgotten one
+		// is not a compile error: it silently makes back-fill generate under
+		// different settings than the live commit path. `localAgentModel` was
+		// exactly that, defaulting back-fill to the pinned model and overriding a
+		// user who had chosen `inherit`.
+		localAgentModel: config.localAgentModel,
 	};
 	const credsOk = hasLlmCredentials(config);
 

@@ -143,9 +143,9 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(out.cachedTokens).toBe(150);
 	});
 
-	// No model is sent to the CLI any more, so `modelUsage` is the only record of
-	// what actually ran — without reading it back, stored metadata would name a
-	// model that was never asked for. Key shape captured from a real 2.1.220 run.
+	// `modelUsage` is the only record of what actually ran — a pinned model is a
+	// request, not a receipt, so without reading this back stored metadata would
+	// name a model the CLI may never have used. Shape from a real 2.1.220 run.
 	it("reports the model the CLI actually ran, keeping the context-window variant", () => {
 		const json = JSON.stringify({
 			is_error: false,
@@ -159,16 +159,96 @@ describe("ClaudeCodeBackend.parseResult", () => {
 		expect(backend.parseResult(json).model).toBe("claude-opus-5[1m]");
 	});
 
-	it("picks the highest-output model when the envelope names more than one", () => {
+	// The regression this whole parameter exists for. Captured verbatim from a real
+	// 2.1.212 run with the full isolation set: claude runs a small helper turn of
+	// its own, and on a short answer that helper OUT-PRODUCES the model we asked
+	// for. Picking by output tokens named haiku for a sonnet run.
+	const TWO_ENTRY_SONNET_RUN = JSON.stringify({
+		is_error: false,
+		result: "ok",
+		modelUsage: {
+			"claude-haiku-4-5-20251001": { inputTokens: 523, outputTokens: 12, cacheReadInputTokens: 0 },
+			"claude-sonnet-5": { inputTokens: 1, outputTokens: 4, cacheReadInputTokens: 3289 },
+		},
+	});
+
+	it("names the requested model when the envelope reports a helper turn alongside it", () => {
+		expect(backend.parseResult(TWO_ENTRY_SONNET_RUN, "sonnet").model).toBe("claude-sonnet-5");
+	});
+
+	it("falls back to the heaviest-input turn when nothing was requested", () => {
+		// The `inherit` choice sends no model flag, so there is no alias to match.
+		// Total input is what identifies the answering turn — it carries the
+		// conversation cache (1 + 3289) while the helper carries none (523 + 0),
+		// which is the opposite of what the output column says.
+		expect(backend.parseResult(TWO_ENTRY_SONNET_RUN).model).toBe("claude-sonnet-5");
+		expect(backend.parseResult(TWO_ENTRY_SONNET_RUN, "").model).toBe("claude-sonnet-5");
+		expect(backend.parseResult(TWO_ENTRY_SONNET_RUN, "   ").model).toBe("claude-sonnet-5");
+	});
+
+	it("reports the model that DID run when the requested one is absent, so the caller can warn", () => {
+		// Nothing matches "sonnet", so the heuristic answers and LlmClient's
+		// requested-vs-actual check has a real value to disagree with. Reporting
+		// undefined here would silently suppress that warning instead.
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: { "claude-opus-5[1m]": { inputTokens: 10, outputTokens: 900 } },
+		});
+		expect(backend.parseResult(json, "sonnet").model).toBe("claude-opus-5[1m]");
+	});
+
+	it("prefers the heavier match when two entries both name the requested model", () => {
 		const json = JSON.stringify({
 			is_error: false,
 			result: "OK",
 			modelUsage: {
-				"claude-haiku-4-5": { outputTokens: 3 },
-				"claude-opus-5": { outputTokens: 900 },
+				"claude-sonnet-4-6": { inputTokens: 5, outputTokens: 900 },
+				"claude-sonnet-5": { inputTokens: 4000, outputTokens: 4 },
 			},
 		});
-		expect(backend.parseResult(json).model).toBe("claude-opus-5");
+		expect(backend.parseResult(json, "sonnet").model).toBe("claude-sonnet-5");
+	});
+
+	it("keeps the matching entry even when a later helper turn is far heavier", () => {
+		// Order matters here: the match arrives FIRST, so the guard that refuses to
+		// demote an already-matched entry is what carries it. Without that, a helper
+		// turn with a big cached prompt would displace the model we asked for.
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-sonnet-5": { inputTokens: 1, cacheReadInputTokens: 0 },
+				"claude-haiku-4-5": { inputTokens: 9000, cacheReadInputTokens: 9000 },
+			},
+		});
+		expect(backend.parseResult(json, "sonnet").model).toBe("claude-sonnet-5");
+	});
+
+	it("keeps the heaviest turn when no entry matches and the heavier one came first", () => {
+		// Exercises the "this entry is lighter, leave the incumbent" arm of the
+		// fallback, which the two-entry fixture above never reaches.
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-opus-4-8": { inputTokens: 4000 },
+				"claude-haiku-4-5": { inputTokens: 12 },
+			},
+		});
+		expect(backend.parseResult(json).model).toBe("claude-opus-4-8");
+	});
+
+	it("matches the alias case-insensitively", () => {
+		const json = JSON.stringify({
+			is_error: false,
+			result: "OK",
+			modelUsage: {
+				"claude-haiku-4-5": { inputTokens: 900 },
+				"Claude-Sonnet-5": { inputTokens: 1 },
+			},
+		});
+		expect(backend.parseResult(json, "SONNET").model).toBe("Claude-Sonnet-5");
 	});
 
 	it("leaves model unset when the envelope names none, so the caller can fall back", () => {
@@ -291,9 +371,16 @@ describe("ClaudeCodeBackend.buildInvocation", () => {
 		]);
 	});
 
-	it("declares its three isolation flags as individually droppable", () => {
+	it("declares its three isolation flags as individually droppable, and nothing else", () => {
 		// Pins the granularity contract: if these were ever collapsed into one
 		// entry, a single unsupported flag would cost all three.
+		//
+		// `--model` is deliberately NOT here. It was, briefly: the degradation loop
+		// only sees failures `run()` rejects with, and a refused model exits nonzero
+		// having written its envelope to stdout, which the runner resolves — so the
+		// entry was inert for the case it existed for while silently dropping the
+		// pin on any unattributed setup error. The un-pinned retry in
+		// `LlmClient.callLocalAgent` replaces it.
 		expect(backend.optionalFlags?.map((f) => f.id)).toEqual([
 			"--strict-mcp-config",
 			"--disable-slash-commands",

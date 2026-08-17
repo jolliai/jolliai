@@ -57,6 +57,8 @@ Two cells are easy to get wrong and are deliberate. The empty-setting-sources un
 
 One environment variable that serves the same isolation purpose for one tool is deliberately **not** a droppable flag: an unrecognized environment variable is ignored by every version, so it cannot fail a run and needs no degradation path.
 
+**The model flag is deliberately not one either, and the reason generalises.** This mechanism can only react to failures the runner REJECTS with — a nonzero exit that produced no output. A model the agent refuses exits nonzero having written its failure envelope to standard output, and the runner resolves that on purpose so the backend can classify it (an expired login arrives the same way), so the failure surfaces during result parsing, downstream of this loop. Declaring the model flag droppable therefore makes it inert for the case it was declared for, while leaving it live for every case it was not: any setup-class failure that names no flag drops the whole remaining set, so an unrelated failure would silently withdraw the model pin and the run would quietly go back to whatever the tool was configured with. A failure this loop cannot see needs its own handler at the layer that can (spec 280, *Model attribution*), not an entry here.
+
 ### The unsupported-flag store
 
 A single JSON file named `agent-unsupported-flags.json` in the machine-global configuration directory (shared by every repository and every surface on the machine):

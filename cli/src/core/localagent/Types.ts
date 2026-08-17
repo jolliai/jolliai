@@ -98,7 +98,17 @@ export interface LocalAgentBackend {
 	readonly unnamedFlagFailures?: boolean;
 	discoverExecutable(overridePath?: string): Promise<ResolvedExecutable>;
 	buildInvocation(exe: ResolvedExecutable, req: LocalAgentRequest): Invocation;
-	parseResult(stdout: string): LocalAgentOutcome;
+	/**
+	 * `requestedModel` is the value this invocation actually put in its model flag,
+	 * or undefined when it emitted none. It exists because a usage report can name
+	 * more than one model — claude adds a small helper turn of its own — and the
+	 * model we ASKED for is the only non-heuristic way to say which entry answered.
+	 *
+	 * Optional, and most backends ignore it: a method may declare fewer parameters
+	 * than the interface, so the four tools that report no model at all keep their
+	 * one-parameter signature unchanged.
+	 */
+	parseResult(stdout: string, requestedModel?: string): LocalAgentOutcome;
 	/**
 	 * Cheap presence check — is this tool on disk? No capability probe, no
 	 * subprocess. Used by onboarding surfaces that must decide what to OFFER

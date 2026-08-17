@@ -25,8 +25,10 @@ import {
 	loadUnsupportedFlagIds,
 	recordUnsupportedFlagIds,
 } from "./localagent/OptionalFlags.js";
+import { resolveLocalAgentModel } from "./localagent/ToolMeta.js";
 import {
 	type LocalAgentBackend,
+	type LocalAgentOutcome,
 	LocalAgentSetupError,
 	LocalAgentTransientError,
 	type ResolvedExecutable,
@@ -207,6 +209,8 @@ interface LlmCredentials {
 	readonly localAgentTool?: LocalAgentToolId;
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
+	/** Which model to pin for the chosen tool; see `JolliMemoryConfig.localAgentModel`. */
+	readonly localAgentModel?: string;
 }
 
 /**
@@ -255,7 +259,7 @@ export function resolveLlmCredentialSource(
 /** The credential-carrying fields callLlm needs to select and drive a provider. */
 type LlmCredentialFields = Pick<
 	LlmCredentials,
-	"apiKey" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+	"apiKey" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath" | "localAgentModel"
 >;
 
 /**
@@ -274,6 +278,7 @@ export function llmCredentials(config: LlmCredentialFields): LlmCredentialFields
 		aiProvider: config.aiProvider,
 		localAgentTool: config.localAgentTool,
 		localAgentPath: config.localAgentPath,
+		localAgentModel: config.localAgentModel,
 	};
 }
 
@@ -627,48 +632,89 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	const tool = options.localAgentTool ?? "claude-code";
 	const backend = getBackend(tool);
 	const exe = await backend.discoverExecutable(options.localAgentPath);
-	// NO tool receives a resolved model id: every local-agent CLI runs whatever
-	// model it is configured with, and an empty model tells the backend to emit no
-	// model flag at all. claude-code used to be special-cased here and got the
-	// action-driven alias; the local-agent provider now defers to the tool
-	// uniformly, matching the Settings local-agent card, which offers an "Agent
-	// tool" picker and no model picker.
+	// The model is pinned PER TOOL, not per action, and only for the tools that
+	// declare one (claude-code today) — `resolveLocalAgentModel` returns "" for
+	// every other tool, and an empty model tells the backend to emit no model flag
+	// at all, so those four keep running whatever they are configured with.
 	//
-	// Know what this gives up, because it is not nothing:
+	// Why pin at all, when the spend lands on the user's own subscription: leaving
+	// it unpinned does not mean "the user chose" — it means a background,
+	// mechanical workload silently rides whatever model the developer picked for
+	// INTERACTIVE work. Measured on one machine, every generation ran
+	// `claude-opus-5[1m]`, the most expensive model at its most expensive context
+	// tier: a 418-token routing decision cost $0.08, and one session consumed ~73%
+	// of a five-hour window. The same work then costs different amounts on two
+	// machines, for a reason that has nothing to do with this tool. `inherit` keeps
+	// that behaviour available, as an explicit choice rather than the default.
 	//
-	//   * `jolli configure --set model=…` is a real, documented setting
-	//     (ConfigureCommand.ts) and it no longer reaches this provider.
-	//   * `PlanProgressEvaluator` deliberately asks for `haiku` to keep a
-	//     high-frequency call cheap. That intent is discarded here too.
-	//   * The replacement is the user's own CLI default, which can be a much
-	//     bigger model — measured on one machine, claude-code ran `claude-opus-5[1m]`
-	//     where the jollimemory default alias would have picked sonnet. Cost and
-	//     latency both move, and the spend lands on the tool's subscription.
+	// Why an alias (`sonnet`) rather than `resolveModelId`'s API model id: measured,
+	// the CLI accepts both, but an alias tracks the latest of its family (so it does
+	// not 404 when a dated model retires) and cannot select the `[1m]` SKU.
 	//
-	// The trade accepted: under a subscription the user, not jollimemory, is the
-	// one paying, so their configured default is the right authority — and it is
-	// the ONLY authority available for the other four tools regardless. If a
-	// per-action model ever matters again, the fix is a model picker on the
-	// local-agent card feeding a real per-tool model id, not a special case here.
-	//
-	// Metadata stays honest despite all of the above: backends that can name the
-	// model they ran report it in `LocalAgentOutcome.model`, which wins over this
-	// alias below. See the `resultModel` note at the return.
+	// Still NOT threaded here, deliberately: `jolli configure --set model=…` and
+	// `PlanProgressEvaluator`'s `haiku` both name Anthropic API model ids, which are
+	// a different namespace from a local CLI's aliases — `localAgentModel` is the
+	// setting that reaches this provider.
+	const localModel = resolveLocalAgentModel(tool, options.localAgentModel);
 	const run = options.__localAgentRun ?? defaultRunInvocation;
 	const startTime = Date.now();
 	// Collected across every attempt so the `finally` below cleans up the temp
 	// dirs of failed attempts too, not just the last one.
 	const spawnedCwds: string[] = [];
 	try {
-		const { stdout, disabledFlagIds } = await runWithFlagDegradation(backend, exe, run, {
-			prompt,
-			model: "",
-			systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
-			timeoutMs: options.timeoutMs,
-			globalDir: options.__localAgentGlobalDir,
-			spawnedCwds,
-		});
-		const outcome = backend.parseResult(stdout);
+		const runOnce = async (model: string) => {
+			const { stdout, disabledFlagIds } = await runWithFlagDegradation(backend, exe, run, {
+				prompt,
+				model,
+				systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
+				timeoutMs: options.timeoutMs,
+				globalDir: options.__localAgentGlobalDir,
+				spawnedCwds,
+			});
+			// The requested model is handed to the parser, not just to the spawn: a
+			// tool's usage report can name several models (claude adds a small helper
+			// turn of its own), and the one we ASKED for is the only non-heuristic way
+			// to say which entry is the answering turn. See ClaudeCodeBackend.pickModel.
+			return { outcome: backend.parseResult(stdout, model || undefined), disabledFlagIds };
+		};
+
+		// A model the tool REFUSES must not take the machine's summaries down with
+		// it, and the flag-degradation loop cannot save us here — that loop only
+		// sees failures `run()` rejects with, and a refused model is not one of
+		// them. Measured: `--model bogus` exits 1 but WRITES the failure envelope to
+		// stdout, and `LocalAgentRunner` deliberately resolves a nonzero exit that
+		// produced stdout so the backend can classify it. So the throw happens in
+		// `parseResult`, downstream of the loop, and the only place that can react
+		// is here.
+		//
+		// The realistic trigger is not a corrupt config — `resolveLocalAgentModel`
+		// clamps an unrecognised stored value — it is entitlement: the picker offers
+		// Opus, and a subscription without Opus answers 404 for every single call.
+		// One un-pinned retry turns "this machine can no longer generate anything"
+		// into "this machine generates on the tool's own model", which is exactly
+		// the pre-pinning behaviour and strictly better than nothing.
+		//
+		// Deliberately NOT persisted: unlike an unsupported flag, an entitlement can
+		// be granted later, and the next call should ask for the pinned model again.
+		// Deliberately only for `LocalAgentSetupError` — auth and transient failures
+		// are not about the model, and retrying them un-pinned would double the cost
+		// of every outage.
+		let attempt: { outcome: LocalAgentOutcome; disabledFlagIds: ReadonlySet<string> };
+		let effectiveModel = localModel;
+		try {
+			attempt = await runOnce(localModel);
+		} catch (err) {
+			if (!localModel || !(err instanceof LocalAgentSetupError)) throw err;
+			log.warn(
+				'Local agent %s refused model "%s" (%s); retrying once on the tool\'s own model.',
+				tool,
+				localModel,
+				err.message,
+			);
+			attempt = await runOnce("");
+			effectiveModel = "";
+		}
+		const { outcome, disabledFlagIds } = attempt;
 
 		// An empty completion is a FAILED run, not an answer. Every action's
 		// template asks for structured output, so no caller has a use for "" — and
@@ -690,19 +736,57 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 			);
 		}
 
-		// Prefer the model the tool reported actually running over the alias we
-		// resolved but never sent. Claude Code names it (`modelUsage`); codex,
-		// cursor-agent, opencode and kimi do not, so those still fall back to the
-		// alias — a guess, but the only value available, and the same one every
-		// other provider records.
-		const resultModel = outcome.model ?? model;
+		// Prefer the model the tool reported actually running over anything we
+		// resolved. Claude Code names it (`modelUsage`); codex, cursor-agent,
+		// opencode and kimi do not, so those fall back to the pinned value if there
+		// is one and to the config alias otherwise — a guess, but the only value
+		// available, and the same one every other provider records.
+		const resultModel = outcome.model ?? (effectiveModel || model);
+
+		// Verify rather than assume. Pinning a model is only worth anything if a
+		// request that was NOT honoured is visible: a silently upgraded model is
+		// exactly as expensive as never having asked, and `modelUsage` is the only
+		// place the truth is written down. Skipped entirely when nothing was pinned
+		// (`inherit`, or an unpinned tool) or when the tool reports no model — there
+		// is no claim to check in either case.
+		//
+		// Containment, not equality: the request is a CLI alias ("sonnet") while the
+		// envelope reports a full id ("claude-sonnet-5").
+		// `effectiveModel`, not `localModel`: after an un-pinned retry the request
+		// was withdrawn by US, and warning that "the tool did not run the requested
+		// model" would blame it for our own decision. The retry already logged why.
+		if (effectiveModel && outcome.model) {
+			if (!outcome.model.toLowerCase().includes(effectiveModel.toLowerCase())) {
+				log.warn(
+					"Local-agent model mismatch: action=%s tool=%s requested=%s actual=%s — the tool did not run the requested model.",
+					options.action,
+					tool,
+					effectiveModel,
+					outcome.model,
+				);
+			} else if (/\[\d+[mk]\]/i.test(outcome.model)) {
+				// Reported separately from a plain mismatch because the FAMILY matched
+				// and only the tier did not: a long-context variant is a distinct SKU
+				// priced above the base model, and an alias is never supposed to be able
+				// to select one. If this ever fires, the assumption that aliases cannot
+				// reach the `[1m]` tier has stopped holding.
+				log.warn(
+					"Local-agent ran a long-context variant: action=%s tool=%s requested=%s actual=%s — that tier is priced above the base model.",
+					options.action,
+					tool,
+					effectiveModel,
+					outcome.model,
+				);
+			}
+		}
 
 		// Surface the subscription cost the backend parsed. `LlmCallResult` has no
 		// cost field (no provider carries one), so without this the value would be
 		// dead — and local-agent spend is otherwise invisible, since it bills the
 		// tool's own subscription rather than a jollimemory-metered key. `model` is
-		// logged beside it because no model is sent any more: which one ran is the
-		// tool's decision, and this line is where that becomes observable.
+		// logged beside it because cost is only interpretable next to the tier that
+		// produced it, and for an unpinned tool this line is the only place the
+		// tool's own model choice becomes observable at all.
 		log.info(
 			"Local-agent completion: action=%s tool=%s model=%s cost=$%s in=%d out=%d cached=%d%s",
 			options.action,

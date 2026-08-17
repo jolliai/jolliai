@@ -8,7 +8,7 @@
 import { join } from "node:path";
 import type { Command } from "commander";
 import { resolveJolliUrlForKey, validateJolliApiKey } from "../core/JolliApiUtils.js";
-import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
+import { ALL_LOCAL_AGENT_MODEL_IDS, LOCAL_AGENT_TOOLS, localAgentToolModels } from "../core/localagent/ToolMeta.js";
 import { getGlobalConfigDir, loadConfig, saveConfig } from "../core/SessionTracker.js";
 import { track } from "../core/Telemetry.js";
 import { validateBackupFolder, validateBackupRetentionDays } from "../dashboard/Backup.js";
@@ -32,6 +32,16 @@ const VALID_AI_PROVIDERS: ReadonlyArray<NonNullable<JolliMemoryConfig["aiProvide
 const VALID_LOCAL_AGENT_TOOLS: ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>> = Object.keys(
 	LOCAL_AGENT_TOOLS,
 ) as ReadonlyArray<NonNullable<JolliMemoryConfig["localAgentTool"]>>;
+
+/**
+ * The tools jollimemory pins a model for, derived from the registry rather than
+ * named — `--list-keys` states this fact to the user, and a hand-written
+ * "claude-code only" would silently become wrong the day a second tool declares
+ * a model list.
+ */
+const PINNED_LOCAL_AGENT_TOOLS: ReadonlyArray<string> = (
+	Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>
+).filter((id) => localAgentToolModels(id).length > 0);
 
 /** Valid values for the `globalInstructions` config key. */
 const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["globalInstructions"]>> = [
@@ -79,6 +89,7 @@ const VALID_CONFIG_KEYS = [
 	"syncOnPush",
 	"localAgentTool",
 	"localAgentPath",
+	"localAgentModel",
 	"backupFolder",
 	"backupRetentionDays",
 	"wikiRebuild",
@@ -183,6 +194,21 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 			throw new Error(`${key} must be one of: ${VALID_LOCAL_AGENT_TOOLS.join(", ")} (got: ${raw})`);
 		}
 		return raw;
+	}
+	if (key === "localAgentModel") {
+		// Rejected here rather than normalised away, unlike the two Settings panels:
+		// those submit a dropdown value, so a bad one means a stale page and the
+		// kind thing is to drop it; this is a person typing, and telling them the
+		// value was ignored is better than silently storing something else.
+		//
+		// Trimmed before the check so `--set localAgentModel=" haiku"` is accepted
+		// and stored the way the runtime reads it — an untrimmed compare would
+		// reject a value `resolveLocalAgentModel` handles fine.
+		const value = raw.trim();
+		if (!ALL_LOCAL_AGENT_MODEL_IDS.includes(value)) {
+			throw new Error(`${key} must be one of: ${ALL_LOCAL_AGENT_MODEL_IDS.join(", ")} (got: ${raw})`);
+		}
+		return value;
 	}
 	if (key === "globalInstructions") {
 		if (!(VALID_GLOBAL_INSTRUCTIONS as ReadonlyArray<string>).includes(raw)) {
@@ -296,6 +322,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "localAgentPath",
 		type: "string",
 		description: "Explicit path to the local agent binary, overriding PATH discovery",
+	},
+	{
+		key: "localAgentModel",
+		type: "enum",
+		description: `Model the local agent is told to run (${PINNED_LOCAL_AGENT_TOOLS.join(", ")} only): ${ALL_LOCAL_AGENT_MODEL_IDS.join(" | ")} — "inherit" runs whatever the tool is configured with`,
 	},
 	{
 		key: "globalInstructions",

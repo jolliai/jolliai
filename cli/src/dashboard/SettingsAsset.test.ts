@@ -87,6 +87,14 @@ const MODEL = {
 			hasJolliKey: false,
 			localAgentTool: "claude-code",
 			localAgentTools: [{ id: "claude-code", label: "Claude Code" }],
+			localAgentModel: "haiku",
+			localAgentModels: {
+				"claude-code": [
+					{ id: "sonnet", label: "Sonnet (default)" },
+					{ id: "haiku", label: "Haiku - cheapest" },
+					{ id: "inherit", label: "Use Claude Code's own setting" },
+				],
+			},
 		},
 		memoryBank: { localFolder: "/mem/bank", compileExcludeFolders: "archive", syncTranscripts: false },
 		others: { dcoSignoff: true, excludePatterns: "*.lock" },
@@ -240,5 +248,142 @@ describe("settings.js form wiring", () => {
 		expect(body.codexEnabled).toBe(false); // seeded from MODEL, untouched
 		expect(body.aiProvider).toBe("anthropic"); // seeded, untouched
 		expect(body.dcoSignoff).toBe(true); // seeded from MODEL.others
+	});
+});
+
+describe("settings.js local-agent model picker", () => {
+	/** The AI Summary section markup with the provider forced to local-agent. */
+	function summaryHtml(over: Record<string, unknown> = {}): string {
+		const { renderSettings, app, rail } = loadJD();
+		const model = structuredClone(MODEL) as typeof MODEL;
+		const summary = model.settings.summary as Record<string, unknown>;
+		summary.aiProvider = "local-agent";
+		Object.assign(summary, over);
+		renderSettings(model);
+		rail.get("summary")?.onclick?.();
+		return app.innerHTML;
+	}
+
+	it("renders the model picker for a pinned tool, selecting the stored value", () => {
+		const html = summaryHtml();
+		expect(html).toContain('id="localAgentModel"');
+		expect(html).toContain('data-field="localAgentModel"');
+		expect(html).toContain("Haiku - cheapest");
+		// The stored value is what must come back selected — a picker that always
+		// showed the first option would silently misreport the machine's setting.
+		expect(html).toMatch(/value="haiku"[^>]*selected/);
+	});
+
+	it("offers the inherit escape hatch, with its label HTML-escaped", () => {
+		// Labels go through `esc()` like every other server-provided string, so the
+		// apostrophe arrives as an entity — asserting the raw form would pass only
+		// by accident of the label's wording.
+		expect(summaryHtml()).toContain("Use Claude Code&#39;s own setting");
+	});
+
+	it("hides the row for a tool with no pinned models", () => {
+		// The four unpinned tools defer to their own configuration, so offering a
+		// model control for them would promise a setting that does nothing.
+		const html = summaryHtml({
+			localAgentTool: "codex",
+			localAgentTools: [{ id: "codex", label: "Codex" }],
+		});
+		expect(html).toContain('id="localAgentTool"');
+		expect(html).not.toContain('id="localAgentModel"');
+	});
+
+	it("hides the row when the payload carries no model map at all", () => {
+		// An older server (or a partial payload) must degrade to "no picker",
+		// never to a picker with an empty dropdown.
+		const html = summaryHtml({ localAgentModels: undefined });
+		expect(html).not.toContain('id="localAgentModel"');
+	});
+
+	it("submits the selected model in the Apply payload", () => {
+		const { fields, applyBtn, posts } = loadFormJD();
+		applyBtn.onclick?.();
+		const body = posts.find((p) => p.path === "/api/settings/apply")?.body as Record<string, unknown>;
+		// Seeded from the payload and carried through collect() untouched — the
+		// field has to survive a save that edited something else entirely.
+		expect(body.localAgentModel).toBe("haiku");
+		expect(fields).toBeTruthy();
+	});
+});
+
+/**
+ * Tool-switch harness: renders like `loadJD` but also serves a `localAgentTool`
+ * field stub to `wire()`, so the real `onchange` handler runs. `loadJD` returns
+ * [] for `[data-field]` (so it never exercises edits) and `loadFormJD` does not
+ * expose the rendered markup — this needs both.
+ */
+function loadToolSwitchJD(): {
+	app: { innerHTML: string };
+	rail: Map<string, FakeButton>;
+	tool: FieldStub;
+	render: (model: unknown) => void;
+} {
+	const app = { innerHTML: "", insertAdjacentHTML: () => undefined };
+	const rail = new Map<string, FakeButton>(
+		SECTION_IDS.map((id) => [id, { getAttribute: (n: string) => (n === "data-section" ? id : null) }]),
+	);
+	const tool: FieldStub = {
+		getAttribute: (n: string) => (n === "data-field" ? "localAgentTool" : null),
+		type: "select-one",
+		checked: false,
+		value: "claude-code",
+	};
+	const doc = {
+		getElementById: (id: string) => (id === "settingsModalBody" ? app : { innerHTML: "", textContent: "" }),
+		querySelectorAll: (sel: string) =>
+			sel.includes("[data-field]") ? [tool] : sel.includes(".set-rail-item") ? [...rail.values()] : [],
+		querySelector: () => null,
+		addEventListener: () => undefined,
+		createElement: () => ({ innerHTML: "" }),
+		body: { innerHTML: "" },
+	};
+	const win = {
+		JD: {
+			getJson: () => new Promise(() => {}),
+			post: () => new Promise(() => {}),
+			refreshNow: () => undefined,
+			renderPage: () => undefined,
+		},
+		document: doc,
+		addEventListener: () => undefined,
+	} as Record<string, unknown>;
+	for (const f of ["format.js", "settings.js"]) {
+		new Function("window", "document", readFileSync(new URL(`./assets/js/${f}`, import.meta.url), "utf8"))(
+			win,
+			doc,
+		);
+	}
+	return { app, rail, tool, render: (win.JD as { renderSettings: (m: unknown) => void }).renderSettings };
+}
+
+describe("settings.js Agent-tool switching", () => {
+	it("re-renders the model row when the tool changes, not only on a provider change", () => {
+		// `localAgentModels` is keyed by tool precisely because switching the picker
+		// is a client-side state change that never refetches the payload. With only
+		// `aiProvider` in the re-render set, the row kept showing the PREVIOUS
+		// tool's options — offering models for a tool that pins none, and hiding
+		// the row for one that does — until an unrelated toggle happened to
+		// re-render. Both earlier tests set the payload tool and the form tool to
+		// the same value, so neither could see it.
+		const { app, rail, tool, render } = loadToolSwitchJD();
+		const model = structuredClone(MODEL) as typeof MODEL;
+		const summary = model.settings.summary as Record<string, unknown>;
+		summary.aiProvider = "local-agent";
+		summary.localAgentTools = [
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "codex", label: "Codex" },
+		];
+		render(model);
+		rail.get("summary")?.onclick?.();
+		expect(app.innerHTML).toContain('id="localAgentModel"');
+
+		tool.value = "codex";
+		tool.onchange?.();
+
+		expect(app.innerHTML).not.toContain('id="localAgentModel"');
 	});
 });

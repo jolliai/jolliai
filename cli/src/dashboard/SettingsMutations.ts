@@ -24,7 +24,7 @@ import { isAbsolute } from "node:path";
 import { getProjectRootDir, listWorktrees } from "../core/GitOps.js";
 import { assertJolliOriginAllowed, parseJolliApiKey, resolveJolliUrlForKey } from "../core/JolliApiUtils.js";
 import { extractRepoName } from "../core/KBPathResolver.js";
-import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
+import { LOCAL_AGENT_TOOLS, normalizeStoredLocalAgentModel } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { getGlobalConfigDir, updateConfigTransactionalScoped } from "../core/SessionTracker.js";
 import {
@@ -71,6 +71,8 @@ export interface SettingsApplyInput {
 	readonly apiKey: string;
 	readonly jolliApiKey: string;
 	readonly localAgentTool: LocalAgentToolId;
+	/** `DEFAULT_LOCAL_AGENT_MODEL` (the default) is stored as unset, like `model`. */
+	readonly localAgentModel: string;
 	readonly localFolder: string;
 	readonly compileExcludeFolders: string;
 	readonly syncTranscripts: boolean;
@@ -135,6 +137,12 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 			`localAgentTool must be one of: ${Object.keys(LOCAL_AGENT_TOOLS).join(", ")}`,
 		);
 	}
+	// Deliberately NOT rejected the way localAgentTool is. A tool id decides which
+	// binary runs, so a bad one has to stop the save; a model id is a dropdown
+	// value that the runner clamps at read time anyway, and refusing the whole
+	// submission over one would block a user whose stored value came from a newer
+	// build from saving anything at all — including the setting that would fix it.
+	const localAgentModel = asString(body.localAgentModel);
 	const agents = Object.fromEntries(AGENT_FIELDS.map((f) => [f, asBool(body[f])])) as Record<
 		(typeof AGENT_FIELDS)[number],
 		boolean
@@ -156,6 +164,7 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 		apiKey: asString(body.apiKey),
 		jolliApiKey: asString(body.jolliApiKey),
 		localAgentTool: localAgentTool as LocalAgentToolId,
+		localAgentModel,
 		localFolder: asString(body.localFolder),
 		compileExcludeFolders: asString(body.compileExcludeFolders),
 		syncTranscripts: asBool(body.syncTranscripts),
@@ -280,6 +289,9 @@ export async function applySettings(
 			apiKey: apiKey || undefined,
 			jolliApiKey: jolliApiKey || undefined,
 			localAgentTool: input.localAgentTool,
+			// One shared rule for what reaches disk, so this surface, the VS Code
+			// panel and `configure --set` cannot disagree about the same intent.
+			localAgentModel: normalizeStoredLocalAgentModel(input.localAgentModel),
 			localFolder: input.localFolder.trim() || undefined,
 			compileExcludeFolders: splitCsv(input.compileExcludeFolders),
 			syncTranscripts: input.syncTranscripts,

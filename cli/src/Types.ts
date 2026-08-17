@@ -1638,7 +1638,7 @@ export interface CommitCatalog {
  */
 export type LlmConfig = Pick<
 	JolliMemoryConfig,
-	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath"
+	"apiKey" | "model" | "jolliApiKey" | "aiProvider" | "localAgentTool" | "localAgentPath" | "localAgentModel"
 >;
 
 /** Configuration stored in .jolli/jollimemory/config.json */
@@ -1771,6 +1771,33 @@ export interface JolliMemoryConfig {
 	readonly localAgentTool?: LocalAgentToolId;
 	/** Optional explicit path to the local agent binary, overriding PATH discovery. */
 	readonly localAgentPath?: string;
+	/**
+	 * Which model the local agent tool is told to run, for the tools jollimemory
+	 * pins one for (`LOCAL_AGENT_TOOLS[…].models`, claude-code today). An id from
+	 * that tool's own list; `"inherit"` means "send no model flag and run whatever
+	 * the tool is configured with", and an ABSENT value means the default
+	 * (`DEFAULT_LOCAL_AGENT_MODEL`). Both Settings panels store the default as
+	 * absent — they always submit the effective value, so writing it would inflate
+	 * config.json on any unrelated save — while `configure --set` keeps an explicit
+	 * default verbatim, since a value someone typed should be visible in the file
+	 * they typed it into. `resolveLocalAgentModel` reads the two identically TODAY,
+	 * and the divergence is deliberate rather than incidental: if
+	 * `DEFAULT_LOCAL_AGENT_MODEL` ever changes, an absent value follows the new
+	 * default while a literal one stays pinned — which is the right reading of
+	 * "I selected the default option" versus "I typed this model's name". The CLI
+	 * way back to following the default is `configure --remove localAgentModel`,
+	 * not `--set …=""`: every enum key rejects an empty value.
+	 *
+	 * Deliberately NOT the same field as `model`. That one names an Anthropic API
+	 * model id for the direct/proxy providers; this one names an alias in a local
+	 * CLI's own namespace. Merging them would make the field mean two different
+	 * things depending on `aiProvider`, and would have nothing to say at all for
+	 * the four tools that are not pinned.
+	 *
+	 * Ignored unless `aiProvider === "local-agent"`, and ignored for a tool that
+	 * declares no models.
+	 */
+	readonly localAgentModel?: string;
 	/**
 	 * When the wiki/graph (topic KB) is rebuilt from newly-summarized commits.
 	 *  - "manual" (DEFAULT — an absent value means manual): no git operation

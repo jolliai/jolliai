@@ -36,26 +36,53 @@ interface ClaudePrintEnvelope {
 	 * keeps the context-window variant (`[1m]`), which is a distinct SKU at a
 	 * distinct price, and the whole point of reading this is to stop guessing.
 	 */
-	modelUsage?: Record<string, { outputTokens?: number } | null>;
+	modelUsage?: Record<string, { outputTokens?: number; inputTokens?: number; cacheReadInputTokens?: number } | null>;
 }
 
 /**
  * The model id from a `modelUsage` map, or undefined when the envelope carries
  * none (older CLI, or an error envelope — real runs emit `"modelUsage":{}`).
  *
- * Picks the highest-output entry rather than the first key: this backend denies
- * every tool (`--tools ""`) so a single-model turn is the norm, but key order in
- * a multi-model envelope is not a documented guarantee and "the model that wrote
- * the answer" is the one worth recording.
+ * This map is NOT single-entry, and assuming it was is what this function used to
+ * get wrong. Measured on 2.1.212 with the full isolation set, a `--model sonnet`
+ * run reports `{"claude-haiku-4-5-…":{outputTokens:12}, "claude-sonnet-5":{outputTokens:4}}`
+ * — claude runs a small helper turn of its own, which we cannot switch off, and
+ * when the real answer is short that helper OUT-PRODUCES it. Picking the
+ * highest-output entry therefore named haiku for a sonnet run.
+ *
+ * So `requested` — the alias this invocation actually put in `--model` — wins over
+ * any heuristic: an entry naming it is the turn we asked for, by construction.
+ * That matters twice over, because `LlmClient` compares this value against the
+ * request to detect a model that was not honoured; a heuristic that picks the
+ * helper turn would fire that warning on every short-output action and train
+ * everyone to ignore it.
+ *
+ * With no `requested` (the `inherit` choice, which sends no model flag) there is
+ * nothing to match, so fall back to the highest TOTAL INPUT rather than the
+ * highest output: the answering turn is the one carrying the conversation cache
+ * (measured, sonnet 1 + 3289 cached against the helper's 523 + 0), which the
+ * output column gets exactly backwards.
  */
-function pickModel(modelUsage: ClaudePrintEnvelope["modelUsage"]): string | undefined {
+function pickModel(modelUsage: ClaudePrintEnvelope["modelUsage"], requested?: string): string | undefined {
+	const needle = requested?.trim().toLowerCase() ?? "";
 	let best: string | undefined;
-	let bestOut = -1;
+	let bestWeight = -1;
+	let bestMatched = false;
 	for (const [id, usage] of Object.entries(modelUsage ?? {})) {
-		const out = usage?.outputTokens ?? 0;
-		if (out > bestOut) {
+		const weight = (usage?.inputTokens ?? 0) + (usage?.cacheReadInputTokens ?? 0);
+		const matched = needle !== "" && id.toLowerCase().includes(needle);
+		// An entry naming the requested model is never displaced by one that does
+		// not, however much the other turn consumed. Among equals, heaviest input.
+		if (bestMatched && !matched) continue;
+		if (matched && !bestMatched) {
 			best = id;
-			bestOut = out;
+			bestWeight = weight;
+			bestMatched = true;
+			continue;
+		}
+		if (weight > bestWeight) {
+			best = id;
+			bestWeight = weight;
 		}
 	}
 	return best;
@@ -128,10 +155,17 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 				"-p",
 				"--output-format",
 				"json",
-				// Conditional, like every other backend: LlmClient sends an empty model
-				// for the local-agent provider (the Settings UI has an agent-tool picker
-				// and no model picker), and `--model ""` would assert an empty selection
-				// instead of leaving the CLI's own configured default alone.
+				// Conditional, like every other backend: an empty model means "leave the
+				// CLI's own configured default alone" (the `inherit` choice), and
+				// `--model ""` would instead assert an empty selection.
+				//
+				// NOT an OptionalFlag, and that was tried: the degradation loop only
+				// sees failures `run()` REJECTS with, while a refused model exits
+				// nonzero having written its failure envelope to stdout, which the
+				// runner deliberately resolves. So the entry was inert for the case it
+				// existed for, and live for every case it did not — any unattributed
+				// setup error would silently drop the pin. `LlmClient.callLocalAgent`
+				// owns the one un-pinned retry instead.
 				...(req.model ? ["--model", req.model] : []),
 				"--system-prompt",
 				req.systemPrompt,
@@ -184,7 +218,7 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 		};
 	}
 
-	parseResult(stdout: string): LocalAgentOutcome {
+	parseResult(stdout: string, requestedModel?: string): LocalAgentOutcome {
 		let env: ClaudePrintEnvelope;
 		try {
 			env = JSON.parse(stdout) as ClaudePrintEnvelope;
@@ -211,7 +245,7 @@ export class ClaudeCodeBackend implements LocalAgentBackend {
 			throw new LocalAgentSetupError(msg);
 		}
 		const usage = env.usage ?? {};
-		const model = pickModel(env.modelUsage);
+		const model = pickModel(env.modelUsage, requestedModel);
 		return {
 			text: env.result ?? "",
 			inputTokens: usage.input_tokens ?? 0,
