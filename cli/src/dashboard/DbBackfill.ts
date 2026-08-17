@@ -30,6 +30,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { AlreadyCurrent } from "../core/DiskSessionScan.js";
 import { execGit, getHeadHash } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
@@ -37,7 +38,8 @@ import { isJolliInternalRef } from "../core/JolliRefs.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
-import { SESSION_SOURCES } from "../core/sessions/SessionSources.js";
+import type { SessionSourceDefinition } from "../core/sessions/SessionSourceDefinition.js";
+import { DAEMON_RESCAN_SOURCES, SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { ToolCallCount, TranscriptSource } from "../Types.js";
 import {
@@ -54,7 +56,7 @@ import {
 	sessionPassKey,
 } from "./DashboardCollector.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
-import { inTransaction, withDashboardDb } from "./DashboardDb.js";
+import { getDashboardDbPath, inTransaction, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import type {
 	CommitCreatedEvent,
 	CommitSummaryEvent,
@@ -64,6 +66,7 @@ import type {
 	StatsEventEnvelope,
 	StatsModelUsage,
 } from "./DashboardModel.js";
+import { sessionEventId } from "./DashboardModel.js";
 import { existingWorktrees, hasLiveWorktree, type RegisteredRepo, readRepoCutoverFence } from "./RepoRegistry.js";
 import {
 	countMemoriesAbsentFromListing,
@@ -73,7 +76,7 @@ import {
 	resolveProtectNewerThanMs,
 	type SotImportResult,
 } from "./SotImport.js";
-import { applyToDb, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
+import { applyToDb, countStuckEvents, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
 
 const log = createLogger("DbBackfill");
 
@@ -136,8 +139,25 @@ const CURSOR_SOT = "sot-import";
  * `session_tool_use` rows with the calls split between them, one of them named
  * something the user never typed. Re-reading is what removes the stale row: the
  * upsert deletes a session's tool rows before rewriting them, so nothing else can.
+ *
+ * `4` — Codex skill capture now reads the `<skill>` block Codex Desktop injects when a
+ * skill is actually entered, not only the shell reads of a `SKILL.md` that the CLI
+ * produces (see `CodexSkillScanner`). Measured on one real session that entered three
+ * skills: the old read recorded NONE of them while storing its MCP and builtin calls
+ * normally — so the gap is invisible in the row's own shape, and the mtime-based
+ * instant cannot move on its own once the conversation has stopped. This is the case
+ * the BUMP THIS paragraph above calls "improvement", and the bump is the only thing
+ * that makes an existing database pick it up. A separate number from `3` deliberately:
+ * that value has already shipped, so a database carrying it would otherwise never
+ * re-read for this.
+ *
+ * A bump heals THIS store and only this store. `SkillUse` also reaches the
+ * `plans.json` skill registry, whose high-water mark carries no generation and so
+ * cannot be invalidated — an already-scanned Codex Desktop session therefore reads as
+ * three skills here and zero in the SKILLS panel. That asymmetry is understood and
+ * accepted; `scanSkillsWithCursor` carries the decision and is where to argue with it.
  */
-const SESSION_READ_GENERATION = "3";
+const SESSION_READ_GENERATION = "4";
 
 /**
  * Content fingerprint of the summary index — the summaries cursor value.
@@ -475,6 +495,134 @@ function readKnownSessions(db: DashboardDbHandle, repoIdentity: string): Map<str
 	const known = new Map<string, number>();
 	for (const row of rows) known.set(`${row.source}:${row.session_id}`, row.updated_at_ms);
 	return known;
+}
+
+/**
+ * Turns one repo's stored instants into the collector's skip predicate.
+ *
+ * Extracted so the two callers cannot drift: `jolli dashboard` (via
+ * {@link dbBackfillRepo}) and the global daemon (via {@link dbRescanSessions}) must
+ * answer "have I already processed this session?" the same way, or a session the
+ * timer considers current would be re-read by the next dashboard run and vice versa.
+ * It is also the one place the comparison's direction is stated.
+ */
+function alreadyCurrentFrom(known: ReadonlyMap<string, number>): AlreadyCurrent {
+	return (source: TranscriptSource, sessionId: string, updatedAtMs: number) => {
+		const stored = known.get(`${source}:${sessionId}`);
+		// `>=`, not `>`: an equal instant means a re-read would write back the row
+		// already there, which is not worth the transcript parse.
+		return stored !== undefined && stored >= updatedAtMs;
+	};
+}
+
+/**
+ * Latest OBSERVED mtime per session event, as epoch ms.
+ *
+ * The SEED for {@link SessionRescanOptions.emitted}, read ONCE per daemon process
+ * rather than once per tick, which is the whole reason it is affordable:
+ * `events_raw` carries no index on `event_id` — one existed and was removed for
+ * costing a write per enqueue on the blocking commit path — so this is a full scan of
+ * the largest table in the database. Once at startup is fine; every 30 s would not be.
+ *
+ * ## Why the mtime out of `data_json`, and never `received_at`
+ *
+ * The gate compares against MTIMES, so the seed has to be one. `received_at` is the
+ * instant the row was WRITTEN, and every producer samples a session's mtime tens of
+ * seconds before it inserts (a dashboard collect is a whole-repo git walk first), so a
+ * write instant always sits at or AFTER the version it stands for. Seeding one stamps
+ * anything appended inside that window as already-seen — and PERMANENTLY, which is the
+ * part that makes it data loss rather than a delay: the gate then suppresses the very
+ * read that would correct the entry, so no tick can overwrite it, and the next process
+ * re-seeds the same row to the same wrong value. A conversation that grew during an
+ * import and then stopped is invisible to this pass for as long as it stays in the
+ * window, with no log line and no counter moving.
+ *
+ * `data_json` carries the producer's own observed value — the same fact the live path
+ * records after each emit — so both halves of the map now hold one kind of thing, and
+ * an eviction plus re-seed can no longer change what the gate means.
+ *
+ * ## Why the JSON is read in JS, and never by SQLite
+ *
+ * `json_type` / `json_extract` abort the WHOLE STATEMENT on the first document that is
+ * not valid JSON — measured: `ERR_SQLITE_ERROR: malformed JSON`, no rows for any group,
+ * not merely a NULL for the offending one. `events_raw.data_json` is the one column in
+ * this schema with nothing validating it: `TEXT NOT NULL`, no CHECK and no STORED
+ * generated column, deliberately, because it is the raw log written on the blocking
+ * commit path. Every other `json_extract` consumer here reads a column that was
+ * validated at INSERT; this one cannot be.
+ *
+ * And an unparseable row is a state the system deliberately PRODUCES and then keeps:
+ * `drainPending` catches `JSON.parse` and parks the row `failed`, and the prune deletes
+ * only `projected` rows. So a SQL-side parse would be a permanent, machine-wide off
+ * switch for this whole feature — the seed throws, phase 1 rejects, the tick reports
+ * `failed` at DEBUG, `seeded` never flips because it is set from a successful result,
+ * and every later tick re-runs the same throwing statement. Guarding with
+ * `json_valid(data_json)` does fix that, and costs 283 ms where this costs 31 ms
+ * (80,000 rows / 4,000 sessions; the plain `MAX(received_at)` column read it replaced
+ * was 21 ms). Parsing in JS is both the cheaper and the only per-row-recoverable form.
+ *
+ * ## Why the NEWEST row rather than the largest instant
+ *
+ * Step 1 asks a question SQLite can answer without opening a document — the highest
+ * `seq` per `event_id`, `seq` being the insert order — and step 2 parses only those.
+ * That is one document per session instead of one per row, which is where the 31 ms
+ * comes from.
+ *
+ * The value it yields is a MEMBER of the group, so it is always at or below the largest
+ * instant any producer recorded: the gate can never come out WIDER than the aggregate
+ * would have made it, and the error direction is one redundant read. It is also exactly
+ * what the live path records after an emit — the most recent emission's observed mtime —
+ * so seed and live agree by construction rather than by coincidence.
+ *
+ * A row this cannot read is ABSENT from the result, never defaulted: no entry means no
+ * gate, which costs one redundant read and cannot lose anything, whereas falling back
+ * to `received_at` would keep the seeding defect alive on exactly the rows least likely
+ * to be looked at. So an unparseable NEWEST row costs that one session its entry even
+ * when an older row of its own is readable — the safe direction, and the reason nothing
+ * tries to fall back to one.
+ *
+ * Every producer's rows count, not just the re-scan's. That is deliberate: a row the
+ * VS Code tick or `jolli dashboard` wrote really did read this session's transcript at
+ * that version, so honouring it saves a redundant read. There is no way to tell the
+ * re-scan's rows apart anyway (it shares the `bootstrap` producer tag with the
+ * back-fill, deliberately), so filtering would be a half-measure rather than a fix.
+ *
+ * ## `limit` bounds the ROWS RETURNED, newest first
+ *
+ * The caller holds the result in memory for the life of the process, so it owns a budget
+ * and this has to honour it. Newest first, because a session whose row was written most
+ * recently is the one most likely to be discovered again — and because an arbitrary
+ * subset would make the gate's contents depend on SQLite's scan order. The `GROUP BY`
+ * still touches every row (there is no `event_id` index, on purpose); what the limit
+ * removes is the JSON parse per group and the unbounded map.
+ */
+function readEmittedFromLog(db: DashboardDbHandle, limit?: number): Map<string, number> {
+	const rows = db
+		.prepare(
+			`SELECT e.event_id AS event_id, e.data_json AS data_json
+			   FROM events_raw e
+			   JOIN (SELECT event_id, MAX(seq) AS seq
+			           FROM events_raw
+			          WHERE type = 'session.upserted' AND event_id IS NOT NULL
+			          GROUP BY event_id) newest
+			     ON newest.seq = e.seq
+			  ORDER BY newest.seq DESC${limit === undefined ? "" : " LIMIT ?"}`,
+		)
+		.all(...(limit === undefined ? [] : [limit])) as ReadonlyArray<{ event_id: string; data_json: string }>;
+	const out = new Map<string, number>();
+	for (const row of rows) {
+		let updatedAtMs: unknown;
+		try {
+			updatedAtMs = (JSON.parse(row.data_json) as { updatedAtMs?: unknown } | null)?.updatedAtMs;
+		} catch {
+			// Per row, which is the entire point of parsing here: one document this cannot
+			// read costs its own session a gate entry and leaves every other session's
+			// intact. A throw out of this function kills re-scanning for the process.
+			continue;
+		}
+		if (typeof updatedAtMs === "number" && Number.isFinite(updatedAtMs)) out.set(row.event_id, updatedAtMs);
+	}
+	return out;
 }
 
 /**
@@ -863,23 +1011,73 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 }
 
 /**
+ * `models` folded the way `MODEL_USAGE_UPSERT` would store it — the shape
+ * {@link sameModelSplit} must compare against.
+ *
+ * `model` is that table's key, and two entries in ONE event may name the same model
+ * (two segments of one model's usage, which sum). The write path handles that with
+ * `ON CONFLICT(session_event_id, model) DO UPDATE … + excluded`, so the row that lands
+ * is the SUM and the stored map has one entry where the event had two.
+ *
+ * This mirror exists because the comparison used to skip it, on the strength of a
+ * docblock claiming a duplicate "would violate the primary key on the plain INSERT —
+ * the projection would throw, not merge". That was true before the conflict clause and
+ * false after it, and the consequence was permanent: `models.length !== stored.size`
+ * made such an event report CHANGED on every pass, so every dashboard run and every
+ * 30-second tick re-projected the session and appended another byte-identical
+ * `events_raw` row — the exact churn `unchangedSessionEvent` exists to remove.
+ *
+ * The cost arm reproduces the upsert's `CASE`, not a `COALESCE` pair: NULL means
+ * "unpriced", so two unpriced segments stay NULL rather than summing to a priced 0.00,
+ * which every downstream reader would take for a real answer.
+ *
+ * `||`, matching that `CASE`'s `IS NULL OR IS NULL`, so a MIXED pair is NULL here too. This
+ * said `&&` while claiming to reproduce the `CASE`, which made the claim false in the one
+ * case the two spellings differ in: the mirror folded a priced and an unpriced segment into a
+ * confident total where SQL stores NULL, so a comparison meant to answer "would re-writing
+ * change anything" would have answered no to a difference it had itself invented — the
+ * permanent-churn bug, in the other direction. Unreachable today (both rows come from one
+ * event's `models` array and one `Pricing.ts` lookup, so same-model segments are priced alike
+ * or not at all), and written to agree anyway, because a mirror whose docblock overstates it
+ * is how the last divergence survived review.
+ */
+function foldModelSplit(models: ReadonlyArray<StatsModelUsage>): Map<string, StoredModelRow> {
+	const folded = new Map<string, StoredModelRow>();
+	for (const m of models) {
+		const prior = folded.get(m.model);
+		const cost = m.estCostUsd ?? null;
+		if (prior === undefined) {
+			folded.set(m.model, { input: m.inputTokens, output: m.outputTokens, cached: m.cachedTokens, cost });
+			continue;
+		}
+		folded.set(m.model, {
+			input: prior.input + m.inputTokens,
+			output: prior.output + m.outputTokens,
+			cached: prior.cached + m.cachedTokens,
+			cost: prior.cost === null || cost === null ? null : prior.cost + cost,
+		});
+	}
+	return folded;
+}
+
+/**
  * True when re-writing `models` would leave `session_model_usage` as it stands.
  *
  * The split is replaced WHOLESALE, so this is set equality and not containment:
  * a shrinking set leaves a stale row behind, which is the whole reason
  * `projectSession` deletes before inserting.
  *
- * `model` is that table's key, so duplicate entries in one event would violate
- * the primary key on the plain INSERT — the projection would throw, not merge.
- * Nothing to mirror here; a size check plus a per-key lookup is exact.
+ * Compared against {@link foldModelSplit}'s output rather than against the raw array,
+ * because the write path merges same-model entries — see there.
  */
 function sameModelSplit(models: ReadonlyArray<StatsModelUsage>, stored: ReadonlyMap<string, StoredModelRow>): boolean {
-	if (models.length !== stored.size) return false;
-	for (const m of models) {
-		const row = stored.get(m.model);
+	const folded = foldModelSplit(models);
+	if (folded.size !== stored.size) return false;
+	for (const [model, m] of folded) {
+		const row = stored.get(model);
 		if (!row) return false;
-		if (row.input !== m.inputTokens || row.output !== m.outputTokens || row.cached !== m.cachedTokens) return false;
-		if (row.cost !== (m.estCostUsd ?? null)) return false;
+		if (row.input !== m.input || row.output !== m.output || row.cached !== m.cached) return false;
+		if (row.cost !== m.cost) return false;
 	}
 	return true;
 }
@@ -1446,16 +1644,7 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				// The one caller that widens the horizon past every source's 48 h default.
 				windowMs: BACKFILL_SESSION_WINDOW_MS,
 				...(opts.preScanned ? { preScanned: opts.preScanned } : {}),
-				...(maySkip
-					? {
-							isAlreadyCurrent: (source: TranscriptSource, sessionId: string, updatedAtMs: number) => {
-								const stored = known.get(`${source}:${sessionId}`);
-								// `>=`, not `>`: an equal instant means a re-read would write back
-								// the row already there, which is not worth the transcript parse.
-								return stored !== undefined && stored >= updatedAtMs;
-							},
-						}
-					: {}),
+				...(maySkip ? { isAlreadyCurrent: alreadyCurrentFrom(known) } : {}),
 				...(opts.loadSessions ? { loadSessions: opts.loadSessions } : {}),
 			});
 			const storedSessions = storedSessionRows(db, repo.repoIdentity);
@@ -1741,20 +1930,73 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
  * workspaces are) has genuinely found those sessions. Dropping them because a sibling
  * directory was unreadable would lose data the old per-repo path also kept — its
  * callers read `.sessions` and ignored `.error` for exactly this reason.
+ *
+ * `sources` narrows the fan-out and defaults to the whole registry, which is what the
+ * back-fill wants. The one caller that narrows it is {@link dbRescanSessions}, whose
+ * whole point is to touch a subset on a timer — and narrowing HERE rather than
+ * filtering the RESULT matters: an unasked-for source must not be opened at all, not
+ * merely have its sessions discarded afterwards.
  */
-async function scanAllStores(alreadyRecorded?: AlreadyCurrent): Promise<PreScannedSessions> {
+interface ScanAllStoresOptions {
+	readonly alreadyRecorded?: AlreadyCurrent;
+	readonly sources?: ReadonlyArray<SessionSourceDefinition>;
+	/**
+	 * Discovery horizon handed to every scanner, defaulting to the back-fill's.
+	 *
+	 * Threaded rather than hard-coded because the caller's own `windowMs` narrows the
+	 * collector: with the scan pinned to one width and the collector to another, a caller
+	 * asking for a wider window silently got nothing extra (nothing older than the pinned
+	 * width was ever scanned) and one asking for a narrower one still paid for the wider
+	 * scan. That is the "purely decorative parameter — no error, no warning, and a
+	 * plausible-looking empty result" failure this file's own history documents.
+	 */
+	readonly windowMs?: number;
+}
+
+/** One source's scan failure, for the caller to report in its own words. */
+interface ScanFailure {
+	readonly source: TranscriptSource;
+	readonly error: string;
+}
+
+/**
+ * What {@link scanAllStores} found, and what it could not read.
+ *
+ * The failures are RETURNED rather than logged here, and that is the fix for a real
+ * flood: this function is called once per `dbRescanSessions` tick, so one standing
+ * condition (`~/.codex` permissions, an unmounted volume) was one WARN every 30
+ * seconds — 2,880 a day, tick 1 and tick 2,880 indistinguishable — which is precisely
+ * what `SessionRescanTask`'s once-per-situation reporting exists to prevent. It also
+ * carried the `DbBackfill` module tag, so `grep AgentScan …/debug.log` did not return
+ * it, contradicting that file's header promise.
+ *
+ * Reporting belongs to the caller for a second reason: the two callers' consequences
+ * are OPPOSITE. The back-fill genuinely falls back to a per-repo scan; the re-scan
+ * hands the collector an empty loader precisely so that fallback cannot run. That used
+ * to be threaded back IN as an English sentence (`onFailure`) purely to interpolate
+ * into the warn line here — the data layer carrying prose so it could describe a
+ * decision it does not make.
+ */
+interface ScanAllStoresResult {
+	readonly scanned: PreScannedSessions;
+	readonly failures: ReadonlyArray<ScanFailure>;
+}
+
+async function scanAllStores(opts: ScanAllStoresOptions): Promise<ScanAllStoresResult> {
+	const { alreadyRecorded, sources = SESSION_SOURCES, windowMs } = opts;
 	const scanned = new Map<TranscriptSource, ReadonlyArray<unknown>>();
+	const failures: ScanFailure[] = [];
 	// Concurrent, and the results are collected by source tag rather than positionally:
 	// a positional destructure is a second ordering to keep in step with the registry,
 	// and getting it wrong would file one agent's sessions under another's name.
 	await Promise.all(
-		SESSION_SOURCES.map(async (def) => {
+		sources.map(async (def) => {
 			// `alreadyRecorded` reaches only the definitions that declare they use it —
 			// the two whose per-session read is expensive enough to be worth skipping.
 			// Passing it to the rest would be harmless but misleading: it would read as a
 			// promise that every scanner honours it.
 			const opts = {
-				windowMs: BACKFILL_SESSION_WINDOW_MS,
+				windowMs: windowMs ?? BACKFILL_SESSION_WINDOW_MS,
 				...(alreadyRecorded && def.usesAlreadyRecorded ? { alreadyRecorded } : {}),
 			};
 			try {
@@ -1765,15 +2007,33 @@ async function scanAllStores(alreadyRecorded?: AlreadyCurrent): Promise<PreScann
 				// exists precisely for this case would never run.
 				scanned.set(def.source, result as ReadonlyArray<unknown>);
 			} catch (err) {
-				log.warn(
-					"%s scan failed -- back-fill falls back to per-repo scans for it: %s",
-					def.source,
-					errMsg(err),
-				);
+				// The FACT is this function's; the CONSEQUENCE belongs to the caller. See
+				// {@link ScanAllStoresResult} for why nothing is logged here.
+				failures.push({ source: def.source, error: errMsg(err) });
 			}
 		}),
 	);
-	return Object.fromEntries(scanned) as PreScannedSessions;
+	return { scanned: Object.fromEntries(scanned) as PreScannedSessions, failures };
+}
+
+/**
+ * {@link scanAllStores} for the callers that want one WARN per failing source, now.
+ *
+ * The back-fill's shape: it runs when a user asked for it, so a line per failing source
+ * per run is proportionate, and `consequence` is that caller's own sentence about what
+ * happens to those sessions. `dbRescanSessions` deliberately does NOT use this — at
+ * 30-second cadence the same line is 2,880 a day, so it carries the failures out to
+ * `SessionRescanTask`, which says them once per situation under the `AgentScan` tag.
+ */
+async function scanAllStoresLoggingFailures(
+	opts: ScanAllStoresOptions,
+	consequence: string,
+): Promise<PreScannedSessions> {
+	const { scanned, failures } = await scanAllStores(opts);
+	for (const failure of failures) {
+		log.warn("%s scan failed -- %s: %s", failure.source, consequence, failure.error);
+	}
+	return scanned;
 }
 
 /**
@@ -1957,7 +2217,15 @@ export async function dbBackfillRepos(
 		rest.preScanned ??
 		(live.length === 0 || rest.loadSessions
 			? {}
-			: await scanAllStores(await readRecordedSessions(live, rest.dbPath)));
+			: await scanAllStoresLoggingFailures(
+					{ alreadyRecorded: await readRecordedSessions(live, rest.dbPath) },
+					// The back-fill's own consequence, which is NOT the re-scan's: absence from
+					// `preScanned` is what makes the collector fall back to this source's per-repo
+					// scan, so the sessions may still be picked up. Once per run, because a
+					// back-fill is something a user asked for — unlike the 30-second tick, whose
+					// caller says this once per situation instead.
+					"back-fill falls back to per-repo scans for it",
+				));
 
 	const results: DbBackfillResult[] = [];
 	for (const [i, repo] of live.entries()) {
@@ -1987,4 +2255,608 @@ export async function dbBackfillRepos(
 	// repos that were worked on first, and these carry no per-repo detail to
 	// interleave with them.
 	return [...results, ...unavailable];
+}
+
+/** Options for {@link dbRescanSessions}. */
+export interface SessionRescanOptions {
+	/** Registry entries to consider. Ones with no checkout left on disk are dropped. */
+	readonly repos: ReadonlyArray<RegisteredRepo>;
+	/**
+	 * Which sources to re-scan, defaulting to the registry entries that opted in.
+	 *
+	 * An empty list is a valid answer and means "do nothing" — see
+	 * {@link DAEMON_RESCAN_SOURCES} and `SessionSourceSpec.daemonRescan` for the one
+	 * property a source must have before a timer over it can find anything.
+	 */
+	readonly sources?: ReadonlyArray<SessionSourceDefinition>;
+	/** Discovery horizon. Defaults to the back-fill's, so both passes see one set. */
+	readonly windowMs?: number;
+	/** Test seam: path override for the dashboard DB. */
+	readonly dbPath?: string;
+	readonly now?: () => number;
+	readonly producerKind?: ProducerKind;
+	/** Test seam: use these scan results instead of reading the real stores. */
+	readonly preScanned?: PreScannedSessions;
+	/**
+	 * The gate that stops a session whose file has NOT changed from being emitted again.
+	 *
+	 * Maps a {@link sessionEventId} to the mtime this pass last emitted an event for.
+	 * OWNED BY THE CALLER and mutated here, because it has to outlive one tick — the
+	 * task holds it, which also keeps each task instance clean and lets a test drive
+	 * several ticks against one map.
+	 *
+	 * ## What it is for, and why the two existing gates cannot do it
+	 *
+	 * Both of those read the projection's OUTPUT: `readKnownSessions` queries the
+	 * `sessions` table and `unchangedSessionEvent` compares against the stored row. A
+	 * session whose event FAILED to project has no row for either of them to see, so
+	 * both answer "never processed" — the transcript is re-read and an identical event
+	 * is appended to `events_raw` on every single tick, forever, and those rows are
+	 * never pruned (the prune only deletes `projected` ones). This map is the only
+	 * thing that can answer "I already emitted for this version", because it records
+	 * what this pass DID rather than what the projection achieved.
+	 *
+	 * ## Why the recorded value is the OBSERVED mtime and never a write instant
+	 *
+	 * The mtime is sampled BEFORE the transcript is read, so the value stored here is
+	 * always at or before the content actually read. The next tick's mtime is therefore
+	 * greater whenever anything was appended, and the worst this gate can do is cause
+	 * one redundant re-read. Recording the WRITE instant instead reverses the direction
+	 * of that error: everything appended between the read and the insert would be
+	 * stamped already-seen and become permanently invisible if the session then stopped.
+	 *
+	 * Deliberately NOT persisted. A restart re-seeds it from the log — see
+	 * {@link seedEmitted} — which is what keeps a restart from re-emitting for every
+	 * already-parked session.
+	 *
+	 * ## REQUIRED, and that is the whole guarantee
+	 *
+	 * It used to default to a fresh `new Map()`. That reads as a harmless convenience and
+	 * is the bug back: a caller that omits it gets a gate scoped to ONE invocation, so
+	 * every discovered session looks un-emitted and one identical `events_raw` row is
+	 * written per session per call — the ~2,880-rows-a-day growth this map exists to stop,
+	 * reachable again by leaving out one argument, with no type error and no failing test.
+	 * A future caller (a VS Code tick, an ide-bridge action, a `jolli doctor --fix`, a
+	 * second daemon task) must therefore decide where the state lives before it can call
+	 * this at all. Nothing may reintroduce a default here.
+	 */
+	readonly emitted: Map<string, number>;
+	/**
+	 * Seed {@link emitted} from the write-ahead log during this pass.
+	 *
+	 * Set on a process's FIRST tick only. Seeding is a full table scan, and repeating
+	 * it would put that scan on the 30-second path — which is exactly what holding the
+	 * map in memory exists to avoid.
+	 */
+	readonly seedEmitted?: boolean;
+	/**
+	 * Cap on {@link emitted}, which is the caller's memory budget for it.
+	 *
+	 * Enforced by REFUSING NEW KEYS once reached — never by clearing the map. That is the
+	 * opposite of the whole-map policy the two `CodexSessionDiscoverer` memos use, and the
+	 * asymmetry is the point: their refill is one `readdir` or one first-line read, while
+	 * this map's refill is a full scan of the largest table in the database PLUS
+	 * re-emitting an event for every already-parked session. Clearing it therefore cannot
+	 * converge — the seed is drawn from the same population that just overflowed, so the
+	 * next tick refills past the limit and clears again, every 30 s for the machine's whole
+	 * uptime, with the gate empty the entire time. Refusing new keys degrades instead: the
+	 * newest `emittedLimit` sessions stay gated and anything beyond them is re-read as it
+	 * was before the gate existed.
+	 *
+	 * Refreshing a key the map already holds is always allowed — that is the freshness
+	 * update the gate runs on, and it cannot grow the map.
+	 *
+	 * ## The seed alone can consume the whole budget
+	 *
+	 * `readEmittedFromLog` is given this same number as its `LIMIT`, so on a database with at
+	 * least this many distinct session events the FIRST tick fills the map before phase 2 has
+	 * scanned anything — and from then on no session discovered this process's whole life can
+	 * enter it. That is the degradation above rather than a separate fault (the seed IS the
+	 * newest `emittedLimit` sessions), and it is left as is deliberately: with the cap at
+	 * 50,000 and `projected` rows pruned at `PROJECTED_RETENTION_DAYS`, reaching it needs a
+	 * population no real machine produces. Worth stating because the arithmetic is invisible
+	 * at the call site, and because the reason it is tolerable is the SIZE of the cap — halve
+	 * it and the honest fix is to seed to a fraction of the budget rather than all of it, so
+	 * the sessions this tick discovers still have somewhere to go.
+	 */
+	readonly emittedLimit?: number;
+	/**
+	 * Called once, the moment the seed has been merged into {@link emitted}.
+	 *
+	 * A CALLBACK rather than a field on the result, because the caller's use for it is a
+	 * once-per-process flag and a result cannot be observed when the call REJECTS. Two
+	 * failure sites live after the seed — phase 3's `withDashboardDb` (write contention
+	 * with a git hook is enough) and anything `applyBatches` throws — so keying the flag
+	 * off the resolved value meant a standing fault put the full-table scan back on the
+	 * 30-second path while the merge it produced was already in memory and paid for.
+	 */
+	readonly onSeeded?: () => void;
+}
+
+/**
+ * What one {@link dbRescanSessions} pass did — enough for a single log line, with
+ * nothing the caller would have to reopen the database to learn.
+ */
+export interface SessionRescanResult {
+	/** Repos actually worked on: a live checkout AND a session baseline. */
+	readonly reposScanned: number;
+	/** Live repos passed over for want of a baseline. See {@link dbRescanSessions}. */
+	readonly reposWithoutBaseline: number;
+	/**
+	 * Sessions seen across those repos, counted per repo — two checkouts of one
+	 * project each claiming the same conversation count it twice, on the same basis
+	 * the back-fill's own per-source totals are counted.
+	 */
+	readonly discovered: number;
+	/** Sessions that were not skipped, i.e. re-read in full and re-projected. */
+	readonly processed: number;
+	readonly eventsApplied: number;
+	/** Sources whose machine-wide scan failed this pass. */
+	readonly failedSources: ReadonlyArray<TranscriptSource>;
+	/**
+	 * Events parked unprojected across the WHOLE database, not just this pass's repos.
+	 *
+	 * Machine-wide on purpose: it is a health number, and the daemon is the one process
+	 * that can report it without a user asking.
+	 *
+	 * Counts only the parked events this build cannot revive by itself — see
+	 * {@link countStuckEvents}. The `unknown-type` rows a later build un-parks on its next
+	 * writable open are excluded, because warning about those tells the user to look at
+	 * something that is already fixing itself.
+	 */
+	readonly failedEvents: number;
+	/**
+	 * Why the pass did nothing, when it did nothing for a reason that is not "no repo
+	 * has a baseline yet".
+	 *
+	 * Three separate situations used to arrive at the caller as one all-zero result,
+	 * and it rendered them all as "no baseline yet for 0 repo(s) -- run 'jolli
+	 * dashboard' once": a suggestion that would change nothing, for a count of zero,
+	 * about repos that may not exist. `no-sources` is the documented one-line off
+	 * switch (`DAEMON_RESCAN_SOURCES` empty), which is supposed to read as "nothing to
+	 * do"; `no-live-repos` is every registered checkout having been deleted; and
+	 * `no-database` is a machine that has never opened the dashboard, which this pass
+	 * answers rather than fixes — see the docblock on why a background timer must not
+	 * create the database.
+	 *
+	 * `database-unusable` is the fourth, and it is deliberately NOT folded into
+	 * `no-database`: the file is there and cannot be read. `existsSync` answers only the
+	 * first of those questions — a zero-byte or truncated `jollimemory.db` (a crashed
+	 * create, an interrupted copy, a disk that filled) opens READ-ONLY without error and
+	 * throws on the first statement instead. Left as a rejection it became one warn for the
+	 * daemon's entire lifetime followed by permanent silence, because the once-only dedup
+	 * keys on the message; as an idle reason it is reported like any other outcome and
+	 * `jolli doctor` can say so too.
+	 *
+	 * Reported rather than derived by the caller. The derivation is available today —
+	 * all-zero plus a non-empty source list can only mean no live checkout — but it is
+	 * an inference across a module boundary that a fifth early return would silently
+	 * invalidate.
+	 */
+	readonly idleReason?: "no-sources" | "no-live-repos" | "no-database" | "database-unusable";
+}
+
+/**
+ * Re-projects a FEW sources' sessions across every registered repo — the global
+ * daemon's timer tick.
+ *
+ * ## Why this is not `dbBackfillRepos`
+ *
+ * The two answer different questions. `jolli dashboard` rebuilds everything a repo
+ * has (git history, summaries, the SOT import, worktree state), which on a two-repo
+ * machine measured 22 s and 11 s in the git tier alone — fine for something a user
+ * asked for, impossible on a timer. This pass touches ONE tier and only the sources
+ * that opted in, so a converged tick parses no transcript and writes no session row.
+ * It is not free: the scan still stats every rollout on disk and reads the first line
+ * of every rollout inside the window, and phase 1 below still opens the database. See
+ * `SessionRescanTask`'s header for what the interval is actually a budget against.
+ *
+ * It also deliberately shares the parts where drift would be invisible:
+ * {@link alreadyCurrentFrom} is the same predicate, `collectSessionEvents` is the
+ * same collector, `unchangedSessionEvent` is the same no-op filter, and `applyBatches`
+ * is the same idempotent writer. A session re-read here produces exactly the row a
+ * dashboard run would have produced — and, because the filter is shared too, it
+ * produces exactly the same `events_raw` rows as well, which at this cadence is the
+ * half that matters (see phase 3).
+ *
+ * ## Why a repo needs a baseline first — and why ANY generation is one
+ *
+ * A repo that has never completed a full session pass has no trustworthy set of stored
+ * instants to compare against: `readKnownSessions` would answer with an empty or partial
+ * map, every discovered session would look new, and the timer would re-parse the repo's
+ * whole 7-day history on its first tick. `CURSOR_SESSIONS_GENERATION`'s PRESENCE is what
+ * rules that out, so a repo with no cursor at all is passed over and one
+ * `jolli dashboard` run establishes it.
+ *
+ * The presence, NOT the value — and that distinction is the whole point of this
+ * paragraph. Requiring an exact match against {@link SESSION_READ_GENERATION} was the
+ * original spelling and it made every generation bump switch this feature OFF for every
+ * installed machine: on upgrade each repo still carries the previous number, so `ready`
+ * is empty everywhere, the pass warns once about a missing baseline, and the timer does
+ * nothing until the user opens the dashboard. That is exactly the user this task exists
+ * for — "a user who never opens the dashboard … had that usage recorded nowhere". The
+ * value has no work to do here either: what a generation bump buys is a full RE-READ so
+ * an improved scanner reaches already-stored sessions, and that is the back-fill's job
+ * (`readRecordedSessions` still demands an exact match, deliberately — do not loosen
+ * that one). A repo on an older generation has real read receipts; they are simply the
+ * old scanner's, which is the same state the timer leaves an unchanged session in
+ * anyway.
+ *
+ * Note the seed case is NOT what this gate protects against, despite being the obvious
+ * reading: `readKnownSessions` already excludes a commit-summary seed per row, by
+ * requiring `started_at_ms`/`duration_ms`. `projectSession` carries the same predicate
+ * for the same reason — see the monotonic guard there.
+ *
+ * ## What this must never write
+ *
+ * `CURSOR_SESSIONS_GENERATION` — it is the claim "a FULL session pass completed for
+ * this repo", and this pass reads a subset of sources by design. Writing it would
+ * turn on scan-level skipping for the eleven sources this tick never looked at, whose
+ * rows may not exist yet. `CURSOR_SESSIONS` is left alone too: it is observability
+ * for the back-fill's own progress, and a timer advancing it would describe work the
+ * back-fill did not do.
+ *
+ * ## What runs concurrently, and the one barrier that remains
+ *
+ * The expensive half — reading and parsing the conversations that moved — is a SHARED
+ * QUEUE, not a per-source batch. `collectSessionEvents` merges every source's
+ * sessions into one list before it fans out, and `mapWithConcurrency` hands its 8
+ * workers the next item off that list as each finishes. So a source with fifty
+ * changed conversations and one with two do not get a worker each: they share all
+ * eight, and no worker idles while another source still has work. That property is
+ * what makes adding sources safe, and it is the collector's, not this function's.
+ *
+ * The barrier is EARLIER, in `scanAllStores`: its `Promise.all` means every source's
+ * store must be read before the first conversation is parsed. Today that costs
+ * nothing measurable — a scan is one `stat` per file (~10 ms across 460 Codex
+ * rollouts) against tens of milliseconds of parsing — and with one opted-in source
+ * there is nothing to wait for at all. It becomes worth removing only if some future
+ * source's SCAN approaches its parse cost (a scan that opens a SQLite per
+ * conversation, say), and the fix then is to stream each source's result into the
+ * shared queue as it lands rather than to widen anything.
+ *
+ * Repos are walked one at a time; see the comment on that loop for why concurrency
+ * there would add contention rather than throughput.
+ *
+ * ## The emission gate, and why it is half in memory and half in the log
+ *
+ * `emitted` is what stops a session whose projection FAILED from being re-read and
+ * re-emitted on every tick. Neither existing gate can: both read the projection's
+ * OUTPUT, and a failed projection has none, so both answer "never processed" forever.
+ * Left alone that is one identical `events_raw` row every 30 s — 2,880 a day, never
+ * pruned, because the prune only deletes `projected` rows — plus five projection
+ * attempts and their log lines for each. It records what this pass DID, not what the
+ * projection achieved, which is the one question that distinguishes the two states.
+ *
+ * The value recorded is the OBSERVED mtime, sampled before the transcript is read, so
+ * it can only ever cause a redundant re-read and never a missed append. A write
+ * instant would reverse that; see `SessionRescanOptions.emitted`.
+ *
+ * It lives in the CALLER's memory and is SEEDED from the log at startup, and both
+ * halves are load-bearing. Memory keeps the per-tick cost at a hash lookup instead of
+ * a full scan of the largest table — `events_raw` has no `event_id` index, on purpose.
+ * The seed is what stops a restart re-emitting once for every already-parked session.
+ * The residue of that choice is that a restart no longer RETRIES a parked session
+ * either, so a session whose projection a later build could handle is healed by
+ * `jolli dashboard` rather than by the next restart — accepted, and the reason the
+ * back-fill deliberately does not share this gate.
+ *
+ * ## Why the database is opened twice rather than held
+ *
+ * The scan and the per-session reads are disk I/O measured in hundreds of
+ * milliseconds, and every dashboard write takes SQLite's single writer lock. Holding
+ * the handle across the scan would put a background timer between a user's git hook
+ * and the lock it needs, every 30 s. So: read baselines, close, scan and collect with
+ * nothing held, reopen only to apply. (The handle would in fact survive an async
+ * callback — `withDashboardDb` awaits inside its `try` — so this is about lock
+ * duration, not correctness.)
+ *
+ * Phase 1 is the READ-ONLY handle and phase 3 the writable one, which is the boundary
+ * `DashboardDb`'s header calls hard. Phase 1 only reads two cursors, a session map and
+ * a count, so the writable handle bought it nothing and cost it three things at
+ * 30-second cadence: the migration pass and the ownership chmod ran 2,880 times a day,
+ * the open contended with git hooks and the extension tick for SQLite's single writer,
+ * and on a machine that had never opened the dashboard a background timer CREATED the
+ * database. The last of those is why the swap needed more than a handle change — a
+ * read-only open throws where the writable one creates — so an absent database is now
+ * an explicit idle answer (`idleReason: "no-database"`) rather than a reason to make
+ * one. Phase 3 stays writable because it writes.
+ */
+export async function dbRescanSessions(opts: SessionRescanOptions): Promise<SessionRescanResult> {
+	const sources = opts.sources ?? DAEMON_RESCAN_SOURCES;
+	const now = opts.now ?? Date.now;
+	// `bootstrap`, like the back-fill: this reconstructs state from records already on
+	// disk, which is what that producer means. Deliberately not a new `ProducerKind` —
+	// the tag is stored on every event row, and adding a value for a pass whose output
+	// is byte-identical to the back-fill's would split one fact across two names.
+	const producerKind = opts.producerKind ?? "bootstrap";
+	const windowMs = opts.windowMs ?? BACKFILL_SESSION_WINDOW_MS;
+	const dbOpts = opts.dbPath ? { dbPath: opts.dbPath } : {};
+	const emitted = opts.emitted;
+	const emittedLimit = opts.emittedLimit;
+	/**
+	 * Records one emission, honouring the caller's cap.
+	 *
+	 * Refusing a NEW key when full, never clearing — see
+	 * {@link SessionRescanOptions.emittedLimit} for why the whole-map policy the memos use
+	 * cannot converge here. Refreshing a key already present is always allowed: it is the
+	 * freshness update the gate runs on and it cannot grow the map.
+	 */
+	const rememberEmitted = (key: string, mtimeMs: number): void => {
+		if (emittedLimit !== undefined && emitted.size >= emittedLimit && !emitted.has(key)) return;
+		emitted.set(key, mtimeMs);
+	};
+	/** The all-zero answer, for every path that returns before phase 1 measured anything. */
+	const idleWith = (idleReason: SessionRescanResult["idleReason"]): SessionRescanResult => ({
+		reposScanned: 0,
+		reposWithoutBaseline: 0,
+		discovered: 0,
+		processed: 0,
+		eventsApplied: 0,
+		failedSources: [],
+		// Every path that uses this returns BEFORE phase 1 reads the database, so this is
+		// genuinely unknown rather than zero. Reported as 0 because the caller's only use
+		// is "warn once when it is non-zero", and a guess would be worse than a pass that
+		// stays quiet.
+		failedEvents: 0,
+		idleReason,
+	});
+
+	if (sources.length === 0) return idleWith("no-sources");
+	// Same predicate the back-fill uses, and for the same reason: `existingWorktrees`
+	// falls back to the recorded path, so a repo whose checkout is gone would have this
+	// pass narrowing sessions against a directory that does not exist.
+	const live = opts.repos.filter(hasLiveWorktree);
+	if (live.length === 0) return idleWith("no-live-repos");
+
+	// A read-only open THROWS on an absent file where the writable one creates it, and a
+	// background timer has no business creating a machine-global database — so absence is
+	// answered here rather than discovered inside phase 1. Checked on the same path the
+	// handle would use, `dbPath` seam included, so a test cannot land on a different file
+	// than the one this decision was made about.
+	if (!existsSync(opts.dbPath ?? getDashboardDbPath())) return idleWith("no-database");
+
+	// Phase 1 — baselines, the emission-gate seed, and the health count. One short
+	// READ-ONLY open with no I/O inside it; see the docblock on why the handle matters
+	// here even though every statement below is a SELECT.
+	let phase1: {
+		readonly baselines: Map<string, ReadonlyMap<string, number>>;
+		readonly seed: Map<string, number> | undefined;
+		readonly failedEvents: number;
+	};
+	try {
+		phase1 = await withReadonlyDashboardDb((db) => {
+			const baselines = new Map<string, ReadonlyMap<string, number>>();
+			for (const repo of live) {
+				// PRESENCE, not equality — see "why ANY generation is one" in the docblock. An
+				// exact match against this build's number turned every generation bump into a
+				// silent, machine-wide off switch for this whole feature. Empty counts as
+				// absent: the cursor column is a free-form string, and "" is not a generation
+				// any pass ever claimed to have completed.
+				if (!readCursor(db, repo.repoIdentity, CURSOR_SESSIONS_GENERATION)) continue;
+				baselines.set(repo.repoIdentity, readKnownSessions(db, repo.repoIdentity));
+			}
+			return {
+				baselines,
+				seed: opts.seedEmitted ? readEmittedFromLog(db, emittedLimit) : undefined,
+				failedEvents: countStuckEvents(db),
+			};
+		}, dbOpts);
+	} catch (err) {
+		// The file exists and cannot be used — a state `existsSync` above cannot see and
+		// this pass cannot repair (it deliberately never migrates). Left as a rejection it
+		// became ONE warn for the daemon's whole lifetime, because the caller's dedup keys
+		// on the message; as an idle reason it is reported like every other outcome. DEBUG
+		// here rather than WARN: at 30-second ticks a standing fault is 2,880 lines a day,
+		// and the caller is the one that knows how to say a thing once.
+		log.debug("AgentScan: dashboard database unusable: %s", errMsg(err));
+		return idleWith("database-unusable");
+	}
+	const { baselines, failedEvents } = phase1;
+	// Seeded, never merged OVER. Both sides are observed mtimes now, so this can no longer
+	// be the downgrade it once guarded against — but NEITHER ORDERING IS GUARANTEED, so
+	// the choice still has to be made deliberately rather than derived. The seed is the
+	// newest ROW's instant, and this process can hold an entry with no row of its own
+	// behind it: the map is recorded from `entry.events` rather than from `changed` (see
+	// there), so a session the unchanged-filter dropped is entered here while nothing is
+	// written; and a row it did write can later be pruned, the prune deleting only
+	// `projected` rows while an older producer's `failed` one survives untouched.
+	//
+	// So what this keeps is not "the narrower of the two" — it is the observation THIS
+	// process made and verified on this tick, which is the one it can account for.
+	if (phase1.seed !== undefined) {
+		for (const [key, ms] of phase1.seed) if (!emitted.has(key)) rememberEmitted(key, ms);
+		// Announced HERE, before anything that can throw, rather than on the result — see
+		// `onSeeded`. The merge is done and paid for at this point, so the caller's
+		// once-per-process flag is entitled to flip even if a later phase fails.
+		opts.onSeeded?.();
+	}
+
+	const ready = live.filter((repo) => baselines.has(repo.repoIdentity));
+	if (ready.length === 0) {
+		// Spelled out rather than spread over `idleWith`'s zeros: phase 1 DID run, so
+		// `failedEvents` is measured here and this is a real answer rather than an idle one.
+		// Borrowing the idle shape for it is what made three fields look like copy-paste
+		// omissions.
+		return {
+			reposScanned: 0,
+			reposWithoutBaseline: live.length,
+			discovered: 0,
+			processed: 0,
+			eventsApplied: 0,
+			failedSources: [],
+			failedEvents,
+		};
+	}
+
+	// Phase 2 — one machine-wide scan for the whole tick, then per-repo narrowing.
+	// Nothing is held open here.
+	//
+	// `alreadyRecorded` is deliberately not passed: it only reaches sources that
+	// declare `usesAlreadyRecorded`, and none of the opted-in ones does — their scans
+	// are a `stat` per session, where the check would cost about what it saves. A
+	// future opt-in whose scan is expensive (a whole-transcript parse, a SQLite open
+	// per conversation) should pass one, built from `baselines` rather than from a
+	// third database read.
+	// No fallback here, deliberately — the empty loader below is what confines the
+	// tick to `sources`, so a failed scan means this tick sees none of that source's
+	// sessions and the next one retries from scratch.
+	//
+	// NOT `scanAllStoresLoggingFailures`: at 30-second cadence one WARN per failing source
+	// per tick is 2,880 a day for a standing condition. The names go out on the result and
+	// `SessionRescanTask` says them once per situation; the REASON is kept here at DEBUG,
+	// under the `AgentScan` prefix so one grep still returns it when debug is on.
+	const scan = opts.preScanned ? undefined : await scanAllStores({ sources, windowMs });
+	const preScanned = opts.preScanned ?? (scan?.scanned as PreScannedSessions);
+	for (const failure of scan?.failures ?? []) {
+		log.debug("AgentScan: %s scan failed -- its sessions are skipped this tick: %s", failure.source, failure.error);
+	}
+	// Derived from ABSENCE rather than from `scan.failures`, and that is deliberate: it is
+	// the collector's own empty-versus-absent rule, and it stays right for the
+	// `opts.preScanned` test seam, which has no failure list to read.
+	const failedSources = sources.filter((def) => preScanned[def.source] === undefined).map((def) => def.source);
+
+	let discovered = 0;
+	let processed = 0;
+	const pending: Array<{ repo: RegisteredRepo; events: ReadonlyArray<SessionUpsertedEvent> }> = [];
+	// Repos are walked one at a time, and that costs nothing worth reclaiming: the
+	// expensive half is inside `collectSessionEvents`, which already fans out its
+	// per-session reads against the process-wide I/O budget (8 slots, 64 MB). Running
+	// repos concurrently would have them competing for those same slots rather than
+	// adding any, while making a failure harder to attribute and the log order
+	// non-deterministic. The sources above ARE concurrent, because those are different
+	// stores.
+	for (const repo of ready) {
+		const known = baselines.get(repo.repoIdentity) ?? new Map<string, number>();
+		// The newest surviving checkout, exactly as `dbBackfillRepo` picks it: sessions
+		// are recorded per project, not per checkout.
+		//
+		// Not null-checked, and that is not an oversight: `existingWorktrees` is documented
+		// to never return empty while the repo is registered (it falls back to the recorded
+		// path), and `live` has already been filtered by `hasLiveWorktree`, so this repo has
+		// a checkout on disk. A guard here would be an unreachable branch spending the
+		// suite's branch-coverage floor and reading to the next maintainer as a real case.
+		const cwd = existingWorktrees(repo)[0] as string;
+		// Two questions, ORed. The shared predicate answers "the database already holds
+		// this version"; the emission gate answers "I already emitted for this version",
+		// which is the state the shared one structurally cannot see (see `emitted`).
+		//
+		// Composed HERE rather than folded into `alreadyCurrentFrom`, and that is a
+		// decision rather than a style: that helper is shared with `dbBackfillRepo`,
+		// where re-emitting is CORRECT. A dashboard run is the user asking for a rebuild,
+		// and re-trying a session whose projection failed is how a fixed parser heals it
+		// — a durable gate there would judge such a session permanently.
+		const dbCurrent = alreadyCurrentFrom(known);
+		const isAlreadyCurrent: AlreadyCurrent = (source, sessionId, updatedAtMs) => {
+			if (dbCurrent(source, sessionId, updatedAtMs)) return true;
+			const last = emitted.get(sessionEventId(repo.repoIdentity, source, sessionId));
+			// `>=`, matching `alreadyCurrentFrom`: both sides are mtimes, so an equal
+			// instant is the same version and a re-read would only write it back.
+			return last !== undefined && last >= updatedAtMs;
+		};
+		try {
+			const events = await collectSessionEvents({
+				repoIdentity: repo.repoIdentity,
+				cwd,
+				windowMs,
+				preScanned,
+				// Every session in this pass comes from `preScanned`, which the collector
+				// narrows itself. The empty loader is what CONFINES the tick to `sources`:
+				// the default `loadAllSessions` would run the per-repo discoverer of every
+				// source that was not pre-scanned — eleven agents' stores, once per repo,
+				// every 30 s — and would also pull in `sessions.json`, whose Claude and
+				// Gemini rows this pass has no baseline reasoning for.
+				loadSessions: async () => [],
+				isAlreadyCurrent,
+				onCounts: (seen) => {
+					discovered += seen.discovered;
+				},
+			});
+			processed += events.length;
+			if (events.length > 0) pending.push({ repo, events });
+		} catch (err) {
+			// One repo's failure must not cost the others their tick. No result row and no
+			// terminal to print to — this is a daemon — so a warn in the log is the signal.
+			// `AgentScan` prefix on purpose: this line comes from a different module than
+			// the task's own output, and one grep has to return both.
+			log.warn("AgentScan: session re-scan failed for %s: %s", repo.repoName, errMsg(err));
+		}
+	}
+
+	const totals = {
+		reposScanned: ready.length,
+		reposWithoutBaseline: live.length - ready.length,
+		discovered,
+		processed,
+		failedSources,
+		failedEvents,
+	};
+
+	// Phase 3 — apply. Second short open, no I/O inside.
+	//
+	// Skipped entirely on the converged tick, which is the one that runs 99 ticks out of
+	// 100: nothing changed, so there is nothing to write. Phase 1's open has already
+	// happened either way — see the docblock. Guarding the OPEN rather than returning early
+	// keeps one exit and one `eventsApplied`.
+	//
+	// `unchangedSessionEvent` is the SAME filter `dbBackfillRepo` runs ahead of its own
+	// `applyBatches`, and sharing it is not tidiness — it is what makes this pass's claim
+	// to be idempotent true of the events table and not only of the projection. Every
+	// event still reaches Tx1 of `applyToDb` as an `events_raw` row whether or not it
+	// changes anything, and a session with no read receipt (`readKnownSessions` counts
+	// only `started_at_ms`/`duration_ms`, so a rollout that parsed to zero entries has
+	// none) is re-read on EVERY tick, forever, while it stays inside the window —
+	// measured: 1 of 16 in-window Codex rollouts on one real machine. Unfiltered that is
+	// one identical row every 30 s, 2,880 a day, kept for `PROJECTED_RETENTION_DAYS`.
+	// The back-fill never paid it because a dashboard run is rare; a timer is not.
+	let eventsApplied = 0;
+	if (pending.length > 0)
+		await withDashboardDb((db) => {
+			for (const entry of pending) {
+				const stored = storedSessionRows(db, entry.repo.repoIdentity);
+				// Empty is a no-op inside `applyBatches`, exactly as in the back-fill — so a
+				// repo whose every event was unchanged also skips its pending drain there.
+				const changed = entry.events.filter(
+					(event) => !unchangedSessionEvent(event, stored.get(`${event.source}\0${event.sessionId}`)),
+				);
+				if (changed.length !== entry.events.length) {
+					// DEBUG, not the back-fill's INFO: at this cadence the unchanged case is the
+					// normal one, and an INFO here would be the per-tick line this feature's
+					// logging exists to avoid.
+					log.debug(
+						"AgentScan: %s: %d of %d session event(s) unchanged, skipping their projection",
+						entry.repo.repoName,
+						entry.events.length - changed.length,
+						entry.events.length,
+					);
+				}
+				eventsApplied += applyBatches(db, changed, producerKind, now).applied;
+				// Recorded from `entry.events`, NOT from `changed`. A session filtered out by
+				// `unchangedSessionEvent` was still READ this tick, and the whole point of the
+				// gate is to stop the NEXT tick reading it again — that filter only ever
+				// prevented the write. Recorded AFTER the apply so a throw here leaves the
+				// session un-gated and the next tick retries it.
+				for (const event of entry.events) {
+					rememberEmitted(
+						sessionEventId(entry.repo.repoIdentity, event.source, event.sessionId),
+						event.updatedAtMs,
+					);
+				}
+			}
+			// The same housekeeping the other two apply paths run (`applyStatsEvents` and
+			// `dbBackfillRepo`), and this is the path that most needs it: on the machine this
+			// feature exists for — a user who never opens the dashboard — the timer is the ONLY
+			// writer of `session.upserted` rows, so without a prune here nothing ever deletes a
+			// `projected` row past `PROJECTED_RETENTION_DAYS` and the table only grows. That
+			// feeds straight back into the emission gate, whose startup seed is a full scan of
+			// exactly this table. Bounded per pass, inside the lock this write already holds,
+			// and it never touches a `failed` row.
+			//
+			// Tagged, like every other line this pass can emit — see `pruneProjectedEvents`. The
+			// prune is shared with two user-triggered paths that want no prefix, so the caller
+			// supplies it rather than the helper assuming one.
+			pruneProjectedEvents(db, now, "AgentScan: ");
+		}, dbOpts);
+
+	return { ...totals, eventsApplied };
 }

@@ -35,8 +35,10 @@ export type SkillLineScanner = (lines: ReadonlyArray<string>, fromLine: number) 
 
 const SCANNERS: Partial<Record<TranscriptSource, { source: SkillSource; scan: SkillLineScanner }>> = {
 	claude: { source: "claude", scan: scanClaudeSkillLines },
-	// Codex is HEURISTIC — it has no skill tool, only shell commands that read a
-	// SKILL.md. Every entry it produces carries `detection: "heuristic"`.
+	// Codex produces BOTH kinds, because its two hosts differ. Codex Desktop injects a
+	// `<skill>` block on a real entry (observed, no marker); the CLI has no such
+	// mechanism, so there it stays an inference from a shell command that read a
+	// SKILL.md (`detection: "heuristic"`). See `CodexSkillScanner`.
 	codex: { source: "codex", scan: scanCodexSkillLines },
 	// Kimi ships a real `Skill` tool, so its invocations are OBSERVED (no
 	// `detection` marker) — its wire.jsonl carries a `tool.call` named "Skill".

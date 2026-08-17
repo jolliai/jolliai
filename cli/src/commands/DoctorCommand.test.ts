@@ -971,3 +971,110 @@ describe("doctor --schema-log", () => {
 		process.exitCode = 0;
 	});
 });
+
+describe("doctor — parked events", () => {
+	it("reports parked events, and says nothing when there are none", async () => {
+		// Until this row a parked event was invisible in every direction: the projection
+		// wrote no `sessions` row to notice missing, nothing queries `events_raw`, and
+		// the prune deletes only `projected` rows so a failure does not even age out.
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-parked-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
+		try {
+			const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
+
+			// No database at all — a normal state, not a fault, so the row is absent
+			// rather than reading a confident "0".
+			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
+
+			// An empty database says nothing either.
+			await withDashboardDb(() => undefined);
+			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
+
+			await withDashboardDb((db) =>
+				db
+					.prepare(
+						`INSERT INTO events_raw
+						   (event_id, repo_identity, type, schema_version, received_at, data_json,
+						    projection_status, failed_kind, attempts)
+						 VALUES ('session:r:codex:s', 'r', 'session.upserted', 1, '2026-08-01T00:00:00.000Z',
+						         '{}', 'failed', 'error', 5)`,
+					)
+					.run(),
+			);
+
+			const out = (await runDoctor()).join("\n");
+			expect(out).toContain("Dashboard events");
+			expect(out).toContain("1 event(s) parked unprojected");
+		} finally {
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("does not count a row the next writable open revives by itself", async () => {
+		// `drainPending` un-parks `unknown-type` rows whose type this build now understands
+		// on every writable open — a version-skew artefact (an older CLI parked an event a
+		// newer VS Code build wrote) whose repair is the upgrade that already happened.
+		// Counting them made this row assert "some conversations may be missing from the
+		// dashboard", with no fixer to offer, for rows the next commit silently revives.
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-revivable-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(join(home, ".jolli", "jollimemory"));
+		try {
+			const { withDashboardDb } = await import("../dashboard/DashboardDb.js");
+			await withDashboardDb((db) =>
+				db
+					.prepare(
+						`INSERT INTO events_raw
+						   (event_id, repo_identity, type, schema_version, received_at, data_json,
+						    projection_status, failed_kind, attempts)
+						 VALUES ('session:r:codex:revivable', 'r', 'session.upserted', 1,
+						         '2026-08-01T00:00:00.000Z', '{}', 'failed', 'unknown-type', 5)`,
+					)
+					.run(),
+			);
+
+			expect((await runDoctor()).join("\n")).not.toContain("Dashboard events");
+		} finally {
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+
+	it("says a database that is present and unreadable, instead of nothing at all", async () => {
+		// The state the bare `catch { return null }` folded in with "no database": a zero-byte
+		// or truncated `jollimemory.db` opens READ-ONLY without error and throws on the first
+		// statement. It is also the state that permanently stops the daemon's re-scan, and the
+		// one command whose job is to tell these apart printed no row for it.
+		const { mkdirSync, mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-unreadable-"));
+		const restoreHome = setIsolatedHome(home);
+		const st = await import("../core/SessionTracker.js");
+		const configDir = join(home, ".jolli", "jollimemory");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(configDir);
+		try {
+			const { getDashboardDbPath } = await import("../dashboard/DashboardDb.js");
+			const dbPath = getDashboardDbPath();
+			mkdirSync(join(dbPath, ".."), { recursive: true });
+			writeFileSync(dbPath, "");
+
+			const out = (await runDoctor()).join("\n");
+			expect(out).toContain("Dashboard events");
+			expect(out).toContain("present but unreadable");
+		} finally {
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
+});

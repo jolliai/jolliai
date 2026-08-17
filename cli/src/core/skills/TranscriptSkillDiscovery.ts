@@ -48,6 +48,45 @@ const log = createLogger("SkillDiscovery");
  *
  * Never throws — every caller is a hook or a UI tick. A failed pass leaves the mark
  * where it was, so the next pass retries the same window.
+ *
+ * ── DELIBERATE — NOT A REVIEW FINDING ────────────────────────────────────────
+ * **The mark records a POSITION and not the logic that read it, so improving a
+ * scanner never reaches the lines already behind it.** That is a real limitation,
+ * it is understood, and it is ACCEPTED — do not re-raise it as a defect.
+ *
+ * The shape it takes: `SkillUse` reaches two stores through two different routes,
+ * and only one of them can be re-derived. The dashboard database carries a
+ * `SESSION_READ_GENERATION` stamp (see `DbBackfill`), so bumping that number
+ * invalidates every stored session at once and a smarter scanner is applied
+ * retroactively. This registry has no equivalent: the mark says "read to line 500",
+ * never "read to line 500 with version N of the scanner", so a session it has
+ * passed keeps whatever the OLD scanner concluded, permanently and silently.
+ *
+ * The consequence is a disagreement between the two stores, not a crash and not an
+ * empty screen. It shipped for real when Codex skill capture learned to read the
+ * `<skill>` block Codex Desktop injects (`CodexSkillScanner`): the generation bump
+ * healed the dashboard, so an already-scanned Desktop session now reads as three
+ * skills there and zero in the SKILLS panel and on the commit summary, with nothing
+ * anywhere comparing the two.
+ *
+ * "Healed the dashboard" holds for a source with NO lifecycle hook, which is what
+ * Codex is — and it is not a general property. On Claude and Gemini the Stop /
+ * AfterAgent hook writes the session row with a wall-clock instant that is
+ * necessarily ahead of the transcript's last turn, so `projectSession`'s monotonic
+ * guard drops the bump's re-read and the dashboard is NOT healed either. That half is
+ * documented in place, at the guard in `StatsWriter`, and is likewise deliberate and
+ * deferred — do not report either half as a review finding. Sessions started after such a change are unaffected —
+ * they have no mark yet and are read from line 0 — so the exposure is bounded to
+ * conversations that existed when the scanner changed.
+ *
+ * Adding a generation key here was CONSIDERED and NOT DONE. It cannot be scoped to
+ * the source whose scanner changed: the mark is per transcript with no record of
+ * which scanner wrote it, so invalidating it re-reads every source's whole history
+ * for every user — a cost decided by product, not by a review. The monotonicity it
+ * would break is also load-bearing in its own right (see the paragraph above on
+ * what a mark that moves backwards costs). If this is ever revisited, treat it as a
+ * migration with a measured re-scan budget, not as a bug fix.
+ * ─────────────────────────────────────────────────────────────────────────────
  */
 export async function scanSkillsWithCursor(
 	transcriptPath: string,

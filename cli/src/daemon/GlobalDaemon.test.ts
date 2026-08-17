@@ -7,6 +7,7 @@ import { encodeHandshakeLine, readHandshakeLine } from "../core/DaemonHandshake.
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { defaultTasks, runGlobalDaemon } from "./GlobalDaemon.js";
 import { parseGlobalDaemonHello } from "./GlobalDaemonProtocol.js";
+import { SESSION_RESCAN_TASK_NAME, SESSION_RESCAN_TICK_MS } from "./SessionRescanTask.js";
 import type { DaemonTask } from "./TaskScheduler.js";
 
 // `defaultTasks`' backup task calls the real snapshot engine, which touches
@@ -14,6 +15,16 @@ import type { DaemonTask } from "./TaskScheduler.js";
 // result branches never writes outside this test's control.
 vi.mock("../dashboard/Backup.js", () => ({
 	opportunisticSnapshot: vi.fn(),
+}));
+
+// The other default task re-scans agent conversations, and its first act is to read
+// this machine's repo registry — after which it would open the real dashboard
+// database. An empty registry makes it a no-op that still exercises the wiring under
+// test (the scheduler really does tick it), which mocking the task away would not.
+// Only this one export is replaced; `existingWorktrees` and the rest stay real.
+vi.mock("../dashboard/RepoRegistry.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../dashboard/RepoRegistry.js")>()),
+	listActiveRepos: vi.fn(async () => []),
 }));
 
 // Only the ownership gate is faked; every other handshake helper stays real —
@@ -241,6 +252,24 @@ describe("runGlobalDaemon — decisions taken before any bind", () => {
 
 		mockedSnapshot.mockResolvedValueOnce({ status: "skipped", reason: "too soon" });
 		await expect(task.run()).resolves.toBe("skipped: too soon");
+	});
+
+	it("carries the session re-scan at its declared interval", async () => {
+		// A unit test cannot see a task that was never registered, so the presence of this
+		// entry — and that its period is the constant rather than a literal — is pinned
+		// here rather than inferred from the re-scan's own tests.
+		const rescan = defaultTasks().find((task) => task.name === SESSION_RESCAN_TASK_NAME);
+
+		expect(rescan).toBeDefined();
+		expect(rescan?.tickIntervalMs).toBe(SESSION_RESCAN_TICK_MS);
+	});
+
+	it("the session re-scan reports an idle tick when no repo is registered", async () => {
+		// The whole point of the empty-registry mock above: the task runs for real, takes
+		// its earliest exit, and never reaches the dashboard database.
+		const rescan = defaultTasks().find((task) => task.name === SESSION_RESCAN_TASK_NAME);
+
+		await expect(rescan?.run()).resolves.toBe("no registered repos");
 	});
 });
 

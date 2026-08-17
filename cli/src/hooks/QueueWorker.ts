@@ -159,7 +159,7 @@ import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
-import { createLogger, errMsg, getJolliMemoryDir, setLogDir, setLogLevel } from "../Logger.js";
+import { applyConfiguredLogLevel, createLogger, errMsg, getJolliMemoryDir, setLogDir } from "../Logger.js";
 import { recordPendingIngest, wakePendingIngest } from "../sync/PendingIngest.js";
 import { recordPendingWorker, wakePendingWorkers } from "../sync/PendingWorkers.js";
 import { deriveMemoryBankRoot } from "../sync/SyncBootstrap.js";
@@ -184,7 +184,6 @@ import {
 	type IngestOperation,
 	isIngestOperation,
 	type JolliMemoryConfig,
-	type LogLevel,
 	type ModelTokenUsage,
 	type NoteReference,
 	type PlanProgressArtifact,
@@ -1994,9 +1993,11 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 	const commitSource: CommitSource = op.commitSource ?? "cli";
 	const commitType: CommitType = op.type === "amend" ? "amend" : (op.type as CommitType);
 
-	// Load config and initialize log level before any pipeline logging
+	// Load config and initialize log level before any pipeline logging. The `?? "info"`
+	// fallback lives in `applyConfiguredLogLevel` — it was duplicated here and in the global
+	// daemon, and it decides whether every `log.debug` in the process is written at all.
 	const config = await loadConfig();
-	setLogLevel(config.logLevel ?? "info", config.logLevelOverrides as Record<string, LogLevel> | undefined);
+	applyConfiguredLogLevel(config.logLevel, config.logLevelOverrides);
 
 	// Step 1: Get commit info from the queue entry's hash (not HEAD — HEAD may have moved)
 	let stepStart = now();

@@ -1,9 +1,9 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // import type { KnowledgeGraph } from "../graph/GraphSchema.js"; // parked with the graph case
-import { withDashboardDb } from "./DashboardDb.js";
+import { withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import type { CommitCreatedEvent, SessionUpsertedEvent, WorktreeStatusEvent } from "./DashboardModel.js";
 import type { RegisteredRepo } from "./RepoRegistry.js";
 
@@ -123,7 +123,8 @@ import {
 	collectSummaryEvents,
 	collectWorktreeEvent,
 } from "./DashboardCollector.js";
-import { dbBackfillRepo, dbBackfillRepos, pruneUnreachableCommits } from "./DbBackfill.js";
+import { sessionEventId } from "./DashboardModel.js";
+import { dbBackfillRepo, dbBackfillRepos, dbRescanSessions, pruneUnreachableCommits } from "./DbBackfill.js";
 import { importRepoMemory } from "./SotImport.js";
 
 let dir: string;
@@ -277,7 +278,7 @@ describe("dbBackfillRepo — bootstrap", () => {
 			// full transcript read produced the stored session rows, and it is the only
 			// thing that makes the per-session skip safe to trust. See
 			// `SESSION_READ_GENERATION`.
-			{ source: "sessions-read-generation", cursor: "3" },
+			{ source: "sessions-read-generation", cursor: "4" },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
@@ -1029,7 +1030,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ source: string; cursor: string }>(
 			"SELECT source, cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "3" }]);
+		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "4" }]);
 		// And the second sweep is the one that gets a predicate.
 		await dbBackfillRepo({ repo, dbPath });
 		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeDefined();
@@ -1064,7 +1065,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ cursor: string }>(
 			"SELECT cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ cursor: "3" }]);
+		expect(cursors).toEqual([{ cursor: "4" }]);
 	});
 });
 
@@ -1795,6 +1796,63 @@ describe("dbBackfillRepo — sessions sweep", () => {
 		expect(await loggedSessions("s1")).toBe(1);
 	});
 
+	it("does not re-enqueue a session whose split names ONE model twice", async () => {
+		// The write path merges same-model entries (`ON CONFLICT(session_event_id, model)
+		// DO UPDATE … + excluded`), so two segments of one model land as one summed row.
+		// The comparison used to skip that fold on the strength of a docblock claiming a
+		// duplicate "would throw, not merge" — true before the conflict clause, false after
+		// — so `models.length !== stored.size` reported CHANGED forever. Permanent churn:
+		// every dashboard run and every 30-second tick re-projected the session and appended
+		// another byte-identical `events_raw` row, kept for `PROJECTED_RETENTION_DAYS`.
+		const split: SessionUpsertedEvent = {
+			...sessionEvent,
+			tokenCoverage: "full",
+			models: [
+				{ model: "claude-opus-5", inputTokens: 100, outputTokens: 50, cachedTokens: 10, estCostUsd: 0.5 },
+				{ model: "claude-opus-5", inputTokens: 7, outputTokens: 3, cachedTokens: 1, estCostUsd: 0.25 },
+			],
+		};
+		vi.mocked(collectSessionEvents).mockResolvedValue([split]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+		// One row, summed — the shape the comparison has to be measured against.
+		expect(
+			await query(
+				"SELECT model, input_tokens, output_tokens, cached_tokens, est_cost_usd FROM session_model_usage",
+			),
+		).toEqual([
+			{ model: "claude-opus-5", input_tokens: 107, output_tokens: 53, cached_tokens: 11, est_cost_usd: 0.75 },
+		]);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("keeps a summed cost NULL when both duplicate segments are unpriced", async () => {
+		// NULL means "unpriced", not zero — the upsert's cost arm is a CASE for exactly this
+		// reason, and the comparison's fold has to reproduce it. Summing two unpriced
+		// segments as `0 + 0` would store a priced 0.00, which every reader takes for a real
+		// answer, and would then also disagree with the stored row on every later pass.
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...sessionEvent,
+				tokenCoverage: "full",
+				models: [
+					{ model: "claude-opus-5", inputTokens: 100, outputTokens: 50, cachedTokens: 0 },
+					{ model: "claude-opus-5", inputTokens: 1, outputTokens: 1, cachedTokens: 0 },
+				],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await query("SELECT est_cost_usd FROM session_model_usage")).toEqual([{ est_cost_usd: null }]);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
 	it("still projects a session whose model split moved", async () => {
 		vi.mocked(collectSessionEvents).mockResolvedValue([modelSession]);
 		await dbBackfillRepo({ repo, dbPath });
@@ -2372,5 +2430,733 @@ describe("dbBackfillRepo — progress", () => {
 	it("runs unchanged when no callback is supplied", async () => {
 		const result = await dbBackfillRepo({ repo, dbPath });
 		expect(result.mode).toBe("bootstrapped");
+	});
+});
+
+describe("dbRescanSessions", () => {
+	/**
+	 * Establishes a baseline — a completed session pass, which is exactly what
+	 * `dbBackfillRepo` records: the generation cursor plus one `sessions` row per
+	 * discovered session (here `s1` at `sessionEvent.updatedAtMs`).
+	 */
+	const withBaseline = async (): Promise<void> => {
+		await dbBackfillRepo({ repo, dbPath });
+	};
+
+	/**
+	 * An empty database, with no cursor for any repo.
+	 *
+	 * Needed explicitly now that phase 1 is a READ-ONLY open: a background timer must not
+	 * create a machine-global database, so an absent file is answered `no-database`
+	 * instead of being materialised. A case about a MISSING BASELINE therefore has to
+	 * supply the file itself, or it is testing the other branch.
+	 */
+	const withEmptyDb = async (): Promise<void> => {
+		await withDashboardDb(() => undefined, { dbPath });
+	};
+
+	/** The stored value of one `ingest_cursors` row for the fixture repo. */
+	const cursorFor = (source: string): Promise<string | undefined> =>
+		withDashboardDb(
+			(db) => {
+				const row = db
+					.prepare(
+						`SELECT c.cursor FROM ingest_cursors c JOIN repos r ON r.id = c.repo_id
+						  WHERE r.repo_identity = ? AND c.source = ?`,
+					)
+					.get(repo.repoIdentity, source) as { cursor?: string } | undefined;
+				return row?.cursor;
+			},
+			{ dbPath },
+		);
+
+	it("does nothing when no source has opted in", async () => {
+		await withBaseline();
+
+		await expect(dbRescanSessions({ repos: [repo], dbPath, sources: [], emitted: new Map() })).resolves.toEqual({
+			reposScanned: 0,
+			reposWithoutBaseline: 0,
+			discovered: 0,
+			processed: 0,
+			eventsApplied: 0,
+			failedSources: [],
+			// Zero because this return happens BEFORE phase 1 reads the database — the
+			// count is genuinely unknown here, not observed to be zero. See `idleWith`.
+			failedEvents: 0,
+			// Named rather than left to the caller to infer from an all-zero shape. The
+			// off switch is supposed to read as "nothing to do", not as a prompt to run
+			// `jolli dashboard` for a count of zero repos.
+			idleReason: "no-sources",
+		});
+	});
+
+	it("names 'no live checkout' apart from a missing baseline", async () => {
+		// The other all-zero return. It used to be indistinguishable from a genuine
+		// missing baseline, so the daemon told the user to run `jolli dashboard` in
+		// repositories whose checkouts had been deleted.
+		const gone: RegisteredRepo = { ...repo, worktreeRoot: join(dir, "gone") };
+
+		const result = await dbRescanSessions({ repos: [gone], dbPath, emitted: new Map() });
+
+		expect(result.idleReason).toBe("no-live-repos");
+	});
+
+	it("leaves the reason unset when the repos are simply un-baselined", async () => {
+		await withEmptyDb();
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposWithoutBaseline).toBe(1);
+		expect(result.idleReason).toBeUndefined();
+	});
+
+	it("passes over a repo with no completed session pass", async () => {
+		// Deliberately no `withBaseline()`. Without a generation cursor there is no
+		// trustworthy set of stored instants to compare against, so every discovered
+		// session would look new and the timer would re-parse the repo's whole history.
+		await withEmptyDb();
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(0);
+		expect(result.reposWithoutBaseline).toBe(1);
+		expect(result.processed).toBe(0);
+	});
+
+	it("answers 'no database' rather than creating one", async () => {
+		// Phase 1 is a read-only open, so a machine that has never run `jolli dashboard`
+		// gets an answer instead of a database. The writable handle used to CREATE
+		// `jollimemory.db` here — a machine-global side effect from a background timer,
+		// every 30 seconds, on a machine whose user never asked for it.
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.idleReason).toBe("no-database");
+		expect(existsSync(dbPath)).toBe(false);
+	});
+
+	it("answers 'database unusable' for a file it cannot read, rather than throwing", async () => {
+		// `existsSync` answers "is there a file", not "is there a usable database": a
+		// zero-byte or truncated `jollimemory.db` (a crashed create, an interrupted copy)
+		// opens READ-ONLY without error and throws on the first statement. Left as a
+		// rejection that became ONE warn for the daemon's entire lifetime — the caller's
+		// dedup keys on the message — followed by permanent silence, for a state nothing on
+		// this path can repair (it deliberately never migrates).
+		writeFileSync(dbPath, "");
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.idleReason).toBe("database-unusable");
+		expect(result.reposScanned).toBe(0);
+	});
+
+	it("threads its window into the SCAN, not only into the collector", async () => {
+		// The option was documented "so both passes see one set" while `scanAllStores`
+		// hard-coded the back-fill's width — which made it purely decorative in the one
+		// direction that matters: a wider window silently found nothing extra, because
+		// nothing older than the pinned width was ever scanned. That is verbatim the failure
+		// the code this replaced had documented.
+		await withBaseline();
+
+		await dbRescanSessions({ repos: [repo], dbPath, windowMs: 12_345, emitted: new Map() });
+
+		expect(scanCodexSessionsOnDisk).toHaveBeenCalledWith(12_345);
+	});
+
+	it("accepts a baseline recorded at an OLDER read generation", async () => {
+		// PRESENCE, not equality. Requiring an exact match made every `SESSION_READ_
+		// GENERATION` bump a silent, machine-wide off switch: on upgrade each repo still
+		// carries the previous number, so no repo has a baseline, the pass warns once and
+		// the timer does nothing until the user opens the dashboard — which is exactly the
+		// user this feature exists for. A repo on an older generation has real read
+		// receipts; they are simply the old scanner's, and healing those is the
+		// back-fill's job, not the timer's.
+		await withBaseline();
+		await withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						`UPDATE ingest_cursors SET cursor = '1'
+						  WHERE source = 'sessions-read-generation'`,
+					)
+					.run(),
+			{ dbPath },
+		);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(1);
+		expect(result.reposWithoutBaseline).toBe(0);
+	});
+
+	it("still passes over a repo whose generation cursor is blank", async () => {
+		// The cursor column is a free-form string; "" is not a generation any pass ever
+		// claimed to have completed, so it counts as absent rather than as a baseline.
+		await withBaseline();
+		await withDashboardDb(
+			(db) => db.prepare("UPDATE ingest_cursors SET cursor = '' WHERE source = 'sessions-read-generation'").run(),
+			{ dbPath },
+		);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(0);
+		expect(result.reposWithoutBaseline).toBe(1);
+	});
+
+	it("re-projects a moved session and leaves both session cursors untouched", async () => {
+		await withBaseline();
+		const sessionsCursor = await cursorFor("sessions");
+		const generation = await cursorFor("sessions-read-generation");
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...sessionEvent, updatedAtMs: sessionEvent.updatedAtMs + 60_000 },
+		]);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(1);
+		expect(result.processed).toBe(1);
+		expect(result.eventsApplied).toBeGreaterThan(0);
+		// The two writes this pass must never make: the generation cursor is the claim
+		// "a FULL session pass completed", which a subset re-scan has not done, and
+		// `sessions` is the back-fill's own progress marker.
+		expect(await cursorFor("sessions")).toBe(sessionsCursor);
+		expect(await cursorFor("sessions-read-generation")).toBe(generation);
+	});
+
+	it("writes no events_raw row for an event identical to the stored session", async () => {
+		// The shape a 30-second timer meets constantly and a dashboard run almost never
+		// does: the per-session skip could NOT stop this session — `readKnownSessions`
+		// counts only `started_at_ms`/`duration_ms`, so a rollout that parsed to zero
+		// entries has no receipt and is re-read every single tick — yet the row it would
+		// write is the one already there. Unfiltered, that is one `events_raw` row every
+		// 30 s that changes nothing, kept for `PROJECTED_RETENTION_DAYS`. The filter is
+		// `dbBackfillRepo`'s own; this pins that the two apply phases share it.
+		await withBaseline();
+		const before = await query<{ n: number }>("SELECT COUNT(*) AS n FROM events_raw");
+		vi.mocked(collectSessionEvents).mockResolvedValue([sessionEvent]);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		// Discovered and re-read all the same — `processed` counts the read, not the write.
+		expect(result.processed).toBe(1);
+		expect(result.eventsApplied).toBe(0);
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM events_raw")).toEqual(before);
+	});
+
+	it("reports an unchanged tick with nothing applied", async () => {
+		await withBaseline();
+		vi.mocked(collectSessionEvents).mockResolvedValue([]);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(1);
+		expect(result.processed).toBe(0);
+		expect(result.eventsApplied).toBe(0);
+	});
+
+	it("builds the skip predicate from the stored instants, treating an equal one as current", async () => {
+		await withBaseline();
+		vi.mocked(collectSessionEvents).mockResolvedValue([]);
+
+		await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+		const opts = vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0];
+
+		expect(opts?.isAlreadyCurrent?.("claude", "s1", sessionEvent.updatedAtMs)).toBe(true);
+		expect(opts?.isAlreadyCurrent?.("claude", "s1", sessionEvent.updatedAtMs + 1)).toBe(false);
+		expect(opts?.isAlreadyCurrent?.("claude", "never-seen", 1)).toBe(false);
+	});
+
+	it("confines the tick to the opted-in sources with an empty loader", async () => {
+		// The collector's default loader would run every other agent's per-repo discoverer
+		// once per repo, every tick. Pinned because nothing else would notice it happening.
+		await withBaseline();
+		vi.mocked(collectSessionEvents).mockResolvedValue([]);
+
+		await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+		const opts = vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0];
+
+		await expect(opts?.loadSessions?.(repo.worktreeRoot)).resolves.toEqual([]);
+	});
+
+	it("reports a source whose machine-wide scan failed", async () => {
+		await withBaseline();
+		vi.mocked(scanCodexSessionsOnDisk).mockRejectedValue(new Error("store unreadable"));
+		vi.mocked(collectSessionEvents).mockResolvedValue([]);
+
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+		expect(result.failedSources).toEqual(["codex"]);
+	});
+
+	it("drops a repo whose recorded checkout no longer exists", async () => {
+		const gone: RegisteredRepo = { ...repo, worktreeRoot: join(dir, "gone") };
+
+		const result = await dbRescanSessions({ repos: [gone], dbPath, emitted: new Map() });
+
+		expect(result.reposScanned).toBe(0);
+		expect(result.reposWithoutBaseline).toBe(0);
+	});
+
+	/**
+	 * The emission gate — `emitted`.
+	 *
+	 * Every case here uses a session with NO read receipt (no `startedAtMs`, no
+	 * `durationMs`), because that is the only shape where the gate is reachable at all:
+	 * `readKnownSessions` counts a row as evidence on exactly those two columns, so a
+	 * session without them is invisible to the database gate no matter how many times
+	 * it has been processed. Real examples are a rollout that parsed to zero entries
+	 * (measured: 1 of 16 in-window Codex rollouts on one machine) and any event whose
+	 * projection failed and therefore wrote no row at all.
+	 */
+	describe("emission gate", () => {
+		/** A session the database gate can never recognise. See the block comment. */
+		const noReceipt: SessionUpsertedEvent = {
+			type: "session.upserted",
+			repoIdentity: repo.repoIdentity,
+			source: "codex",
+			sessionId: "no-receipt",
+			updatedAtMs: 1_700_000_090_000,
+		};
+
+		/** The predicate `collectSessionEvents` was handed on the most recent tick. */
+		const lastPredicate = () => vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent;
+
+		/**
+		 * A collector that HONOURS the skip predicate, the way the real one does.
+		 *
+		 * `mockResolvedValue` cannot express this feature at all: it returns its event
+		 * whatever the gate says, so every assertion would be about a predicate rather
+		 * than about an outcome. Asking the predicate from inside the mock is also the
+		 * only way to see what it answered DURING a tick — read afterwards it reflects
+		 * the map as the same tick left it, which is how the first draft of this suite
+		 * managed to assert the opposite of what happened.
+		 *
+		 * Returns the per-tick answers so a case can pin "read, then skipped".
+		 */
+		const collectorHonouringGate = (event: SessionUpsertedEvent): ReadonlyArray<boolean> => {
+			const skips: boolean[] = [];
+			vi.mocked(collectSessionEvents).mockImplementation(async (opts) => {
+				const skip = opts.isAlreadyCurrent?.(event.source, event.sessionId, event.updatedAtMs) ?? false;
+				skips.push(skip);
+				return skip ? [] : [event];
+			});
+			return skips;
+		};
+
+		it("skips a session it already emitted for, which the database gate cannot", async () => {
+			await withBaseline();
+			const skips = collectorHonouringGate(noReceipt);
+			const emitted = new Map<string, number>();
+			const before = await query<{ n: number }>("SELECT COUNT(*) AS n FROM events_raw");
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+
+			// Read once, then skipped — the database holds no receipt for this session on
+			// any of the three ticks, so the database gate said "not current" every time.
+			expect(skips).toEqual([false, true, true]);
+			// And the outcome that matters: ONE row, not one per tick. Unfiltered this is
+			// 2,880 identical rows a day, none of which the prune ever removes.
+			const after = await query<{ n: number }>("SELECT COUNT(*) AS n FROM events_raw");
+			expect((after[0]?.n ?? 0) - (before[0]?.n ?? 0)).toBe(1);
+		});
+
+		it("lets a session through again once its file has grown", async () => {
+			// The gate must never become a permanent block: it records a VERSION, not the
+			// session, so a conversation that gains a turn is read again.
+			await withBaseline();
+			const emitted = new Map<string, number>();
+			collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+
+			const grown = { ...noReceipt, updatedAtMs: noReceipt.updatedAtMs + 60_000 };
+			const skips = collectorHonouringGate(grown);
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted });
+
+			expect(skips).toEqual([false]);
+			expect(result.processed).toBe(1);
+		});
+
+		it("refuses a NEW key once the cap is reached, rather than clearing the map", async () => {
+			// The whole-map clear the two `CodexSessionDiscoverer` memos use cannot converge
+			// here, and that asymmetry is the decision: their refill is one `readdir`, while
+			// this map's is a full scan of the largest table PLUS an event for every parked
+			// session — and the seed comes from the same population that just overflowed, so a
+			// clear lands back over the limit on the very next tick, every 30 s, with the gate
+			// empty the whole time.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			const emitted = new Map<string, number>([["session:someone-else:codex:kept", 1]]);
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted, emittedLimit: 1 });
+
+			expect([...emitted.keys()]).toEqual(["session:someone-else:codex:kept"]);
+		});
+
+		it("still refreshes a key it already holds when full", async () => {
+			// The freshness update cannot grow the map, so the cap must not block it —
+			// otherwise a full gate would freeze every entry at its first observed instant and
+			// permanently stop re-reading the conversations it does still cover.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			const emitted = new Map<string, number>([[noReceiptId(), 1]]);
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted, emittedLimit: 1 });
+
+			expect(emitted.get(noReceiptId())).toBe(noReceipt.updatedAtMs);
+		});
+
+		it("prunes projected events past retention, like the other two apply paths", async () => {
+			// `applyStatsEvents` and `dbBackfillRepo` both prune; this path did not. On the
+			// machine the feature exists for — a user who never opens the dashboard — the timer
+			// is the ONLY writer of `session.upserted` rows, so nothing ever deleted a
+			// `projected` row past `PROJECTED_RETENTION_DAYS` and the table only grew. That
+			// feeds straight back into the seed, which is a full scan of exactly this table.
+			await withBaseline();
+			await logRawRow("session:someone-else:codex:ancient", JSON.stringify(noReceipt));
+			collectorHonouringGate(noReceipt);
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			const left = await query<{ n: number }>(
+				"SELECT COUNT(*) AS n FROM events_raw WHERE event_id = 'session:someone-else:codex:ancient'",
+			);
+			expect(left[0]?.n).toBe(0);
+		});
+
+		it("records the OBSERVED instant, not the moment the row was written", async () => {
+			// The difference is the one way this scheme can lose data. The mtime is sampled
+			// before the transcript is read, so the recorded value is at or BEFORE the
+			// content read — anything appended in between makes the next tick's mtime
+			// larger and triggers a re-read. A write instant would be LATER than such an
+			// append and would stamp it as already-seen, permanently, if the session then
+			// stopped growing. Pinned by asserting the boundary sits exactly on the event's
+			// own instant rather than somewhere after it.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			const emitted = new Map<string, number>();
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+
+			expect([...emitted.values()]).toContain(noReceipt.updatedAtMs);
+		});
+
+		it("records a session whose event the unchanged-filter dropped", async () => {
+			// `unchangedSessionEvent` only ever prevented the WRITE. The read had already
+			// happened, so the gate has to record it too — otherwise the identical session
+			// is re-read (whole transcript, every tick) forever while never writing a row,
+			// and the saving is only half of what it looks like.
+			await withBaseline();
+			vi.mocked(collectSessionEvents).mockResolvedValue([sessionEvent]);
+			const emitted = new Map<string, number>();
+
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted });
+
+			expect(result.eventsApplied).toBe(0);
+			expect(lastPredicate()?.("claude", "s1", sessionEvent.updatedAtMs)).toBe(true);
+		});
+
+		it("seeds from the log so a restart does not re-emit", async () => {
+			// A fresh map is what a restarted daemon has. Without the seed it would emit
+			// once more for every already-parked session on its first tick.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			const afterRestart = new Map<string, number>();
+			const skips = collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: afterRestart, seedEmitted: true });
+
+			expect(skips).toEqual([true]);
+		});
+
+		/**
+		 * Appends one raw `session.upserted` row carrying `dataJson` VERBATIM.
+		 *
+		 * Written straight to `events_raw` rather than through a tick because that is the
+		 * only way to put a document in the log this pass did not produce — another
+		 * producer's claim, a value of the wrong type, or bytes that are not JSON at all,
+		 * which is what the cases below are about. `projected` so the drain leaves it
+		 * alone: a pending row would be projected into the same `sessions` row and the case
+		 * would be measuring the projection instead of the seed.
+		 */
+		const logRawRow = (eventId: string, dataJson: string): Promise<void> =>
+			withDashboardDb(
+				(db) => {
+					db.prepare(
+						`INSERT INTO events_raw
+						   (event_id, repo_identity, type, schema_version, received_at, data_json, projection_status)
+						 VALUES (?, ?, 'session.upserted', 1, ?, ?, 'projected')`,
+					).run(
+						eventId,
+						repo.repoIdentity,
+						new Date(noReceipt.updatedAtMs + 600_000).toISOString(),
+						dataJson,
+					);
+				},
+				{ dbPath },
+			);
+
+		/** The event id of the fixture's no-receipt session. */
+		const noReceiptId = (): string => sessionEventId(repo.repoIdentity, noReceipt.source, noReceipt.sessionId);
+
+		/** That session, claimed at `updatedAtMs` by a producer other than this pass. */
+		const logRow = (updatedAtMs: unknown): Promise<void> =>
+			logRawRow(noReceiptId(), JSON.stringify({ ...noReceipt, updatedAtMs }));
+
+		it("seeds the OBSERVED mtime, so an append inside a producer's write window survives a restart", async () => {
+			// The scenario a write instant loses, end to end — and the reason it is data
+			// loss rather than a delay. A producer samples the mtime, spends its collect
+			// phase (a whole-repo git walk), then inserts, so `received_at` lands after any
+			// turn the user added in between. Seeding THAT judged the turn already-seen and
+			// permanently: the gate suppressed the read that would have corrected the entry,
+			// so no tick could overwrite it, and every restart re-seeded the same value.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			// Tick 1 records the sampled version but writes the row two minutes later.
+			await dbRescanSessions({
+				repos: [repo],
+				dbPath,
+				emitted: new Map(),
+				now: () => noReceipt.updatedAtMs + 120_000,
+			});
+
+			// The user appended 30 s after the sample — inside that window — then stopped.
+			const grown = { ...noReceipt, updatedAtMs: noReceipt.updatedAtMs + 30_000 };
+			const skips = collectorHonouringGate(grown);
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), seedEmitted: true });
+
+			expect(skips).toEqual([false]);
+			expect(result.processed).toBe(1);
+		});
+
+		it("treats a row with no usable instant as ungated rather than guessing one", async () => {
+			// A row from a build that recorded no mtime, or one whose value is not a number.
+			// Absent is the only safe answer: no entry costs one redundant read, while any
+			// default — `received_at` above all — reinstates the defect on exactly the rows
+			// least likely to be looked at.
+			await withBaseline();
+			await logRow("not-a-number");
+			const skips = collectorHonouringGate(noReceipt);
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), seedEmitted: true });
+
+			expect(skips).toEqual([false]);
+		});
+
+		it("survives an unparseable row belonging to a DIFFERENT session", async () => {
+			// Parsed in SQL this was fatal AND permanent. `json_type`/`json_extract` abort the
+			// whole statement on the first malformed document — measured: no rows for any
+			// group, not a NULL for the offending one — so the seed threw, phase 1 rejected,
+			// the tick reported `failed` at DEBUG, and `seeded` never flipped because it is
+			// set from a successful result. Every later tick, and every later process, re-ran
+			// the same throwing statement: re-scanning was dead machine-wide.
+			//
+			// Not a corruption-only scenario either, which is what made it worth closing
+			// before release: `drainPending` catches `JSON.parse` and parks the row `failed`,
+			// and the prune deletes only `projected` rows, so an unparseable row is a state
+			// the system deliberately produces and then keeps forever.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+			await logRawRow("session:someone-elses-repo:codex:poison", "{ this is not json");
+
+			const skips = collectorHonouringGate(noReceipt);
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), seedEmitted: true });
+
+			// The bad row cost only itself — this session's entry seeded normally.
+			expect(result.idleReason).toBeUndefined();
+			expect(skips).toEqual([true]);
+		});
+
+		it("treats an unparseable row of its OWN as absent rather than falling back", async () => {
+			// The seed reads each session's NEWEST row, so an unreadable one costs that
+			// session its entry even though an older row of its own parses fine. Reaching
+			// back to that older row would widen the gate on the strength of the weaker
+			// record; absence costs one redundant read.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+			await logRawRow(noReceiptId(), "{ this is not json");
+
+			const skips = collectorHonouringGate(noReceipt);
+			await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), seedEmitted: true });
+
+			expect(skips).toEqual([false]);
+		});
+
+		it("does not seed over an instant this process already observed", async () => {
+			// The merge guard. Both sides hold observed mtimes now, so a seed can no longer be
+			// the downgrade this once protected against — but the seed is whatever a session's
+			// NEWEST row says, which may be another producer's, so it can disagree in either
+			// direction. What this keeps is the observation THIS pass made and verified on the
+			// tick; taking the other would trust a claim to have read a version it never saw.
+			await withBaseline();
+			collectorHonouringGate(noReceipt);
+			const emitted = new Map<string, number>();
+			await dbRescanSessions({ repos: [repo], dbPath, emitted });
+			await logRow(noReceipt.updatedAtMs + 60_000);
+
+			await dbRescanSessions({ repos: [repo], dbPath, emitted, seedEmitted: true });
+
+			// Still this process's own instant, so a file one millisecond past it is read.
+			// The seeded value sits a minute above and would swallow it.
+			expect([...emitted.values()]).toContain(noReceipt.updatedAtMs);
+			expect(lastPredicate()?.("codex", "no-receipt", noReceipt.updatedAtMs + 1)).toBe(false);
+		});
+
+		it("reports how many events are parked unprojected", async () => {
+			await withBaseline();
+			vi.mocked(collectSessionEvents).mockResolvedValue([]);
+			await withDashboardDb(
+				(db) =>
+					db
+						.prepare(
+							`UPDATE events_raw SET projection_status = 'failed', failed_kind = 'error'
+							  WHERE seq = (SELECT MIN(seq) FROM events_raw)`,
+						)
+						.run(),
+				{ dbPath },
+			);
+
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			expect(result.failedEvents).toBe(1);
+		});
+
+		it("counts a parked event whose reason predates the failed_kind column", async () => {
+			// `failed_kind` arrived in a migration, so a row parked by an older build reads
+			// NULL — and `NULL = 'unknown-type'` is NULL, not false. Inside the count's
+			// `NOT (…)` that NULL propagated and `WHERE` discarded the row, so exactly the
+			// rows `drainPending` can never revive (NULL is not a reason it knows) were the
+			// ones the count could not see: permanently stuck AND permanently invisible,
+			// which is the opposite of what narrowing the count was for.
+			//
+			// The type is pinned to a KNOWN one deliberately. With an unknown type the third
+			// conjunct is false, the `NOT` yields true, and the row is counted even with the
+			// bug present — so a case that left the type alone could pass either way.
+			await withBaseline();
+			vi.mocked(collectSessionEvents).mockResolvedValue([]);
+			await withDashboardDb(
+				(db) =>
+					db
+						.prepare(
+							`UPDATE events_raw
+							    SET projection_status = 'failed', failed_kind = NULL, type = 'session.upserted'
+							  WHERE seq = (SELECT MIN(seq) FROM events_raw)`,
+						)
+						.run(),
+				{ dbPath },
+			);
+
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			expect(result.failedEvents).toBe(1);
+		});
+
+		/**
+		 * `events_raw`'s columns, read through a READ-ONLY handle.
+		 *
+		 * Read-only is the whole point rather than a detail: `withDashboardDb` MIGRATES on
+		 * open, so the file-wide `query` helper would re-add a dropped column as a side
+		 * effect of asking about it, and the two cases below would pass whatever the pass
+		 * under test had done.
+		 */
+		const eventColumns = (): Promise<string[]> =>
+			withReadonlyDashboardDb(
+				(db) =>
+					(db.prepare("PRAGMA table_info(events_raw)").all() as Array<{ name: string }>).map((c) => c.name),
+				{ dbPath },
+			);
+
+		it("counts parked events on a schema that has no failed_kind column at all", async () => {
+			// Phase 1 holds a READ-ONLY handle, which by contract never migrates, so on a
+			// database still behind that migration the narrowed count raises `no such
+			// column`. Reachable on an ordinary upgrade — this pass ticks every 30 s and can
+			// easily run before the first commit gives the database its first writable open.
+			// Left to throw it took the WHOLE pass down as `database-unusable`, and the early
+			// return meant the writable phase that would have migrated never ran.
+			//
+			// Simulated by dropping the column and LEAVING the migration logged as applied,
+			// so nothing re-adds it. That isolates the phase this case is about: the whole
+			// pass runs against a schema with no `failed_kind`, start to finish.
+			//
+			// It is deliberately NOT the real pre-migration shape — a genuine old database
+			// has no log row either, so its first writable open migrates and heals. That is
+			// the sibling case below; this one would not reach it anyway, since
+			// `collectSessionEvents` is empty here and phase 3 only opens when a repo
+			// produced events. So what this proves is exactly one thing: phase 1 degraded
+			// instead of taking the pass down.
+			await withBaseline();
+			vi.mocked(collectSessionEvents).mockResolvedValue([]);
+			await withDashboardDb(
+				(db) => {
+					db.prepare(
+						`UPDATE events_raw SET projection_status = 'failed'
+						  WHERE seq = (SELECT MIN(seq) FROM events_raw)`,
+					).run();
+					db.exec("ALTER TABLE events_raw DROP COLUMN failed_kind");
+				},
+				{ dbPath },
+			);
+
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			// Counted, not guessed: before that migration nothing could be parked as
+			// `unknown-type` — there was no column to record a reason in — so every `failed`
+			// row IS stuck and the un-narrowed count is the exact answer.
+			expect(result.failedEvents).toBe(1);
+			// And the pass itself still ran, rather than reporting the database unusable.
+			expect(result.idleReason).toBeUndefined();
+			expect(result.reposScanned).toBe(1);
+
+			// The column is STILL gone — nothing here re-added it, because the migration is
+			// still logged as applied and no writable open happened. Asserted so this case
+			// and its sibling are a genuine pair: the sibling's identical read observes the
+			// column back, which it could not do if the read itself were what created it.
+			expect(await eventColumns()).not.toContain("failed_kind");
+		});
+
+		it("heals a genuinely pre-migration database on the same tick", async () => {
+			// The consequence the degradation exists to protect, end to end. The failure it
+			// replaced was not just a wrong count: phase 1 threw, the pass returned
+			// `database-unusable`, and the early return meant the WRITABLE phase — the one
+			// that would have migrated the column back — never ran. So the tick that could
+			// have fixed the database was precisely the tick the missing column aborted, and
+			// the next one repeated it, every 30 seconds, forever.
+			//
+			// The real pre-migration shape, unlike the case above: the log row goes too, so
+			// `migrateDashboardDb` reads the entry as never applied and re-runs it. Its DDL
+			// is a single `ALTER TABLE … ADD COLUMN`, which is why re-running is a repair
+			// rather than a `duplicate column`.
+			await withBaseline();
+			// A CHANGED event, so the repo produces something to apply: phase 3's writable
+			// open is gated on `pending.length > 0`, and it is that open that migrates.
+			vi.mocked(collectSessionEvents).mockResolvedValue([
+				{ ...sessionEvent, updatedAtMs: sessionEvent.updatedAtMs + 60_000 },
+			]);
+			await withDashboardDb(
+				(db) => {
+					db.prepare(
+						`UPDATE events_raw SET projection_status = 'failed'
+						  WHERE seq = (SELECT MIN(seq) FROM events_raw)`,
+					).run();
+					db.exec("ALTER TABLE events_raw DROP COLUMN failed_kind");
+					db.prepare("DELETE FROM schema_migrations WHERE name = 'EVENT_FAILED_KIND_DDL'").run();
+				},
+				{ dbPath },
+			);
+
+			const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() });
+
+			// Phase 1 still answered — read-only, so it saw the old schema and degraded.
+			expect(result.failedEvents).toBe(1);
+			expect(result.idleReason).toBeUndefined();
+			// And phase 3 ran, which is what carried the repair.
+			expect(result.eventsApplied).toBe(1);
+
+			expect(await eventColumns()).toContain("failed_kind");
+		});
 	});
 });

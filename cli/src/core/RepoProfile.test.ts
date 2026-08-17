@@ -27,6 +27,7 @@ vi.mock("./Locks.js", async (importOriginal) => {
 import {
 	readCutoverFence,
 	readManualDisableFlag,
+	readManualDisableFlagReadonly,
 	readManualDisableFlagSync,
 	readRepoProfile,
 	resetRepoProfileRootCache,
@@ -344,6 +345,82 @@ describe("RepoProfile", () => {
 				} finally {
 					rmSync(nonGit, { recursive: true, force: true });
 				}
+			});
+		});
+
+		/**
+		 * The async twin, for a RESIDENT caller: the global daemon's session re-scan asks
+		 * this once per repo per worktree every 30 seconds, and the sync form makes that
+		 * dozens of blocking syscalls a minute for the machine's whole uptime.
+		 *
+		 * Asserted to agree with the sync form case for case rather than tested in
+		 * isolation — the two share `decodeManualDisable` precisely so the "userDisabled
+		 * wins, the composite is only the pre-split fallback" rule exists once, and a
+		 * divergence here would mean a cutover fence starting to block a runtime it must
+		 * not block.
+		 */
+		describe("readManualDisableFlagReadonly", () => {
+			it("returns false when nothing is set", async () => {
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(false);
+			});
+
+			it("reads an explicit profile.json value (true then false)", async () => {
+				await writeManualDisableFlag(cwd, true);
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(true);
+				await writeManualDisableFlag(cwd, false);
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(false);
+			});
+
+			it("prefers userDisabled, then falls back to the pre-split composite", async () => {
+				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+				// A fence-era profile: the composite says disabled, the user's own axis says
+				// otherwise. New code decides on `userDisabled`, so a fence must NOT stop
+				// this runtime — the whole reason the composite is a fallback and not a peer.
+				writeFileSync(profilePath(cwd), JSON.stringify({ userDisabled: false, manuallyDisabled: true }));
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(false);
+
+				writeFileSync(profilePath(cwd), JSON.stringify({ manuallyDisabled: true }));
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(true);
+			});
+
+			it("reads the main-worktree profile from a linked worktree", async () => {
+				execFileSync("git", ["commit", "--allow-empty", "-m", "init", "-q"], { cwd, env: GIT_ENV });
+				await writeManualDisableFlag(cwd, true);
+				const wt = mkdtempSync(join(tmpdir(), "jolli-repoprofile-awt-"));
+				try {
+					execFileSync("git", ["worktree", "add", "-q", wt, "HEAD"], { cwd });
+					await expect(readManualDisableFlagReadonly(wt)).resolves.toBe(true);
+				} finally {
+					rmSync(wt, { recursive: true, force: true });
+				}
+			});
+
+			it("falls back to the legacy cwd marker when no profile value is set", async () => {
+				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+				writeFileSync(legacyMarker(cwd), new Date(0).toISOString());
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(true);
+			});
+
+			it("treats a corrupt profile as saying nothing rather than throwing", async () => {
+				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+				writeFileSync(profilePath(cwd), "{ not json");
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(false);
+			});
+
+			it("never migrates or persists, unlike the async READER it is not", async () => {
+				// The reason this exists alongside `readManualDisableFlag`, which is already
+				// async: that one persists a `userDisabled` decision for a pre-split profile
+				// and for the legacy marker. A question asked on the way to a background task
+				// must not write someone's profile as a side effect.
+				mkdirSync(join(cwd, ".jolli", "jollimemory"), { recursive: true });
+				writeFileSync(legacyMarker(cwd), new Date(0).toISOString());
+
+				await expect(readManualDisableFlagReadonly(cwd)).resolves.toBe(true);
+				expect(existsSync(profilePath(cwd))).toBe(false);
+
+				// The migrating reader, for contrast — same answer, but it writes.
+				await expect(readManualDisableFlag(cwd)).resolves.toBe(true);
+				expect(existsSync(profilePath(cwd))).toBe(true);
 			});
 		});
 	});

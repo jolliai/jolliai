@@ -469,27 +469,84 @@ function resolveMainRootSync(cwd: string): string {
  */
 export function readManualDisableFlagSync(cwd: string): boolean {
 	const mainRoot = resolveMainRootSync(cwd);
+	let raw: string | undefined;
 	try {
-		const parsed = JSON.parse(readFileSync(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8"));
-		if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
-			const profile = parsed as RepoProfile;
-			// userDisabled first (the axis new code decides on); the composite
-			// only as the read-only migration fallback for pre-split profiles —
-			// a fence must NOT stop this runtime, only old ones.
-			if (profile.userDisabled !== undefined) {
-				return profile.userDisabled === true;
-			}
-			if (profile.manuallyDisabled !== undefined) {
-				return profile.manuallyDisabled === true;
-			}
-		}
+		raw = readFileSync(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8");
 	} catch {
-		// Missing or corrupt profile — fall through to the legacy marker.
+		// Missing or unreadable profile — fall through to the legacy marker.
 	}
+	const fromProfile = decodeManualDisable(raw);
+	if (fromProfile !== undefined) return fromProfile;
 	// Legacy per-worktree marker, this worktree only (the async reader
 	// enumerates every worktree and migrates; this fast path stays cheap).
 	try {
 		statSync(join(getJolliMemoryDir(cwd), LEGACY_DISABLE_FILE));
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/**
+ * The disable decision a profile's raw JSON carries, or `undefined` when it carries
+ * none (absent, corrupt, or present but saying nothing about either field).
+ *
+ * Extracted so {@link readManualDisableFlagSync} and
+ * {@link readManualDisableFlagReadonly} cannot drift. Which of the two fields wins is a
+ * rule, not a detail: `userDisabled` is the axis new code decides on, and the composite
+ * is consulted ONLY as the read-only migration fallback for pre-split profiles — a
+ * cutover fence must not stop this runtime, only older ones. Two spellings of that rule
+ * is one more place for the fence to start blocking writes it must not block.
+ */
+function decodeManualDisable(raw: string | undefined): boolean | undefined {
+	if (raw === undefined) return undefined;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(raw);
+	} catch {
+		return undefined;
+	}
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+	const profile = parsed as RepoProfile;
+	if (profile.userDisabled !== undefined) return profile.userDisabled === true;
+	if (profile.manuallyDisabled !== undefined) return profile.manuallyDisabled === true;
+	return undefined;
+}
+
+/**
+ * Asynchronous, read-only variant — same decision as {@link readManualDisableFlagSync},
+ * without blocking the event loop.
+ *
+ * For a caller that asks this repeatedly from a RESIDENT process: the global daemon's
+ * session re-scan asks it once per registered repo per worktree every 30 seconds, and
+ * the sync form makes that dozens of blocking syscalls a minute for the life of the
+ * machine's uptime.
+ *
+ * NOT {@link readManualDisableFlag}, even though that one is already async, and the
+ * difference is the whole reason this exists: that reader MIGRATES — it persists a
+ * `userDisabled` decision for a pre-split profile and for the legacy marker. A question
+ * asked on the way to a background task must not write someone's profile as a side
+ * effect, which is the same rule `jolli dashboard` follows in choosing the sync
+ * read-only form over it. This is that rule with the blocking removed, not a relaxation
+ * of it.
+ *
+ * `resolveMainRootSync` is still shared, deliberately: it is memoized per cwd, so the
+ * one call that can spawn `git rev-parse` happens at most once per directory per
+ * process — and reimplementing the anchor asynchronously would restate the "a linked
+ * worktree reads the shared profile" rule a second time.
+ */
+export async function readManualDisableFlagReadonly(cwd: string): Promise<boolean> {
+	const mainRoot = resolveMainRootSync(cwd);
+	let raw: string | undefined;
+	try {
+		raw = await readFile(join(getJolliMemoryDir(mainRoot), PROFILE_FILE), "utf-8");
+	} catch {
+		// Missing or unreadable profile — fall through to the legacy marker.
+	}
+	const fromProfile = decodeManualDisable(raw);
+	if (fromProfile !== undefined) return fromProfile;
+	try {
+		await stat(join(getJolliMemoryDir(cwd), LEGACY_DISABLE_FILE));
 		return true;
 	} catch {
 		return false;

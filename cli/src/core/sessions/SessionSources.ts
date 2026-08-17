@@ -91,6 +91,10 @@ const claudeSource = defineSessionSource<ClaudeDiskSession>({
 
 const codexSource = defineSessionSource<CodexDiskSession>({
 	source: "codex",
+	// The one source the global daemon re-scans on a timer today. Its `updatedAt` is
+	// the rollout file's mtime, so it moves when a conversation is appended to —
+	// which is the property {@link SessionSourceSpec.daemonRescan} asks for.
+	daemonRescan: true,
 	scan: async ({ windowMs }) => (await import("../CodexSessionDiscoverer.js")).scanCodexSessionsOnDisk(windowMs),
 	forRepo: async (scanned, cwd) => (await import("../CodexSessionDiscoverer.js")).codexSessionsForRepo(scanned, cwd),
 	scanForRepo: async (cwd, windowMs) =>
@@ -252,6 +256,21 @@ export const SESSION_SOURCES: ReadonlyArray<SessionSourceDefinition> = [
 	cursorCliSource,
 	antigravitySource,
 ];
+
+/**
+ * The sources the global daemon may re-scan on a timer.
+ *
+ * Derived from the registry rather than listed again here, so opting a source in is
+ * one field on its definition and this list cannot fall behind it. See
+ * {@link SessionSourceSpec.daemonRescan} for the single property a source has to
+ * have before it belongs here.
+ *
+ * Empty is a legitimate answer and the daemon treats it as "nothing to do" — which
+ * is what makes turning the feature off a one-line change.
+ */
+export const DAEMON_RESCAN_SOURCES: ReadonlyArray<SessionSourceDefinition> = SESSION_SOURCES.filter(
+	(source) => source.daemonRescan,
+);
 
 // A run's scan results are `PreScannedSessions` in `DashboardCollector`, keyed by
 // source tag with the same absent-versus-empty rule this file's `orFail` enforces.

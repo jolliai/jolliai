@@ -83,6 +83,25 @@ export interface SessionSourceSpec<T> {
 	 * read per file and costing a full parse of every one.
 	 */
 	readonly usesAlreadyRecorded?: boolean;
+	/**
+	 * True when the global daemon may re-scan this source on a timer, without a
+	 * `jolli dashboard` run behind it.
+	 *
+	 * The bar is ONE property, and it is about the source's `updatedAt`, not about
+	 * scan cost: the instant this source reports must move forward when a
+	 * conversation is appended to. That is what a periodic re-scan compares against
+	 * the database, so a source whose `updatedAt` is a CREATION time answers
+	 * "unchanged" forever and a timer over it burns I/O to discover nothing — which
+	 * is exactly what Codex did before its scan moved to file mtime.
+	 *
+	 * So this is opt-in per source and deliberately conservative. Today only `codex`
+	 * declares it. Adding a source means checking that one property against a real
+	 * capture of its store, not assuming it: Claude's mtime, for instance, moves for
+	 * `ai-title` writes that are not conversation at all, which is sound for a
+	 * re-scan trigger but is the reason its `updatedAt` is read from the transcript
+	 * instead — see `ClaudeSessionDiscoverer`.
+	 */
+	readonly daemonRescan?: boolean;
 	/** Read this agent's machine-global store. MUST import its discoverer lazily. */
 	readonly scan: (opts: SessionScanOptions) => Promise<ReadonlyArray<T>>;
 	/**
@@ -124,6 +143,8 @@ export interface SessionSourceSpec<T> {
 export interface SessionSourceDefinition {
 	readonly source: TranscriptSource;
 	readonly usesAlreadyRecorded: boolean;
+	/** See {@link SessionSourceSpec.daemonRescan}. */
+	readonly daemonRescan: boolean;
 	readonly scan: (opts: SessionScanOptions) => Promise<unknown>;
 	readonly forRepo: (
 		scanned: unknown,
@@ -148,6 +169,7 @@ export function defineSessionSource<T>(spec: SessionSourceSpec<T>): SessionSourc
 	return {
 		source: spec.source,
 		usesAlreadyRecorded: spec.usesAlreadyRecorded ?? false,
+		daemonRescan: spec.daemonRescan ?? false,
 		scan: spec.scan,
 		forRepo: (scanned, cwd, windowMs) => spec.forRepo(scanned as ReadonlyArray<T>, cwd, windowMs),
 		...(spec.scanForRepo ? { scanForRepo: spec.scanForRepo } : {}),

@@ -136,6 +136,30 @@ export function setLogLevel(level: LogLevel, overrides?: Record<string, LogLevel
 }
 
 /**
+ * {@link setLogLevel} with the default a config's ABSENT level falls back to.
+ *
+ * One line, and it exists so that `?? "info"` lives in one place rather than in each
+ * long-lived process that reads the config (`QueueWorker` and the global daemon had a copy
+ * each, with nothing connecting them). It is the load-bearing half: the file threshold
+ * decides whether a process's `log.debug` output is written at all, so the two copies
+ * drifting means one process silently stops logging.
+ *
+ * Deliberately takes the two FIELDS rather than a `JolliMemoryConfig`, and lives here
+ * rather than beside `loadConfig`. Both callers already import this module and neither
+ * mocks it, whereas `SessionTracker` is mocked with an ALLOWLIST in a dozen suites — so a
+ * helper there would have made "import one more function" mean "add an entry to every one
+ * of those mocks, forever". Measured the hard way: 171 tests across five files failed on
+ * exactly that, for a two-line dedup.
+ *
+ * Does no I/O and cannot throw, so each caller keeps its own policy for a config it could
+ * not READ — the daemon warns and comes up with the default, `QueueWorker` lets it
+ * propagate on the blocking commit path.
+ */
+export function applyConfiguredLogLevel(level: LogLevel | undefined, overrides?: Record<string, LogLevel>): void {
+	setLogLevel(level ?? "info", overrides);
+}
+
+/**
  * When true, info/debug messages are not written to stderr (only to the log file).
  * warn/error always go to stderr regardless of this flag.
  * Default: true — hooks and background scripts should never pollute the user's terminal.

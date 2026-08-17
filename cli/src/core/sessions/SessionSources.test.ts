@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { orFail, SESSION_SOURCES } from "./SessionSources.js";
+import { DAEMON_RESCAN_SOURCES, orFail, SESSION_SOURCES } from "./SessionSources.js";
 
 describe("orFail", () => {
 	it("passes a clean scan straight through", () => {
@@ -70,5 +70,30 @@ describe("SESSION_SOURCES", () => {
 		// Read off the table by the back-fill; an undefined would be falsy by accident
 		// rather than by declaration.
 		for (const def of SESSION_SOURCES) expect(typeof def.usesAlreadyRecorded, def.source).toBe("boolean");
+	});
+
+	it("opts exactly codex into the daemon's 30-second re-scan", () => {
+		// The sibling flag above is pinned exhaustively and this one was not, which is the
+		// asymmetry worth closing: a copy-pasted `daemonRescan: true` on a 13th source would
+		// put that agent's whole-transcript parse (Claude) or its per-conversation SQLite
+		// open (Antigravity) on a machine-wide 30-second timer, with the full suite green.
+		// Nothing else in the product would notice — the flag has no other reader.
+		const rescanned = SESSION_SOURCES.filter((def) => def.daemonRescan).map((def) => def.source);
+		expect(rescanned).toEqual(["codex"]);
+	});
+
+	it("derives DAEMON_RESCAN_SOURCES from the flag rather than from a second list", () => {
+		// The list is a `filter` today; spelled out again it could fall behind the flag, and
+		// the failure would be silent in the direction that matters (a source opted in but
+		// never ticked).
+		expect(DAEMON_RESCAN_SOURCES.map((def) => def.source)).toEqual(
+			SESSION_SOURCES.filter((def) => def.daemonRescan).map((def) => def.source),
+		);
+	});
+
+	it("defaults `daemonRescan` to a real boolean on every entry", () => {
+		// Same reason as `usesAlreadyRecorded`: an undefined would be falsy by accident
+		// rather than by declaration.
+		for (const def of SESSION_SOURCES) expect(typeof def.daemonRescan, def.source).toBe("boolean");
 	});
 });

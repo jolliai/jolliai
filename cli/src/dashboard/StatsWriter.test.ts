@@ -2,20 +2,57 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { LogLevel } from "../Types.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import type {
 	CommitCreatedEvent,
+	CommitSummaryEvent,
 	SessionUpsertedEvent,
 	StatsEventEnvelope,
 	WorktreeStatusEvent,
 } from "./DashboardModel.js";
 import { STATS_EVENT_SCHEMA_VERSION } from "./DashboardModel.js";
-import { applyStatsEvents, drainPending, observeWorktree, pruneProjectedEvents } from "./StatsWriter.js";
+import {
+	applyStatsEvents,
+	countStuckEvents,
+	drainPending,
+	observeWorktree,
+	pruneProjectedEvents,
+} from "./StatsWriter.js";
 
 vi.mock("../core/GitOps.js", () => ({
 	execGit: vi.fn(),
 }));
+
+/**
+ * The `tag` a caller hands {@link pruneProjectedEvents} is a diagnostic contract, not
+ * decoration: the daemon's 30-second re-scan promises that one `grep AgentScan` returns
+ * everything that pass emitted. So what reaches the log is behaviour here.
+ *
+ * Rendered through the REAL formatter rather than by concatenating the format string with
+ * its args. The tag arrives as a `%s`, so an un-interpolated capture would pass just as
+ * happily if the argument were dropped — which is the exact regression this pins.
+ */
+const { logLines } = vi.hoisted(() => ({ logLines: [] as Array<{ level: string; text: string }> }));
+
+vi.mock("../Logger.js", async (importOriginal) => {
+	const original = await importOriginal<typeof import("../Logger.js")>();
+	const record =
+		(level: LogLevel, module: string) =>
+		(message: string, ...args: unknown[]): void => {
+			logLines.push({ level, text: original.formatLogMessage(level, module, message, args) });
+		};
+	return {
+		...original,
+		createLogger: (module: string) => ({
+			debug: record("debug", module),
+			info: record("info", module),
+			warn: record("warn", module),
+			error: record("error", module),
+		}),
+	};
+});
 
 import { execGit } from "../core/GitOps.js";
 
@@ -25,13 +62,16 @@ let dbPath: string;
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "jolli-statsw-"));
 	dbPath = join(dir, "dashboard.db");
+	logLines.length = 0;
 });
 
 afterEach(() => {
 	rmSync(dir, { recursive: true, force: true });
 });
 
-const envelope = (event: SessionUpsertedEvent | CommitCreatedEvent | WorktreeStatusEvent): StatsEventEnvelope => ({
+const envelope = (
+	event: SessionUpsertedEvent | CommitCreatedEvent | CommitSummaryEvent | WorktreeStatusEvent,
+): StatsEventEnvelope => ({
 	event,
 	producerKind: "cli",
 });
@@ -467,6 +507,36 @@ describe("write-ahead log", () => {
 		expect(await query("SELECT event_id FROM events_raw WHERE projection_status = 'failed'")).toEqual([
 			{ event_id: "bad" },
 		]);
+	});
+
+	it("leaves a pre-migration parked row alone rather than reviving it on a guess", async () => {
+		// The other half of the COALESCE in `REVIVABLE_PREDICATE`. `failed_kind` arrived in a
+		// migration, so a row parked by an older build carries NULL — no recorded reason at
+		// all. The drain must not treat that as `unknown-type`: it would reset the attempt
+		// budget of a row that may be genuinely defective, on every writable open, forever.
+		// `COALESCE(failed_kind, '')` yields `''`, which matches nothing, so the row stays
+		// parked — and the count is what has to surface it instead.
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json,
+					                         projection_status, attempts, failed_kind)
+				 VALUES ('legacy', 'session.upserted', ?, 't', ?, 'failed', 5, NULL)`,
+				).run(STATS_EVENT_SCHEMA_VERSION, JSON.stringify(session()));
+			},
+			{ dbPath },
+		);
+
+		await applyStatsEvents([], { producerKind: "cli", dbPath });
+
+		// Not revived: still failed, attempts untouched. A projectable `data_json` is used
+		// deliberately — if the drain HAD claimed it the row would have projected and left
+		// 'failed', so a defective payload could not tell the two outcomes apart.
+		expect(
+			await query<{ projection_status: string; attempts: number }>(
+				"SELECT projection_status, attempts FROM events_raw WHERE event_id = 'legacy'",
+			),
+		).toEqual([{ projection_status: "failed", attempts: 5 }]);
 	});
 
 	it("poison-pills an event that keeps failing, without blocking the rest", async () => {
@@ -1200,6 +1270,30 @@ describe("events_raw retention (§11 defect 2)", () => {
 		expect(pruneProjectedEvents(broken, () => Date.parse("2026-07-31T12:00:00Z"))).toBe(0);
 	});
 
+	it("tags the FAILURE line too, so one grep returns the whole pass", () => {
+		// The tag exists because the daemon's re-scan promises that one `grep AgentScan`
+		// returns everything it emitted. Tagging only the success line left the pair's one
+		// report of a real fault as the single thing that grep drops — and DEBUG is exactly
+		// the level someone raises before running it, so the line was present, relevant and
+		// filtered out.
+		const broken = {
+			prepare: () => {
+				throw new Error("disk I/O error");
+			},
+		} as unknown as DashboardDbHandle;
+		const now = () => Date.parse("2026-07-31T12:00:00Z");
+
+		expect(pruneProjectedEvents(broken, now, "AgentScan: ")).toBe(0);
+		expect(pruneProjectedEvents(broken, now)).toBe(0);
+
+		const skipped = logLines.filter((line) => line.text.includes("event pruning skipped"));
+		expect(skipped).toHaveLength(2);
+		expect(skipped[0]?.text).toContain("AgentScan: event pruning skipped");
+		// And the default stays empty, so the two user-triggered callers' output is
+		// byte-identical to what it was before the tag existed.
+		expect(skipped[1]?.text).not.toContain("AgentScan");
+	});
+
 	it("never prunes pending or failed rows, however old", async () => {
 		const now = Date.parse("2026-07-31T12:00:00Z");
 		const statuses = await withDashboardDb(
@@ -1236,5 +1330,292 @@ describe("events_raw retention (§11 defect 2)", () => {
 			{ dbPath },
 		);
 		expect(old).toBe(0);
+	});
+});
+
+describe("countStuckEvents", () => {
+	/**
+	 * A handle whose NARROWED count fails and whose un-narrowed fallback would succeed.
+	 *
+	 * The second half is what gives these cases teeth. A fake that throws on every
+	 * statement cannot tell a rethrow from a degradation — the fallback would throw the same
+	 * error and the assertion would pass either way — so deleting the guard outright, the
+	 * crudest form of the regression, would go unnoticed. Here a degradation returns 7.
+	 */
+	function failingFirstStatement(message: string): DashboardDbHandle {
+		let statements = 0;
+		return {
+			prepare: () => {
+				statements += 1;
+				if (statements === 1) throw new Error(message);
+				return { get: () => ({ n: 7 }) };
+			},
+		} as unknown as DashboardDbHandle;
+	}
+
+	it("rethrows a genuine fault rather than counting around it", () => {
+		// The degradation is narrowed to one SQLite message deliberately: on a pre-migration
+		// schema the un-narrowed count is the exact answer, but corruption or a permissions
+		// change must still surface. Nothing pinned this half — both existing cases
+		// (DbBackfill.test.ts) exercise only the degradation — so turning the rethrow into
+		// `return 0`, or dropping the guard so everything degrades, each reads as a harmless
+		// simplification of a defensive catch while reporting a broken database as a number.
+		expect(() => countStuckEvents(failingFirstStatement("database disk image is malformed"))).toThrow(/malformed/);
+	});
+
+	it("rethrows a DIFFERENT missing column, so the pattern cannot be widened", () => {
+		// `/no such column/i` is the tempting simplification, and it is wrong: a column
+		// missing for any other reason is real schema drift, not the one shape whose
+		// un-narrowed count is provably exact. Only `failed_kind` has that property.
+		expect(() => countStuckEvents(failingFirstStatement("no such column: time_updated"))).toThrow(/time_updated/);
+	});
+
+	it("degrades for exactly that one message, answering with the un-narrowed count", () => {
+		expect(countStuckEvents(failingFirstStatement("no such column: failed_kind"))).toBe(7);
+	});
+});
+
+describe("projectSession — monotonic guard", () => {
+	/**
+	 * The guard only fires against a row whose instant is TRANSCRIPT-DERIVED, which it
+	 * recognises by `started_at_ms` / `duration_ms` — `readKnownSessions`' read-receipt
+	 * pair. So what arms it in the cases below is those two columns, NOT the `title` this
+	 * helper also sets: a FAILED transcript read writes a title too, which is exactly why
+	 * `title` is part of neither predicate (see `projectSession`, and the case further
+	 * down that a title-based test walked straight into). The title is here only to keep
+	 * the event production-shaped — `resolveTitle` yields one for any transcript with a
+	 * first user message, which is every conversation that has content.
+	 */
+	const read = (over: Partial<SessionUpsertedEvent> = {}): SessionUpsertedEvent =>
+		session({ title: "a real conversation", startedAtMs: 1_699_999_000_000, durationMs: 1_000, ...over });
+
+	/**
+	 * `updated_at_ms` is ASSIGNED by the UPSERT, not MAX'd, so without the guard an
+	 * older event silently rewinds the row — and takes the model split and the tool set
+	 * with it, since both are replace-wholesale.
+	 *
+	 * Reachable because insertion order is not observation order: four independent
+	 * processes emit for one session, and a producer that observed an older version can
+	 * still write later. It self-heals on the next pass, which is why it went unnoticed.
+	 */
+	it("does not let an older event rewind the stored session", async () => {
+		const newer = read({ updatedAtMs: 1_700_000_200_000, messageCount: 9 });
+		const older = read({ updatedAtMs: 1_700_000_000_000, messageCount: 4 });
+
+		await applyStatsEvents([envelope(newer)], { producerKind: "cli", dbPath });
+		await applyStatsEvents([envelope(older)], { producerKind: "vscode", dbPath });
+
+		expect(await query("SELECT updated_at_ms, message_count FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_200_000, message_count: 9 },
+		]);
+	});
+
+	it("does not let an older event replace the newer event's model split", async () => {
+		const newer = read({
+			updatedAtMs: 1_700_000_200_000,
+			models: [{ model: "claude-opus-5", inputTokens: 900, outputTokens: 90, cachedTokens: 0 }],
+		});
+		const older = read({
+			updatedAtMs: 1_700_000_000_000,
+			models: [{ model: "claude-haiku-4-5", inputTokens: 1, outputTokens: 1, cachedTokens: 0 }],
+		});
+
+		await applyStatsEvents([envelope(newer)], { producerKind: "cli", dbPath });
+		await applyStatsEvents([envelope(older)], { producerKind: "vscode", dbPath });
+
+		expect(await query("SELECT model, input_tokens FROM session_model_usage")).toEqual([
+			{ model: "claude-opus-5", input_tokens: 900 },
+		]);
+	});
+
+	it("still projects a real read whose instant PRE-DATES a commit-summary seed", async () => {
+		// The guard's one dangerous shape, and it is the common one rather than an edge.
+		// A commit summary stamps its seeded `sessions` row with `committedAtMs`, which is
+		// later than the conversation's last turn — measured on one real machine, 42 of 56
+		// stored session links. `dbBackfillRepo` applies summaries BEFORE sessions, so on
+		// a fresh import the seed always lands first, and a guard that compared against it
+		// dropped the real read whole while reporting the event as projected. Permanent:
+		// the stub is not a read receipt, so every later pass re-read and dropped it again.
+		await applyStatsEvents(
+			[
+				envelope({
+					type: "commit.summary",
+					repoIdentity: "repo-1",
+					hash: "abc123",
+					committedAtMs: 1_700_000_100_000,
+					title: "feat: thing",
+					sessionLinks: [{ source: "claude", sessionId: "s1", messageCount: 2 }],
+				} as unknown as CommitSummaryEvent),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await query("SELECT updated_at_ms, title FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_100_000, title: null },
+		]);
+
+		await applyStatsEvents(
+			[
+				envelope(
+					read({
+						updatedAtMs: 1_700_000_000_000,
+						messageCount: 40,
+						tools: [{ name: "Bash", kind: "builtin", calls: 3 }],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		expect(await query("SELECT updated_at_ms, title, started_at_ms, message_count FROM sessions")).toEqual([
+			{
+				updated_at_ms: 1_700_000_000_000,
+				title: "a real conversation",
+				started_at_ms: 1_699_999_000_000,
+				message_count: 40,
+			},
+		]);
+		expect(await query("SELECT tool_name, calls FROM session_tool_use")).toEqual([{ tool_name: "Bash", calls: 3 }]);
+	});
+
+	it("still projects a real read whose instant PRE-DATES a FAILED read's stub", async () => {
+		// The guard's OTHER dangerous shape, and the one a title-based provenance test
+		// walked straight into. A failed transcript read writes `{title, updated_at_ms}`
+		// and nothing else, stamped with the `sessions.json` instant — the last turn plus
+		// the hook's delay, not anything a transcript said. Claude's Stop hook is
+		// `async: true` and races the agent's own append, so this is an ordinary event.
+		// 48 h later `pruneStale` drops the registry row and the 7-day back-fill sees only
+		// the disk copy, whose mtime is EARLIER — so the good read arrives with the
+		// SMALLER instant and has to land anyway.
+		//
+		// The same stub-then-read shape at an EQUAL instant is deliberately NOT a second
+		// case. `prior.updated_at_ms > event.updatedAtMs` is false there whatever the
+		// provenance test answers, so no mutation of the guard can make such a case fail
+		// and it pins nothing — it was written, measured to be inert, and removed. A
+		// larger stub instant is what makes provenance the only thing deciding.
+		const stub = session({
+			title: "a real conversation",
+			updatedAtMs: 1_700_000_200_000,
+			models: [],
+			tokenCoverage: "sessions-only",
+			messageCount: undefined,
+		});
+		await applyStatsEvents([envelope(stub)], { producerKind: "vscode", dbPath });
+		// The shape that made this reachable: a title, and neither receipt column.
+		expect(await query("SELECT updated_at_ms, title, started_at_ms, duration_ms FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_200_000, title: "a real conversation", started_at_ms: null, duration_ms: null },
+		]);
+
+		await applyStatsEvents(
+			[
+				envelope(
+					read({
+						updatedAtMs: 1_700_000_000_000,
+						messageCount: 40,
+						tools: [{ name: "Bash", kind: "builtin", calls: 3 }],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		// The whole payload, not just the instant — this is what used to be discarded
+		// while the event was recorded as successfully projected.
+		expect(await query("SELECT updated_at_ms, started_at_ms, duration_ms, message_count FROM sessions")).toEqual([
+			{
+				updated_at_ms: 1_700_000_000_000,
+				started_at_ms: 1_699_999_000_000,
+				duration_ms: 1_000,
+				message_count: 40,
+			},
+		]);
+		expect(await query("SELECT tool_name, calls FROM session_tool_use")).toEqual([{ tool_name: "Bash", calls: 3 }]);
+	});
+
+	it("still projects an event carrying the SAME instant", async () => {
+		// STRICTLY greater, never `>=`. BOTH rows are real reads here, so the provenance
+		// test passes and the comparison is genuinely what decides — which is the point of
+		// the case: a re-read at an unchanged mtime is how a fixed parser or a bumped
+		// `SESSION_READ_GENERATION` heals a row projected from less, and `>=` would drop
+		// every one of them.
+		const first = read({ updatedAtMs: 1_700_000_000_000, messageCount: 4 });
+		const reread = read({ updatedAtMs: 1_700_000_000_000, messageCount: 12 });
+
+		await applyStatsEvents([envelope(first)], { producerKind: "vscode", dbPath });
+		await applyStatsEvents([envelope(reread)], { producerKind: "cli", dbPath });
+
+		expect(await query("SELECT updated_at_ms, message_count FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_000_000, message_count: 12 },
+		]);
+	});
+
+	it("marks a skipped event projected rather than failed, so the prune can reach it", async () => {
+		// "Nothing to do" is a form of completion. Parking it as `failed` instead would
+		// keep it forever — `pruneProjectedEvents` only ever deletes `projected` rows.
+		//
+		// Both events are real reads, so a skip actually happens; and the row assertion is
+		// what lets this case fail at all. Without the guard the older event projects
+		// normally and the status is `projected` either way, so the status alone cannot
+		// tell the two worlds apart.
+		await applyStatsEvents([envelope(read({ updatedAtMs: 1_700_000_200_000, messageCount: 9 }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await applyStatsEvents([envelope(read({ updatedAtMs: 1_700_000_000_000, messageCount: 4 }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+
+		const statuses = await query<{ projection_status: string }>(
+			"SELECT projection_status FROM events_raw ORDER BY seq",
+		);
+		expect(statuses.every((r) => r.projection_status === "projected")).toBe(true);
+		// The skip really happened — otherwise this is the older event's 4.
+		expect(await query("SELECT message_count FROM sessions")).toEqual([{ message_count: 9 }]);
+	});
+});
+
+describe("projectSession — duplicate model entries", () => {
+	/**
+	 * A deterministic poison shape before the conflict clause: the split is deleted and
+	 * re-inserted per projection, so two entries naming one model hit the
+	 * `(session_event_id, model)` primary key. The projection threw, the event burned
+	 * its five attempts and parked as `failed`, and because the collision comes from
+	 * the transcript's own content it reproduced on every re-read.
+	 */
+	it("sums two entries naming the same model instead of failing the projection", async () => {
+		const event = session({
+			models: [
+				{ model: "claude-opus-5", inputTokens: 100, outputTokens: 50, cachedTokens: 25, estCostUsd: 0.5 },
+				{ model: "claude-opus-5", inputTokens: 10, outputTokens: 5, cachedTokens: 2, estCostUsd: 0.25 },
+			],
+		});
+
+		const result = await applyStatsEvents([envelope(event)], { producerKind: "cli", dbPath });
+
+		expect(result.pending).toBe(0);
+		expect(
+			await query(
+				"SELECT model, input_tokens, output_tokens, cached_tokens, est_cost_usd FROM session_model_usage",
+			),
+		).toEqual([
+			{ model: "claude-opus-5", input_tokens: 110, output_tokens: 55, cached_tokens: 27, est_cost_usd: 0.75 },
+		]);
+	});
+
+	it("keeps a wholly unpriced model NULL rather than summing it to zero", async () => {
+		// NULL means "unpriced", not zero. `0 + 0` would store a priced 0.00, which every
+		// downstream reader treats as a real answer rather than a missing one.
+		const event = session({
+			models: [
+				{ model: "some-local-model", inputTokens: 10, outputTokens: 5, cachedTokens: 0 },
+				{ model: "some-local-model", inputTokens: 1, outputTokens: 1, cachedTokens: 0 },
+			],
+		});
+
+		await applyStatsEvents([envelope(event)], { producerKind: "cli", dbPath });
+
+		expect(await query("SELECT model, input_tokens, est_cost_usd FROM session_model_usage")).toEqual([
+			{ model: "some-local-model", input_tokens: 11, est_cost_usd: null },
+		]);
 	});
 });

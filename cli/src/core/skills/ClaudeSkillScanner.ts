@@ -42,6 +42,7 @@
 
 import { createLogger } from "../../Logger.js";
 import type { SkillEntryPath, SkillInvocation, SkillUse } from "../../Types.js";
+import { splitSkillId } from "./SkillId.js";
 
 const log = createLogger("ClaudeSkillScanner");
 
@@ -353,7 +354,9 @@ function assemble(
 	const uses: SkillUse[] = [];
 	for (const [skill, { paths, invocations }] of bySkill) {
 		invocations.sort((a, b) => (a.at === b.at ? 0 : a.at < b.at ? 1 : -1));
-		const plugin = pluginBySkill.get(skill) ?? pluginPrefixOf(skill);
+		// The namespace only — Claude deliberately keeps it inside `skill` as well, unlike
+		// Codex, which must strip it. Shared parser, separate projection; see `splitSkillId`.
+		const plugin = pluginBySkill.get(skill) ?? splitSkillId(skill).plugin;
 		uses.push({
 			source: "claude",
 			skill,
@@ -363,12 +366,6 @@ function assemble(
 		});
 	}
 	return uses;
-}
-
-/** `superpowers:brainstorming` → `superpowers`; an unnamespaced id has no plugin. */
-function pluginPrefixOf(skill: string): string | undefined {
-	const colon = skill.indexOf(":");
-	return colon > 0 ? skill.slice(0, colon) : undefined;
 }
 
 function messageContent(record: Record<string, unknown>): unknown {

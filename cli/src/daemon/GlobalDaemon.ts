@@ -1,12 +1,13 @@
 /**
  * GlobalDaemon — the one resident process per machine per user.
  *
- * It exists to run work that must happen when NOBODY is working: today the
- * daily `jollimemory.db` snapshot, next the periodic session-activity upload.
- * Every other trigger for that snapshot is opportunistic (the dashboard
- * launcher, the post-commit worker, `doctor`), which covers the user who
- * commits regularly and abandons the user who does not — exactly the user who
- * needs an old snapshot most.
+ * It exists to run work that must happen when NOBODY is asking for it: the daily
+ * `jollimemory.db` snapshot, and the periodic re-scan that notices an agent
+ * conversation has grown since the dashboard last imported it. Every other trigger
+ * for either is opportunistic (the dashboard launcher, the post-commit worker,
+ * `doctor`), which covers the user who commits regularly and abandons the user who
+ * does not — exactly the user whose snapshot is oldest and whose afternoon of agent
+ * work is least likely to have been recorded.
  *
  * Owned by NO session, spawned detached. Unlike `McpDaemon` it has **no idle
  * timeout**, and that inversion is the whole point: the MCP daemon reaps itself
@@ -28,14 +29,16 @@ import {
 	parseDaemonGreeting,
 	readHandshakeLine,
 } from "../core/DaemonHandshake.js";
+import { loadConfig } from "../core/SessionTracker.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
-import { createLogger, errMsg, setLogDir } from "../Logger.js";
+import { applyConfiguredLogLevel, createLogger, errMsg, setLogDir } from "../Logger.js";
 import {
 	GLOBAL_DAEMON_PROTOCOL,
 	type GlobalDaemonHello,
 	globalSocketDir,
 	globalSocketPath,
 } from "./GlobalDaemonProtocol.js";
+import { sessionRescanTask } from "./SessionRescanTask.js";
 import { type DaemonTask, startScheduler } from "./TaskScheduler.js";
 
 const log = createLogger("GlobalDaemon");
@@ -64,9 +67,24 @@ export interface RunGlobalDaemonOptions {
 /**
  * The tasks a production daemon runs.
  *
- * `opportunisticSnapshot` is asked hourly and decides for itself: it reads
- * `last-snapshot-at` from the database and skips unless a day has passed. The
- * daemon adds no scheduling knowledge of its own — see `TaskScheduler`.
+ * Both are asked on a clock and decide for themselves whether to act, which is the
+ * whole of the scheduling model: `opportunisticSnapshot` reads `last-snapshot-at`
+ * from the database and skips unless a day has passed, and the session re-scan
+ * compares each conversation's instant against the one already stored. The daemon
+ * adds no scheduling knowledge of its own — see `TaskScheduler`.
+ *
+ * The two intervals differ by two orders of magnitude and that is not an
+ * inconsistency: an hourly question is right for work whose answer changes once a
+ * day, and a 30-second one is right for work whose answer changes while the user is
+ * typing. What makes the fast one affordable is that its converged tick does no I/O
+ * beyond a `stat` per conversation file.
+ *
+ * They may overlap, and deliberately nothing stops them. `TaskScheduler`'s in-flight
+ * flag is per task, so the backup's `VACUUM INTO` can begin while a re-scan is
+ * waiting on disk. That is safe rather than merely unlikely: the snapshot reads the
+ * database and writes a separate file, the re-scan's own write is a short transaction
+ * at the very end, and WAL lets those coexist. Adding a cross-task mutex would mean
+ * giving the scheduler shared state, which is the one thing it must not have.
  */
 export function defaultTasks(): ReadonlyArray<DaemonTask> {
 	return [
@@ -78,6 +96,7 @@ export function defaultTasks(): ReadonlyArray<DaemonTask> {
 				return result.status === "created" ? `created ${result.path}` : `${result.status}: ${result.reason}`;
 			},
 		},
+		sessionRescanTask(),
 	];
 }
 
@@ -98,6 +117,18 @@ export async function runGlobalDaemon(options: RunGlobalDaemonOptions = {}): Pro
 	// different one across reboots. `homedir()` lands it in the global config
 	// dir, since getGlobalConfigDir() is join(homedir(), ".jolli", "jollimemory").
 	setLogDir(homedir());
+	// Then honour the configured level, which nothing here used to do: the default
+	// file threshold is `info`, so every `log.debug` in this process — including the
+	// scheduler's per-task result line — was dropped, and setting `logLevel: "debug"`
+	// in the config had no effect on the one process a user cannot watch directly.
+	// Best-effort: a daemon must still come up when the config is missing or corrupt,
+	// and the default level is the right fallback.
+	try {
+		const config = await loadConfig();
+		applyConfiguredLogLevel(config.logLevel, config.logLevelOverrides);
+	} catch (error: unknown) {
+		log.warn("could not read the configured log level: %s", errMsg(error));
+	}
 
 	await ensureSocketParentDir(socketPath);
 	/* v8 ignore start -- process.getuid is undefined only on win32, which this suite does not run on */

@@ -296,6 +296,21 @@ export interface StatsEventEnvelope {
 }
 
 /**
+ * The `session.upserted` idempotency key, spelled ONCE.
+ *
+ * {@link statsEventId} builds it from a whole event, which is all any producer needs.
+ * A consumer that holds only the three parts — the session re-scan's emission gate,
+ * which asks "have I already emitted for this session?" without an event in hand —
+ * goes through here rather than re-spelling the format. Two spellings of one key are
+ * two things nothing type-checks, and the day either moves they stop matching in
+ * silence: the gate simply never fires again and the duplicate it exists to stop
+ * comes back.
+ */
+export function sessionEventId(repoIdentity: string, source: string, sessionId: string): string {
+	return `session:${repoIdentity}:${source}:${sessionId}`;
+}
+
+/**
  * Deterministic primary key for an event's projected row.
  *
  * Determinism is the whole idempotency story: bootstrap, gap recovery and a
@@ -306,7 +321,7 @@ export interface StatsEventEnvelope {
 export function statsEventId(event: StatsEvent): string {
 	switch (event.type) {
 		case "session.upserted":
-			return `session:${event.repoIdentity}:${event.source}:${event.sessionId}`;
+			return sessionEventId(event.repoIdentity, event.source, event.sessionId);
 		case "commit.created":
 			return `commit:${event.repoIdentity}:${event.hash}`;
 		case "commit.summary":

@@ -59,6 +59,7 @@ import {
 	STATS_EVENT_SCHEMA_VERSION,
 	type StatsEvent,
 	type StatsEventEnvelope,
+	sessionEventId,
 	statsEventId,
 	type WorktreeStatusEvent,
 } from "./DashboardModel.js";
@@ -184,6 +185,82 @@ interface PendingRow {
 }
 
 /**
+ * The parked rows a later build un-parks by itself, as a SQL predicate.
+ *
+ * ONE fragment shared by the two statements that must agree about it: {@link drainPending}
+ * revives exactly these, and {@link countStuckEvents} must therefore not count them. A
+ * second spelling of the predicate is how those two silently disagree — and the direction
+ * they disagreed in was user-facing, since the count feeds a message that asserts data
+ * loss. `type IN (…)` is filled from {@link KNOWN_EVENT_TYPES} by the caller.
+ *
+ * `COALESCE` rather than a bare `failed_kind = …`, and that is not defensive noise: the
+ * column arrived in a MIGRATION, so every row parked by a build older than it reads NULL,
+ * and `NULL = 'unknown-type'` is NULL rather than false. Inside {@link countStuckEvents}'s
+ * `NOT (…)` that NULL propagates and `WHERE` discards the row — so exactly the rows
+ * `drainPending` can never revive (NULL is not a reason it knows) were also the ones the
+ * count could not see. Permanently stuck AND permanently invisible, which is the opposite
+ * of what narrowing the count was for. Measured on four parked rows: 4 before the
+ * narrowing, 2 after it, 3 correct.
+ */
+const REVIVABLE_PREDICATE = "projection_status = 'failed' AND COALESCE(failed_kind, '') = 'unknown-type'";
+
+/**
+ * Parked events this build cannot recover on its own — the number worth telling a user.
+ *
+ * NOT every `failed` row. `drainPending` un-parks `unknown-type` rows whose type this build
+ * now understands on every writable open, so those are a version-skew artefact that heals
+ * itself: an older CLI parked an event a newer VS Code build wrote, and upgrading the CLI
+ * is the whole repair. Counting them made both readers assert something false — `jolli
+ * doctor` printed "N event(s) parked unprojected — some conversations may be missing from
+ * the dashboard", with no fixer to offer, for rows the next commit silently revives.
+ *
+ * Both readers go through a READ-ONLY handle, which is why the count has to do this
+ * narrowing itself rather than draining first: a diagnostic must not write, and the daemon's
+ * phase 1 is deliberately read-only. Counting through a writable handle so the drain runs
+ * would make asking the question change the answer.
+ *
+ * Lives here rather than beside the schema helpers because the predicate it must agree with
+ * lives here. Cheap for both callers: `ix_events_pending` leads with `projection_status`, so
+ * this is an index scan.
+ *
+ * ## Why a missing column degrades instead of throwing
+ *
+ * `failed_kind` is added by a MIGRATION, and both callers hold a READ-ONLY handle, which by
+ * contract never migrates — so on a database still at a pre-migration schema this statement
+ * raises `no such column`. That is reachable on an ordinary upgrade: the daemon's re-scan
+ * runs on a 30-second timer and can easily tick before the first commit gives the database
+ * its first writable open. Left to throw it took the whole pass down (reported as
+ * `database-unusable`, and the early return meant the writable phase that would have
+ * migrated never ran), for a number that is one health metric among several.
+ *
+ * The fallback is not a guess. Before that migration nothing could be parked as
+ * `unknown-type` — there was no column to record a reason in — so on such a schema every
+ * `failed` row IS stuck, and the un-narrowed count is the exact answer rather than an
+ * approximation of it. Narrowed to that one SQLite message so a genuine fault (corruption,
+ * permissions) still surfaces rather than being counted around.
+ */
+export function countStuckEvents(db: DashboardDbHandle): number {
+	const revivable = KNOWN_EVENT_TYPES.map(() => "?").join(", ");
+	try {
+		const row = db
+			.prepare(
+				`SELECT COUNT(*) AS n FROM events_raw
+				  WHERE projection_status = 'failed'
+				    AND NOT (${REVIVABLE_PREDICATE} AND type IN (${revivable}))`,
+			)
+			.get(...KNOWN_EVENT_TYPES) as { n: number };
+		return row.n;
+	} catch (err) {
+		if (!/no such column: failed_kind/i.test(errMsg(err))) throw err;
+		log.debug("failed_kind absent — counting every parked event on this pre-migration schema");
+		const row = db.prepare("SELECT COUNT(*) AS n FROM events_raw WHERE projection_status = 'failed'").get() as {
+			n: number;
+		};
+		return row.n;
+	}
+}
+
+/**
  * Projects up to {@link DRAIN_BATCH_SIZE} pending rows.
  *
  * Each row is projected in its OWN transaction. That costs a few more commits
@@ -214,8 +291,7 @@ export function drainPending(
 	const revivable = KNOWN_EVENT_TYPES.map(() => "?").join(", ");
 	db.prepare(
 		`UPDATE events_raw SET projection_status = 'pending', attempts = 0, failed_kind = NULL
-		  WHERE projection_status = 'failed' AND failed_kind = 'unknown-type'
-		    AND type IN (${revivable})`,
+		  WHERE ${REVIVABLE_PREDICATE} AND type IN (${revivable})`,
 	).run(...KNOWN_EVENT_TYPES);
 
 	const rows = db
@@ -491,9 +567,235 @@ function resolveRepoId(db: DashboardDbHandle, repoIdentity: string): number | nu
 	return row?.id ?? null;
 }
 
+/**
+ * The per-model split's insert, shared by the two paths that write one.
+ *
+ * ## Why the conflict clause is not optional
+ *
+ * Both callers DELETE this session's split before inserting, so the only way to reach
+ * `ON CONFLICT` is two entries naming the SAME model inside ONE event — two segments
+ * of one model, which sum. Without the clause that is an unhandled UNIQUE violation
+ * on `(session_event_id, model)`, and the consequences are out of all proportion to
+ * the typo that causes it: the projection throws, the event burns its five attempts
+ * and parks as `failed`, and because the collision is derived from the transcript's
+ * own content it reproduces identically on every re-read. A parked `session.upserted`
+ * is invisible in every direction — no `sessions` row, no reader, and (until
+ * {@link countStuckEvents}) no count anywhere.
+ *
+ * The sibling insert into `session_tool_use` has carried a conflict clause all along;
+ * this one was the odd one out, in both places.
+ *
+ * NULL means "unpriced", not zero, which is why the cost arm is a CASE rather than a
+ * pair of COALESCEs: summing two unpriced segments as `0 + 0` would store a priced
+ * 0.00, and every downstream reader treats that as a real answer rather than a
+ * missing one.
+ *
+ * A MIXED pair — one segment priced, the other not — is NULL for the same reason, and
+ * that is a deliberate loss of the known half. `COALESCE(…, 0) + COALESCE(…, 0)` would
+ * store a confident total covering tokens that were never priced, and this schema has no
+ * way to say "at least this much" (the lower-bound signal exists only on the TS side, as
+ * the unpriced-model set). Between an understated definite number and an honest unknown,
+ * the column's own contract picks the unknown.
+ *
+ * The mixed case is not reachable today: both rows always come from ONE event's `models`
+ * array (each caller DELETEs the split first), and pricing is resolved per model id from
+ * one `Pricing.ts` table, so two segments of the same model are priced the same way or not
+ * at all. Written explicitly anyway — the arm that used to cover it silently summed.
+ */
+const MODEL_USAGE_UPSERT = `INSERT INTO session_model_usage
+   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd)
+ VALUES (?, ?, ?, ?, ?, ?)
+ ON CONFLICT(session_event_id, model) DO UPDATE SET
+   input_tokens  = session_model_usage.input_tokens  + excluded.input_tokens,
+   output_tokens = session_model_usage.output_tokens + excluded.output_tokens,
+   cached_tokens = session_model_usage.cached_tokens + excluded.cached_tokens,
+   est_cost_usd  = CASE
+     WHEN session_model_usage.est_cost_usd IS NULL OR excluded.est_cost_usd IS NULL THEN NULL
+     ELSE session_model_usage.est_cost_usd + excluded.est_cost_usd
+   END`;
+
 function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): void {
-	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const eventId = statsEventId(event);
+
+	// Monotonic guard, and it runs before `ensureRepoRow` because it is the cheapest
+	// thing here and a skipped event has no business creating a repos row.
+	//
+	// `updated_at_ms` below is ASSIGNED, not MAX'd, so an event describing an OLDER
+	// version of this session moves the row BACKWARDS — and takes the model split and
+	// the tool set with it, since both are replace-wholesale.
+	//
+	// That is reachable because insertion order is not observation order. Four
+	// independent processes emit for the same session (the Stop hook, the VS Code 60 s
+	// tick, `jolli dashboard`, the global daemon's re-scan), each reads, then collects,
+	// then writes, and their collect phases differ in length — so a producer that
+	// observed an older version can still write later, and the drain claims by `seq`.
+	// It self-heals on the next pass (the file's mtime exceeds the rolled-back value,
+	// so the session is re-read), which is exactly why it has never been noticed: the
+	// row just serves stale tokens and a stale tool set until then, silently.
+	//
+	// STRICTLY greater, never `>=`. An equal instant is a re-read of the SAME version,
+	// and a re-read at an unchanged mtime is precisely how a fixed parser or a bumped
+	// `SESSION_READ_GENERATION` heals a row that was projected from less — dropping it
+	// would turn both of those mechanisms into no-ops for every file that has not moved
+	// since. Re-projecting costs one idempotent UPSERT and cannot lose anything.
+	//
+	// ## And it compares only against a row THIS function produced
+	//
+	// `updated_at_ms` does not mean the same thing in every row, so the guard is only
+	// meaningful between two rows of the same provenance. `projectCommitSummary` seeds a
+	// `sessions` row for a session the memory pipeline is the only record of, and stamps
+	// it with the COMMIT's instant — which its own comment notes is "later than the
+	// conversation's last turn". That value is therefore routinely AHEAD of any instant a
+	// transcript read will ever report: measured on one real machine, 42 of 56 stored
+	// `commit.summary` session links carry `committedAtMs` greater than the session's own
+	// `updated_at_ms`.
+	//
+	// Comparing against such a row inverts this guard into the data loss it exists to
+	// prevent, and permanently. `dbBackfillRepo` applies its summaries tier BEFORE its
+	// sessions tier inside one handle, so on a fresh import the seed always lands first;
+	// the session's real event then arrives with the older transcript instant and is
+	// dropped whole — no title, no `started_at_ms`, no `duration_ms`, no message count,
+	// no model split, no tool rows — while `applyToDb` records it as successfully
+	// projected. Nothing recovers it either: `readKnownSessions` counts only
+	// `started_at_ms`/`duration_ms` as a read receipt, so the stub never becomes one, and
+	// every later pass re-reads the transcript and drops it again.
+	//
+	// The provenance test is `started_at_ms` / `duration_ms` — `readKnownSessions`' pair,
+	// deliberately the SAME predicate, because it turns out to be the same question.
+	//
+	// The question is not "who wrote this row" but "is `prior.updated_at_ms` a
+	// TRANSCRIPT-DERIVED high-water mark, so that a lower instant is describing an older
+	// version of the same content". Only a SUCCESSFUL read produces one, and two kinds of
+	// row fail that:
+	//
+	//   1. `projectCommitSummary`'s seed — the case above.
+	//   2. A FAILED read, which is this same function. `sessionEventFromInfo` resolves the
+	//      title BEFORE it opens the transcript and still returns a base event when the
+	//      read throws, so a row can carry `{title, updated_at_ms}` and nothing else — and
+	//      that instant came from `sessions.json` (the last turn plus the hook's delay),
+	//      not from any transcript. It therefore sits AHEAD of what a later disk scan
+	//      reports, in exactly the way the commit seed's instant does.
+	//
+	// `title` used to be on this list, reasoning that the seed cannot write one so its
+	// presence proves this function did. Both halves are true and neither is the question:
+	// (2) is this function writing a row whose instant is not comparable. Claude's Stop
+	// hook is `async: true` and races the agent's own append, so a locked or half-written
+	// transcript is an ordinary event, not an exotic one; 48 h later `pruneStale` drops the
+	// registry row and the 7-day back-fill sees only the disk copy, whose mtime is EARLIER.
+	// `readKnownSessions` correctly refuses the stub as a receipt, so the transcript really
+	// is re-read — and the whole payload (message count, duration, model split, tool rows,
+	// skills) was then dropped here while `applyToDb` recorded the event as projected, and
+	// dropped again on every later pass, since the stub never becomes a receipt either.
+	// That also silently voided `SESSION_READ_GENERATION`: a bump correctly forces the
+	// un-skipped re-read, which landed here and was discarded.
+	//
+	// What narrowing gives up is protection for a title-only row, whose `updated_at_ms` an
+	// older event can now rewind. That is the right way round — such a row holds no
+	// transcript-derived fact to lose — and it is the same call already made for the other
+	// unguarded residue: a read that SUCCEEDED on a transcript with no entries and no
+	// first user message, so neither column is set.
+	// ── DELIBERATE — NOT A REVIEW FINDING ──────────────────────────────────────────
+	// **The provenance test below cannot tell a REGISTRY-derived instant from a
+	// TRANSCRIPT-derived one, so for one class of row this guard drops the very re-read a
+	// `SESSION_READ_GENERATION` bump deliberately forced.** That is real, it is measured,
+	// and it is DEFERRED to its own change — do not re-raise it as a defect.
+	//
+	// ## Why the test misses it
+	//
+	// The question the test wants answered is "is `prior.updated_at_ms` a
+	// transcript-derived high-water mark". `started_at_ms`/`duration_ms` stand in for it,
+	// on the reasoning that only a successful read produces them. Claude's Stop hook
+	// produces them too — it reads the transcript in full — while its `updatedAtMs` comes
+	// from `sessions.json`, which `StopHook` stamps with `new Date()` BEFORE it reads. So a
+	// hook-written row carries transcript-derived columns and a WALL-CLOCK instant, and
+	// that instant is necessarily `last turn + δ` with δ > 0, because the Stop hook fires
+	// after the agent has stopped. Any later disk read of the same unchanged file reports
+	// the last turn itself, so `prior > event` holds for EVERY hook-written Claude/Gemini
+	// row on every forced re-read, permanently. δ need not be seconds: the comparison is
+	// strictly greater, so any δ at all is enough.
+	//
+	// The `>` rather than `>=` below was chosen precisely to let a same-version re-read
+	// through. For these rows the two numbers are never equal, so that channel has never
+	// once opened.
+	//
+	// ## What it costs — and why it is NOT "data loss on every run"
+	//
+	// Nothing at all on the overwhelming majority of passes. The upstream read gate
+	// (`alreadyCurrentFrom`: stored >= discovered) skips these sessions outright, so the
+	// only thing that ever reaches this guard for one of them is a generation bump — and a
+	// bump has something to add only when an EXTRACTOR improved. What is broken is the
+	// repair CHANNEL, not the steady state.
+	//
+	// Measured against the bump that shipped alongside this comment (3 → 4): the extractor
+	// that changed is `CodexSkillScanner`, and Codex has NO hook — its stored instant and
+	// its re-read are both the file's mtime, so an unchanged file compares EQUAL and passes.
+	// The rows that needed healing were healed. `scanClaudeSkillLines` did not change, so
+	// no Claude row needed healing. This release loses nothing. The next release that
+	// improves extraction for a hook-backed source will, and silently.
+	//
+	// One case needs no upgrade at all: `extractSessionSignals` catches each extractor
+	// independently — by design, because they read other applications' live files — so a
+	// hook run whose skill scan threw while its tool scan succeeded writes a row that LOOKS
+	// like a complete read (both columns set) and can never be repaired here. Low
+	// frequency, one warn line at the time, no repair path afterwards.
+	//
+	// ## The fix, and why it is not folded in here
+	//
+	// The two instants have to stop sharing one column: record the transcript's own
+	// FINAL-ENTRY timestamp ("which version of the content is this event describing")
+	// beside `updated_at_ms` ("when was this session last active"), and compare only that.
+	// Both producers read the same file, so they agree on it exactly — a hook row and a
+	// disk re-read of an unchanged file then land on EQUAL and pass, while a genuinely
+	// older read still lands below and is still dropped.
+	//
+	// That is a permanent schema commitment (`MIGRATIONS` names are forever, DDL freezes on
+	// release) for a LATENT defect. It is also the same class of problem, and the same
+	// trade, that `TranscriptSkillDiscovery`'s own DELIBERATE block documents and declines
+	// on the skills-registry side: a mark that records a POSITION and not the logic that
+	// read it. Treat it as a scoped migration with a measured re-scan budget, not as a bug
+	// fix folded into unrelated work.
+	//
+	// ## Two shortcuts that look like the fix and are worse than the defect
+	//
+	// Do NOT narrow `>` to `>=`, and do NOT simply delete the early return. This guard also
+	// stops an out-of-order producer's OLDER payload from overwriting the model split and
+	// the tool set, both of which are replace-wholesale. Letting one through while
+	// `updated_at_ms` keeps the newer value (an obvious-looking `max()`) leaves the row
+	// asserting it is current while holding stale content — and the read gate believes that
+	// assertion, so nothing re-reads it and it never heals. Today's drop keeps the row's
+	// instant and its content consistent with each other, which is what makes the
+	// pre-guard behaviour's self-healing property recoverable at all.
+	// ───────────────────────────────────────────────────────────────────────────────
+	//
+	// ONE read of the row, serving both this guard and the token carry-forward below.
+	// They asked the same primary key twice, which on the 30-second re-scan path is two
+	// lookups per session per tick for one row. The cost of merging is that the
+	// carry-forward's five columns are now fetched even when `hasUsage` makes them
+	// unnecessary — cheaper than a second `get()`, since both are index lookups of the
+	// same page and only the column decode differs.
+	const prior = db
+		.prepare(
+			`SELECT updated_at_ms, started_at_ms, duration_ms,
+			        input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage
+			   FROM sessions WHERE event_id = ?`,
+		)
+		.get(eventId) as
+		| {
+				updated_at_ms: number;
+				started_at_ms: number | null;
+				duration_ms: number | null;
+				input_tokens: number;
+				output_tokens: number;
+				cached_tokens: number;
+				est_cost_usd: number | null;
+				token_coverage: string;
+		  }
+		| undefined;
+	if (prior !== undefined && (prior.started_at_ms !== null || prior.duration_ms !== null)) {
+		if (prior.updated_at_ms > event.updatedAtMs) return;
+	}
+
+	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const models = event.models ?? [];
 	// An event that carries NO usage information at all (no model split, no
 	// scalar token fields) means "tokens unobserved this time", not "zero" —
@@ -501,21 +803,9 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 	// clobber a previously enriched row, so carry the existing values forward.
 	const hasUsage =
 		models.length > 0 || event.inputTokens != null || event.outputTokens != null || event.cachedTokens != null;
-	const existing = hasUsage
-		? undefined
-		: (db
-				.prepare(
-					"SELECT input_tokens, output_tokens, cached_tokens, est_cost_usd, token_coverage FROM sessions WHERE event_id = ?",
-				)
-				.get(eventId) as
-				| {
-						input_tokens: number;
-						output_tokens: number;
-						cached_tokens: number;
-						est_cost_usd: number | null;
-						token_coverage: string;
-				  }
-				| undefined);
+	// Still gated on `hasUsage`, so the fallbacks below read `undefined` exactly when they
+	// did before — the merge changed where the row is read, never when it is consulted.
+	const existing = hasUsage ? undefined : prior;
 	// Token totals come from the per-model split when it is present, so the
 	// scalar columns can never disagree with `session_model_usage`. Only when a
 	// source exposes no per-model breakdown do the event's own scalars apply.
@@ -587,11 +877,7 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent): voi
 	// accepted producer shape, so the gap was one producer away from shipping.
 	if (hasUsage && event.models !== undefined) {
 		db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?").run(eventId);
-		const insertModel = db.prepare(
-			`INSERT INTO session_model_usage
-			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-		);
+		const insertModel = db.prepare(MODEL_USAGE_UPSERT);
 		for (const m of models) {
 			insertModel.run(eventId, m.model, m.inputTokens, m.outputTokens, m.cachedTokens, m.estCostUsd ?? null);
 		}
@@ -835,14 +1121,21 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 
 	if (event.sessionLinks) {
 		// This statement's COLUMN LIST is load-bearing, and not only for what it writes.
-		// `title`, `started_at_ms` and `duration_ms` are absent because a commit summary
-		// cannot know them — and the back-fill's per-session skip reads that absence as
-		// "no transcript was ever read for this row" (`readKnownSessions` in DbBackfill).
-		// Its instant is the COMMIT's time, later than the conversation's last turn, so a
-		// row this seed created must never look like a read receipt: adding one of those
-		// three columns here would make the sweep skip that session's transcript on every
-		// pass from then on, permanently and silently. Token columns are safe — the
-		// summary genuinely observed those.
+		// `started_at_ms` and `duration_ms` are absent because a commit summary cannot know
+		// them, and their absence is exactly what reads as "no transcript was ever read for
+		// this row" — to the back-fill's per-session skip (`readKnownSessions` in
+		// DbBackfill) and to `projectSession`'s monotonic guard, which share that predicate
+		// deliberately. This seed's instant is the COMMIT's time, later than the
+		// conversation's last turn, so a row it created must never look like a read
+		// receipt: adding either column here would make the sweep skip that session's
+		// transcript on every pass from then on, permanently and silently.
+		//
+		// `title` is absent for the weaker reason that a summary has no session title to
+		// offer. It is NOT part of either predicate, and must not be added to one: a FAILED
+		// transcript read writes a title too, so it cannot distinguish a read that happened
+		// from one that was attempted.
+		//
+		// Token columns are safe — the summary genuinely observed those.
 		const seedSession = db.prepare(
 			`INSERT INTO sessions
 			   (event_id, repo_id, source, session_id, updated_at_ms, message_count,
@@ -858,11 +1151,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 			 WHERE sessions.token_coverage = 'sessions-only' AND excluded.token_coverage = 'full'`,
 		);
 		const deleteModels = db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?");
-		const insertModel = db.prepare(
-			`INSERT INTO session_model_usage
-			   (session_event_id, model, input_tokens, output_tokens, cached_tokens, est_cost_usd)
-			 VALUES (?, ?, ?, ?, ?, ?)`,
-		);
+		const insertModel = db.prepare(MODEL_USAGE_UPSERT);
 		const deleteTools = db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?");
 		const insertTool = db.prepare(
 			`INSERT INTO session_tool_use (session_event_id, tool_name, kind, server, calls, last_call_at_ms)
@@ -874,7 +1163,10 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0)`,
 		);
 		for (const link of event.sessionLinks) {
-			const sessionEventId = `session:${event.repoIdentity}:${link.source}:${link.sessionId}`;
+			// Through the helper, not a fourth hand-written template: this key is also
+			// what `readEmittedFromLog` looks a row up by, and a spelling that drifts
+			// from `statsEventId`'s stops matching in silence.
+			const linkEventId = sessionEventId(event.repoIdentity, link.source, link.sessionId);
 			const models = link.models ?? [];
 			const cost = models.some((m) => m.estCostUsd != null) ? sum(models, (m) => m.estCostUsd ?? 0) : null;
 			// Seed a minimal session row when the memory pipeline is the only
@@ -886,7 +1178,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 			// tells us whether the row was freshly inserted or genuinely upgraded,
 			// which is also why the model split below only runs in those two cases.
 			const result = seedSession.run(
-				sessionEventId,
+				linkEventId,
 				repoId,
 				link.source,
 				link.sessionId,
@@ -900,10 +1192,10 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 				models.length > 0 ? PRICES_AS_OF : null,
 			) as { changes?: number | bigint };
 			if (Number(result?.changes ?? 0) > 0) {
-				deleteModels.run(sessionEventId);
+				deleteModels.run(linkEventId);
 				for (const m of models) {
 					insertModel.run(
-						sessionEventId,
+						linkEventId,
 						m.model,
 						m.inputTokens,
 						m.outputTokens,
@@ -928,16 +1220,9 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent):
 				// a commit column this table does not have. Undercounting a split
 				// session beats a number that grows every time the queue redrains.
 				if (link.tools !== undefined) {
-					deleteTools.run(sessionEventId);
+					deleteTools.run(linkEventId);
 					for (const t of link.tools) {
-						insertTool.run(
-							sessionEventId,
-							t.name,
-							t.kind,
-							t.server ?? null,
-							t.calls,
-							t.lastCallAtMs ?? null,
-						);
+						insertTool.run(linkEventId, t.name, t.kind, t.server ?? null, t.calls, t.lastCallAtMs ?? null);
 					}
 				}
 			}
@@ -1066,8 +1351,20 @@ const PRUNE_BATCH_SIZE = 2_000;
  * Bounded per pass and called from the writer path that already holds the lock, so
  * it costs no extra acquisition and cannot stall other writers on a first run
  * against a log that has grown for months.
+ *
+ * `tag` prefixes BOTH lines this can emit, and exists because the callers do not share a
+ * reader. Two are user-triggered writes whose output is read in context; the third is the
+ * daemon's 30-second re-scan, whose whole diagnostic story is "one `grep AgentScan` returns
+ * all of it" — a promise every line that pass can emit keeps, and that an unprefixed line
+ * from a shared helper quietly broke. Empty by default, so the two existing callers' output
+ * is byte-identical.
+ *
+ * Both lines, not just the successful one. Tagging only the INFO line left the pair's one
+ * report of a REAL fault as the single thing the grep drops — and DEBUG is precisely the
+ * level someone raises before running that grep, so the line would be present, relevant,
+ * and filtered out.
  */
-export function pruneProjectedEvents(db: DashboardDbHandle, now: () => number = Date.now): number {
+export function pruneProjectedEvents(db: DashboardDbHandle, now: () => number = Date.now, tag = ""): number {
 	try {
 		const cutoff = new Date(now() - PROJECTED_RETENTION_DAYS * 86_400_000).toISOString();
 		const result = db
@@ -1080,11 +1377,11 @@ export function pruneProjectedEvents(db: DashboardDbHandle, now: () => number = 
 			)
 			.run(cutoff, PRUNE_BATCH_SIZE) as { changes?: number | bigint };
 		const deleted = Number(result?.changes ?? 0);
-		if (deleted > 0) log.info("pruned %d projected events older than %s", deleted, cutoff.slice(0, 10));
+		if (deleted > 0) log.info("%spruned %d projected events older than %s", tag, deleted, cutoff.slice(0, 10));
 		return deleted;
 	} catch (err) {
 		// Housekeeping must never fail a write that already succeeded.
-		log.debug("event pruning skipped: %s", errMsg(err));
+		log.debug("%sevent pruning skipped: %s", tag, errMsg(err));
 		return 0;
 	}
 }
