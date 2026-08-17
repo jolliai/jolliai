@@ -21,6 +21,8 @@ interface JDNamespace {
 	query: (model: unknown, over?: Record<string, unknown>) => string;
 	scopeIdentities: (model: unknown) => string[];
 	repoToken: (model: unknown, identity: string) => string;
+	/** The shell's own POST helper, overwritten by the remove-control cases. */
+	post: (path: string, body?: unknown) => Promise<unknown>;
 }
 
 interface FakeInput {
@@ -58,12 +60,24 @@ interface FakeElement {
 	focus: () => void;
 }
 
+/** The ✕ a missing repo's row carries. Its own shape: it has an `onclick`. */
+interface FakeButton {
+	disabled: boolean;
+	attrs: Record<string, string>;
+	getAttribute: (name: string) => string | null;
+	onclick?: (event: { preventDefault: () => void; stopPropagation: () => void }) => void;
+}
+
 interface Harness {
 	JD: JDNamespace;
 	element: (id: string) => FakeElement;
 	/** Checkboxes the picker last wrote into `#repoScopeList`, by `data-repo` / `all`. */
 	boxes: () => ReadonlyArray<FakeInput>;
+	/** Remove controls the picker last wrote, by `data-forget`. */
+	forgetButtons: () => ReadonlyArray<FakeButton>;
 	href: () => string;
+	/** The window object the asset ran against, for `confirm` / `alert` / reload. */
+	win: Record<string, unknown>;
 	/** Every `document`-level keydown listener still bound, so leaks are visible. */
 	keydownCount: () => number;
 	escape: () => void;
@@ -97,10 +111,30 @@ function parseBoxes(html: string): FakeInput[] {
 	return out;
 }
 
+/**
+ * The same trick as {@link parseBoxes}, for the remove control.
+ *
+ * Parses the whole tag rather than one attribute: the ✕ now carries the absence
+ * KIND alongside the identity (`data-forget-volume`), and a parser that picks
+ * attributes by name one at a time makes every later one invisible to the handler
+ * under test — the click would silently take the wrong branch and the test would
+ * still be asserting something.
+ */
+function parseForgetButtons(html: string): FakeButton[] {
+	const out: FakeButton[] = [];
+	for (const tag of html.matchAll(/<button\b[^>]*\bdata-forget="[^"]*"[^>]*>/g)) {
+		const attrs: Record<string, string> = {};
+		for (const attr of tag[0].matchAll(/([\w-]+)="([^"]*)"/g)) attrs[attr[1]] = attr[2];
+		out.push({ disabled: false, attrs, getAttribute: (name) => attrs[name] ?? null });
+	}
+	return out;
+}
+
 function loadJD(): Harness {
 	const elements = new Map<string, FakeElement>();
 	let listeners: Array<(event: { key: string }) => void> = [];
 	let lastBoxes: FakeInput[] = [];
+	let lastForget: FakeButton[] = [];
 	const make = (): FakeElement => {
 		const attrs: Record<string, string> = {};
 		let html = "";
@@ -132,6 +166,13 @@ function loadJD(): Harness {
 			querySelectorAll: (selector) => {
 				// The picker re-reads the boxes it just wrote; everything else in the
 				// shell (the range segment, the nav) has no rows in this harness.
+				if (selector === "button[data-forget]") {
+					// Re-parsed on every ask rather than cached against `html` like the
+					// boxes: identity does not matter here (nothing holds focus on it),
+					// and a shared cache key would make one selector evict the other.
+					lastForget = parseForgetButtons(html);
+					return lastForget as unknown as ReadonlyArray<FakeInput>;
+				}
 				if (selector !== "input[type=checkbox]") return [];
 				if (parsedFrom !== html) {
 					parsed = parseBoxes(html);
@@ -177,6 +218,8 @@ function loadJD(): Harness {
 		JD: win.JD as unknown as JDNamespace,
 		element: (id) => doc.getElementById(id) as FakeElement,
 		boxes: () => lastBoxes,
+		forgetButtons: () => lastForget,
+		win,
 		href: () => location.href,
 		keydownCount: () => listeners.length,
 		escape: () => {
@@ -368,6 +411,267 @@ describe("the topbar repo picker", () => {
 		docs?.onchange?.();
 		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
 		expect(h.href()).toContain("repo=docs");
+	});
+
+	it("marks a repo whose folder is gone, keeps it selectable, and offers a ✕", () => {
+		// Marked, never dropped: the memories are still reachable. What must not
+		// happen is the row reading as a working checkout, since every action on it
+		// names a directory that is not there.
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+					{ repoIdentity: SITE, repoName: "site", worktreeRoot: "/b", sessionsThisWeek: 1 },
+					{ repoIdentity: THIRD, repoName: "docs", worktreeRoot: "/c", sessionsThisWeek: 0, missing: true },
+				],
+				scope: scoped(JOLLIAI),
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+
+		expect(html).toContain('class="repo-scope-row missing"');
+		expect(html).toContain(">folder missing</span>");
+		expect(html).toContain(`data-forget="${THIRD}"`);
+		// Only the dead row gets one.
+		expect(h.forgetButtons().map((b) => b.getAttribute("data-forget"))).toEqual([THIRD]);
+		// Still a real checkbox — its history is worth scoping to. (Three repos, so
+		// the two-of-three selection stays a `repo=` param instead of collapsing to
+		// "all", which is what an all-ticked list means.)
+		h.boxes()
+			.find((b) => b.getAttribute("data-repo") === THIRD)
+			?.onchange?.();
+		h.element("repoScope").onsubmit?.({ preventDefault: () => undefined });
+		expect(h.href()).toContain("repo=docs");
+	});
+
+	it("says the drive is not mounted rather than claiming the folder is gone", () => {
+		// The two absences are not degrees of one thing: here the repository is
+		// probably fine and the machine is what is missing, so the row must not
+		// assert a deletion. `existsSync` alone cannot tell them apart.
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+					{
+						repoIdentity: THIRD,
+						repoName: "docs",
+						worktreeRoot: "Z:\\docs",
+						sessionsThisWeek: 0,
+						missing: true,
+						volumeUnavailable: true,
+					},
+				],
+				scope: scoped(JOLLIAI),
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+
+		expect(html).toContain(">drive not mounted</span>");
+		expect(html).not.toContain(">folder missing</span>");
+		// Still the `missing` class and still a ✕ — the row is unreachable either way,
+		// and withholding the control is what B rejected.
+		expect(html).toContain('class="repo-scope-row missing"');
+		expect(html).toContain('data-forget-volume="1"');
+	});
+
+	it("shows both flags when a repo is paused AND gone", () => {
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+					{
+						repoIdentity: THIRD,
+						repoName: "docs",
+						worktreeRoot: "/c",
+						sessionsThisWeek: 0,
+						disabled: true,
+						missing: true,
+					},
+				],
+				scope: scoped(JOLLIAI),
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+		expect(html).toContain('class="repo-scope-row paused missing"');
+		expect(html).toContain(">paused · folder missing</span>");
+	});
+
+	it("keeps the disambiguating path when neither flag is set", () => {
+		// The flags take the meta slot; without them two same-named repos still get
+		// their checkout paths, which is the only thing telling them apart.
+		const h = loadJD();
+		h.JD.renderShell(
+			model({
+				repos: [
+					{ repoIdentity: "local:a", repoName: "repo", worktreeRoot: "/src/one", sessionsThisWeek: 2 },
+					{ repoIdentity: "local:b", repoName: "repo", worktreeRoot: "/src/two", sessionsThisWeek: 0 },
+				],
+				scope: scoped("local:a"),
+			}),
+		);
+		h.element("repoScopeBtn").onclick?.();
+		const html = h.element("repoScopeList").innerHTML;
+		expect(html).toContain('class="meta path"');
+		expect(html).toContain("/src/two");
+	});
+
+	describe("the ✕ itself", () => {
+		const withMissingRow = (): Harness => {
+			const h = loadJD();
+			h.JD.renderShell(
+				model({
+					repos: [
+						{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+						{
+							repoIdentity: THIRD,
+							repoName: "docs",
+							worktreeRoot: "/c",
+							sessionsThisWeek: 0,
+							missing: true,
+						},
+					],
+					scope: scoped(JOLLIAI),
+				}),
+			);
+			h.element("repoScopeBtn").onclick?.();
+			return h;
+		};
+		const withVolumeRow = (): Harness => {
+			const h = loadJD();
+			h.JD.renderShell(
+				model({
+					repos: [
+						{ repoIdentity: JOLLIAI, repoName: "jolliai", worktreeRoot: "/a", sessionsThisWeek: 3 },
+						{
+							repoIdentity: THIRD,
+							repoName: "docs",
+							worktreeRoot: "Z:\\docs",
+							sessionsThisWeek: 0,
+							missing: true,
+							volumeUnavailable: true,
+						},
+					],
+					scope: scoped(JOLLIAI),
+				}),
+			);
+			h.element("repoScopeBtn").onclick?.();
+			return h;
+		};
+		const click = (h: Harness): void => {
+			const [btn] = h.forgetButtons();
+			btn.onclick?.({ preventDefault: () => undefined, stopPropagation: () => undefined });
+		};
+		/** Answers each `confirm` in turn, recording the sentences it was shown. */
+		const confirmScript = (h: Harness, answers: ReadonlyArray<boolean>): string[] => {
+			const shown: string[] = [];
+			h.win.confirm = (message: string) => {
+				shown.push(message);
+				return answers[shown.length - 1] ?? false;
+			};
+			return shown;
+		};
+
+		it("posts nothing until the confirmation is accepted", () => {
+			const h = withMissingRow();
+			const posts: string[] = [];
+			h.win.confirm = () => false;
+			h.JD.post = (path: string) => {
+				posts.push(path);
+				return Promise.resolve({});
+			};
+			click(h);
+			expect(posts).toEqual([]);
+		});
+
+		it("forgets the identity on the row and reloads", async () => {
+			const h = withMissingRow();
+			const calls: Array<[string, unknown]> = [];
+			let reloaded = 0;
+			h.win.confirm = () => true;
+			h.win.location = { reload: () => void reloaded++ };
+			h.JD.post = (path: string, body: unknown) => {
+				calls.push([path, body]);
+				return Promise.resolve({ ok: true });
+			};
+			click(h);
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(calls).toEqual([["/api/repos/forget", { repoIdentity: THIRD }]]);
+			expect(reloaded).toBe(1);
+		});
+
+		it("re-enables the button and says why when the removal was refused", async () => {
+			// A 409 (the folder came back) has to leave the control usable — the page
+			// has no other way to retry, and a dead ✕ reads as a broken dashboard.
+			const h = withMissingRow();
+			const alerts: string[] = [];
+			h.win.confirm = () => true;
+			h.win.alert = (message: string) => void alerts.push(message);
+			h.JD.post = () => Promise.reject(new Error("that repository still exists on disk"));
+			const [btn] = h.forgetButtons();
+
+			click(h);
+			await Promise.resolve();
+			await Promise.resolve();
+
+			expect(btn.disabled).toBe(false);
+			expect(alerts[0]).toContain("still exists on disk");
+		});
+
+		it("asks a deleted folder for ONE confirmation, and says so", () => {
+			const h = withMissingRow();
+			const shown = confirmScript(h, [true]);
+			h.win.location = { reload: () => undefined };
+			h.JD.post = () => Promise.resolve({ ok: true });
+			click(h);
+
+			expect(shown).toHaveLength(1);
+			expect(shown[0]).toContain("folder cannot be found");
+		});
+
+		it("asks TWO confirmations for an unmounted volume, each saying something true", () => {
+			// The likeliest reading of this row is "plug it back in", and the
+			// registration is kept on purpose — so the first sentence must not claim a
+			// deletion, and the second has to offer waiting as the alternative.
+			const h = withVolumeRow();
+			const shown = confirmScript(h, [true, true]);
+			const calls: Array<[string, unknown]> = [];
+			h.win.location = { reload: () => undefined };
+			h.JD.post = (path: string, body: unknown) => {
+				calls.push([path, body]);
+				return Promise.resolve({ ok: true });
+			};
+			click(h);
+
+			expect(shown).toHaveLength(2);
+			expect(shown[0]).toContain("not mounted");
+			expect(shown[0]).not.toContain("cannot be undone");
+			expect(shown[1]).toContain("reconnect it instead");
+			// The flag is the record that a human saw that second sentence — the server
+			// refuses this verdict without it.
+			expect(calls).toEqual([["/api/repos/forget", { repoIdentity: THIRD, acknowledgeUnavailableVolume: true }]]);
+		});
+
+		it("posts nothing when the second confirmation is declined", () => {
+			const h = withVolumeRow();
+			const shown = confirmScript(h, [true, false]);
+			const posts: string[] = [];
+			h.JD.post = (path: string) => {
+				posts.push(path);
+				return Promise.resolve({});
+			};
+			click(h);
+
+			expect(shown).toHaveLength(2);
+			expect(posts).toEqual([]);
+		});
 	});
 
 	it("names the exact identities on the button, where the label cannot", () => {

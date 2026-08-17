@@ -210,13 +210,22 @@ describe("resolveGitFsLayout", () => {
 	});
 
 	describe("path spelling", () => {
-		/** A symlink pointing at the repo, standing in for macOS's /tmp → /private/tmp. */
+		/**
+		 * A link pointing at the repo, standing in for macOS's /tmp → /private/tmp.
+		 *
+		 * Created as a `"junction"` rather than a `"dir"` symlink so the pair runs
+		 * everywhere: a directory symlink on Windows needs Developer Mode or elevation and
+		 * throws EPERM in the seed, while a junction needs neither and is resolved by
+		 * `realpathSync` the same way. The type argument is ignored on POSIX, where this
+		 * stays an ordinary symlink — so one call covers both, and what these assert
+		 * (`realpath` on / off) never becomes platform-gated.
+		 */
 		function seedRepoBehindSymlink(): string {
 			const real = join(root, "real");
 			mkdirSync(real, { recursive: true });
 			seedPlainRepo(real, "ref: refs/heads/main\n");
 			const link = join(root, "link");
-			symlinkSync(real, link, "dir");
+			symlinkSync(real, link, "junction");
 			return link;
 		}
 

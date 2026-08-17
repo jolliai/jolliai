@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
@@ -23,6 +23,18 @@ vi.mock("../install/Installer.js", () => ({
 // Partial: only the three registry WRITERS/readers are stubbed. Pure helpers the
 // routes also reach (`existingWorktrees`, which fans a mutation out over every
 // surviving checkout) stay real, so adding one does not 500 every write test.
+// Partial for the same reason as the registry below: the forget route's own
+// liveness checks stay real, only the removal is stubbed.
+// `classifyRegistryEntry` keeps the REAL implementation (`vi.fn(impl)`), so every
+// test that does not override it behaves exactly as the unmocked module would. It
+// is wrapped only because its `unavailable` verdict is unreachable on this CI: the
+// volume walk needs a path with no existing ancestor, and on POSIX every absolute
+// path bottoms out at a live `/` — which is why `volumeReachable` carries an
+// `exists` seam that `classifyRegistryEntry`'s callers here cannot reach.
+vi.mock("./RepoForget.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./RepoForget.js")>();
+	return { ...actual, forgetRepo: vi.fn(), classifyRegistryEntry: vi.fn(actual.classifyRegistryEntry) };
+});
 vi.mock("./RepoRegistry.js", async (importOriginal) => ({
 	...(await importOriginal<typeof import("./RepoRegistry.js")>()),
 	registerRepo: vi.fn().mockResolvedValue({
@@ -75,6 +87,7 @@ import {
 	resolveDashboardAssetsDir,
 	startDashboardServer,
 } from "./DashboardServer.js";
+import * as repoForget from "./RepoForget.js";
 import * as repoRegistry from "./RepoRegistry.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
@@ -1002,6 +1015,271 @@ describe("write surface", () => {
 		expect((await res.json()) as Record<string, unknown>).toEqual({ ok: true, repoIdentity: "r1" });
 	});
 
+	describe("forget", () => {
+		const FORGOTTEN = {
+			identity: "r1",
+			removedFromRegistry: true,
+			repoRowDeleted: true,
+			childRowsDeleted: 3,
+			pendingEventsDeleted: 0,
+		};
+
+		beforeEach(() => {
+			vi.mocked(repoForget.forgetRepo).mockReset();
+			// Restores the real implementation the factory passed to `vi.fn(impl)`, so a
+			// verdict one test forced cannot leak into the next.
+			vi.mocked(repoForget.classifyRegistryEntry).mockReset();
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({ version: 1, repos: [] });
+		});
+
+		const post = async (body: unknown): Promise<Response> => {
+			const port = await listen(writeServer());
+			return fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+				method: "POST",
+				headers: HEADERS,
+				body: JSON.stringify(body),
+			});
+		};
+
+		it("400s without a repoIdentity", async () => {
+			expect((await post({})).status).toBe(400);
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("400s a whitespace-only repoIdentity", async () => {
+			expect((await post({ repoIdentity: "   " })).status).toBe(400);
+		});
+
+		it("forgets a dead entry and reports what went", async () => {
+			vi.mocked(repoForget.forgetRepo).mockResolvedValue(FORGOTTEN);
+			const res = await post({ repoIdentity: "r1" });
+			expect(res.status).toBe(200);
+			expect((await res.json()) as Record<string, unknown>).toEqual({
+				ok: true,
+				repoIdentity: "r1",
+				removedFromRegistry: true,
+				repoRowDeleted: true,
+				childRowsDeleted: 3,
+			});
+		});
+
+		it("409s a repository that still exists on disk, without calling forget", async () => {
+			// The control is drawn from a payload that can be minutes old, so state —
+			// not the page — is what says no. 409 because the request was well-formed.
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "r", worktreeRoot: dir, enabledAt: "t" }],
+			});
+			const res = await post({ repoIdentity: "r1" });
+			expect(res.status).toBe(409);
+			expect((await res.json()) as { error: string }).toMatchObject({
+				error: expect.stringContaining("on disk"),
+			});
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("consults every recorded clone, not just the displayed root", async () => {
+			// A registry entry is keyed by IDENTITY, so a second clone shares the row —
+			// `worktreeRoot` alone would report a live repo as gone.
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [
+					{
+						repoIdentity: "r1",
+						repoName: "r",
+						worktreeRoot: join(dir, "no-such-clone"),
+						worktrees: [join(dir, "no-such-clone"), dir],
+						enabledAt: "t",
+					},
+				],
+			});
+			expect((await post({ repoIdentity: "r1" })).status).toBe(409);
+		});
+
+		it("409s a repository whose volume this machine cannot reach, without calling forget", async () => {
+			// The one verdict `doctor` refuses even under `--fix --forget-dead-repos`: an
+			// unplugged drive or an unmounted share is a repo the user expects back, and
+			// `existsSync` alone cannot tell it from a deleted folder. Before this gate a
+			// single confirm deleted twelve child tables for a repository that was merely
+			// unplugged.
+			vi.mocked(repoForget.classifyRegistryEntry).mockReturnValueOnce("unavailable");
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "r", worktreeRoot: "Z:\\gone\\repo", enabledAt: "t" }],
+			});
+			const res = await post({ repoIdentity: "r1" });
+			expect(res.status).toBe(409);
+			expect((await res.json()) as { error: string }).toMatchObject({
+				error: expect.stringContaining("cannot reach"),
+			});
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("removes an unreachable-volume repo once the request says the user was told", async () => {
+			// B: the user is the one who knows whether that drive is coming back, so the
+			// refusal is a re-ask rather than a dead end. The flag is the record that a
+			// human saw the volume-specific sentence — without it a stale click and an
+			// informed one are the same bytes.
+			vi.mocked(repoForget.classifyRegistryEntry).mockReturnValueOnce("unavailable");
+			vi.mocked(repoForget.forgetRepo).mockResolvedValue(FORGOTTEN);
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "r", worktreeRoot: "Z:\\gone\\repo", enabledAt: "t" }],
+			});
+			const res = await post({ repoIdentity: "r1", acknowledgeUnavailableVolume: true });
+			expect(res.status).toBe(200);
+			expect(repoForget.forgetRepo).toHaveBeenCalled();
+		});
+
+		it("tags the refusal so the page can re-ask instead of just reporting failure", async () => {
+			vi.mocked(repoForget.classifyRegistryEntry).mockReturnValueOnce("unavailable");
+			// A registry ENTRY, so the verdict comes from the classifier rather than from
+			// `classifyProjectedRoot`'s no-database shortcut.
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "r", worktreeRoot: "Z:\\gone\\repo", enabledAt: "t" }],
+			});
+			const res = await post({ repoIdentity: "r1" });
+			expect(res.status).toBe(409);
+			expect((await res.json()) as Record<string, unknown>).toMatchObject({ volumeUnavailable: true });
+		});
+
+		it("ignores the acknowledgement for a repository that still exists", async () => {
+			// The flag speaks for ONE verdict. A live checkout is refused whatever the
+			// body claims — that answer is not the user's to override from here.
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "r", worktreeRoot: dir, enabledAt: "t" }],
+			});
+			const res = await post({ repoIdentity: "r1", acknowledgeUnavailableVolume: true });
+			expect(res.status).toBe(409);
+			expect((await res.json()) as { error: string }).toMatchObject({
+				error: expect.stringContaining("still exists on disk"),
+			});
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("applies the same volume gate to a row the registry does not list", async () => {
+			// The unregistered half is the identical hazard through the identical button,
+			// so it is judged by the same classifier on a synthetic single-path entry —
+			// not by a second copy of the rule that could drift.
+			vi.mocked(repoForget.classifyRegistryEntry).mockReturnValueOnce("unavailable");
+			const dbPath = join(dir, "projected-unavailable.db");
+			await applyStatsEvents(
+				[
+					{
+						producerKind: "cli",
+						event: {
+							type: "repo.enabled",
+							repoIdentity: "r1",
+							repoName: "r",
+							worktreeRoot: "Z:\\gone\\repo",
+							enabledAt: "t",
+						},
+					},
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const port = await listen(writeServer({ dbPath }));
+			const res = await fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+				method: "POST",
+				headers: HEADERS,
+				body: JSON.stringify({ repoIdentity: "r1" }),
+			});
+			expect(res.status).toBe(409);
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("backs the registry up before removing anything", async () => {
+			// Ordering, for the reason `applyRepoRegistryFix` states: a copy taken after
+			// the first removal is a copy of the damage. It protects the REGISTRATION and
+			// not the memories — that file holds none — so it is not what makes this safe.
+			const configDir = join(dir, "forget-backup-config");
+			mkdirSync(configDir, { recursive: true });
+			const registryPath = join(configDir, "dashboard-repos.json");
+			writeFileSync(registryPath, JSON.stringify({ version: 1, repos: [] }));
+			// Recorded rather than asserted in place: this proves the ORDERING (the copy is
+			// already on disk when the removal runs), and a throw from inside the mock
+			// would surface as a 500 instead of naming the ordering.
+			let backedUpBeforeRemoval = false;
+			vi.mocked(repoForget.forgetRepo).mockImplementation(async () => {
+				backedUpBeforeRemoval = readdirSync(configDir).some((f) => f.endsWith(".bak"));
+				return FORGOTTEN;
+			});
+
+			const port = await listen(writeServer({ configDir }));
+			const res = await fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+				method: "POST",
+				headers: HEADERS,
+				body: JSON.stringify({ repoIdentity: "r1" }),
+			});
+
+			expect(res.status).toBe(200);
+			expect(backedUpBeforeRemoval).toBe(true);
+			const backups = readdirSync(configDir).filter((f) => f.endsWith(".bak"));
+			expect(backups).toHaveLength(1);
+			expect(readFileSync(join(configDir, backups[0]), "utf-8")).toBe(JSON.stringify({ version: 1, repos: [] }));
+		});
+
+		it("500s without removing anything when the registry could not be backed up", async () => {
+			// A removal that could not be backed up is not the operation the user
+			// consented to — and the message names the step that failed, since "could not
+			// forget" would point at one that never ran.
+			const configDir = join(dir, "forget-backup-fail-config");
+			mkdirSync(configDir, { recursive: true });
+			// A DIRECTORY where the registry file belongs: it exists (so the backup is
+			// attempted) and `copyFileSync` cannot read it.
+			mkdirSync(join(configDir, "dashboard-repos.json"), { recursive: true });
+
+			const port = await listen(writeServer({ configDir }));
+			const res = await fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+				method: "POST",
+				headers: HEADERS,
+				body: JSON.stringify({ repoIdentity: "r1" }),
+			});
+
+			expect(res.status).toBe(500);
+			expect((await res.json()) as { error: string }).toMatchObject({
+				error: expect.stringContaining("back up"),
+			});
+			expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+		});
+
+		it("404s when there was nothing left to remove", async () => {
+			// A second window may already have removed it; a cheerful 200 would reload
+			// to the same list.
+			vi.mocked(repoForget.forgetRepo).mockResolvedValue({
+				identity: "r1",
+				removedFromRegistry: false,
+				repoRowDeleted: false,
+				childRowsDeleted: 0,
+				pendingEventsDeleted: 0,
+			});
+			expect((await post({ repoIdentity: "r1" })).status).toBe(404);
+		});
+
+		it("500s when the removal reported an error rather than claiming success", async () => {
+			vi.mocked(repoForget.forgetRepo).mockResolvedValue({
+				identity: "r1",
+				removedFromRegistry: false,
+				repoRowDeleted: false,
+				childRowsDeleted: 0,
+				pendingEventsDeleted: 0,
+				error: "database is locked",
+			});
+			const res = await post({ repoIdentity: "r1" });
+			expect(res.status).toBe(500);
+			expect((await res.json()) as { error: string }).toMatchObject({
+				error: expect.stringContaining("database is locked"),
+			});
+		});
+
+		it("500s when the removal throws", async () => {
+			vi.mocked(repoForget.forgetRepo).mockRejectedValue(new Error("node:sqlite is unavailable"));
+			expect((await post({ repoIdentity: "r1" })).status).toBe(500);
+		});
+	});
+
 	it("400s enable with no path", async () => {
 		const port = await listen(writeServer());
 		const res = await fetch(`http://127.0.0.1:${port}/api/repos/enable`, {
@@ -1160,6 +1438,93 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		const retired = await get(port, "/api/model?view=repositories");
 		expect(retired.status).toBe(200);
 		expect(((await retired.json()) as DashboardModel).view).toBe("stats");
+	});
+
+	/** Seeds one enabled repo whose projected `worktree_root` is `root`. */
+	async function seedRepo(dbPath: string, root: string): Promise<void> {
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: root,
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+	}
+
+	async function repoOptions(port: number): Promise<ReadonlyArray<{ missing?: boolean }>> {
+		return ((await (await get(port, "/api/model?view=stats")).json()) as DashboardModel).repos;
+	}
+
+	// `worktree_root` carries the registry entry's single `worktreeRoot`, but an
+	// entry is keyed by repo IDENTITY and can list several clones — so the row alone
+	// renders a forget ✕ over a repo whose sibling checkout is alive and well.
+	it("asks the registry about every clone before marking a repo missing", async () => {
+		const dbPath = join(dir, "clones.db");
+		const dead = join(dir, "clone-dead");
+		const live = join(dir, "clone-live");
+		mkdirSync(live, { recursive: true });
+		await seedRepo(dbPath, dead);
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "clones-config") }),
+		);
+
+		// Default mock: an empty registry, so nothing outranks the row.
+		expect((await repoOptions(port))[0].missing).toBe(true);
+
+		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
+			version: 1,
+			repos: [
+				{
+					repoIdentity: "repo-1",
+					repoName: "jolli",
+					worktreeRoot: dead,
+					worktrees: [dead, live],
+					enabledAt: "t",
+				},
+			],
+		});
+		expect((await repoOptions(port))[0].missing).toBeUndefined();
+	});
+
+	// The memo is real-time-generational and nothing else invalidates it, so a
+	// checkout that existed by the time the user clicked Enable would keep rendering
+	// with a forget ✕ for the rest of the window — on the repo they just enabled.
+	it("drops the worktree-existence memo when a repo is enabled", async () => {
+		const TOKEN = "enable-memo-0123456789abcdef";
+		const dbPath = join(dir, "enable-memo.db");
+		const checkout = join(dir, "enabled-checkout");
+		await seedRepo(dbPath, checkout);
+		const port = await listen(
+			createDashboardServer({
+				port: 0,
+				assetsDir,
+				dbPath,
+				configDir: join(dir, "enable-memo-config"),
+				token: TOKEN,
+			}),
+		);
+
+		expect((await repoOptions(port))[0].missing).toBe(true);
+		mkdirSync(checkout, { recursive: true });
+		// Still missing: served from the memo, which is the whole point of it.
+		expect((await repoOptions(port))[0].missing).toBe(true);
+
+		const enabled = await fetch(`http://127.0.0.1:${port}/api/repos/enable`, {
+			method: "POST",
+			headers: { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" },
+			body: JSON.stringify({ path: checkout }),
+		});
+		expect(enabled.status).toBe(200);
+
+		expect((await repoOptions(port))[0].missing).toBeUndefined();
 	});
 
 	it("reads knowledge and graph models off the Memory Bank folder", async () => {

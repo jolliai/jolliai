@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -26,13 +26,19 @@ import {
 	existingWorktrees,
 	getRepoRegistryPath,
 	hasLiveWorktree,
+	isDisposableRepo,
 	listActiveRepos,
+	type RegisteredRepo,
 	readRegistryInstanceId,
 	readRepoRegistry,
 	registerRepo,
+	removeRepoFromRegistry,
+	removeReposFromRegistry,
+	repairRegistryEntries,
 	resolveRepoIdentity,
 	sameRecordedRoot,
 	stampRegistryInstanceId,
+	tempRoots,
 } from "./RepoRegistry.js";
 
 let configDir: string;
@@ -326,6 +332,378 @@ describe("multiple checkouts of one project (§10.2)", () => {
 			enabledAt: "t",
 		};
 		expect(existingWorktrees(repo)).toEqual(["/gone-too"]);
+	});
+});
+
+describe("isDisposableRepo", () => {
+	const TEMP = "/tmp/jolli-fixtures";
+	const disposable = (over: Partial<RegisteredRepo> = {}): RegisteredRepo => ({
+		repoIdentity: "local:abc",
+		repoName: "repo",
+		worktreeRoot: `${TEMP}/gone/repo`,
+		enabledAt: "t",
+		...over,
+	});
+	const opts = { tempRoots: [TEMP], platform: "linux" as const };
+
+	it("accepts a local: identity whose every recorded path is a vanished temp path", () => {
+		expect(isDisposableRepo(disposable(), opts)).toBe(true);
+	});
+
+	it("refuses a remote-backed identity on an unmarked temp path", () => {
+		// The identity is shared between clones — the `repos` row is keyed by it — so
+		// forgetting it on this evidence alone could take another clone's history.
+		expect(isDisposableRepo(disposable({ repoIdentity: "https://github.com/a/b" }), opts)).toBe(false);
+	});
+
+	it("accepts a remote-backed identity when every path names a known throwaway", () => {
+		// A vanished `%TEMP%/jolli-cutover-…/repo` is a fixture whichever remote it
+		// was cloned from, which is the one inference narrow enough to act on.
+		const repo = disposable({
+			repoIdentity: "https://github.com/a/b",
+			worktreeRoot: `${TEMP}/jolli-cutover-sG1Rx7/repo`,
+			worktrees: [`${TEMP}/jolli-cutover-sG1Rx7/repo`],
+		});
+		expect(isDisposableRepo(repo, opts)).toBe(true);
+	});
+
+	it("accepts an agent scratchpad checkout under any remote", () => {
+		// The real shape this widening was added for.
+		const path = `${TEMP}/claude/c--jolli-project-jolliai/3e49b42d/scratchpad/pr/c2`;
+		const repo = disposable({
+			repoIdentity: "https://github.com/fake/shared",
+			worktreeRoot: path,
+			worktrees: [path],
+		});
+		expect(isDisposableRepo(repo, opts)).toBe(true);
+	});
+
+	it("refuses a remote-backed entry that mixes a marked path with an unmarked one", () => {
+		// One unmarked temp path is enough to make "no other clone exists" unproven.
+		const repo = disposable({
+			repoIdentity: "https://github.com/a/b",
+			worktreeRoot: `${TEMP}/jolli-cutover-x/repo`,
+			worktrees: [`${TEMP}/jolli-cutover-x/repo`, `${TEMP}/plain/repo`],
+		});
+		expect(isDisposableRepo(repo, opts)).toBe(false);
+	});
+
+	it("refuses a remote-backed entry recorded AT the temp root itself", () => {
+		// `isUnder` accepts the root, but there is no segment below it to carry a
+		// marker — so the identity clause still has nothing to go on.
+		const repo = disposable({ repoIdentity: "https://github.com/a/b", worktreeRoot: TEMP, worktrees: [TEMP] });
+		expect(isDisposableRepo(repo, opts)).toBe(false);
+	});
+
+	it("looks for the marker BELOW the temp root, not in the root's own name", () => {
+		// A test that injects its own `jolli-…` mkdtemp dir as the temp root must not
+		// see everything inside it marked — that is the distinction being tested.
+		const injected = `${TEMP}/jolli-forget-abc`;
+		const repo = disposable({
+			repoIdentity: "https://github.com/a/b",
+			worktreeRoot: `${injected}/gone`,
+			worktrees: [`${injected}/gone`],
+		});
+		expect(isDisposableRepo(repo, { tempRoots: [injected], platform: "linux" })).toBe(false);
+		// Measured against the REAL temp root, the same path is a fixture.
+		expect(isDisposableRepo(repo, opts)).toBe(true);
+	});
+
+	it("refuses an entry that mixes a temp path with a real one", () => {
+		const repo = disposable({ worktrees: ["/home/dev/real", `${TEMP}/gone/repo`] });
+		expect(isDisposableRepo(repo, opts)).toBe(false);
+	});
+
+	it("judges worktreeRoot too, not only the worktrees list", () => {
+		// A `worktrees` list that happens to be all-temp says nothing about a
+		// `worktreeRoot` pointing somewhere real.
+		const repo = disposable({ worktreeRoot: "/home/dev/real", worktrees: [`${TEMP}/gone/repo`] });
+		expect(isDisposableRepo(repo, opts)).toBe(false);
+	});
+
+	it("refuses a temp checkout that still exists — a session may be using it", () => {
+		const live = mkdtempSync(join(tmpdir(), "jolli-live-"));
+		try {
+			const repo = disposable({ worktreeRoot: live, worktrees: [live] });
+			expect(isDisposableRepo(repo, { tempRoots: [tmpdir()], platform: process.platform })).toBe(false);
+		} finally {
+			rmSync(live, { recursive: true, force: true });
+		}
+	});
+
+	it("asks the SAME union about liveness that it asked about scope", () => {
+		// The scope and identity clauses deliberately re-derive the claim rather than
+		// trusting `registerRepo`'s "worktreeRoot is inside worktrees" invariant. The
+		// liveness clause must not then rely on it: `hasLiveWorktree` reads
+		// `recordedRepoPaths` alone, so an entry whose `worktrees` omits a LIVE
+		// `worktreeRoot` would be pruned with its own checkout still on disk.
+		const live = mkdtempSync(join(tmpdir(), "jolli-live-root-"));
+		try {
+			const repo = disposable({
+				worktreeRoot: live,
+				worktrees: [join(tmpdir(), "jolli-gone-fixture", "repo")],
+			});
+			expect(isDisposableRepo(repo, { tempRoots: [tmpdir()], platform: process.platform })).toBe(false);
+		} finally {
+			rmSync(live, { recursive: true, force: true });
+		}
+	});
+
+	it("refuses a path that merely starts with the temp root's characters", () => {
+		// `/tmp/jolli-fixtures-elsewhere` is not inside `/tmp/jolli-fixtures`; a
+		// prefix test without the separator boundary would say it is.
+		expect(isDisposableRepo(disposable({ worktreeRoot: `${TEMP}-elsewhere/repo` }), opts)).toBe(false);
+	});
+
+	it("folds case on win32 and not on linux", () => {
+		const repo = disposable({ worktreeRoot: "C:\\Temp\\Fix\\repo", worktrees: ["C:\\Temp\\Fix\\repo"] });
+		expect(isDisposableRepo(repo, { tempRoots: ["c:\\temp\\fix"], platform: "win32" })).toBe(true);
+		expect(isDisposableRepo(repo, { tempRoots: ["c:\\temp\\fix"], platform: "linux" })).toBe(false);
+	});
+
+	it("defaults to the real temp roots and the host platform", () => {
+		// The no-options call is what production makes; every case above names both,
+		// so without this the defaults were never exercised.
+		const gone = join(tmpdir(), "jolli-no-such-fixture-9f3a2c");
+		expect(isDisposableRepo(disposable({ worktreeRoot: gone, worktrees: [gone] }))).toBe(true);
+		expect(isDisposableRepo(disposable({ worktreeRoot: "/home/dev/real", worktrees: ["/home/dev/real"] }))).toBe(
+			false,
+		);
+	});
+
+	it("names the real temp dir and its resolved twin", () => {
+		// Both spellings, so a macOS `/var` vs `/private/var` recording matches.
+		const roots = tempRoots();
+		expect(roots).toContain(tmpdir());
+		expect(roots.length).toBeGreaterThanOrEqual(1);
+		expect(new Set(roots).size).toBe(roots.length);
+	});
+});
+
+describe("removeReposFromRegistry", () => {
+	const seed = (identities: ReadonlyArray<string>): void => {
+		writeFileSync(
+			getRepoRegistryPath(configDir),
+			JSON.stringify({
+				version: 1,
+				instanceId: "id-1",
+				repos: identities.map((repoIdentity) => ({
+					repoIdentity,
+					repoName: "r",
+					worktreeRoot: `/gone/${repoIdentity}`,
+					enabledAt: "t",
+				})),
+			}),
+		);
+	};
+
+	it("removes only the named entries and reports which were present", async () => {
+		seed(["a", "b", "c"]);
+		const removed = await removeReposFromRegistry(["a", "c", "never"], configDir);
+		expect([...removed].sort()).toEqual(["a", "c"]);
+		expect((await readRepoRegistry(configDir)).repos.map((r) => r.repoIdentity)).toEqual(["b"]);
+	});
+
+	it("preserves the instance-id witness", async () => {
+		// A read-modify-write that dropped it would blind the deletion detector.
+		seed(["a"]);
+		await removeReposFromRegistry(["a"], configDir);
+		expect(await readRegistryInstanceId(configDir)).toBe("id-1");
+	});
+
+	it("writes nothing when no identity matched", async () => {
+		seed(["a"]);
+		const before = readFileSync(getRepoRegistryPath(configDir), "utf-8");
+		expect(await removeReposFromRegistry(["nope"], configDir)).toEqual([]);
+		expect(readFileSync(getRepoRegistryPath(configDir), "utf-8")).toBe(before);
+	});
+
+	it("short-circuits an empty request without touching the file", async () => {
+		expect(await removeReposFromRegistry([], configDir)).toEqual([]);
+		expect(existsSync(getRepoRegistryPath(configDir))).toBe(false);
+	});
+
+	it("refuses to rewrite a registry it could not read", async () => {
+		// Fail-open here would write back "everything except the ones I wanted",
+		// i.e. delete every other repo. See readRepoRegistryStrict.
+		writeFileSync(getRepoRegistryPath(configDir), "{ not json");
+		await expect(removeReposFromRegistry(["a"], configDir)).rejects.toThrow();
+	});
+
+	it("removeRepoFromRegistry answers whether the one entry was there", async () => {
+		seed(["a"]);
+		expect(await removeRepoFromRegistry("a", configDir)).toBe(true);
+		expect(await removeRepoFromRegistry("a", configDir)).toBe(false);
+	});
+});
+
+describe("repairRegistryEntries", () => {
+	let live: string;
+	let temp: string;
+
+	beforeEach(() => {
+		temp = mkdtempSync(join(tmpdir(), "jolli-repair-"));
+		live = join(temp, "live");
+		mkdirSync(live, { recursive: true });
+	});
+
+	afterEach(() => {
+		rmSync(temp, { recursive: true, force: true });
+	});
+
+	const seed = (repo: Partial<RegisteredRepo>): void => {
+		writeFileSync(
+			getRepoRegistryPath(configDir),
+			JSON.stringify({
+				version: 1,
+				repos: [{ repoIdentity: "id", repoName: "r", worktreeRoot: live, enabledAt: "t", ...repo }],
+			}),
+		);
+	};
+
+	it("drops a vanished temp path merged into a real repo's worktrees", async () => {
+		// The ticket's corrupted real entry: a genuine checkout with two fixture
+		// paths in its list.
+		const ghost = join(temp, "jolli-cutover-x", "repo");
+		seed({ worktrees: [ghost, live] });
+
+		const repairs = await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform });
+
+		expect(repairs).toHaveLength(1);
+		expect(repairs[0].droppedPaths).toEqual([ghost]);
+		expect((await readRepoRegistry(configDir)).repos[0].worktrees).toEqual([live]);
+	});
+
+	it("keeps a vanished path that is NOT under a temp root", async () => {
+		// An unmounted share comes back, and a checkout the list forgot is invisible
+		// to the cutover's source enumeration.
+		seed({ worktrees: ["/mnt/share/project", live] });
+		const repairs = await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform });
+		expect(repairs).toEqual([]);
+		expect((await readRepoRegistry(configDir)).repos[0].worktrees).toEqual(["/mnt/share/project", live]);
+	});
+
+	it("collapses two spellings of one path, newest winning", async () => {
+		const shouty = live.toUpperCase();
+		seed({ worktrees: [shouty, live] });
+
+		// No temp roots, because the two repair rules would otherwise interact and the
+		// outcome would depend on the FILESYSTEM rather than on the `platform` argument.
+		// Vanished-under-a-temp-root is checked first by design, and `isUnder` folds case
+		// under win32 — so on a case-INSENSITIVE filesystem the shouty spelling exists and
+		// reaches the collapse, while on a case-sensitive one it does not exist, matches
+		// the temp root under win32 folding, and is dropped as a vanished fixture path
+		// before the collapse is ever reached. That is what made this pass on Windows and
+		// fail on CI. The temp rule has its own cases above; this one is about the collapse.
+		const repairs = await repairRegistryEntries({ configDir, tempRoots: [], platform: "win32" });
+
+		expect(repairs[0].collapsedPaths).toEqual([shouty]);
+		expect((await readRepoRegistry(configDir)).repos[0].worktrees).toEqual([live]);
+	});
+
+	it("repoints a dead worktreeRoot at the newest live path", async () => {
+		const dead = join(temp, "moved-away");
+		seed({ worktreeRoot: dead, worktrees: [live, dead] });
+
+		const repairs = await repairRegistryEntries({ configDir, tempRoots: [], platform: process.platform });
+
+		expect(repairs[0].repointedTo).toBe(live);
+		expect((await readRepoRegistry(configDir)).repos[0].worktreeRoot).toBe(live);
+	});
+
+	it("does not re-append a worktreeRoot it just dropped as a dead temp path", async () => {
+		const ghost = join(temp, "jolli-cutover-y", "repo");
+		seed({ worktreeRoot: ghost, worktrees: [live, ghost] });
+
+		await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform });
+
+		const entry = (await readRepoRegistry(configDir)).repos[0];
+		expect(entry.worktrees).toEqual([live]);
+		expect(entry.worktreeRoot).toBe(live);
+	});
+
+	it("re-adds a worktreeRoot the list never carried, keeping registerRepo's invariant", async () => {
+		// `registerRepo` guarantees `worktreeRoot` is the last entry of `worktrees`;
+		// a hand-edited or pre-`worktrees` entry can break that, and a repair must
+		// not be the thing that leaves the displayed root out of the collected set.
+		const other = join(temp, "other-clone");
+		mkdirSync(other, { recursive: true });
+		const ghost = join(temp, "jolli-cutover-w", "repo");
+		seed({ worktreeRoot: live, worktrees: [ghost, other] });
+
+		const repairs = await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform });
+
+		expect(repairs[0].droppedPaths).toEqual([ghost]);
+		expect(repairs[0].repointedTo).toBeUndefined();
+		expect((await readRepoRegistry(configDir)).repos[0].worktrees).toEqual([other, live]);
+	});
+
+	it("leaves a wholly dead entry to forgetRepos", async () => {
+		seed({ worktreeRoot: join(temp, "gone"), worktrees: [join(temp, "gone")] });
+		expect(await repairRegistryEntries({ configDir, tempRoots: [], platform: process.platform })).toEqual([]);
+	});
+
+	it("takes no write lock for a dry run, and takes it for a real pass", async () => {
+		// `jolli doctor` computes this preview on EVERY run, including a plain
+		// read-only one — so taking the registry lock for it put a diagnostic into
+		// contention with the `registerRepo` a post-commit hook runs concurrently.
+		// A preview performs no write, and reads need no lock (writes are atomic).
+		const locks = await import("../core/Locks.js");
+		const spy = vi.spyOn(locks, "withRepoRegistryLock");
+		const ghost = join(temp, "jolli-cutover-lock", "repo");
+		seed({ worktrees: [ghost, live] });
+
+		try {
+			const preview = await repairRegistryEntries({
+				configDir,
+				tempRoots: [temp],
+				platform: process.platform,
+				dryRun: true,
+			});
+			expect(preview).toHaveLength(1);
+			expect(spy).not.toHaveBeenCalled();
+
+			await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform });
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("writes nothing when there is nothing to repair", async () => {
+		seed({ worktrees: [live] });
+		const before = readFileSync(getRepoRegistryPath(configDir), "utf-8");
+		expect(await repairRegistryEntries({ configDir, tempRoots: [temp], platform: process.platform })).toEqual([]);
+		expect(readFileSync(getRepoRegistryPath(configDir), "utf-8")).toBe(before);
+	});
+
+	it("defaults to the real temp roots and the host platform", async () => {
+		// Same reason as the disposable predicate's own default case: production
+		// passes neither, so the `??` sides need one call that omits them. The temp
+		// dir this fixture lives in IS a real temp root, so the ghost is dropped.
+		const ghost = join(temp, "jolli-cutover-default", "repo");
+		seed({ worktrees: [ghost, live] });
+
+		const repairs = await repairRegistryEntries({ configDir });
+
+		expect(repairs).toHaveLength(1);
+		expect(repairs[0].droppedPaths).toEqual([ghost]);
+	});
+
+	it("dryRun computes the same repairs and changes nothing on disk", async () => {
+		const ghost = join(temp, "jolli-cutover-z", "repo");
+		seed({ worktrees: [ghost, live] });
+		const before = readFileSync(getRepoRegistryPath(configDir), "utf-8");
+
+		const repairs = await repairRegistryEntries({
+			configDir,
+			tempRoots: [temp],
+			platform: process.platform,
+			dryRun: true,
+		});
+
+		expect(repairs).toHaveLength(1);
+		expect(readFileSync(getRepoRegistryPath(configDir), "utf-8")).toBe(before);
 	});
 });
 

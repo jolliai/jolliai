@@ -31,6 +31,33 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+/**
+ * Whether this machine can create a symlink at all — a CAPABILITY, not a platform.
+ *
+ * The suites below split cleanly along it. Everything about what the mirror CONTAINS,
+ * when it is refreshed and when it is removed holds under both placements and is
+ * asserted unconditionally — the Windows fallback's copy even has its own cases here,
+ * planted directly by `plantWindowsFallbackCopy`. What cannot hold without the
+ * capability is the symlink's SHAPE: on a machine where `symlink` throws EPERM,
+ * `linkMirroredSkill` deliberately writes a copy instead (see its docstring), so there
+ * is no link to read a target off and no entry that vanishes with the bundle.
+ *
+ * Probed rather than keyed off `process.platform`, because Developer Mode makes a
+ * Windows box plant real symlinks — and that run is precisely where asserting the shape
+ * is worth something.
+ */
+const canSymlink = ((): boolean => {
+	const probe = mkdtempSync(join(tmpdir(), "jolli-symlink-probe-"));
+	try {
+		symlinkSync(join(probe, "target"), join(probe, "link"), "dir");
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(probe, { recursive: true, force: true });
+	}
+})();
+
 // `reconcileCursorRepoSkills` asks Cursor whether it will load the other hosts' skill
 // roots. Left unmocked that reads the DEVELOPER's live Cursor database, so the same
 // test would pass here, fail on a machine with the toggle off, and take a third path
@@ -1660,7 +1687,7 @@ describe("reconcileCursorRepoSkills", () => {
 	 * bundle throws, while `readlink` answers fine, and "broken" and "stale" have to
 	 * reach the same rebuild.
 	 */
-	it("rebuilds a link left pointing at a previous bundle", async () => {
+	it.skipIf(!canSymlink)("rebuilds a link left pointing at a previous bundle", async () => {
 		await reconcileCursorRepoSkills(tempDir);
 		const link = join(tempDir, ".cursor/skills", "jolli-recall");
 		rmSync(link, { recursive: true, force: true });
@@ -1977,8 +2004,13 @@ describe("reconcileCursorRepoSkills — plugin removed outside our control", () 
  * symlinked into the bundle and the other four written as real directories, deleting
  * the bundle removed exactly the symlinked entry from the slash menu and left the four
  * real ones behind. That experiment is what these assert in code.
+ *
+ * Being a filesystem property is also why the whole suite is gated on {@link canSymlink}:
+ * where symlinks need Developer Mode the placement is a copy, the property genuinely does
+ * not hold, and the code knows it — that state's cleanup is `removeCursorRepoSkills`,
+ * covered above by the cases that plant the fallback copy directly.
  */
-describe("the Cursor mirror disappears with the plugin", () => {
+describe.skipIf(!canSymlink)("the Cursor mirror disappears with the plugin", () => {
 	it("plants symlinks, not copies", async () => {
 		await reconcileCursorRepoSkills(tempDir);
 		for (const name of CURSOR_MIRRORED) {

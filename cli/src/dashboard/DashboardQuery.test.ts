@@ -1,7 +1,17 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+// `volumeReachable` keeps the REAL implementation; it is wrapped only because its
+// `false` answer is unreachable on POSIX, where every absolute path bottoms out at
+// a live `/`. That is the same seam `RepoForget` gives its own callers, and the only
+// way the volume-absent verdict can be covered on an ubuntu CI.
+vi.mock("./RepoForget.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./RepoForget.js")>();
+	return { ...actual, volumeReachable: vi.fn(actual.volumeReachable) };
+});
+
 import { withDashboardDb } from "./DashboardDb.js";
 import type {
 	DashboardScope,
@@ -22,6 +32,7 @@ import {
 	type QueryOptions,
 	startOfLocalDay,
 } from "./DashboardQuery.js";
+import { volumeReachable } from "./RepoForget.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
 /**
@@ -402,9 +413,20 @@ describe("buildDashboardModel", () => {
 		expect(model.timeZone).toBe("UTC");
 		// `sessionsThisWeek` is the sidebar's per-repo meta figure — both seeded
 		// sessions land inside the 7-day window.
-		expect(model.repos).toEqual([
-			{ repoIdentity: "repo-1", repoName: "jolli", worktreeRoot: "/w", sessionsThisWeek: 2 },
-		]);
+		//
+		// Deliberately not an exact-shape `toEqual`: `missing` is decided by whether
+		// `/w` exists, which is a property of the machine rather than of this test
+		// (it resolves to `C:\w` on Windows, and that directory does exist on some
+		// developer boxes). The flag has its own tests below and in RepoForget.
+		expect(model.repos).toHaveLength(1);
+		expect(model.repos[0]).toMatchObject({
+			repoIdentity: "repo-1",
+			repoName: "jolli",
+			worktreeRoot: "/w",
+			sessionsThisWeek: 2,
+		});
+		// An active row still carries no `disabled` key at all.
+		expect(model.repos[0].disabled).toBeUndefined();
 		expect(model.standup).toBeUndefined();
 
 		const stats = model.stats;
@@ -3290,5 +3312,171 @@ describe("knowledge & graph payloads", () => {
 			{ dbPath },
 		);
 		expect(fallback.graph).toEqual({ repos: [] });
+	});
+});
+
+describe("repo picker — checkouts that are gone", () => {
+	let dir: string;
+	let dbPath: string;
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-dq-missing-"));
+		dbPath = join(dir, "d.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	/** Rows straight into `repos`: the flag is about the path, not about events. */
+	async function seedRepos(rows: ReadonlyArray<{ identity: string; root: string }>): Promise<void> {
+		await withDashboardDb(
+			(db) => {
+				for (const { identity, root } of rows) {
+					db.prepare(
+						`INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+						 VALUES (?, 'r', ?, '1970-01-01T00:00:00.000Z')`,
+					).run(identity, root);
+				}
+			},
+			{ dbPath },
+		);
+	}
+
+	async function repos(
+		registryRoots?: ReadonlyMap<string, ReadonlyArray<string>>,
+	): Promise<ReadonlyArray<{ repoIdentity: string; missing?: boolean; volumeUnavailable?: boolean }>> {
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs: 0,
+					...(registryRoots ? { registryRoots } : {}),
+				}),
+			{ dbPath },
+		);
+		return model.repos;
+	}
+
+	it("marks a row whose worktree is gone and leaves a live row's shape alone", async () => {
+		await seedRepos([
+			{ identity: "live", root: dir },
+			{ identity: "gone", root: join(dir, "no-such-checkout") },
+		]);
+
+		const byIdentity = new Map((await repos()).map((r) => [r.repoIdentity, r]));
+
+		// Absent, not `false`, on a live row — same contract as `disabled`.
+		expect(byIdentity.get("live")?.missing).toBeUndefined();
+		expect(byIdentity.get("gone")?.missing).toBe(true);
+	});
+
+	it("never marks the placeholder row an event creates before its repo registers", async () => {
+		// `ensureRepoRow` stores the identity in `worktree_root`, which names no
+		// directory. Marking it would put a remove control on a repo that is about
+		// to register normally.
+		await seedRepos([{ identity: "local:not-yet", root: "local:not-yet" }]);
+		expect((await repos())[0].missing).toBeUndefined();
+	});
+
+	it("marks a row rather than dropping it — the memories stay reachable", async () => {
+		await seedRepos([{ identity: "gone", root: join(dir, "no-such-checkout") }]);
+		expect(await repos()).toHaveLength(1);
+	});
+
+	it("reuses the answer across renders, and re-asks once the memo is dropped", async () => {
+		// This is the one filesystem call a render makes, and it is made per repo row
+		// per HTTP request — so a repo on a disconnected mount would block every
+		// refresh for as long as that mount takes to time out.
+		const { clearWorktreeExistenceCache } = await import("./DashboardQuery.js");
+		const checkout = join(dir, "checkout");
+		mkdirSync(checkout, { recursive: true });
+		await seedRepos([{ identity: "r", root: checkout }]);
+		expect((await repos())[0].missing).toBeUndefined();
+
+		rmSync(checkout, { recursive: true, force: true });
+
+		// Still absent: the second render is served from the memo, which is exactly
+		// what `handleForget` re-checks at action time rather than trusting.
+		expect((await repos())[0].missing).toBeUndefined();
+
+		clearWorktreeExistenceCache();
+		expect((await repos())[0].missing).toBe(true);
+	});
+
+	it("does not mark a repo whose OTHER clone is still on disk", async () => {
+		// `worktree_root` is projected from the registry entry's single
+		// `worktreeRoot` field, but an entry is keyed by repo identity and can list
+		// several clones. Judging the row alone renders a forget ✕ over a working
+		// repository — which `handleForget` then refuses with a 409, so the control
+		// was never actionable in the first place.
+		const deadClone = join(dir, "deleted-clone");
+		await seedRepos([{ identity: "two-clones", root: deadClone }]);
+
+		expect((await repos())[0].missing).toBe(true);
+		expect((await repos(new Map([["two-clones", [deadClone, dir]]])))[0].missing).toBeUndefined();
+	});
+
+	it("marks a registered repo when every recorded clone is gone", async () => {
+		const roots = [join(dir, "clone-a"), join(dir, "clone-b")];
+		await seedRepos([{ identity: "all-gone", root: roots[0] }]);
+		expect((await repos(new Map([["all-gone", roots]])))[0].missing).toBe(true);
+	});
+
+	it("marks a placeholder row the registry lists with no surviving clone", async () => {
+		// The opposite direction from the placeholder case above, and deliberately so:
+		// an identity the registry lists IS registered, so it is not "about to
+		// register normally" — the registry is the writer and the row its projection,
+		// so the row can only be staler.
+		await seedRepos([{ identity: "local:registered", root: "local:registered" }]);
+		expect((await repos(new Map([["local:registered", [join(dir, "clone")]]])))[0].missing).toBe(true);
+	});
+
+	it("says the VOLUME is absent rather than claiming the folder was deleted", async () => {
+		// `existsSync` answers false for both, so without this the row asserted a
+		// deletion over a repository that was merely unplugged — and offered a ✕ on it.
+		const onAbsentDrive = join(dir, "unmounted", "repo");
+		await seedRepos([{ identity: "unplugged", root: onAbsentDrive }]);
+		vi.mocked(volumeReachable).mockReturnValueOnce(false);
+
+		const [option] = await repos();
+		expect(option.missing).toBe(true);
+		expect(option.volumeUnavailable).toBe(true);
+	});
+
+	it("calls it a deletion when ANY recorded path is on a volume it can reach", async () => {
+		// Same rule as `classifyRegistryEntry`: one path gone from a disk that IS here
+		// is a deletion, whatever the other paths are on. Only the first probe answers
+		// unreachable, so the second falls through to the real walk.
+		const onAbsentDrive = join(dir, "unmounted", "repo");
+		const deletedLocally = join(dir, "deleted-locally");
+		await seedRepos([{ identity: "mixed", root: onAbsentDrive }]);
+		vi.mocked(volumeReachable).mockReturnValueOnce(false);
+
+		const [option] = await repos(new Map([["mixed", [onAbsentDrive, deletedLocally]]]));
+		expect(option.missing).toBe(true);
+		expect(option.volumeUnavailable).toBeUndefined();
+	});
+
+	it("asks the filesystem nothing about the volume for a repo that is present", async () => {
+		// The walk is one `existsSync` per ancestor and this is the render path, so it
+		// must stay off it for the ordinary row — which is every row on a healthy machine.
+		await seedRepos([{ identity: "live", root: dir }]);
+		vi.mocked(volumeReachable).mockClear();
+
+		expect((await repos())[0].missing).toBeUndefined();
+		expect(volumeReachable).not.toHaveBeenCalled();
+	});
+
+	it("falls back to the row for an identity the registry does not list", async () => {
+		// A row projected from an event before its repo registered has no entry at
+		// all, so an empty answer for it must not read as "no live clone".
+		const gone = join(dir, "unregistered");
+		await seedRepos([{ identity: "orphan", root: gone }]);
+		const other = new Map([["someone-else", [dir]]]);
+		expect((await repos(other))[0].missing).toBe(true);
+		expect((await repos(new Map([["orphan", []]])))[0].missing).toBe(true);
 	});
 });

@@ -223,6 +223,20 @@ body {
      reads as inactive, and its "paused" meta picks up the warning tint. */
   .repo-scope-row.paused .name { color: var(--muted); }
   .repo-scope-row.paused .meta { color: var(--warn, var(--muted)); font-style: italic; }
+  /* A repo whose checkout is gone. Dimmed like a paused one — its history is
+     still reachable — but its meta reads as a fault rather than a choice, and it
+     is the only row with a remove control. The ✕ stays low-contrast until the row
+     is hovered so a list of dead entries does not read as a row of buttons. */
+  .repo-scope-row.missing .name { color: var(--muted); text-decoration: line-through; }
+  .repo-scope-row.missing .meta { color: var(--warn, var(--muted)); font-style: italic; }
+  .repo-forget {
+    flex: none; margin-left: 4px; padding: 0 4px; border: 0; border-radius: 5px;
+    background: none; color: var(--muted); font-size: 12px; line-height: 1.4;
+    cursor: pointer; opacity: .45;
+  }
+  .repo-scope-row:hover .repo-forget { opacity: 1; }
+  .repo-forget:hover { background: var(--page); color: var(--err, var(--ink)); }
+  .repo-forget:disabled { cursor: default; opacity: .3; }
   /* The disambiguating checkout path. `direction: rtl` so a long path elides at
      its HEAD — the tail is the part that tells two clones apart, and a
      left-to-right ellipsis would cut off exactly that. `text-align: left` keeps

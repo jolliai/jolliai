@@ -17,6 +17,7 @@
  * to reach a write from a query.
  */
 
+import { existsSync } from "node:fs";
 import { collectDisplayTopics } from "../core/SummaryTree.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -67,6 +68,7 @@ import {
 	splitDecisionBullets,
 } from "./DashboardScopeUtil.js";
 import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
+import { volumeReachable } from "./RepoForget.js";
 import { WORKTREE_STATUS_MAX_AGE_MS } from "./StatsWriter.js";
 
 const log = createLogger("DashboardQuery");
@@ -365,6 +367,19 @@ export interface QueryOptions {
 	readonly graphModel?: GraphModel;
 	/** Settings view: the async-read config/memory-bank snapshot. Absent on every other view. */
 	readonly settingsModel?: SettingsPageModel;
+	/**
+	 * Every checkout path the repo registry records, keyed by `repo_identity` —
+	 * read async by the server, because the registry is a file and this builder is
+	 * synchronous. Absent, or absent for one identity, falls back to that row's
+	 * `worktree_root`; see {@link isMissingWorktree} for why the fallback is not
+	 * good enough on its own.
+	 *
+	 * Paths only, deliberately — not a precomputed liveness verdict. Probing them
+	 * here is what puts them through {@link worktreeExists}' memo, and a caller
+	 * that answered "live?" itself would be making one uncached `existsSync` per
+	 * clone per request, which is the cost that memo exists to bound.
+	 */
+	readonly registryRoots?: ReadonlyMap<string, ReadonlyArray<string>>;
 	readonly timeZone?: string;
 	readonly nowMs?: number;
 }
@@ -2205,6 +2220,121 @@ const NO_GRAPH_MODEL: GraphModel = { repos: [] };
 
 // ── Model assembly ──────────────────────────────────────────────────────────
 
+/**
+ * Why a row's checkout could not be found, or that it could — the filesystem
+ * question a page render asks, and the reason `RepoOption.missing` /
+ * `volumeUnavailable` exist.
+ *
+ * Three answers rather than a boolean, because "not on disk" is two states and the
+ * page has to say which: a deleted folder, or a volume that is not mounted. See
+ * `RepoOption.volumeUnavailable` for what that distinction buys the reader, and
+ * `DashboardServer.handleForget` for the guard that no longer has to stand in for
+ * it.
+ *
+ * **The registry outranks the row, and that is the whole point.** `worktree_root`
+ * is projected from a registry entry's single `worktreeRoot` field
+ * (`DbBackfill.projectRepoRegistryState`), while an entry is keyed by repo
+ * IDENTITY and can list several clones. So a repo whose recorded root was deleted
+ * with a sibling clone still on disk reads as missing from the row alone — and the
+ * page then renders a forget ✕ over a working repository. `handleForget` already
+ * refuses exactly that with a 409, asking the registry through
+ * `classifyRegistryEntry`; this asks the same question at render time so the
+ * control is not offered in the first place. Nothing else fixes it in passing: the
+ * one pass that repoints a dead `worktreeRoot` at a live sibling,
+ * `repairRegistryEntries`, runs only under `jolli doctor`.
+ *
+ * `registryRoots` is consulted FIRST rather than OR-ed with the row, for the
+ * mirror image of `handleForget`'s reasoning: the registry is the writer and the
+ * row is its projection, so the row can only be staler. That also settles the
+ * placeholder case below in the right direction — an identity the registry lists
+ * is registered, so "all of its recorded paths are gone" is a true `missing`.
+ *
+ * The fallback keeps the pre-registry rule: a row whose `worktree_root` IS its
+ * identity is deliberately not "missing". That is the placeholder
+ * `StatsWriter.ensureRepoRow` inserts when an event arrives before the repo is
+ * registered, so it names no directory rather than naming one that vanished, and
+ * marking it would put a remove control on a repo that is about to register
+ * normally.
+ */
+type WorktreeAbsence = "present" | "missing" | "volume-unavailable";
+
+function absenceOfWorktree(
+	row: { readonly repo_identity: string; readonly worktree_root: string },
+	registryRoots: ReadonlyMap<string, ReadonlyArray<string>> | undefined,
+): WorktreeAbsence {
+	const recorded = registryRoots?.get(row.repo_identity);
+	const paths =
+		recorded !== undefined && recorded.length > 0
+			? recorded
+			: row.worktree_root === row.repo_identity
+				? []
+				: [row.worktree_root];
+	if (paths.length === 0 || paths.some((path) => worktreeExists(path))) return "present";
+	// Same rule as `classifyRegistryEntry`: ONE recorded path on a live volume is
+	// enough to call this a deletion, because that path really is gone from a disk
+	// that is here. Only when no recorded path's volume can be reached at all is the
+	// absence about the volume.
+	return paths.some((path) => volumeReachable(path)) ? "missing" : "volume-unavailable";
+}
+
+/**
+ * How long a checkout's existence is reused before asking the filesystem again.
+ *
+ * This is the ONE filesystem call a page render makes, and it is made per repo row
+ * per request — so an uncached probe of a repo on a disconnected SMB/NFS mount
+ * blocks the whole render until the mount times out, on every refresh, for every
+ * OTHER repo's benefit too.
+ *
+ * Staleness is already part of this value's contract rather than a cost the memo
+ * introduces: `missing` renders a remove control, and `DashboardServer.handleForget`
+ * re-asks at action time precisely because "the control is rendered from a payload
+ * that can be minutes old". Half a minute here is well inside that.
+ */
+const WORKTREE_EXISTENCE_TTL_MS = 30_000;
+
+const worktreeExistence = new Map<string, boolean>();
+let worktreeExistenceStartedAtMs = 0;
+
+/**
+ * `existsSync` with a short real-time memo.
+ *
+ * One generation for the whole memo rather than a TTL per key. That keeps it
+ * BOUNDED without a capacity check: it is emptied wholesale every window, so a
+ * long-lived server watching repo rows come and go cannot accumulate paths. The
+ * cost is that a key added late in a window is dropped early, which is free —
+ * every entry is one `existsSync` to recompute.
+ *
+ * Deliberately `Date.now()` rather than the caller's injected `nowMs`: that clock
+ * is a DISPLAY seam (tests pin it to 0, and views are rendered "as of" a chosen
+ * instant), so keying an I/O throttle on it would freeze this memo for the whole
+ * process whenever a caller froze the display clock.
+ */
+function worktreeExists(path: string): boolean {
+	const nowMs = Date.now();
+	if (nowMs - worktreeExistenceStartedAtMs >= WORKTREE_EXISTENCE_TTL_MS) {
+		worktreeExistence.clear();
+		worktreeExistenceStartedAtMs = nowMs;
+	}
+	const hit = worktreeExistence.get(path);
+	if (hit !== undefined) return hit;
+	const exists = existsSync(path);
+	worktreeExistence.set(path, exists);
+	return exists;
+}
+
+/**
+ * Drops the memo — for a caller that creates or deletes a checkout mid-run.
+ *
+ * `DashboardServer.handleEnable` is the one production caller: it has just been
+ * told a directory exists, and a `false` cached for that path outlives the answer
+ * by up to a whole window, so the reload after its 200 would render the repo the
+ * user just enabled with a remove control on it.
+ */
+export function clearWorktreeExistenceCache(): void {
+	worktreeExistence.clear();
+	worktreeExistenceStartedAtMs = 0;
+}
+
 /** Builds the full page payload for one view + scope. */
 export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): DashboardModel {
 	const timeZone = opts.timeZone ?? machineTimeZone();
@@ -2241,13 +2371,20 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		disabled_at: string | null;
 		week_sessions: number;
 	}>;
-	const repos: RepoOption[] = repoRows.map((r) => ({
-		repoIdentity: r.repo_identity,
-		repoName: r.repo_name,
-		worktreeRoot: r.worktree_root,
-		sessionsThisWeek: r.week_sessions,
-		...(r.disabled_at != null ? { disabled: true as const } : {}),
-	}));
+	const repos: RepoOption[] = repoRows.map((r) => {
+		// `volumeUnavailable` IMPLIES `missing` (see `RepoOption`): the flag says why
+		// nothing was found, never that something else was.
+		const absence = absenceOfWorktree(r, opts.registryRoots);
+		return {
+			repoIdentity: r.repo_identity,
+			repoName: r.repo_name,
+			worktreeRoot: r.worktree_root,
+			sessionsThisWeek: r.week_sessions,
+			...(r.disabled_at != null ? { disabled: true as const } : {}),
+			...(absence !== "present" ? { missing: true as const } : {}),
+			...(absence === "volume-unavailable" ? { volumeUnavailable: true as const } : {}),
+		};
+	});
 
 	// The footer carries ONE note now, and only when the database is empty.
 	//

@@ -1,8 +1,32 @@
-import { lstatSync, readlinkSync } from "node:fs";
+import { lstatSync, mkdtempSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+/**
+ * Whether this machine can create a symlink at all — a CAPABILITY, not a platform.
+ *
+ * Windows needs Developer Mode or elevation for `symlink`, so `linkMirroredSkill`
+ * deliberately falls back to copying the bundle's `SKILL.md`; a machine in that state
+ * has no symlink to assert the SHAPE of. Probed rather than keyed off
+ * `process.platform` because a Developer-Mode Windows box does plant real symlinks, and
+ * that is exactly the run where the shape assertion is worth having.
+ *
+ * Only the shape claim is gated. That the mirror is PLACED, and that a vanished bundle
+ * gets it cleaned up, hold under both placements and stay asserted everywhere.
+ */
+const canSymlink = ((): boolean => {
+	const probe = mkdtempSync(join(tmpdir(), "jolli-symlink-probe-"));
+	try {
+		symlinkSync(join(probe, "target"), join(probe, "link"), "dir");
+		return true;
+	} catch {
+		return false;
+	} finally {
+		rmSync(probe, { recursive: true, force: true });
+	}
+})();
 
 // Mock homedir so installDistPath() writes to a temp dir, not the real home.
 // The actual mock value is set in beforeEach via mockHomedir.
@@ -320,9 +344,16 @@ describe("Installer", () => {
 		fakeBundleDir = await mkdtemp(join(tmpdir(), "jollimemory-bundle-"));
 		for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
 			await mkdir(join(fakeBundleDir, "mirror", name), { recursive: true });
+			// The vendor marker is load-bearing, not decoration: where symlinks need
+			// Developer Mode the reconcile falls back to COPYING this file into the repo,
+			// and the teardown side then recognises that copy as ours only by this marker
+			// (`removeJolliOwnedSkillDir`). A marker-less fixture makes the copy permanently
+			// unremovable, so the cleanup assertions below would fail on that platform while
+			// passing wherever the placement happens to be a symlink. The bundle's real
+			// `mirror/` copies keep their `metadata:` block for exactly this reason.
 			await writeFile(
 				join(fakeBundleDir, "mirror", name, "SKILL.md"),
-				`---\nname: ${name}\n---\nbody\n`,
+				`---\nname: ${name}\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n`,
 				"utf-8",
 			);
 		}
@@ -1661,15 +1692,23 @@ describe("Installer", () => {
 			for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
 				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(true);
 			}
-			// Planted as SYMLINKS into the bundle, which is what makes them vanish when the
-			// plugin is uninstalled. What the target CONTAINS is the bundle's business and
-			// is asserted in SkillInstaller.test.ts against the real builders.
-			const recall = join(tempDir, ".cursor", "skills", "jolli-recall");
-			expect(lstatSync(recall).isSymbolicLink()).toBe(true);
-			expect(readlinkSync(recall)).toBe(join(fakeBundleDir, "mirror", "jolli-recall"));
 			// The `/jolli` umbrella is NOT among them: it is machine-global, because the
 			// chat-first window that most needs a front door never names a workspace.
 			expect(await exists(join(tempDir, ".cursor", "skills", "jolli", "SKILL.md"))).toBe(false);
+		});
+
+		// The PLACEMENT above holds on every machine; its shape does not. Split out rather
+		// than asserted conditionally inside that test, so a skipped capability shows up as
+		// a skipped test instead of a passing one that quietly checked less.
+		it.skipIf(!canSymlink)("plants that mirror as symlinks into the bundle", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			// A symlink is what makes the entry vanish when the plugin is uninstalled. What
+			// the target CONTAINS is the bundle's business and is asserted in
+			// SkillInstaller.test.ts against the real builders.
+			const recall = join(tempDir, ".cursor", "skills", "jolli-recall");
+			expect(lstatSync(recall).isSymbolicLink()).toBe(true);
+			expect(readlinkSync(recall)).toBe(join(fakeBundleDir, "mirror", "jolli-recall"));
 		});
 
 		/*

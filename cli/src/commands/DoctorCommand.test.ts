@@ -44,6 +44,10 @@ vi.mock("../core/LlmClient.js", () => ({ resolveLlmCredentialSource: h.resolveLl
 vi.mock("../core/Locks.js", () => ({
 	isWorkerLockStale: h.isWorkerLockStale,
 	releaseWorkerLock: h.releaseWorkerLock,
+	// The repo-registry row's dry-run repair pass takes this lock. A plain
+	// pass-through rather than a spy: these tests are about doctor's output, and an
+	// unmocked export throws on the very first check that reaches it.
+	withRepoRegistryLock: async <T>(fn: () => Promise<T>) => fn(),
 }));
 vi.mock("../core/localagent/BackendRegistry.js", () => ({ getBackend: h.getBackend }));
 vi.mock("../core/RepoProfile.js", () => ({
@@ -121,6 +125,39 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 	afterEach(() => {
 		vi.clearAllMocks();
 		process.exitCode = undefined;
+	});
+
+	it("survives a registry it cannot read, and still prints every other check", async () => {
+		// The repo-registry row reads STRICTLY (its repair pass is a
+		// read-modify-write), so corrupt JSON throws — and nothing has been printed
+		// by then, so an unguarded throw costs the user all ten diagnoses above it on
+		// exactly the machine doctor exists for.
+		const { mkdtempSync, rmSync, writeFileSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const dir = mkdtempSync(join(tmpdir(), "jolli-doctor-corrupt-"));
+		h.getGlobalConfigDir.mockReturnValue(dir);
+		writeFileSync(join(dir, "dashboard-repos.json"), "{ not json", "utf-8");
+		h.getBackend.mockReturnValue({
+			discoverExecutable: vi.fn().mockResolvedValue({ file: "/usr/bin/claude", version: "2.0.0" }),
+		});
+
+		try {
+			const joined = (await runDoctor()).join("\n");
+
+			expect(joined).toContain("Jolli Memory Doctor");
+			expect(joined).toContain("Git hooks");
+			expect(joined).toContain("Repo registry");
+			expect(joined).toContain("unreadable");
+			// The survey reads fail-open, so it would have answered "0 repos, every
+			// recorded checkout present" about a registry nothing could read. Sharing
+			// the guard is what stops that reaching the screen.
+			expect(joined).not.toContain("every recorded checkout present");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+			process.exitCode = undefined;
+		}
 	});
 
 	it("probes getBackend with the configured localAgentTool (not the claude-code default)", async () => {
@@ -269,6 +306,39 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 		expect(lines).toContain("absent (expected");
 		expect(lines).not.toContain("will be created on first commit");
 	});
+
+	it("--dry-run lists what --fix would do and applies nothing", async () => {
+		h.getStatus.mockResolvedValue({
+			gitHookInstalled: false,
+			claudeHookInstalled: true,
+			geminiHookInstalled: true,
+		});
+
+		const lines = (await runDoctor(["--dry-run"])).join("\n");
+
+		expect(lines).toContain("--fix would apply:");
+		expect(lines).toContain("→ Git hooks:");
+		expect(lines).not.toContain("Applying fixes...");
+		expect(h.install).not.toHaveBeenCalled();
+		// Nothing was repaired, so it exits like a plain report.
+		expect(process.exitCode).toBe(1);
+	});
+
+	it("--fix applies the fixers and reports each one", async () => {
+		h.getStatus.mockResolvedValue({
+			gitHookInstalled: false,
+			claudeHookInstalled: true,
+			geminiHookInstalled: true,
+		});
+		h.install.mockResolvedValue({ success: true, warnings: [] });
+
+		const lines = (await runDoctor(["--fix"])).join("\n");
+
+		expect(lines).toContain("Applying fixes...");
+		expect(lines).toContain("Git hooks: reinstalled");
+		expect(lines).not.toContain("--fix would apply:");
+		expect(h.install).toHaveBeenCalled();
+	});
 });
 
 describe("global daemon check", () => {
@@ -293,6 +363,304 @@ describe("global daemon check", () => {
 		// the row that reports whether they ACTUALLY landed is "Database backup".
 		expect(check.status).toBe("warn");
 		expect(check.message).toContain("not running");
+	});
+});
+
+describe("repo registry check", () => {
+	const repo = (repoIdentity: string, worktreeRoot: string) => ({
+		repoIdentity,
+		repoName: "r",
+		worktreeRoot,
+		enabledAt: "t",
+	});
+	const empty = { live: [], disposable: [], dead: [], unavailable: [] };
+	const fixer = async () => "did it";
+
+	it("is ok, and offers no fixer, when every recorded checkout is present", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck({ ...empty, live: [repo("a", "/here")] }, [], fixer);
+
+		expect(check.status).toBe("ok");
+		expect(check.message).toContain("1 repo");
+		expect(check.fixer).toBeUndefined();
+	});
+
+	it("warns rather than failing — a stale entry breaks nothing", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck({ ...empty, dead: [repo("a", "/gone")] }, [], fixer);
+
+		// A `fail` would exit 1 on an otherwise healthy machine over a row that
+		// only wastes a sweep.
+		expect(check.status).toBe("warn");
+	});
+
+	it("offers no fixer for a dead entry until --forget-dead-repos is passed", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const survey = { ...empty, dead: [repo("a", "/gone")] };
+
+		// Plain `--fix` must not delete a repo's memories as a side effect of
+		// releasing a lock — and a button that would do nothing is not offered.
+		const plain = formatRepoRegistryCheck(survey, [], fixer);
+		expect(plain.fixer).toBeUndefined();
+		expect(plain.message).toContain("1 to forget with --forget-dead-repos");
+		expect(plain.message).toContain("removed by --fix --forget-dead-repos");
+
+		const optedIn = formatRepoRegistryCheck(survey, [], fixer, { forgetDead: true });
+		expect(optedIn.fixer).toBeDefined();
+		expect(optedIn.message).toContain("1 entry to remove");
+		expect(optedIn.message).not.toContain("--forget-dead-repos");
+	});
+
+	it("still offers the repair fixer while a dead entry waits for its flag", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck(
+			{ ...empty, dead: [repo("a", "/gone")] },
+			[{ repoIdentity: "b", droppedPaths: ["/tmp/x"], collapsedPaths: [] }],
+			fixer,
+		);
+
+		// The two halves are independent: withholding the removal must not withhold
+		// the path repair, which deletes nothing.
+		expect(check.fixer).toBeDefined();
+		expect(check.message).toContain("1 to repair");
+	});
+
+	it("names every entry rather than only counting them", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck(
+			{
+				...empty,
+				disposable: [repo("local:t", "/tmp/fix/repo")],
+				dead: [repo("https://x/y", "/gone/real")],
+			},
+			[],
+			fixer,
+			{ forgetDead: true },
+		);
+
+		expect(check.message).toContain("2 entries to remove");
+		expect(check.message).toContain("/tmp/fix/repo");
+		expect(check.message).toContain("/gone/real");
+		expect(check.message).toContain("removed automatically");
+		expect(check.message).toContain("removed by --fix");
+	});
+
+	it("reports an unavailable volume and offers NO fixer for it", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck({ ...empty, unavailable: [repo("a", "Z:\\work\\repo")] }, [], fixer);
+
+		// The ticket's rule: warn, never remove. A button that must not act is
+		// worse than no button.
+		expect(check.status).toBe("warn");
+		expect(check.fixer).toBeUndefined();
+		expect(check.message).toContain("not mounted");
+		expect(check.message).toContain("left alone");
+	});
+
+	describe("the fixer", () => {
+		let fixDir: string;
+
+		beforeEach(async () => {
+			const { mkdtempSync } = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+			fixDir = mkdtempSync(join(tmpdir(), "jolli-doctor-fix-"));
+		});
+
+		afterEach(async () => {
+			const { rmSync } = await import("node:fs");
+			rmSync(fixDir, { recursive: true, force: true });
+		});
+
+		const seedRegistry = async (repos: ReadonlyArray<unknown>): Promise<void> => {
+			const { getRepoRegistryPath } = await import("../dashboard/RepoRegistry.js");
+			const { writeFileSync } = await import("node:fs");
+			writeFileSync(getRepoRegistryPath(fixDir), JSON.stringify({ version: 1, repos }), "utf-8");
+		};
+
+		it("backs the registry up before removing anything, and says where", async () => {
+			const { applyRepoRegistryFix } = await import("./DoctorCommand.js");
+			const { existsSync, readFileSync } = await import("node:fs");
+			const { getRepoRegistryPath } = await import("../dashboard/RepoRegistry.js");
+			await seedRegistry([{ repoIdentity: "https://x/y", repoName: "r", worktreeRoot: "/gone", enabledAt: "t" }]);
+
+			const message = await applyRepoRegistryFix(
+				{ ...empty, dead: [repo("https://x/y", "/gone")] },
+				{
+					configDir: fixDir,
+					dbPath: `${fixDir}/none.db`,
+					nowMs: Date.UTC(2026, 7, 17, 1, 2, 3),
+					forgetDead: true,
+				},
+			);
+
+			expect(message).toContain("backed up the registry to");
+			expect(message).toContain("forgot 1 entry");
+			// The backup holds the state BEFORE the removal — that is the whole point.
+			// `[^;]+`, not `\S+`: the parts are joined with "; " and a path has no
+			// spaces to stop a greedy match at.
+			const backup = /backed up the registry to ([^;]+)/.exec(message)?.[1];
+			expect(backup && existsSync(backup)).toBe(true);
+			expect(JSON.parse(readFileSync(backup as string, "utf-8")).repos).toHaveLength(1);
+			expect(JSON.parse(readFileSync(getRepoRegistryPath(fixDir), "utf-8")).repos).toEqual([]);
+		});
+
+		it("throws when a removal failed rather than reporting a partial success", async () => {
+			const { applyRepoRegistryFix } = await import("./DoctorCommand.js");
+			const forget = await import("../dashboard/RepoForget.js");
+			const spy = vi.spyOn(forget, "forgetRepos").mockResolvedValue([
+				{
+					identity: "https://x/y",
+					removedFromRegistry: false,
+					repoRowDeleted: false,
+					childRowsDeleted: 0,
+					pendingEventsDeleted: 0,
+					error: "database is locked",
+				},
+			]);
+			try {
+				await expect(
+					applyRepoRegistryFix(
+						{ ...empty, dead: [repo("https://x/y", "/gone")] },
+						{ configDir: fixDir, forgetDead: true },
+					),
+				).rejects.toThrow(/database is locked/);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		it("leaves a dead entry alone unless the fix was asked for it", async () => {
+			const { applyRepoRegistryFix } = await import("./DoctorCommand.js");
+			const forget = await import("../dashboard/RepoForget.js");
+			const spy = vi.spyOn(forget, "forgetRepos");
+			await seedRegistry([{ repoIdentity: "https://x/y", repoName: "r", worktreeRoot: "/gone", enabledAt: "t" }]);
+
+			try {
+				const message = await applyRepoRegistryFix(
+					{ ...empty, dead: [repo("https://x/y", "/gone")] },
+					{ configDir: fixDir },
+				);
+
+				// The registry is still backed up (the repair pass rewrites it too), but
+				// nothing was forgotten — the twelve child tables `forgetRepos` deletes
+				// are exactly what no backup here restores.
+				expect(spy).not.toHaveBeenCalled();
+				expect(message).not.toContain("forgot");
+				const { readFileSync } = await import("node:fs");
+				const { getRepoRegistryPath } = await import("../dashboard/RepoRegistry.js");
+				expect(JSON.parse(readFileSync(getRepoRegistryPath(fixDir), "utf-8")).repos).toHaveLength(1);
+			} finally {
+				spy.mockRestore();
+			}
+		});
+
+		/**
+		 * JOLLI-2212's acceptance case, on the shape it was measured in: a registry
+		 * carrying 84 fixture entries under the system temp directory plus ONE real
+		 * repo whose `worktrees` had two of those fixture paths merged into it. One
+		 * pass has to remove the 84 and repair the 1, without touching the real
+		 * repo's own checkout.
+		 *
+		 * The `C:` / `c:` half of that entry is pinned by RepoRegistry's own win32
+		 * case instead: `sameRecordedRoot` folds case by platform on purpose, and the
+		 * doctor's fixer takes the host's — so asserting it here would pass on Windows
+		 * and quietly assert nothing on Linux.
+		 */
+		it("removes the measured fixture entries and repairs the real one in a single pass", async () => {
+			const { surveyRepoRegistry } = await import("../dashboard/RepoForget.js");
+			const { applyRepoRegistryFix } = await import("./DoctorCommand.js");
+			const { getRepoRegistryPath } = await import("../dashboard/RepoRegistry.js");
+			const { mkdirSync, mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+			const { tmpdir } = await import("node:os");
+			const { join } = await import("node:path");
+
+			// Under the REAL temp dir: the fixer's repair pass asks `tempRoots()`, not
+			// an injected list, so a fake root would make the drop a no-op.
+			const scratch = mkdtempSync(join(tmpdir(), "jolli-2212-"));
+			const live = join(scratch, "jollimemory-design");
+			mkdirSync(live, { recursive: true });
+			const ghosts = [
+				join(scratch, "jolli-cutover-sG1Rx7", "repo"),
+				join(scratch, "jolli-cutover-sG1Rx7", "repo2"),
+			];
+			const fixtures = Array.from({ length: 84 }, (_, i) => ({
+				repoIdentity: `local:${String(i).padStart(32, "0")}`,
+				repoName: "repo",
+				worktreeRoot: join(scratch, `fixture-${i}`, "repo"),
+				enabledAt: "1970-01-01T00:00:00.000Z",
+			}));
+			await seedRegistry([
+				...fixtures,
+				{
+					repoIdentity: "https://github.com/jolliai/jolli-design",
+					repoName: "jolli-design",
+					worktreeRoot: live,
+					worktrees: [...ghosts, live],
+					remoteUrl: "https://github.com/jolliai/jolli-design",
+					enabledAt: "2026-08-01T00:00:00.000Z",
+				},
+			]);
+
+			try {
+				const dbPath = join(scratch, "none.db");
+				const survey = await surveyRepoRegistry({ configDir: fixDir, dbPath });
+				expect(survey.disposable).toHaveLength(84);
+				expect(survey.live.map((r) => r.repoIdentity)).toEqual(["https://github.com/jolliai/jolli-design"]);
+
+				const message = await applyRepoRegistryFix(survey, { configDir: fixDir, dbPath });
+
+				expect(message).toContain("forgot 84 entries");
+				expect(message).toContain("repaired 1 entry");
+				const after = JSON.parse(readFileSync(getRepoRegistryPath(fixDir), "utf-8"));
+				expect(after.repos).toHaveLength(1);
+				expect(after.repos[0].repoIdentity).toBe("https://github.com/jolliai/jolli-design");
+				// The fixture paths are gone from its list; its own checkout is untouched.
+				expect(after.repos[0].worktrees).toEqual([live]);
+				expect(after.repos[0].worktreeRoot).toBe(live);
+			} finally {
+				rmSync(scratch, { recursive: true, force: true });
+			}
+		});
+
+		it("says so when there turned out to be nothing left to do", async () => {
+			// Reachable when another window cleaned up between the survey and the fix:
+			// nothing removable, nothing repairable, and no registry left to back up.
+			const { applyRepoRegistryFix } = await import("./DoctorCommand.js");
+			expect(await applyRepoRegistryFix(empty, { configDir: fixDir })).toBe("nothing left to do");
+		});
+	});
+
+	it("describes a repairable entry by what is wrong with it", async () => {
+		const { formatRepoRegistryCheck } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryCheck(
+			{ ...empty, live: [repo("id", "/here")] },
+			[{ repoIdentity: "id", droppedPaths: ["/tmp/x"], collapsedPaths: ["C:\\A"], repointedTo: "/here" }],
+			fixer,
+		);
+
+		expect(check.message).toContain("1 to repair");
+		expect(check.message).toContain("1 stale temp path(s)");
+		expect(check.message).toContain("1 duplicate spelling(s)");
+		expect(check.message).toContain("a dead recorded root");
+		expect(check.fixer).toBeDefined();
+	});
+
+	it("fails, with no fixer, when the registry could not be read at all", async () => {
+		const { formatRepoRegistryReadFailure } = await import("./DoctorCommand.js");
+		const check = formatRepoRegistryReadFailure(
+			"Unexpected token } in JSON at position 12",
+			"/home/u/.jolli/jollimemory/dashboard-repos.json",
+		);
+
+		// A fault, not a warning: every writer of this file is a read-modify-write
+		// over the strict read, so no repo can register until it is resolved.
+		expect(check.status).toBe("fail");
+		expect(check.message).toContain("Unexpected token");
+		expect(check.message).toContain("dashboard-repos.json");
+		// No fixer: the remedy discards every registration the file holds, which is
+		// not something `--fix` may decide on the user's behalf.
+		expect(check.fixer).toBeUndefined();
 	});
 });
 

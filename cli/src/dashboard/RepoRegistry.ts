@@ -21,8 +21,9 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeFileAtomic } from "../core/AtomicJsonFile.js";
 import { getProjectRootDir } from "../core/GitOps.js";
@@ -89,6 +90,19 @@ export function sameRecordedRoot(a: string, b: string, platform: NodeJS.Platform
 }
 
 /**
+ * The paths this entry claims, tolerating entries written before `worktrees`
+ * existed — the whole claim, live or not.
+ *
+ * Naming the fallback once is what stops its consumers disagreeing about it:
+ * {@link existingWorktrees} wants the live subset, {@link hasLiveWorktree} wants
+ * "any of them", {@link isDisposableRepo} wants "all of them", and `RepoForget`
+ * asks which volume each one is on.
+ */
+export function recordedRepoPaths(repo: RegisteredRepo): ReadonlyArray<string> {
+	return repo.worktrees && repo.worktrees.length > 0 ? repo.worktrees : [repo.worktreeRoot];
+}
+
+/**
  * Every worktree of a repo that still exists on disk, newest first.
  *
  * Tolerates entries written before `worktrees` existed (falls back to
@@ -96,8 +110,7 @@ export function sameRecordedRoot(a: string, b: string, platform: NodeJS.Platform
  * is also what stops a relocated local-only repo from stranding its old path.
  */
 export function existingWorktrees(repo: RegisteredRepo): ReadonlyArray<string> {
-	const known = repo.worktrees && repo.worktrees.length > 0 ? repo.worktrees : [repo.worktreeRoot];
-	const alive = [...known].reverse().filter((path) => existsSync(path));
+	const alive = [...recordedRepoPaths(repo)].reverse().filter((path) => existsSync(path));
 	// Never return empty while the repo is registered: a caller that would then
 	// collect nothing is better off trying the recorded path and failing loudly
 	// in git than silently sweeping zero worktrees.
@@ -112,14 +125,147 @@ export function existingWorktrees(repo: RegisteredRepo): ReadonlyArray<string> {
  * cannot read that off the returned list, because the fallback makes a repo
  * whose every path is gone look identical to one with a single live checkout.
  *
- * The registry is append-only in practice — nothing prunes it, and
- * `deregisterRepo` has to run from inside the repo it removes, which a deleted
- * directory makes impossible — so dead entries accumulate and every sweep pays
- * for them again. Asking this first is how a sweep tells "gone" from "broken".
+ * Dead entries are REMOVABLE but not automatically removed: `deregisterRepo`
+ * has to run from inside the repo it removes, which a deleted directory makes
+ * impossible, so the identity-addressed `forgetRepo` (see `RepoForget.ts`) is
+ * what reaches them — automatically for the narrow {@link isDisposableRepo}
+ * class, and only on request for everything else. A sweep still meets dead
+ * entries in between, so asking this first is how it tells "gone" from "broken".
  */
 export function hasLiveWorktree(repo: RegisteredRepo): boolean {
-	const known = repo.worktrees && repo.worktrees.length > 0 ? repo.worktrees : [repo.worktreeRoot];
-	return known.some((path) => existsSync(path));
+	return recordedRepoPaths(repo).some((path) => existsSync(path));
+}
+
+/** Prefix of the path-hashed identity a repo with no usable remote falls back to. */
+export const LOCAL_IDENTITY_PREFIX = "local:";
+
+/**
+ * The temp roots a recorded path may legitimately sit under.
+ *
+ * Both spellings, because they are produced by different halves of the same
+ * flow: `os.tmpdir()` answers `/var/folders/…` on macOS while every path this
+ * registry stores came from `git rev-parse --show-toplevel`, which resolves the
+ * `/var` → `private/var` symlink and reports `/private/var/folders/…`. Matching
+ * only the first makes {@link isDisposableRepo} answer `false` for every macOS
+ * fixture — silently, since "not disposable" is also the answer for a real repo.
+ *
+ * Known residual: a Windows path recorded in 8.3 short form (`APPDAT~1`) does
+ * not match the long `%TEMP%`. Such an entry is simply never auto-pruned, which
+ * is the safe direction — `jolli doctor --fix` still reaches it.
+ */
+export function tempRoots(): ReadonlyArray<string> {
+	const raw = tmpdir();
+	const roots = new Set<string>([raw]);
+	try {
+		roots.add(realpathSync(raw));
+		/* v8 ignore start -- `os.tmpdir()` not being resolvable means the machine has
+		   no usable temp directory at all; kept so this cannot be the thing that
+		   throws, but there is no state a test can put the host in to reach it */
+	} catch (err) {
+		// A temp dir that cannot be resolved is still a temp dir; the raw spelling
+		// is what most callers will match anyway.
+		log.debug("could not resolve the real path of %s: %s", raw, errMsg(err));
+	}
+	/* v8 ignore stop */
+	return [...roots];
+}
+
+export interface DisposableRepoOptions {
+	/** Defaults to {@link tempRoots}; a test names them so it needs no real temp dir. */
+	readonly tempRoots?: ReadonlyArray<string>;
+	/** Same contract as {@link sameRecordedRoot}'s: never a guess about the host. */
+	readonly platform?: NodeJS.Platform;
+}
+
+/** True when `path` is `root` or lives under it, for the named platform. */
+function isUnder(path: string, root: string, platform: NodeJS.Platform): boolean {
+	const p = normalizePathForCompareOn(path, platform);
+	const r = normalizePathForCompareOn(root, platform);
+	return p === r || p.startsWith(`${r}/`);
+}
+
+/**
+ * Segments that mark a temp directory as a throwaway THIS machine created.
+ *
+ * `jolli-` is the mkdtemp prefix every fixture in this repo uses
+ * (`jolli-cutover-…`, `jolli-autocut-…`), and `scratchpad` is the tree an agent
+ * session works in. Both are conventions rather than guarantees, which is why
+ * they only ever RELAX the identity clause and never the other two — see
+ * {@link isDisposableRepo}.
+ */
+const FIXTURE_SEGMENTS = ["jolli-", "scratchpad"] as const;
+
+/**
+ * Whether the part of `path` BELOW `root` names a throwaway directory.
+ *
+ * Relative to the root on purpose. The absolute form would match the root's own
+ * name, and a test that injects its own `tempRoots` — a `jolli-forget-…` mkdtemp
+ * dir, say — would then see every fixture inside it marked, which is exactly the
+ * distinction being tested. Relative, the same path is a fixture when measured
+ * against the real `%TEMP%` and an ordinary directory when measured against the
+ * throwaway it already lives in.
+ */
+function isFixturePathUnder(path: string, root: string, platform: NodeJS.Platform): boolean {
+	const p = normalizePathForCompareOn(path, platform);
+	const r = normalizePathForCompareOn(root, platform);
+	if (!p.startsWith(`${r}/`)) return false;
+	return p
+		.slice(r.length + 1)
+		.split("/")
+		.some((segment) => FIXTURE_SEGMENTS.some((mark) => segment.startsWith(mark)));
+}
+
+/**
+ * Whether this entry is high-confidence garbage that may be removed WITHOUT
+ * asking — a fixture or scratch checkout under the system temp directory whose
+ * every recorded path is gone.
+ *
+ * Two clauses always hold, and a third decides what an identity has to prove:
+ *
+ * 1. **Every recorded path under a temp root.** The union of `worktreeRoot` and
+ *    `worktrees`, not just the live subset — an entry with one temp path and one
+ *    real one is a real repo that was once opened from a scratch checkout, which
+ *    is exactly the shape a fixture leak leaves behind.
+ * 2. **No path left on disk.** A user working under `%TEMP%` right now has a
+ *    working repo, and a sweep must not delete the history of a session in
+ *    progress. The SAME union as clause 1, never {@link hasLiveWorktree}: this
+ *    function deletes data, so having declined to trust `registerRepo`'s
+ *    "`worktreeRoot` is inside `worktrees`" invariant for the clause that decides
+ *    whether an entry is IN SCOPE, it cannot go on to rely on it for the clause
+ *    that decides whether the entry is ALIVE — an entry whose `worktrees` omitted
+ *    a live `worktreeRoot` would be pruned with its own checkout on disk.
+ * 3. **A `local:` identity, OR every path names a known throwaway directory.**
+ *
+ * Clause 3 is the only inference here, and it is drawn where it is because the
+ * two halves are not equally safe. A `local:` identity is the sha256 of ONE
+ * path, so it cannot be shared and removing it structurally cannot touch
+ * anything else. A remote-backed identity IS shared — the `repos` row is keyed
+ * by it, so every clone of that remote answers to the same row — and "no other
+ * clone exists on this machine" can only be inferred from paths that record the
+ * last registrar. {@link FIXTURE_SEGMENTS} is what makes that inference narrow
+ * enough to act on: a vanished `%TEMP%/jolli-cutover-…/repo` is a fixture
+ * whichever remote it was cloned from. A vanished temp path with no such marker
+ * still needs a human, and `jolli doctor --fix` is where it goes.
+ *
+ * The state `DbBackfill` deliberately refuses to act on — "temporarily
+ * unmounted" (network share, external drive) — cannot arise under any of them: a
+ * temp root is local by construction, so "gone" really does mean gone.
+ */
+export function isDisposableRepo(repo: RegisteredRepo, opts: DisposableRepoOptions = {}): boolean {
+	const roots = opts.tempRoots ?? tempRoots();
+	const platform = opts.platform ?? process.platform;
+	// Deduped: `recordedRepoPaths` falls back to `[worktreeRoot]` on an entry with
+	// no `worktrees`, which would otherwise make the union `[root, root]` and read
+	// as a typo.
+	const claimed = [...new Set([repo.worktreeRoot, ...recordedRepoPaths(repo)])];
+	if (!claimed.every((path) => roots.some((root) => isUnder(path, root, platform)))) return false;
+	if (
+		!repo.repoIdentity.startsWith(LOCAL_IDENTITY_PREFIX) &&
+		!claimed.every((path) => roots.some((root) => isFixturePathUnder(path, root, platform)))
+	) {
+		return false;
+	}
+	return !claimed.some((path) => existsSync(path));
 }
 
 /**
@@ -294,7 +440,7 @@ export async function resolveRepoIdentity(worktreeRoot: string): Promise<{ ident
 		log.debug("no canonical remote for %s (%s) — using path identity", worktreeRoot, errMsg(err));
 	}
 	const hash = createHash("sha256").update(toForwardSlash(worktreeRoot)).digest("hex").slice(0, 32);
-	return { identity: `local:${hash}` };
+	return { identity: `${LOCAL_IDENTITY_PREFIX}${hash}` };
 }
 
 /**
@@ -443,6 +589,164 @@ export async function deregisterRepo(opts: RegisterRepoOptions): Promise<string 
 		},
 		{ globalDir: opts.configDir },
 	);
+}
+
+/**
+ * Removes entries by IDENTITY, returning the identities that were actually
+ * present — the half `deregisterRepo` structurally cannot do.
+ *
+ * `deregisterRepo` resolves its target by asking `cwd` (`getProjectRootDir` then
+ * `resolveRepoIdentity`), so a checkout that no longer exists can never be
+ * named; and its remedy — stamp `disabledAt` — is the wrong one anyway, since a
+ * disabled entry is still an entry. Both survive because they answer different
+ * questions: this is "forget it", `deregisterRepo` is `jolli disable`.
+ *
+ * Batched deliberately. The prune sweep has 85 victims on a machine that ran the
+ * test suite before HOME isolation became the default, and one lock plus one
+ * atomic write is the difference between that and 85 read-modify-write cycles
+ * racing every other registrar. It also makes the sweep's registry half
+ * all-or-nothing, which is what `forgetRepos`' ordering contract wants.
+ *
+ * Callers must delete the database rows FIRST — see `forgetRepos`.
+ */
+export async function removeReposFromRegistry(
+	identities: ReadonlyArray<string>,
+	configDir?: string,
+): Promise<ReadonlyArray<string>> {
+	if (identities.length === 0) return [];
+	const wanted = new Set(identities);
+	return withRepoRegistryLock(
+		async () => {
+			// Strict, not the fail-open read: this is a read-modify-write, and a
+			// registry that failed open here would be written back as "everything
+			// except the ones I meant to remove" — i.e. every other repo deleted. See
+			// `readRepoRegistryStrict`.
+			const registry = await readRepoRegistryStrict(configDir);
+			const removed = registry.repos.filter((r) => wanted.has(r.repoIdentity)).map((r) => r.repoIdentity);
+			if (removed.length === 0) return [];
+			await writeRepoRegistry(
+				{ ...registry, version: 1, repos: registry.repos.filter((r) => !wanted.has(r.repoIdentity)) },
+				configDir,
+			);
+			return removed;
+		},
+		{ globalDir: configDir },
+	);
+}
+
+/** {@link removeReposFromRegistry} for one identity; true when it was present. */
+export async function removeRepoFromRegistry(identity: string, configDir?: string): Promise<boolean> {
+	return (await removeReposFromRegistry([identity], configDir)).length > 0;
+}
+
+export interface RegistryRepairOptions extends DisposableRepoOptions {
+	readonly configDir?: string;
+	/**
+	 * Compute the repairs and write nothing.
+	 *
+	 * What makes `doctor --dry-run` honest about this half: the removals can be
+	 * previewed from a survey, but a path repair is only knowable by running the
+	 * same pass that would apply it, and a preview computed by different code is
+	 * a second implementation of the rule.
+	 *
+	 * Also takes NO registry lock — see the tail of {@link repairRegistryEntries}.
+	 */
+	readonly dryRun?: boolean;
+}
+
+/** What {@link repairRegistryEntries} changed about one entry. */
+export interface RegistryRepair {
+	readonly repoIdentity: string;
+	/** Temp-only paths that no longer exist, removed from `worktrees`. */
+	readonly droppedPaths: ReadonlyArray<string>;
+	/** Alternate spellings of a path the entry already listed (`C:` vs `c:`). */
+	readonly collapsedPaths: ReadonlyArray<string>;
+	/** Set when `worktreeRoot` named a dead path and a live one took over. */
+	readonly repointedTo?: string;
+}
+
+/**
+ * Repairs entries that are partly wrong rather than wholly dead — the state a
+ * removal cannot express.
+ *
+ * Three edits, and the two it deliberately does NOT make are the interesting part:
+ *
+ * 1. **Drops a recorded path that is gone AND under a temp root.** That is the
+ *    shape a real repo picks up from a fixture leak: a genuine `worktreeRoot`
+ *    with two `%TEMP%/jolli-cutover-…/repo` paths merged into its `worktrees`.
+ * 2. **Collapses alternate spellings** with {@link sameRecordedRoot}, newest
+ *    spelling winning — the same rule and the same tie-break `registerRepo`
+ *    applies when it re-registers a checkout. So a `C:` / `c:` pair that has not
+ *    been re-registered since is fixed here, and cannot regrow afterwards.
+ * 3. **Repoints `worktreeRoot`** to the newest live path when the recorded one is
+ *    gone. That field is what every surface displays, so a dead value makes a
+ *    working repo look broken.
+ *
+ * NOT dropped: a dead path that is not under a temp root. {@link existingWorktrees}
+ * already filters those on read, so removing them from the file buys nothing and
+ * costs the one thing the file is for — an unmounted share or external drive
+ * comes back, and a checkout the list has forgotten is invisible to the cutover's
+ * source enumeration, so its orphan branch would be neither imported nor fenced.
+ * Same reason `DbBackfill` skips such a repo rather than deregistering it.
+ *
+ * NOT touched: an entry with no live path at all. That is `forgetRepos`'
+ * territory, and rewriting it here would only make dead data tidier.
+ */
+export async function repairRegistryEntries(opts: RegistryRepairOptions = {}): Promise<ReadonlyArray<RegistryRepair>> {
+	const platform = opts.platform ?? process.platform;
+	const roots = opts.tempRoots ?? tempRoots();
+	const pass = async (): Promise<ReadonlyArray<RegistryRepair>> => {
+		const registry = await readRepoRegistryStrict(opts.configDir);
+		const repairs: RegistryRepair[] = [];
+		const repos = registry.repos.map((repo) => {
+			if (!hasLiveWorktree(repo)) return repo;
+			const droppedPaths: string[] = [];
+			const collapsedPaths: string[] = [];
+			const kept: string[] = [];
+			for (const path of recordedRepoPaths(repo)) {
+				if (!existsSync(path) && roots.some((root) => isUnder(path, root, platform))) {
+					droppedPaths.push(path);
+					continue;
+				}
+				// Newest spelling wins: drop the earlier one and re-append.
+				const clash = kept.findIndex((seen) => sameRecordedRoot(seen, path, platform));
+				if (clash !== -1) collapsedPaths.push(...kept.splice(clash, 1));
+				kept.push(path);
+			}
+			// Newest-first, matching `existingWorktrees` — the path a collector would
+			// have picked anyway, so the displayed root and the collected one agree.
+			const live = [...kept].reverse().find((path) => existsSync(path));
+			const repointedTo = live !== undefined && !existsSync(repo.worktreeRoot) ? live : undefined;
+			// `registerRepo` guarantees `worktreeRoot` is the last entry of
+			// `worktrees`; keep that invariant when a repair rewrote the list. AFTER
+			// the repoint, or a `worktreeRoot` that was itself a dead temp path is
+			// re-appended by the very pass that just dropped it.
+			const nextRoot = repointedTo ?? repo.worktreeRoot;
+			if (!kept.some((path) => sameRecordedRoot(path, nextRoot, platform))) kept.push(nextRoot);
+			if (droppedPaths.length === 0 && collapsedPaths.length === 0 && repointedTo === undefined) return repo;
+			repairs.push({
+				repoIdentity: repo.repoIdentity,
+				droppedPaths,
+				collapsedPaths,
+				...(repointedTo !== undefined && { repointedTo }),
+			});
+			return {
+				...repo,
+				...(repointedTo !== undefined && { worktreeRoot: repointedTo }),
+				worktrees: kept,
+			};
+		});
+		if (repairs.length > 0 && opts.dryRun !== true) {
+			await writeRepoRegistry({ ...registry, version: 1, repos }, opts.configDir);
+		}
+		return repairs;
+	};
+	// A dry run takes NO lock. The lock serialises read-modify-WRITE cycles, and a
+	// preview performs no write — `writeRepoRegistry` is atomic, so a lock-free read
+	// can never see a torn file either. Taking it anyway put `jolli doctor`, a
+	// read-only diagnostic that computes this preview on EVERY run, into contention
+	// with the `registerRepo` a post-commit hook is running at the same time.
+	return opts.dryRun === true ? pass() : withRepoRegistryLock(pass, { globalDir: opts.configDir });
 }
 
 /** Registered repos that are not disabled. */

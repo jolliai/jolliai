@@ -105,7 +105,12 @@ import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.
 import { install } from "../install/Installer.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { LocalAgentToolId } from "../Types.js";
-import { ensureDashboardDbExists, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
+import {
+	ensureDashboardDbExists,
+	getDashboardDbPath,
+	withDashboardDb,
+	withReadonlyDashboardDb,
+} from "./DashboardDb.js";
 import {
 	CONTEXT_DOC_KINDS,
 	type DashboardModel,
@@ -116,7 +121,12 @@ import {
 	TOOL_ROWS_LIMIT,
 	type ToolUsageList,
 } from "./DashboardModel.js";
-import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
+import {
+	buildDashboardModel,
+	buildToolUsagePage,
+	clearWorktreeExistenceCache,
+	type QueryOptions,
+} from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
 import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
 import {
@@ -129,8 +139,9 @@ import {
 	WIKI_FILE_PATTERN,
 } from "./KnowledgeQuery.js";
 import { buildMemoriesPage, type ReachableCommits, readContextDoc } from "./MemoriesQuery.js";
+import { backupRepoRegistry, classifyRegistryEntry, forgetRepo, type RegistryEntryVerdict } from "./RepoForget.js";
 import { probeRepo } from "./RepoProbe.js";
-import { existingWorktrees, readRepoRegistry, registerRepo } from "./RepoRegistry.js";
+import { existingWorktrees, readRepoRegistry, recordedRepoPaths, registerRepo } from "./RepoRegistry.js";
 import {
 	applySettings,
 	checkLocalFolder,
@@ -522,6 +533,14 @@ async function defaultModelBuilder(
 	// Knowledge/Graph read the Memory Bank folder (not the DB), like Settings above.
 	const knowledgeModel = request.view === "knowledge" ? await buildKnowledgeModel(configDir) : undefined;
 	const graphModel = request.view === "graph" ? await buildGraphModel(configDir) : undefined;
+	// Not view-gated, unlike the three above: the repo picker is part of the shell,
+	// so `missing` is computed on every view. One small JSON read per request, and
+	// `readRepoRegistry` is the fail-open reader — an unreadable registry yields an
+	// empty map, which is exactly the "fall back to `worktree_root`" case
+	// `isMissingWorktree` already handles.
+	const registryRoots = new Map<string, ReadonlyArray<string>>(
+		(await readRepoRegistry(configDir)).repos.map((repo) => [repo.repoIdentity, recordedRepoPaths(repo)]),
+	);
 	return withReadonlyDashboardDb(
 		async (db) => {
 			// A rebase/reset/squash that rewrites history away leaves the old
@@ -557,6 +576,7 @@ async function defaultModelBuilder(
 			// now, so the call is retired (JOLLI-2209).
 			return buildDashboardModel(db, {
 				...request,
+				registryRoots,
 				...(settingsModel ? { settingsModel } : {}),
 				...(knowledgeModel ? { knowledgeModel } : {}),
 				...(graphModel ? { graphModel } : {}),
@@ -1511,6 +1531,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			await handleEnable(res, b);
 			return;
 		}
+		if (url.pathname === "/api/repos/forget") {
+			await handleForget(res, b);
+			return;
+		}
 		// `/api/repos/disable` and `/api/repos/resume` were the Repositories page's
 		// per-row Pause / Resume. Both went with that page. Pausing a repository
 		// is still a thing — `jolli disable` writes `disabled_at` and every query
@@ -1823,8 +1847,192 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 		const repo = await registerRepo({ cwd: worktreeRoot, configDir });
+		// This process just learned that a directory exists, and the render path's
+		// existence memo (`DashboardQuery.worktreeExists`) may hold the opposite
+		// answer for up to its whole window: a `repos` row pointing here that was
+		// probed while the checkout was absent — cloned back, or created and enabled
+		// from this page — leaves the memo saying `false`, so the reload right after
+		// this 200 renders the repo the user just enabled with a forget ✕ on it.
+		// Nothing else invalidates the memo; it is real-time-generational by design.
+		clearWorktreeExistenceCache();
 		const warning = await projectRegistryEntry(repo.repoIdentity);
 		sendJson(res, 200, { ok: true, repoIdentity: repo.repoIdentity, ...(warning ? { warning } : {}) });
+	}
+
+	/**
+	 * Removes a repository from this machine's dashboard — registry entry, rows and
+	 * unprojected events. The counterpart to `handleEnable`, and the only user-facing
+	 * way to reach an entry whose directory is gone (`deregisterRepo` needs to run
+	 * inside the repo, so it cannot name one).
+	 *
+	 * Refuses a repository that still exists on disk, and the check is deliberately
+	 * not "did the page offer the control": the control is rendered from a payload
+	 * that can be minutes old, a repo can be recreated or a drive remounted in
+	 * between, and this deletes memories irreversibly. `409` rather than `400` — the
+	 * request was well-formed, the state is what says no.
+	 *
+	 * The liveness question goes to whichever source can answer it — the registry
+	 * when there is an entry, the projection otherwise — because either can be the
+	 * only one. A registered entry knows every clone's path, which `worktree_root`
+	 * alone does not, so it outranks the projection; and a row projected from an
+	 * event before its repo registered has no entry at all, where judging it by "not
+	 * registered" would make it unconditionally forgettable.
+	 *
+	 * Deliberately either/or rather than an `||` of both: consulting the projection
+	 * for a registered entry could only change the answer if `worktree_root` were
+	 * FRESHER than the registry, and projection runs registry → database, so it can
+	 * only be staler.
+	 *
+	 * **"Not on disk" is TWO states, and the second one needs the user to say so.**
+	 * `existsSync` cannot tell a deleted folder from one whose VOLUME is absent, and
+	 * `RepoForget.classifyRegistryEntry` draws that line: an unplugged external drive
+	 * or an unmounted share is `unavailable` — a repo that may well come back — and
+	 * `doctor` will not remove it even under `--fix --forget-dead-repos`. This route
+	 * used to ask `hasLiveWorktree` alone, so it answered `false` for exactly that
+	 * case and ONE confirm deleted twelve child tables' worth of a repository that
+	 * was merely unplugged. The gap is platform-weighted rather than academic: on
+	 * POSIX an unmounted mountpoint usually survives as an empty directory and reads
+	 * as `dead`, while a Windows drive letter or UNC host simply goes. Memories
+	 * re-import from the repo when it returns; its sessions and recall receipts have
+	 * no second copy anywhere.
+	 *
+	 * So `unavailable` is refused UNLESS the request carries
+	 * `acknowledgeUnavailableVolume`, which the page sets only after a second
+	 * confirmation naming the volume. An outright refusal was the first shape and is
+	 * wrong in the other direction: the user is the one who knows whether that drive
+	 * is coming back, and a control that cannot be reached leaves them no way to
+	 * remove a repository they are certain about. Accepting it unconditionally is
+	 * equally wrong — the ✕ is drawn from a payload minutes old, so without the flag
+	 * a stale click, a re-POST or a scripted request is indistinguishable from an
+	 * informed one. The flag is not security (nothing stops a caller sending it); it
+	 * is the record that a human was shown the volume-specific sentence, which is the
+	 * only thing that separates the two.
+	 *
+	 * `doctor` stays stricter on purpose: a batch sweep has no row to point at and no
+	 * dialog to show, so there is nothing there for such an acknowledgement to mean.
+	 */
+	async function handleForget(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+		const repoIdentity = typeof body.repoIdentity === "string" ? body.repoIdentity.trim() : "";
+		if (!repoIdentity) {
+			sendJson(res, 400, { error: "repoIdentity is required" });
+			return;
+		}
+		const entry = (await readRepoRegistry(configDir)).repos.find((r) => r.repoIdentity === repoIdentity);
+		// `classifyRegistryEntry` answers `live` on exactly `hasLiveWorktree`, so the
+		// pre-existing verdict is unchanged and only `unavailable` is new. `disposable`
+		// stays forgettable — that class is fixture garbage the launch path prunes
+		// unattended anyway.
+		const verdict = entry ? classifyRegistryEntry(entry) : await classifyProjectedRoot(repoIdentity);
+		if (verdict === "live") {
+			sendJson(res, 409, {
+				error: "that repository still exists on disk — pause it with `jolli disable` instead of forgetting it",
+			});
+			return;
+		}
+		if (verdict === "unavailable" && body.acknowledgeUnavailableVolume !== true) {
+			sendJson(res, 409, {
+				error:
+					"that repository is on a drive or share this machine cannot reach — reconnect it, or confirm that " +
+					"you want its memories deleted anyway",
+				// Named so the page can tell this refusal from the live-checkout one and
+				// re-ask instead of just reporting failure. A client that does not know
+				// the field simply shows the message, which is still true.
+				volumeUnavailable: true,
+			});
+			return;
+		}
+		// Backup FIRST, and for the same reason `applyRepoRegistryFix` takes one: every
+		// step below is irreversible, and a copy taken after the first removal is a copy
+		// of the damage. It protects the REGISTRATION, not the memories — that file holds
+		// none of them — so it is not what makes this removal safe; the two 409s above
+		// are. Doctor needs `--forget-dead-repos` on top because `--fix` is a bundle a
+		// user runs to release a lock or reinstall hooks, where forgetting a repo is not
+		// what they asked for; a click on one row's ✕ names its target and says so, which
+		// is the consent that flag exists to obtain. See `applyRepoRegistryFix`.
+		//
+		// A backup that could not be written fails the request rather than proceeding:
+		// same rule, and its own message, since nothing has been attempted yet and
+		// "could not forget" would name the wrong step.
+		try {
+			const saved = backupRepoRegistry(now(), configDir);
+			if (saved) log.info("backed up the repo registry to %s before forgetting %s", saved, repoIdentity);
+		} catch (err) {
+			log.warn("could not back up the repo registry before forgetting %s: %s", repoIdentity, errMsg(err));
+			sendJson(res, 500, { error: `could not back up the repo registry first: ${errMsg(err)}` });
+			return;
+		}
+		try {
+			const result = await forgetRepo(repoIdentity, {
+				configDir,
+				...(options.dbPath ? { dbPath: options.dbPath } : {}),
+			});
+			if (result.error !== undefined) {
+				sendJson(res, 500, { error: `could not forget that repository: ${result.error}` });
+				return;
+			}
+			// "Nothing was there" is reported rather than dressed up as a removal: a
+			// page acting on a stale payload otherwise gets a cheerful 200 for an
+			// entry another window already removed, and reloads to the same list.
+			const removedSomething =
+				result.removedFromRegistry ||
+				result.repoRowDeleted ||
+				result.childRowsDeleted > 0 ||
+				result.pendingEventsDeleted > 0;
+			if (!removedSomething) {
+				sendJson(res, 404, { error: "no repository with that identity is on this machine any more" });
+				return;
+			}
+			sendJson(res, 200, {
+				ok: true,
+				repoIdentity,
+				removedFromRegistry: result.removedFromRegistry,
+				repoRowDeleted: result.repoRowDeleted,
+				childRowsDeleted: result.childRowsDeleted,
+			});
+		} catch (err) {
+			log.warn("forget failed for %s: %s", repoIdentity, errMsg(err));
+			sendJson(res, 500, { error: `could not forget that repository: ${errMsg(err)}` });
+		}
+	}
+
+	/**
+	 * The same verdict for an identity the registry does not list, read off its
+	 * projected `worktree_root`.
+	 *
+	 * Delegates to `classifyRegistryEntry` on a SYNTHETIC single-path entry rather
+	 * than re-deciding here. An unregistered row on an unplugged drive is the
+	 * identical hazard through the identical button, so the two halves must not be
+	 * able to disagree — and the synthesis is exact: this row carries one recorded
+	 * path and no `worktrees` list, which is precisely what `recordedRepoPaths` falls
+	 * back to. The fields the classifier reads are the three set here.
+	 */
+	async function classifyProjectedRoot(repoIdentity: string): Promise<RegistryEntryVerdict> {
+		// No database means no projected row, which is a real answer rather than a
+		// failed read — and it must not take the fail-safe branch below, or an
+		// unregistered identity could never be forgotten on a fresh machine.
+		if (!existsSync(options.dbPath ?? getDashboardDbPath())) return "dead";
+		try {
+			const root = await withReadonlyDashboardDb(
+				(db) =>
+					(
+						db.prepare("SELECT worktree_root FROM repos WHERE repo_identity = ?").get(repoIdentity) as
+							| { worktree_root: string }
+							| undefined
+					)?.worktree_root,
+				options.dbPath ? { dbPath: options.dbPath } : {},
+			);
+			// The placeholder `ensureRepoRow` writes stores the identity in this
+			// column, which names no directory — see `isMissingWorktree`. Asked first,
+			// so the volume walk inside the classifier is never handed an identity
+			// string to treat as a path.
+			if (root === undefined || root === repoIdentity) return "dead";
+			return classifyRegistryEntry({ repoIdentity, repoName: repoIdentity, worktreeRoot: root, enabledAt: "" });
+		} catch (err) {
+			// Fail SAFE, not open: a read we could not do is not evidence that the
+			// checkout is gone, and the cost of being wrong here is deleted memories.
+			log.warn("could not read the projected root for %s: %s", repoIdentity, errMsg(err));
+			return "live";
+		}
 	}
 
 	/**

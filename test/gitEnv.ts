@@ -91,8 +91,12 @@ import { SCRATCH_HOME_ROOT_VAR } from "./scratchHome.js";
  * real `~/.jolli/jollimemory/jollimemory.db`, and a repo named `acme-api` at
  * `/tmp/acme-api` showed up in the dashboard's repo picker as a real repo.
  * Nothing failed — the test asserts the exact body a SUCCESSFUL projection
- * returns — and `repos_no_delete` (DashboardDb.ts) then refuses any DELETE, so
- * the cleanup is a manual `disabled_at` stamp against a live database.
+ * returns — so both rows sat in a live database with nothing able to reach them:
+ * `deregisterRepo` resolves its target from `cwd`, which a fixture's deleted temp
+ * directory cannot supply. Cleaning them up is what `jolli doctor --fix` and the
+ * `forgetRepo` path behind it now exist for (`dashboard/RepoForget.ts`); the
+ * `repos_no_delete` trigger that used to make even that impossible was dropped by
+ * `REPOS_DELETE_ALLOWED_DDL`.
  *
  * Hence: applied here, to every file, so a test is hermetic by construction with
  * nothing to remember — the same reasoning as the git isolation below.

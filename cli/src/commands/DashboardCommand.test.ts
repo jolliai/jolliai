@@ -24,6 +24,14 @@ vi.mock("../dashboard/Backup.js", () => ({
 vi.mock("../dashboard/AutoCutover.js", () => ({
 	maybeAutoCutover: vi.fn().mockResolvedValue("skipped"),
 }));
+// The history import prunes fixture entries before it reads the registry.
+// Mocked because the real one is a registry read plus `existsSync` over whatever
+// paths the developer's own machine has, and because a swallowed failure there
+// would otherwise make this wiring untestable — `pruneDisposableRepos` never
+// throws by contract.
+vi.mock("../dashboard/RepoForget.js", () => ({
+	pruneDisposableRepos: vi.fn(async () => []),
+}));
 vi.mock("../dashboard/RepoRegistry.js", () => ({
 	registerRepo: vi.fn(
 		async (): Promise<RegisteredRepo> => ({
@@ -54,6 +62,7 @@ import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { DASHBOARD_HEALTH_SERVICE } from "../dashboard/DashboardServer.js";
 import { dbBackfillRepos, type SessionTierSummary } from "../dashboard/DbBackfill.js";
+import { pruneDisposableRepos } from "../dashboard/RepoForget.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import {
 	createDeferredWriter,
@@ -157,6 +166,7 @@ beforeEach(() => {
 	});
 	vi.mocked(dbBackfillRepos).mockResolvedValue([{ mode: "bootstrapped", eventsApplied: 3, repoName: "jolli" }]);
 	vi.mocked(listActiveRepos).mockResolvedValue([]);
+	vi.mocked(pruneDisposableRepos).mockResolvedValue([]);
 	// Enabled unless a case says otherwise. Re-armed here for the same reason as
 	// the others: `clearMocks` drops the factory's implementation.
 	vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
@@ -203,6 +213,88 @@ describe("importDashboardHistory — the disabled repo", () => {
 		vi.mocked(readManualDisableFlagSync).mockReturnValueOnce(true);
 		await importDashboardHistory("/w", deps());
 		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("disabled here");
+	});
+});
+
+describe("importDashboardHistory — the fixture prune", () => {
+	const forgotten = (identity: string) => ({
+		identity,
+		removedFromRegistry: true,
+		repoRowDeleted: true,
+		childRowsDeleted: 0,
+		pendingEventsDeleted: 0,
+	});
+
+	it("prunes before reading the registry, so a fixture is not imported on its way out", async () => {
+		const order: string[] = [];
+		vi.mocked(pruneDisposableRepos).mockImplementation(async () => {
+			order.push("prune");
+			return [];
+		});
+		vi.mocked(listActiveRepos).mockImplementation(async () => {
+			order.push("list");
+			return [];
+		});
+
+		await importDashboardHistory("/w", deps());
+
+		expect(order).toEqual(["prune", "list"]);
+	});
+
+	it("says on screen how many entries it removed", async () => {
+		// `log.info` alone is not enough: it is suppressed from the terminal in CLI
+		// mode, and these removals are irreversible.
+		vi.mocked(pruneDisposableRepos).mockResolvedValue([forgotten("local:a"), forgotten("local:b")]);
+
+		await importDashboardHistory("/w", deps());
+
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).toContain("Removed 2 temporary-checkout entries");
+	});
+
+	it("says nothing when there was nothing to remove", async () => {
+		await importDashboardHistory("/w", deps());
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).not.toContain("temporary-checkout");
+	});
+
+	it("uses the singular for one entry", async () => {
+		vi.mocked(pruneDisposableRepos).mockResolvedValue([forgotten("local:a")]);
+		await importDashboardHistory("/w", deps());
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).toContain("Removed 1 temporary-checkout entry");
+	});
+
+	it("counts only the entries that were actually removed", async () => {
+		// `pruneDisposableRepos` reports one result per VICTIM, failures included: a
+		// repo whose rows a locked database kept comes back with `error` set and its
+		// registry entry still in place. Counting the array claimed a removal for it.
+		vi.mocked(pruneDisposableRepos).mockResolvedValue([
+			forgotten("local:a"),
+			{ ...forgotten("local:b"), removedFromRegistry: false, repoRowDeleted: false, error: "database is locked" },
+		]);
+
+		await importDashboardHistory("/w", deps());
+
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).toContain("Removed 1 temporary-checkout entry");
+		expect(printed).not.toContain("Removed 2");
+		// And the failure is reported rather than netted off — silence would read as
+		// "there was nothing to prune".
+		expect(printed).toContain("1 temporary-checkout entry could not be removed");
+	});
+
+	it("reports a prune that removed nothing at all", async () => {
+		vi.mocked(pruneDisposableRepos).mockResolvedValue([
+			{ ...forgotten("local:a"), removedFromRegistry: false, repoRowDeleted: false, error: "database is locked" },
+			{ ...forgotten("local:b"), removedFromRegistry: false, repoRowDeleted: false, error: "database is locked" },
+		]);
+
+		await importDashboardHistory("/w", deps());
+
+		const printed = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(printed).not.toContain("Removed");
+		expect(printed).toContain("2 temporary-checkout entries could not be removed");
 	});
 });
 

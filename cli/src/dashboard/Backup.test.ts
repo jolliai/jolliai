@@ -497,7 +497,12 @@ describe("rotation", () => {
 		expect(left).toContain(`memory-${formatUtcStamp(NOW - 2 * DAY)}-aaaaaaaa.db`);
 	});
 
-	it("a failed snapshot leaves every old snapshot untouched", async () => {
+	// POSIX-only, and it is the FAILURE that cannot be induced rather than the
+	// assertion that cannot be made: `chmod` on Windows moves the read-only bit,
+	// which directories ignore for creation, so the snapshot below simply succeeds
+	// and the test would assert "failed" about a run that worked. Nothing weaker
+	// stands in — the point is a real write failure mid-snapshot, not a stubbed one.
+	it.skipIf(process.platform === "win32")("a failed snapshot leaves every old snapshot untouched", async () => {
 		plantSnapshot(`memory-${formatUtcStamp(NOW - 100 * DAY)}-aaaaaaaa.db`);
 		plantSnapshot(`memory-${formatUtcStamp(NOW - 90 * DAY)}-aaaaaaaa.db`);
 		// A read-only target folder makes VACUUM INTO's temp file un-creatable

@@ -377,17 +377,30 @@ window.JD = window.JD || {};
 				var ambiguous = options.filter((r) => r.repoName === option.repoName).length > 1;
 				/* A PAUSED repo stays in the list and stays selectable — its rows are
 				   never deleted and it still counts in the aggregate numbers, so its
-				   history is worth reaching. The meta slot says so (over the sessions
-				   figure or the disambiguating path), and `paused` on the row is what
-				   the stylesheet dims it by. */
-				var meta = option.disabled
-					? "paused"
+				   history is worth reaching. A MISSING one (its checkout is gone from
+				   disk) stays for the same reason, and is the only row that carries a
+				   remove control: every action on it names a directory that is not
+				   there, so saying so is what stops it reading as a working checkout.
+				   Both are flags rather than states — a repo can be paused AND gone —
+				   and either one takes the meta slot over the sessions figure or the
+				   disambiguating path, because they are the actionable half. */
+				var flags = [];
+				if (option.disabled) flags.push("paused");
+				/* Two spellings for one absence: `existsSync` cannot tell a deleted
+				   folder from a drive that is not plugged in, and the row used to
+				   assert the first for both. The second is not a milder version of
+				   the first — it is the case where the repository is probably fine
+				   and the machine is what is missing. */
+				if (option.missing) flags.push(option.volumeUnavailable ? "drive not mounted" : "folder missing");
+				var meta = flags.length
+					? flags.join(" · ")
 					: ambiguous
 						? esc(option.worktreeRoot || option.repoIdentity)
 						: option.sessionsThisWeek + (option.sessionsThisWeek === 1 ? " session" : " sessions") + " · 7d";
 				html +=
 					'<label class="repo-scope-row' +
 					(option.disabled ? " paused" : "") +
+					(option.missing ? " missing" : "") +
 					'" title="' +
 					esc(option.worktreeRoot || option.repoIdentity) +
 					'"><input type="checkbox" data-repo="' +
@@ -395,10 +408,21 @@ window.JD = window.JD || {};
 					'"><span class="name">' +
 					esc(option.repoName) +
 					'</span><span class="meta' +
-					(ambiguous && !option.disabled ? " path" : "") +
+					(ambiguous && flags.length === 0 ? " path" : "") +
 					'">' +
 					meta +
-					"</span></label>";
+					"</span>" +
+					/* Inside the label on purpose: a <button> is interactive content, and a
+					   label's activation behaviour does nothing for events targeted at one,
+					   so this cannot toggle the checkbox it sits next to. */
+					(option.missing
+						? '<button type="button" class="repo-forget" data-forget="' +
+							esc(option.repoIdentity) +
+							'" data-forget-volume="' +
+							(option.volumeUnavailable ? "1" : "") +
+							'" title="Remove this repository from the dashboard">✕</button>'
+						: "") +
+					"</label>";
 			});
 			return html;
 		};
@@ -463,6 +487,63 @@ window.JD = window.JD || {};
 					}
 					repoPending = picked.slice();
 					syncMarks(boxes);
+				};
+			});
+			/* Rebound every render, same reason as the boxes above. */
+			Array.prototype.forEach.call(list.querySelectorAll("button[data-forget]"), (btn) => {
+				btn.onclick = (event) => {
+					/* The spec already says a label does not forward activation to a
+					   nested button; this makes it true on an engine that disagrees,
+					   where the cost would be a silent scope change under the pointer. */
+					event.preventDefault();
+					event.stopPropagation();
+					var identity = btn.getAttribute("data-forget");
+					var volumeGone = btn.getAttribute("data-forget-volume") === "1";
+					/* A native confirm, deliberately. This deletes a repository's
+					   memories, sessions and commits from this machine and cannot be
+					   undone, and the page has no dialog layer of its own — a bespoke
+					   modal for one destructive control would be more code between the
+					   user and the sentence they need to read. */
+					/* Each state gets the sentence that is TRUE of it. A deleted folder is
+					   one confirmation; a drive that is not mounted is two, because there
+					   the likeliest reading of the row is "plug it back in" and the
+					   registration is kept on purpose. Only the user knows which. */
+					var first = volumeGone
+						? "Remove this repository from the dashboard?\n\n" +
+							"Its drive or share is not mounted, so Jolli cannot see whether the repository is still " +
+							"there. Its registration is kept on purpose so it comes back with the volume."
+						: "Remove this repository from the dashboard?\n\n" +
+							"Its folder cannot be found on this machine. This deletes the memories, sessions " +
+							"and commits recorded for it here, and cannot be undone.";
+					if (!window.confirm(first)) return;
+					if (
+						volumeGone &&
+						!window.confirm(
+							"Delete this repository's memories anyway?\n\n" +
+								"If the drive is coming back, cancel and reconnect it instead — nothing is lost by " +
+								"waiting. Otherwise this deletes the memories, sessions and commits recorded for it " +
+								"here, and cannot be undone.",
+						)
+					) {
+						return;
+					}
+					btn.disabled = true;
+					/* The server refuses an unreachable volume unless this says a human was
+					   shown the sentence above — see `handleForget`. Sent only in that case,
+					   so an ordinary removal's request shape is unchanged. */
+					JD.post(
+						"/api/repos/forget",
+						volumeGone
+							? { repoIdentity: identity, acknowledgeUnavailableVolume: true }
+							: { repoIdentity: identity },
+					)
+						/* A full reload rather than a local splice: the forgotten repo may
+						   be in the page's own scope, so every number on it changes too. */
+						.then(() => window.location.reload())
+						.catch((e) => {
+							btn.disabled = false;
+							window.alert("Could not remove it: " + String((e && e.message) || "request failed"));
+						});
 				};
 			});
 			syncMarks(boxes);

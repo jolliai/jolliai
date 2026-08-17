@@ -51,6 +51,7 @@ import {
 	dbBackfillRepos,
 	type SessionSourceTotals,
 } from "../dashboard/DbBackfill.js";
+import { pruneDisposableRepos } from "../dashboard/RepoForget.js";
 import { listActiveRepos, registerRepo } from "../dashboard/RepoRegistry.js";
 import { type ServerTelemetryHandle, startServerTelemetry } from "../dashboard/ServerTelemetry.js";
 import { createLogger, errMsg } from "../Logger.js";
@@ -700,6 +701,36 @@ const HISTORY_HEADER = "\n  Indexing your git history…";
 async function runHistoryImport(deps: DashboardDeps): Promise<void> {
 	const output = outputOf(deps);
 	try {
+		// BEFORE the sweep reads the registry, so a fixture entry is not imported one
+		// more time on its way out. Here rather than in `executeDashboard` because
+		// both callers reach the sweep through this function, and a machine that only
+		// ever runs `jolli enable` should not accumulate them for ever.
+		//
+		// Never throws, and returns what it removed rather than logging only: the
+		// removals are irreversible, so the count belongs on screen and not just in
+		// `debug.log`, which is suppressed from the terminal in CLI mode. Every
+		// identity is in the log; these lines are the signal that sends a reader there.
+		const pruned = await pruneDisposableRepos({
+			...(deps.configDir ? { configDir: deps.configDir } : {}),
+			...(deps.dbPath ? { dbPath: deps.dbPath } : {}),
+		});
+		// One result per victim, FAILURES INCLUDED: `forgetRepos` reports a repo whose
+		// rows it could not delete with `error` set and its registry entry left in
+		// place, so counting the whole array claims a removal for every entry a locked
+		// database made it skip. Reported separately rather than netted off — a silent
+		// prune failure reads as "there was nothing to prune".
+		const removed = pruned.filter((r) => r.error === undefined);
+		const failed = pruned.length - removed.length;
+		if (removed.length > 0) {
+			const n = removed.length;
+			output.log(
+				`\n  Removed ${n} temporary-checkout ${n === 1 ? "entry" : "entries"} whose folder no longer exists.`,
+			);
+		}
+		if (failed > 0) {
+			const label = failed === 1 ? "entry" : "entries";
+			output.log(`\n  ${failed} temporary-checkout ${label} could not be removed — see debug.log.`);
+		}
 		const repos = await listActiveRepos(deps.configDir);
 		// Zero registered repos stays completely silent, header included: there is
 		// no work, and announcing none is worse than saying nothing. The call still

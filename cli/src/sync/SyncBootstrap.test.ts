@@ -259,13 +259,22 @@ describe("onRoundComplete wiring (cross-repo pending-worker wakeup)", () => {
 		const cb = await getWiredOnRoundComplete(localFolder);
 		cb("/repo/a");
 
-		// The drain runs in a void-async block off the synchronous callback;
-		// give libuv enough turns for loadConfig + readdir + per-entry
-		// readFile/rm to resolve before assertions.
-		await new Promise((r) => setTimeout(r, 100));
+		// The drain runs in a void-async block off the synchronous callback, so wait for
+		// its EFFECT rather than for a fixed 100 ms. That sleep was a load-dependent
+		// flake, and one that could not be triaged as contention: loadConfig + readdir +
+		// per-entry readFile/rm outruns 100 ms under a full-suite run, the assertion then
+		// saw only the synchronous /repo/a spawn, and it presented as an assertion
+		// failure — the shape the triage rules say to treat as a regression — while
+		// passing every time in isolation.
+		await vi.waitFor(() => expect(launchWorkerMock).toHaveBeenCalledWith("/repo/b"), {
+			timeout: 10_000,
+			interval: 20,
+		});
 
 		// /repo/a spawned synchronously; /repo/b spawned from the drain.
-		// /repo/a from the registry was filtered out by the `!== cwd` guard.
+		// /repo/a from the registry was filtered out by the `!== cwd` guard. Asserted as
+		// the exact sorted set rather than two `toHaveBeenCalledWith`s, so a /repo/a the
+		// drain double-spawned still fails — that guard is the point of the case.
 		const calls = launchWorkerMock.mock.calls.map((c) => c[0]).sort();
 		expect(calls).toEqual(["/repo/a", "/repo/b"]);
 	});

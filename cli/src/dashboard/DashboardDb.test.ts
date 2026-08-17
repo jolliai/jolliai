@@ -634,7 +634,17 @@ describe("transactional migration runner", () => {
 });
 
 describe("owner-only permissions (§11 defect 1)", () => {
-	it("creates the directory 0700 and the database 0600", async () => {
+	/*
+	 * POSIX-only: `chmod` on Windows moves the read-only bit and nothing else, and `stat`
+	 * reports a fixed 0666/0777, so these would be assertions about a permission model
+	 * that does not exist there — the same gate `JsonMcpWriter.test.ts` and
+	 * `CodexTomlWriter.test.ts` put on their own mode checks. Applied per test rather
+	 * than to the describe, because the sidecar-tolerance case below is about the chmod
+	 * loop surviving ENOENT and is worth running on every platform.
+	 */
+	const itPosix = it.skipIf(process.platform === "win32");
+
+	itPosix("creates the directory 0700 and the database 0600", async () => {
 		const nested = join(dir, "cfg");
 		const target = join(nested, "dashboard.db");
 		await withDashboardDb(() => undefined, { dbPath: target });
@@ -643,7 +653,7 @@ describe("owner-only permissions (§11 defect 1)", () => {
 		expect(statSync(target).mode & 0o777).toBe(0o600);
 	});
 
-	it("tightens a database an older build left world-readable", async () => {
+	itPosix("tightens a database an older build left world-readable", async () => {
 		await withDashboardDb(() => undefined, { dbPath });
 		// Simulate the pre-fix state: 0644 file inside a 0755 directory.
 		chmodSync(dbPath, 0o644);
@@ -655,7 +665,7 @@ describe("owner-only permissions (§11 defect 1)", () => {
 		expect(statSync(dir).mode & 0o777).toBe(0o700);
 	});
 
-	it("leaves the WAL sidecars owner-only too", async () => {
+	itPosix("leaves the WAL sidecars owner-only too", async () => {
 		// Hold the handle open across a write so -wal/-shm exist while we look.
 		await withDashboardDb(
 			(db) => {
@@ -670,7 +680,7 @@ describe("owner-only permissions (§11 defect 1)", () => {
 		);
 	});
 
-	it("does not chmod on a read-only open — readers never touch permissions", async () => {
+	itPosix("does not chmod on a read-only open — readers never touch permissions", async () => {
 		await withDashboardDb(() => undefined, { dbPath });
 		chmodSync(dbPath, 0o640);
 

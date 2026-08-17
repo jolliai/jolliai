@@ -74,6 +74,10 @@ vi.mock("./core/SessionTracker.js", () => ({
 vi.mock("./core/Locks.js", () => ({
 	isWorkerLockStale: vi.fn().mockResolvedValue(false),
 	releaseWorkerLock: vi.fn().mockResolvedValue(undefined),
+	// The repo-registry row's dry-run repair pass takes this lock. A plain
+	// pass-through rather than a spy: these tests are about the CLI's output, and an
+	// unmocked export throws on the very first doctor check that reaches it.
+	withRepoRegistryLock: async <T>(fn: () => Promise<T>) => fn(),
 }));
 
 // Default no-op; individual tests use `mockImplementationOnce` to inject

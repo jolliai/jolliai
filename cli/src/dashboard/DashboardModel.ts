@@ -853,6 +853,34 @@ export interface RepoOption {
 	 * so an active row's shape is unchanged.
 	 */
 	readonly disabled?: boolean;
+	/**
+	 * Present and `true` when `worktreeRoot` no longer exists on disk.
+	 *
+	 * MARKED, never filtered — the same decision as `disabled`, for a different
+	 * reason. A repo the user deleted keeps its memories, and those are worth
+	 * reaching; what must not happen is the row presenting itself as a working
+	 * checkout, since every action on it (resume, scope, open) names a directory
+	 * that is not there. It is also what gates the row's remove control: the page
+	 * offers to forget an entry only once it can say the entry is dead.
+	 */
+	readonly missing?: boolean;
+	/**
+	 * Present and `true` when nothing could be found because the VOLUME is absent —
+	 * an unplugged drive or an unmounted share — rather than because a folder was
+	 * deleted. Implies {@link missing}; never set on its own.
+	 *
+	 * Two states, not one, because `existsSync` cannot tell them apart and the row
+	 * used to assert the wrong one: it said "folder missing" and offered a ✕ over a
+	 * repository that was merely unplugged. Splitting them is what lets the page say
+	 * something true and ask for a stronger confirmation, instead of either lying or
+	 * withholding the control from a user who knows their own drive.
+	 *
+	 * The volume walk this needs (`volumeReachable`, one `existsSync` per ancestor)
+	 * runs ONLY for a row already found missing — the case that is rare by
+	 * construction — so the render path still asks the filesystem nothing extra
+	 * about a working repo.
+	 */
+	readonly volumeUnavailable?: boolean;
 }
 
 /**

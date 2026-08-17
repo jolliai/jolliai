@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { GitCommandResult, SessionInfo, TranscriptReadResult, TranscriptSource } from "../Types.js";
 
@@ -75,8 +76,17 @@ const claudeSession = (over: Partial<SessionInfo> = {}): SessionInfo => ({
 	...over,
 });
 
-/** A repo root the disk-scan fixtures below attribute themselves to. */
-const WORKTREE = "/w/repo";
+/**
+ * A repo root the disk-scan fixtures below attribute themselves to.
+ *
+ * `resolve()`d rather than a bare "/w/repo" literal, because one source's narrowing
+ * normalizes the project dir before matching: `copilotSessionsForRepo` runs it through
+ * `path.resolve()`, so on Windows the row's literal "/w/repo" would be compared against
+ * "<drive>:\w\repo" and never match — the same trap `CopilotSessionDiscoverer.test.ts`
+ * documents and avoids the same way. Resolving BOTH sides here keeps every source's
+ * comparison platform-neutral; the other eight compare the string as given.
+ */
+const WORKTREE = resolve("/w/repo");
 
 const diskSession = (over: Partial<ClaudeDiskSession> = {}): ClaudeDiskSession => ({
 	sessionId: "d1",

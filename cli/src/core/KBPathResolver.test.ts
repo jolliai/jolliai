@@ -563,6 +563,10 @@ esac
 			expect(result).toBe(join(tempDir, "corrupt-2"));
 		});
 
+		// No per-test timeout: this seeds 99 folders of real files, and a 15 s override
+		// here NARROWED the 60 s in vite.config.ts rather than widening anything, so a
+		// full run with coverage timed it out on a slower filesystem — the exact trap
+		// that config's `testTimeout` note describes. Inherit the global budget.
 		it("falls back to a timestamp suffix when every -N slot is taken", () => {
 			initializeKBFolder(join(tempDir, "saturated"), "saturated", "https://github.com/u/a.git");
 			// Populate every -2..-99 candidate as a non-matching repo so findAvailablePath
@@ -579,7 +583,7 @@ esac
 			expect(result.startsWith(join(tempDir, "saturated-"))).toBe(true);
 			expect(result).not.toBe(join(tempDir, "saturated"));
 			expect(result).not.toBe(join(tempDir, "saturated-99"));
-		}, 15000);
+		});
 
 		it("walks past a candidate dir that has no .jolli/config.json", () => {
 			// Make the basePath a non-matching repo, then create a "name-2" dir without

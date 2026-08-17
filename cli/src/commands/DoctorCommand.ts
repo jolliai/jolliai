@@ -43,9 +43,11 @@ import {
 	restoreFromSnapshot,
 	surveyRecovery,
 } from "../dashboard/Recovery.js";
+import { backupRepoRegistry, forgetRepos, type RegistrySurvey, surveyRepoRegistry } from "../dashboard/RepoForget.js";
+import { getRepoRegistryPath, type RegistryRepair, repairRegistryEntries } from "../dashboard/RepoRegistry.js";
 import { traverseDistPaths } from "../install/DistPathResolver.js";
 import { getStatus, install } from "../install/Installer.js";
-import { createLogger, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
+import { createLogger, errMsg, ORPHAN_BRANCH, setLogDir } from "../Logger.js";
 import { inspectPlugins } from "../PluginLoader.js";
 import { resolveProjectDir, VERSION } from "./CliUtils.js";
 
@@ -88,13 +90,188 @@ export function formatGlobalDaemonCheck(hello: GlobalDaemonHello | undefined, no
 }
 
 /**
+ * The repo-registry row: entries that name a checkout no longer on disk.
+ *
+ * A `warn`, never a `fail`, and the distinction is this command's own contract —
+ * doctor reports FAULTS, and a stale entry breaks nothing. It costs every sweep a
+ * pass and puts a dead row in the dashboard's repo picker, which is worth saying
+ * and is not worth a non-zero exit on an otherwise healthy machine.
+ *
+ * The message lists every entry, uncapped. This is a diagnostic the user ran on
+ * purpose, `--fix` is irreversible, and the list is the only thing they have to
+ * decide with — a summary count plus "see debug.log" is the shape that gets
+ * skipped. It also shrinks to nothing after the first fix.
+ *
+ * Exported and pure-ish (it takes the survey) so the wording can be asserted
+ * without a registry on disk.
+ */
+export function formatRepoRegistryCheck(
+	survey: RegistrySurvey,
+	repairs: ReadonlyArray<RegistryRepair>,
+	fixer: () => Promise<string>,
+	opts: { readonly forgetDead?: boolean } = {},
+): DoctorCheck {
+	const name = "Repo registry";
+	const forgetDead = opts.forgetDead === true;
+	// `dead` is opt-in — see {@link applyRepoRegistryFix}. It is still REPORTED
+	// either way, so the ok branch cannot key off `removable`, which is only what
+	// the fixer would act on.
+	const removable = [...survey.disposable, ...(forgetDead ? survey.dead : [])];
+	const reported = survey.disposable.length + survey.dead.length + survey.unavailable.length + repairs.length;
+	if (reported === 0) {
+		const n = survey.live.length;
+		return { name, status: "ok", message: `${n} repo${n === 1 ? "" : "s"}, every recorded checkout present` };
+	}
+	const lines: string[] = [];
+	for (const repo of survey.disposable) {
+		lines.push(`      · ${repo.worktreeRoot}  (temporary checkout — removed automatically)`);
+	}
+	const deadBy = forgetDead ? "--fix" : "--fix --forget-dead-repos";
+	for (const repo of survey.dead) lines.push(`      · ${repo.worktreeRoot}  (folder gone — removed by ${deadBy})`);
+	for (const repo of survey.unavailable) {
+		// Never in `removable`: an unplugged drive or an unmounted share is a repo
+		// the user still expects back, and removing it on this evidence would throw
+		// away a registration for a directory that returns. Reported so the silence
+		// does not read as health.
+		lines.push(`      · ${repo.worktreeRoot}  (drive or share not mounted — left alone)`);
+	}
+	for (const repair of repairs) {
+		const what = [
+			repair.droppedPaths.length > 0 ? `${repair.droppedPaths.length} stale temp path(s)` : "",
+			repair.collapsedPaths.length > 0 ? `${repair.collapsedPaths.length} duplicate spelling(s)` : "",
+			repair.repointedTo !== undefined ? "a dead recorded root" : "",
+		].filter(Boolean);
+		lines.push(`      · ${repair.repoIdentity}  (${what.join(", ")} — repaired by --fix)`);
+	}
+	const headline = [
+		removable.length > 0 ? `${removable.length} entr${removable.length === 1 ? "y" : "ies"} to remove` : "",
+		!forgetDead && survey.dead.length > 0 ? `${survey.dead.length} to forget with --forget-dead-repos` : "",
+		repairs.length > 0 ? `${repairs.length} to repair` : "",
+		survey.unavailable.length > 0 ? `${survey.unavailable.length} on unavailable volumes` : "",
+	]
+		.filter(Boolean)
+		.join(", ");
+	return {
+		name,
+		status: "warn",
+		message: `${headline}\n${lines.join("\n")}`,
+		// No fixer when there is nothing this INVOCATION may act on: an unavailable
+		// volume is deliberately not repairable, a `dead` entry needs
+		// `--forget-dead-repos`, and offering a button that does nothing is worse
+		// than offering none. `removable`, not the reported set, is what says so.
+		...(removable.length > 0 || repairs.length > 0 ? { fixer } : {}),
+	};
+}
+
+/**
+ * The repo-registry row's remedy: back the registry up, forget what the survey
+ * found removable, then apply the path repairs.
+ *
+ * Exported and taking the survey as an argument for the same reason
+ * {@link formatRepoRegistryCheck} is: the fixer is the one half of this row that
+ * deletes data, and driving the whole command to reach it would mean running
+ * every other fixer too.
+ *
+ * **`dead` entries need `forgetDead` (`--forget-dead-repos`), and that is the
+ * consent this operation could not otherwise obtain.** `--fix` is a bundle — a
+ * user runs it to release a stale lock, clear a stuck queue or reinstall hooks —
+ * and forgetting a repo is not like the other three: `forgetRepos` deletes twelve
+ * child tables, the `repos` row and every unprojected event, none of which
+ * {@link backupRepoRegistry} can restore (it copies `dashboard-repos.json`, and
+ * that file holds none of it). The evidence is weak in the same direction:
+ * `classifyRegistryEntry` documents that an unmounted POSIX mountpoint usually
+ * still exists as an empty directory, so `dead` can hold a repo that is merely
+ * renamed or temporarily invisible. `disposable` stays in the default set — that
+ * class is fixture garbage under `%TEMP%` which the dashboard launch path already
+ * prunes unattended, so requiring a flag here would not protect anything.
+ *
+ * **The dashboard's per-row ✕ removes the same `dead` class on one confirm, and
+ * that is not the contradiction it looks like.** What the flag buys is not a
+ * second look at the evidence — it is a NAMED TARGET. `--fix` is asked for by a
+ * user who wants something else entirely and would sweep whatever the survey
+ * happened to classify; the ✕ is attached to one row, in a dialog that says what
+ * it deletes, for the repository the user pointed at. `DashboardServer.handleForget`
+ * carries the two guards this side cannot express in a flag: it re-asks at action
+ * time, because its control is drawn from a payload minutes old, and it refuses
+ * `unavailable` unless the request carries a per-row acknowledgement the page only
+ * sets after naming the volume in a second dialog. THIS side stays stricter and
+ * never removes `unavailable` at all: a sweep has no row to point at and no dialog
+ * to show, so there is nothing here for such an acknowledgement to mean. It takes
+ * this same backup first, for the same ordering reason, and with the same limit:
+ * the file holds no memories, so neither path may treat it as what makes a removal
+ * recoverable.
+ */
+export async function applyRepoRegistryFix(
+	survey: RegistrySurvey,
+	opts: {
+		readonly nowMs?: number;
+		readonly configDir?: string;
+		readonly dbPath?: string;
+		readonly forgetDead?: boolean;
+	} = {},
+): Promise<string> {
+	const done: string[] = [];
+	// Backup FIRST: everything below is irreversible, and a backup taken after the
+	// first removal is a backup of the damage.
+	const saved = backupRepoRegistry(opts.nowMs ?? Date.now(), opts.configDir);
+	if (saved) done.push(`backed up the registry to ${saved}`);
+	// `unavailable` is deliberately absent: an unplugged drive is a repo the user
+	// still expects back, so it is reported and never removed. `dead` is absent
+	// unless asked for — see above.
+	const removable = [...survey.disposable, ...(opts.forgetDead === true ? survey.dead : [])];
+	if (removable.length > 0) {
+		const results = await forgetRepos(
+			removable.map((repo) => repo.repoIdentity),
+			{
+				...(opts.configDir ? { configDir: opts.configDir } : {}),
+				...(opts.dbPath ? { dbPath: opts.dbPath } : {}),
+			},
+		);
+		const failed = results.filter((r) => r.error !== undefined);
+		// Thrown, not counted: the fixer contract is that a throw is what makes the
+		// loop print ✗ and set the exit code, and a partial removal reported as
+		// success is exactly the state a user would not run doctor again over.
+		if (failed.length > 0) {
+			throw new Error(`could not forget ${failed.length} of ${results.length} entries — ${failed[0].error}`);
+		}
+		done.push(`forgot ${results.length} entr${results.length === 1 ? "y" : "ies"}`);
+	}
+	const applied = await repairRegistryEntries(opts.configDir ? { configDir: opts.configDir } : {});
+	if (applied.length > 0) done.push(`repaired ${applied.length} entr${applied.length === 1 ? "y" : "ies"}`);
+	return done.length > 0 ? done.join("; ") : "nothing left to do";
+}
+
+/**
+ * The repo-registry row when the registry could not be READ at all.
+ *
+ * A `fail` with no fixer, and both halves are deliberate. It is a fault rather
+ * than a warning because every writer of this file — `registerRepo`,
+ * `ensureWorktreeListed`, `deregisterRepo`, the prune — is a read-modify-write
+ * over `readRepoRegistryStrict`, so an unreadable registry means no repo can
+ * register on this machine until it is dealt with. And there is no fixer because
+ * the remedy is the one thing this command must not do unasked: the file has to be
+ * moved aside, which discards every registration it holds.
+ */
+export function formatRepoRegistryReadFailure(reason: string, path: string): DoctorCheck {
+	return {
+		name: "Repo registry",
+		status: "fail",
+		message:
+			`unreadable — ${reason}\n` +
+			`      · ${path}\n` +
+			"      · no repo can register until this is resolved; move the file aside and re-run `jolli enable`\n" +
+			"        in each repo to rebuild it (every registration in it is lost)",
+	};
+}
+
+/**
  * Diagnoses system health and optionally auto-repairs failures.
  *
  * Rule of thumb:
  *   doctor → "is Jolli Memory working?"
  *   clean  → "what old data can I safely delete?"
  */
-async function runDoctor(cwd: string, fix: boolean): Promise<void> {
+async function runDoctor(cwd: string, fix: boolean, dryRun = false, forgetDead = false): Promise<void> {
 	const checks: DoctorCheck[] = [];
 
 	// 1. Installer status (hooks)
@@ -378,6 +555,38 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 			: {}),
 	});
 
+	// 11. Repo registry — entries whose checkout is gone. Its own row rather than
+	// part of the backup one because it is the only check about the machine's LIST
+	// of repos rather than about one repo's data, and the only one whose fixer
+	// removes something.
+	//
+	// The repair half is computed with `dryRun`, i.e. by the pass that would apply
+	// it, so the preview cannot drift from the fix. The removals come from the
+	// survey, which is read-only anyway.
+	//
+	// Guarded, and the guard covers BOTH calls. `repairRegistryEntries` reads the
+	// registry strictly (it is a read-modify-write), so corrupt JSON, an EACCES or a
+	// Windows AV hold throws — on precisely the machine this command exists for. An
+	// unguarded throw here costs every other check too: nothing has been PRINTED
+	// yet, so the user gets `Fatal error:` in place of all ten diagnoses above.
+	// `surveyRepoRegistry` is inside the same `try` because it reads fail-open:
+	// reporting its answer after the strict read failed would print "0 repos, every
+	// recorded checkout present" about a registry that could not be read at all.
+	try {
+		const registrySurvey = await surveyRepoRegistry();
+		const registryRepairs = await repairRegistryEntries({ dryRun: true });
+		checks.push(
+			formatRepoRegistryCheck(
+				registrySurvey,
+				registryRepairs,
+				() => applyRepoRegistryFix(registrySurvey, { forgetDead }),
+				{ forgetDead },
+			),
+		);
+	} catch (err) {
+		checks.push(formatRepoRegistryReadFailure(errMsg(err), getRepoRegistryPath()));
+	}
+
 	// Print results
 	console.log("\n  Jolli Memory Doctor");
 	console.log("  ──────────────────────────────────────");
@@ -389,12 +598,21 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 		const icon = check.status === "ok" ? "✓" : check.status === "warn" ? "⚠" : "✗";
 		console.log(`  ${icon} ${check.name.padEnd(16)} ${check.message}`);
 		if (check.status === "fail") hasFailures = true;
-		if (fix && check.fixer) fixesToApply.push(check);
+		// `--dry-run` collects the same set `--fix` would, so what it lists is what
+		// would run rather than a second opinion about it.
+		if ((fix || dryRun) && check.fixer) fixesToApply.push(check);
+	}
+
+	if (dryRun && fixesToApply.length > 0) {
+		console.log("\n  --fix would apply:");
+		// The message, not a paraphrase — every fixer's row already names what it
+		// found, and restating it here would be a second wording to keep in step.
+		for (const check of fixesToApply) console.log(`  → ${check.name}: ${check.message}`);
 	}
 
 	// Apply fixes if requested.
 	let fixFailures = 0;
-	if (fix && fixesToApply.length > 0) {
+	if (fix && !dryRun && fixesToApply.length > 0) {
 		console.log("\n  Applying fixes...");
 		for (const check of fixesToApply) {
 			/* v8 ignore start -- defensive: fixesToApply already filtered by check.fixer existence */
@@ -422,8 +640,9 @@ async function runDoctor(cwd: string, fix: boolean): Promise<void> {
 	//   - Fix mode:     only remaining failures count (fixer threw, or fail
 	//                   check has no fixer at all). Successfully-applied
 	//                   fixers are assumed to have repaired the condition.
+	//   - Dry run:       nothing was repaired, so it exits like a plain report.
 	const unfixableFailures = checks.filter((c) => c.status === "fail" && !c.fixer).length;
-	if (fix) {
+	if (fix && !dryRun) {
 		if (fixFailures > 0 || unfixableFailures > 0) {
 			process.exitCode = 1;
 		}
@@ -716,7 +935,15 @@ export function registerDoctorCommand(program: Command): void {
 	program
 		.command("doctor")
 		.description("Diagnose Jolli Memory health; optionally auto-fix issues")
-		.option("--fix", "Auto-fix detected issues (release stale lock, clear stuck queue, reinstall missing hooks)")
+		.option(
+			"--fix",
+			"Auto-fix detected issues (release stale lock, clear stuck queue, reinstall missing hooks, repair registry paths)",
+		)
+		.option(
+			"--forget-dead-repos",
+			"With --fix: also forget registry entries whose folder is gone — deletes those repos' memories, which no backup here restores",
+		)
+		.option("--dry-run", "Print what --fix would do and change nothing")
 		.option("--recover", "List database recovery candidates (snapshots with identity and age)")
 		.option("--from <path>", "With --recover: restore the database from this snapshot file")
 		.option("--schema-log", "Print the database's migration log (who ran what, when, and how it went)")
@@ -726,6 +953,8 @@ export function registerDoctorCommand(program: Command): void {
 			async (options: {
 				cwd: string;
 				fix?: boolean;
+				forgetDeadRepos?: boolean;
+				dryRun?: boolean;
 				recover?: boolean;
 				from?: string;
 				schemaLog?: boolean;
@@ -744,7 +973,12 @@ export function registerDoctorCommand(program: Command): void {
 					await runSchemaLog({ mark: options.markMigration });
 					return;
 				}
-				await runDoctor(options.cwd, options.fix === true);
+				await runDoctor(
+					options.cwd,
+					options.fix === true,
+					options.dryRun === true,
+					options.forgetDeadRepos === true,
+				);
 			},
 		);
 }
