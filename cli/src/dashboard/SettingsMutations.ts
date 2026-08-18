@@ -78,6 +78,25 @@ export interface SettingsApplyInput {
 	readonly syncTranscripts: boolean;
 	readonly dcoSignoff: boolean;
 	readonly excludePatterns: string;
+	/**
+	 * Optional sidebar rows (Advanced). TRI-STATE, unlike every other boolean
+	 * here: `undefined` means "leave the stored value alone".
+	 *
+	 * The others can safely be two-state because a page always submits the value
+	 * it was rendered with, so overwriting one needs a genuinely concurrent edit.
+	 * These two are different in kind — a page that PREDATES them submits nothing,
+	 * and a two-state read would then have the server invent `false` and switch
+	 * both rows off on a save that touched neither. That is reachable without any
+	 * concurrency: `settings.js` is inlined into the page at load, so any tab left
+	 * open across a CLI upgrade is such a page, and Settings is a modal it can
+	 * open without navigating. Same reasoning, and the same conditional spread, as
+	 * `jolliUrl` in `applySettings`.
+	 *
+	 * Unticking a row still persists `false`, because the page always submits an
+	 * explicit boolean for both (see `collect()` in `assets/js/settings.js`).
+	 */
+	readonly dashboardKnowledgeMenuEnabled?: boolean;
+	readonly dashboardGraphMenuEnabled?: boolean;
 }
 
 export interface SettingsApplyResult {
@@ -100,6 +119,16 @@ const AGENT_FIELDS = [
 
 function asBool(v: unknown): boolean {
 	return v === true;
+}
+
+/**
+ * `undefined` for anything that is not a boolean, so a caller can tell "absent"
+ * from "present and false". A malformed value (the string `"on"` an HTML form
+ * would send, say) is treated as absent rather than as `false`: keeping what is
+ * stored is the safe answer to a submission we cannot read.
+ */
+function asOptionalBool(v: unknown): boolean | undefined {
+	return typeof v === "boolean" ? v : undefined;
 }
 
 function asString(v: unknown): string {
@@ -150,6 +179,8 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 	if (!AGENT_FIELDS.some((f) => agents[f])) {
 		throw new SettingsValidationError("At least one AI agent must be enabled");
 	}
+	const knowledgeMenu = asOptionalBool(body.dashboardKnowledgeMenuEnabled);
+	const graphMenu = asOptionalBool(body.dashboardGraphMenuEnabled);
 	const maxTokensRaw = body.maxTokens;
 	const maxTokens =
 		typeof maxTokensRaw === "number" && Number.isFinite(maxTokensRaw) && maxTokensRaw > 0
@@ -170,6 +201,10 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 		syncTranscripts: asBool(body.syncTranscripts),
 		dcoSignoff: asBool(body.dcoSignoff),
 		excludePatterns: asString(body.excludePatterns),
+		// `asOptionalBool`, never `asBool` — see `SettingsApplyInput` for why these
+		// two must be able to say "the submission did not mention me".
+		...(knowledgeMenu !== undefined ? { dashboardKnowledgeMenuEnabled: knowledgeMenu } : {}),
+		...(graphMenu !== undefined ? { dashboardGraphMenuEnabled: graphMenu } : {}),
 	};
 }
 
@@ -296,6 +331,15 @@ export async function applySettings(
 			compileExcludeFolders: splitCsv(input.compileExcludeFolders),
 			syncTranscripts: input.syncTranscripts,
 			dcoSignoff: input.dcoSignoff,
+			// Conditional, unlike every other boolean above — an absent field must
+			// leave the stored row alone rather than switch it off. See
+			// `SettingsApplyInput` for the failure this closes.
+			...(input.dashboardKnowledgeMenuEnabled !== undefined
+				? { dashboardKnowledgeMenuEnabled: input.dashboardKnowledgeMenuEnabled }
+				: {}),
+			...(input.dashboardGraphMenuEnabled !== undefined
+				? { dashboardGraphMenuEnabled: input.dashboardGraphMenuEnabled }
+				: {}),
 			excludePatterns: splitCsv(input.excludePatterns),
 			...giUpdate,
 			// Conditional spread — writing `jolliUrl: undefined` would DELETE a URL a

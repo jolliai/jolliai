@@ -27,6 +27,7 @@ import type {
 	AdoptionTier,
 	CommitInsightKind,
 	CoverageNote,
+	DashboardMenus,
 	DashboardModel,
 	DashboardRange,
 	DashboardScope,
@@ -368,6 +369,13 @@ export interface QueryOptions {
 	readonly graphModel?: GraphModel;
 	/** Settings view: the async-read config/memory-bank snapshot. Absent on every other view. */
 	readonly settingsModel?: SettingsPageModel;
+	/**
+	 * Which optional sidebar rows to show, read from config by the server (this
+	 * builder is synchronous and the flags live in a file). Absent means BOTH
+	 * hidden — the same polarity `config.json` has, so a caller that does not
+	 * know about them cannot switch one on by omission.
+	 */
+	readonly menus?: DashboardMenus;
 	/**
 	 * Every checkout path the repo registry records, keyed by `repo_identity` —
 	 * read async by the server, because the registry is a file and this builder is
@@ -2535,6 +2543,10 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		scope: options.scope,
 		repos,
 		coverage,
+		// Default-off rather than default-on: see `QueryOptions.menus`. Always
+		// present in the payload, so `shell.js` never has to guess what an absent
+		// slice meant.
+		menus: options.menus ?? { knowledge: false, graph: false },
 		...payload(),
 	};
 }

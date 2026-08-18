@@ -139,8 +139,10 @@ window.JD = window.JD || {};
 	   rather than behind an expand/collapse toggle — that interaction is a later
 	   polish pass, not a routing concern.
 
-	   NOTHING IS GATED any more. These rows used to disable themselves until a
-	   repo was enabled, mirroring DashboardServer's GATED_PATHS so a dead row and
+	   NO ROW IS GATED BY REPO COUNT any more (the two optional rows below are a
+	   different question — they are hidden by preference, and their routes stay
+	   open). These rows used to disable themselves until a repo was enabled,
+	   mirroring DashboardServer's GATED_PATHS so a dead row and
 	   a 302 could not disagree, and Repositories sat below them as the never-gated
 	   row that opened the gate. Repositories is gone, so the gate has nowhere to
 	   send anyone — a disabled row leading nowhere is worse than a live one that
@@ -148,8 +150,15 @@ window.JD = window.JD || {};
 	   page used to.
 
 	   Knowledge and Graph ARE routed (VIEW_PATHS has /knowledge, /graph) and sit
-	   below Memories. Settings alone has no scrollable nav row
-	   and no page path — it is a modal pinned to the bottom slot (NAV_BOTTOM),
+	   below Memories, but their ROWS are OPTIONAL and hidden by default: each
+	   carries an `optional` key naming its `model.menus` flag, and the user turns
+	   it on in Settings → Advanced. They stay in this one table so the order
+	   cannot drift from the enabled case, and only the row is gated — the routes,
+	   the /wiki-viewer and /graph-viewer iframes and the Knowledge page's own
+	   "open graph" link all keep working while a row is hidden, so a bookmark is
+	   never answered with a redirect to somewhere the reader did not ask for.
+	   Settings alone has no scrollable nav row and no page path — it is a
+	   modal pinned to the bottom slot (NAV_BOTTOM),
 	   opened via JD.openSettings, so a direct visit to /settings 404s. Adding a
 	   new page needs its server route, view token and model payload too — a nav
 	   row on its own is not enough. */
@@ -164,9 +173,15 @@ window.JD = window.JD || {};
 		{ view: "memories", path: "/memories", label: "Memories" },
 		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
 		   from the enabled dashboard repos — they carry their own empty state. */
-		{ view: "knowledge", path: "/knowledge", label: "Knowledge" },
-		{ view: "graph", path: "/graph", label: "Graph" },
+		{ view: "knowledge", path: "/knowledge", label: "Knowledge", optional: "knowledge" },
+		{ view: "graph", path: "/graph", label: "Graph", optional: "graph" },
 	];
+
+	/* Whether an optional nav row is switched on. Absent `menus` — a payload from a
+	   server that predates the flags, or one that failed to read config — reads as
+	   HIDDEN, matching the config polarity (`=== true`) rather than revealing a row
+	   the user never asked for. */
+	var navRowVisible = (item, model) => !item.optional || (model.menus || {})[item.optional] === true;
 	/* Settings is pinned to the sidebar's bottom edge (its reserved slot), not in
 	   the scrollable menu list — a persistent destination rather than the last
 	   nav row. */
@@ -612,9 +627,12 @@ window.JD = window.JD || {};
 		document.getElementById("pageTitle").textContent = current.label;
 		document.getElementById("pageSub").textContent = current.sub;
 
-		/* Sidebar — the nav list (plus an empty pinned bottom slot). No row is
-		   gated: see NAV_MIDDLE for why the zero-repo gate went away with the
-		   Repositories page it used to redirect to. */
+		/* Sidebar — the nav list (plus an empty pinned bottom slot). Nothing is
+		   gated by repo count: see NAV_MIDDLE for why the zero-repo gate went away
+		   with the Repositories page it used to redirect to. The one filter left is
+		   `navRowVisible` below, which hides the two OPTIONAL rows the user has not
+		   switched on in Settings → Advanced — a preference, not a gate, so their
+		   routes stay open either way. */
 		var navRow = (item, active) =>
 			'<button type="button" class="sb-item' +
 			(item.child ? " child" : "") +
@@ -631,6 +649,7 @@ window.JD = window.JD || {};
 			"</span></button>";
 		var nav = "";
 		NAV_MIDDLE.forEach((item) => {
+			if (!navRowVisible(item, model)) return;
 			if (item.kids) {
 				nav +=
 				'<div class="sb-group-label">' +

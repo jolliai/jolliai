@@ -75,6 +75,7 @@ import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
 import * as installer from "../install/Installer.js";
+import { withIsolatedHome } from "../testUtils/isolatedHome.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
@@ -177,6 +178,7 @@ const model = (view: DashboardView): DashboardModel => ({
 	scope: { kind: "all" },
 	repos: [],
 	coverage: [],
+	menus: { knowledge: false, graph: false },
 });
 
 async function listen(server: Server): Promise<number> {
@@ -1451,6 +1453,79 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		const retired = await get(port, "/api/model?view=repositories");
 		expect(retired.status).toBe(200);
 		expect(((await retired.json()) as DashboardModel).view).toBe("stats");
+	});
+
+	// The optional sidebar rows come from config, and they are read on EVERY view
+	// rather than only on settings — the sidebar is shell furniture, so a flag that
+	// arrived on one view only would leave the nav guessing everywhere else. Both
+	// halves are asserted here because only this block runs the real builder.
+	it("reads the optional menu flags from config, on every view", async () => {
+		const dbPath = join(dir, "menus.db");
+		const configDir = join(dir, "menus-config");
+		mkdirSync(configDir, { recursive: true });
+		writeFileSync(
+			join(configDir, "config.json"),
+			JSON.stringify({ dashboardKnowledgeMenuEnabled: true, dashboardGraphMenuEnabled: false }),
+		);
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+
+		for (const view of ["stats", "standup", "memories", "knowledge", "graph"] as const) {
+			const res = await get(port, `/api/model?view=${view}`);
+			expect(((await res.json()) as DashboardModel).menus, view).toEqual({ knowledge: true, graph: false });
+		}
+	});
+
+	// A config with neither key — every install before this shipped — must read as
+	// both hidden. `=== true` gives that; the test is what stops a later `!== false`
+	// from quietly reversing the default for everyone.
+	it("defaults both optional menu flags to hidden when config says nothing", async () => {
+		const dbPath = join(dir, "menus-default.db");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "menus-default-config") }),
+		);
+		const res = await get(port, "/api/model?view=stats");
+		expect(((await res.json()) as DashboardModel).menus).toEqual({ knowledge: false, graph: false });
+	});
+
+	// `configDir` is optional on this builder, and every caller in production
+	// resolves it before getting here — so the machine-global fallback is only
+	// reachable through a hand-built server. It still has to read the same file the
+	// resolved path would, which is what this pins: HOME is redirected, a config is
+	// written where `getGlobalConfigDir()` will look, and the flags come back.
+	it("falls back to the machine-global config dir when none is given", async () => {
+		// `withIsolatedHome`, never a hand-rolled `process.env.HOME = …`: that is
+		// isolation on POSIX and a NO-OP on Windows, where `os.homedir()` reads
+		// USERPROFILE — so the hand-rolled form writes into the developer's real
+		// `~/.jolli/jollimemory/`. The helper's own docstring records that damage.
+		const home = join(dir, "fallback-home");
+		mkdirSync(join(home, ".jolli", "jollimemory"), { recursive: true });
+		writeFileSync(
+			join(home, ".jolli", "jollimemory", "config.json"),
+			JSON.stringify({ dashboardGraphMenuEnabled: true }),
+		);
+		await withIsolatedHome(home, async () => {
+			const dbPath = join(dir, "menus-global.db");
+			await withDashboardDb(() => {}, { dbPath });
+			const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath }));
+			const res = await get(port, "/api/model?view=stats");
+			expect(((await res.json()) as DashboardModel).menus).toEqual({ knowledge: false, graph: true });
+		});
+	});
+
+	// Hiding a row does NOT close its route: only the sidebar entry is gated, so a
+	// bookmark still opens the page rather than being redirected somewhere the
+	// reader did not ask for. A gate added here later would break this.
+	it("keeps /knowledge and /graph routed while both menu flags are off", async () => {
+		const dbPath = join(dir, "menus-routes.db");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "menus-routes-config") }),
+		);
+		for (const path of ["/knowledge", "/graph"]) {
+			expect((await get(port, path)).status, path).toBe(200);
+		}
 	});
 
 	/** Seeds one enabled repo whose projected `worktree_root` is `root`. */

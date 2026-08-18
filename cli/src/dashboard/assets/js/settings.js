@@ -5,9 +5,11 @@ window.JD = window.JD || {};
 	 * Settings — opened as a MODAL over any page (like the Claude settings dialog),
 	 * not a routed page. `JD.openSettings()` fetches the settings model via
 	 * `/api/model?view=settings`, then renders a left section rail + content into
-	 * the modal body. Five sections mirror the VS Code settings panel's tabs, and
-	 * every label / hint / placeholder / button text is aligned to that panel
-	 * verbatim (SettingsHtmlBuilder.ts) so the two surfaces read identically.
+	 * the modal body. Five of the six sections mirror the VS Code settings panel's
+	 * tabs, and every label / hint / placeholder / button text in those five is
+	 * aligned to that panel verbatim (SettingsHtmlBuilder.ts) so the two surfaces
+	 * read identically. `advanced` is the exception and has NO VS Code counterpart:
+	 * it configures this dashboard's own sidebar, which that panel does not render.
 	 *
 	 * Editable fields are a CONTROLLED FORM: every value lives in `state.form`
 	 * (seeded once from the payload), the renderers read from it, and every edit
@@ -24,6 +26,7 @@ window.JD = window.JD || {};
 		{ id: "sync", label: "Sync to Jolli" },
 		{ id: "bank", label: "Memory Bank" },
 		{ id: "others", label: "Others" },
+		{ id: "advanced", label: "Advanced" },
 	];
 
 	// Per-section leading glyphs — the same compact Lucide-style outlines the
@@ -36,6 +39,7 @@ window.JD = window.JD || {};
 		sync: '<path d="M12 13v8"/><path d="M4 14.899A7 7 0 1 1 15.71 8h1.79a4.5 4.5 0 0 1 2.5 8.242"/><path d="m8 17 4-4 4 4"/>',
 		bank: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
 		others: '<path d="M20 7h-9"/><path d="M14 17H5"/><circle cx="17" cy="17" r="3"/><circle cx="7" cy="7" r="3"/>',
+		advanced: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
 	};
 
 	function sectionIcon(id) {
@@ -107,7 +111,12 @@ window.JD = window.JD || {};
 		return JD.esc(String(s == null ? "" : s));
 	}
 
-	function initForm(s) {
+	// Takes the WHOLE model, not just `model.settings`: the Advanced rows are
+	// driven by `model.menus`, which lives at the top of the payload because the
+	// sidebar reads it on every view (see `DashboardMenus`). One fact, one place.
+	function initForm(model) {
+		var s = model.settings || {};
+		var menus = model.menus || {};
 		var a = s.agents || {};
 		var sum = s.summary || {};
 		var mb = s.memoryBank || {};
@@ -130,6 +139,10 @@ window.JD = window.JD || {};
 			syncTranscripts: mb.syncTranscripts === true,
 			dcoSignoff: others.dcoSignoff === true,
 			excludePatterns: others.excludePatterns || "",
+			// `=== true`, matching the config polarity: an absent flag is HIDDEN, so
+			// a payload without `menus` cannot render a row as switched on.
+			dashboardKnowledgeMenuEnabled: menus.knowledge === true,
+			dashboardGraphMenuEnabled: menus.graph === true,
 		};
 		AGENTS.forEach((pair) => {
 			form[pair[0]] = a[pair[0]] !== false;
@@ -237,7 +250,7 @@ window.JD = window.JD || {};
 	function render(model) {
 		var s = model.settings || {};
 		if (!state.form) {
-			state.form = initForm(s);
+			state.form = initForm(model);
 			// Baseline for dirty-tracking: Apply stays disabled until the form diverges.
 			state.initialForm = JSON.stringify(state.form);
 			state.folderStatus = null;
@@ -328,6 +341,7 @@ window.JD = window.JD || {};
 		if (section === "sync") return syncSection(s.summary || {});
 		if (section === "bank") return bankSection(s.memoryBank || {}, f);
 		if (section === "others") return othersSection(f);
+		if (section === "advanced") return advancedSection(f);
 		return "";
 	}
 
@@ -732,6 +746,41 @@ window.JD = window.JD || {};
 		);
 	}
 
+	// The sidebar's two optional rows. Hidden by default, so this section is the
+	// only place a reader finds out those pages exist at all — which is why each
+	// hint describes what the page IS and what it is for, rather than how it is
+	// produced. Three things are deliberately absent from this copy. "Memory Bank"
+	// is the VS Code panel's name for the folder and means nothing on this surface,
+	// so Knowledge is described by what it shows. `jolli compile` is the command
+	// that builds both, and a reader deciding whether to show a menu row does not
+	// need it (the pages' own empty states name it, which is where it matters). And
+	// the row-only scope stays in the section hint rather than being repeated per
+	// row: it is one fact about both switches.
+	function advancedSection(f) {
+		return block(
+			"Sidebar menu",
+			'<p class="section-hint">Extra pages for the left menu, off by default. Switching one off just hides its row — nothing stops being generated, and the page stays reachable by URL.</p>' +
+				'<div class="set-group">' +
+				toggleRow(
+					"dashboardKnowledgeMenuEnabled",
+					"Show Knowledge",
+					f.dashboardKnowledgeMenuEnabled === true,
+					// "Source Commits" is the literal heading `WikiMarkdownBuilder` writes
+					// at the foot of every topic page, and those links are the ones the
+					// wiki viewer rewrites into memory jumps — so this names the real
+					// affordance rather than implying every sentence is a link.
+					"A reading view over the knowledge distilled from your commits. Search topic pages across your repositories, open one in the side pane, and follow its <strong>Source Commits</strong> list back to the memories it was built from.",
+				) +
+				toggleRow(
+					"dashboardGraphMenuEnabled",
+					"Show Graph",
+					f.dashboardGraphMenuEnabled === true,
+					"The visual companion to Knowledge: the same distilled decisions and gotchas drawn as a graph, so you can follow the relationships between them — and spot the clusters a list never shows.",
+				) +
+				"</div>",
+		);
+	}
+
 	function opt(value, label, current) {
 		return '<option value="' + esc(value) + '"' + (value === current ? " selected" : "") + ">" + esc(label) + "</option>";
 	}
@@ -762,6 +811,8 @@ window.JD = window.JD || {};
 			syncTranscripts: f.syncTranscripts === true,
 			dcoSignoff: f.dcoSignoff === true,
 			excludePatterns: f.excludePatterns,
+			dashboardKnowledgeMenuEnabled: f.dashboardKnowledgeMenuEnabled === true,
+			dashboardGraphMenuEnabled: f.dashboardGraphMenuEnabled === true,
 		};
 		AGENTS.forEach((pair) => {
 			out[pair[0]] = f[pair[0]] === true;
@@ -847,6 +898,26 @@ window.JD = window.JD || {};
 		state.error = null;
 		state.notice = null;
 		var payload = collect();
+		// Whether the SIDEBAR now needs repainting. `refreshSettings` refetches the
+		// settings payload into the modal, which cannot touch the sidebar — that is
+		// rendered from `window.__JOLLI_DASHBOARD__` by the page — so an Advanced
+		// change needs a page-level refresh too, or the row the user just switched on
+		// stays absent until they reload. Conditional because that refresh repaints
+		// the whole page under the modal (on /graph that rebuilds the iframe and
+		// loses its pan/zoom): worth it when the nav moved, gratuitous on every
+		// other save.
+		//
+		// Compared against the PAGE's model, never the modal's own: the question is
+		// "does what the sidebar is showing still match what we just saved?", and the
+		// sidebar was rendered from that payload. Asking the modal's copy instead got
+		// it exactly backwards whenever the two had drifted — another tab switching a
+		// row off moves the page model (the 30 s poll on My Dashboard picks it up)
+		// while the open modal still holds the old value, so re-saving from here
+		// would look unchanged and skip the repaint that was now most needed.
+		var menus = (window.__JOLLI_DASHBOARD__ || {}).menus || {};
+		var menusChanged =
+			payload.dashboardKnowledgeMenuEnabled !== (menus.knowledge === true) ||
+			payload.dashboardGraphMenuEnabled !== (menus.graph === true);
 		render(model);
 		JD.post("/api/settings/apply", payload)
 			.then((data) => {
@@ -856,6 +927,14 @@ window.JD = window.JD || {};
 					? "Settings saved. " + failures.length + " repo hook(s) could not be synced — see the server log."
 					: "Settings saved";
 				refreshSettings();
+				// Two independent refetches, and the order they LAND in does not matter:
+				// this one rewrites the sidebar, the topbar and `#app`, while
+				// refreshSettings rewrites `#settingsModalBody` — a sibling of `#app`,
+				// not a child (see index.html), so neither can overwrite the other.
+				// `JD.renderPage` is assigned by main.js, which loads after this module —
+				// guarded for the same load-order reason `window.JD` itself is, not
+				// because it is expected to be missing at click time.
+				if (menusChanged && JD.refreshNow && JD.renderPage) JD.refreshNow(JD.renderPage);
 			})
 			.catch((err) => {
 				state.busy = null;

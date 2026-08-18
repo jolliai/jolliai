@@ -4,7 +4,7 @@
  * `assets/js/*.js` is plain JavaScript, never type-checked by tsc, so a typo in
  * a field name or a broken template renders silently in the browser. This
  * evaluates the real IIFE against a stub window/document and asserts each of the
- * five section renderers, following the pattern of `FeedCardAsset.test.ts`.
+ * six section renderers, following the pattern of `FeedCardAsset.test.ts`.
  */
 
 import { readFileSync } from "node:fs";
@@ -22,11 +22,12 @@ interface FakeElement {
 	insertAdjacentHTML: (pos: string, html: string) => void;
 }
 
-const SECTION_IDS = ["agents", "summary", "sync", "bank", "others"];
+const SECTION_IDS = ["agents", "summary", "sync", "bank", "others", "advanced"];
 
 /**
  * Loads format.js → settings.js against a stub window/document. The document's
- * `querySelectorAll(".set-rail-item")` returns five persistent fake buttons so
+ * `querySelectorAll(".set-rail-item")` returns one persistent fake button per
+ * section so
  * the test can drive section switches; every other selector returns []. The
  * async `JD` helpers are stubbed to never-resolving promises so the lazy loads
  * that fire on the sync/bank sections make no real request.
@@ -105,7 +106,7 @@ describe("settings.js renderSettings", () => {
 	it("renders the section rail and the default AI Agents section", () => {
 		const { renderSettings, app } = loadJD();
 		renderSettings(MODEL);
-		for (const label of ["AI Agents", "AI Summary", "Sync to Jolli", "Memory Bank", "Others"]) {
+		for (const label of ["AI Agents", "AI Summary", "Sync to Jolli", "Memory Bank", "Others", "Advanced"]) {
 			expect(app.innerHTML).toContain(label);
 		}
 		expect(app.innerHTML).toContain("Claude Code");
@@ -113,7 +114,7 @@ describe("settings.js renderSettings", () => {
 		expect(app.innerHTML).toContain("Apply Changes");
 	});
 
-	it("renders each of the five section renderers with its distinctive content", () => {
+	it("renders each of the six section renderers with its distinctive content", () => {
 		const { renderSettings, app, rail } = loadJD();
 		renderSettings(MODEL);
 		const go = (id: string) => rail.get(id)?.onclick?.();
@@ -134,6 +135,10 @@ describe("settings.js renderSettings", () => {
 		go("others");
 		expect(app.innerHTML).toContain("Exclude Patterns");
 		expect(app.innerHTML).toContain("Sign commits with DCO");
+
+		go("advanced");
+		expect(app.innerHTML).toContain("Show Knowledge");
+		expect(app.innerHTML).toContain("Show Graph");
 	});
 
 	it("survives a settings payload missing optional sections, still rendering each section's own content", () => {
@@ -148,6 +153,7 @@ describe("settings.js renderSettings", () => {
 			sync: "Outbound push per repo",
 			bank: "Folder Path",
 			others: "Exclude Patterns",
+			advanced: "Show Knowledge",
 		};
 		for (const id of SECTION_IDS) {
 			rail.get(id)?.onclick?.();
@@ -170,12 +176,30 @@ interface FieldStub {
 	oninput?: () => void;
 }
 
-function loadFormJD(): {
+function loadFormJD(
+	model: unknown = MODEL,
+	extraFields: ReadonlyArray<readonly [string, string]> = [],
+	/**
+	 * `window.__JOLLI_DASHBOARD__.menus` — what the SIDEBAR is currently showing,
+	 * which is what `doApply` compares against. Defaults to the settings payload's
+	 * own slice, the normal case where page and modal agree; pass it explicitly to
+	 * model two tabs that have drifted apart.
+	 */
+	pageMenus: unknown = (model as { menus?: unknown }).menus,
+): {
 	fields: Map<string, FieldStub>;
 	applyBtn: { onclick?: () => void };
 	posts: { path: string; body: Record<string, unknown> }[];
+	/** How many times doApply asked the PAGE to repaint (the sidebar refresh). */
+	pageRefreshes: () => number;
+	/** The callbacks doApply handed to `JD.refreshNow`, for an identity check. */
+	refreshArgs: () => ReadonlyArray<unknown>;
+	/** The stub the page render must be driven through. */
+	renderPage: unknown;
 } {
 	const posts: { path: string; body: Record<string, unknown> }[] = [];
+	let pageRefreshes = 0;
+	const refreshArgs: unknown[] = [];
 	const app = { innerHTML: "", insertAdjacentHTML: () => undefined };
 	const applyBtn: { onclick?: () => void } = {};
 	const field = (name: string, type: string): FieldStub => ({
@@ -188,6 +212,7 @@ function loadFormJD(): {
 		["globalInstructions", field("globalInstructions", "checkbox")],
 		["codexEnabled", field("codexEnabled", "checkbox")],
 		["maxTokens", field("maxTokens", "number")],
+		...extraFields.map(([name, type]): [string, FieldStub] => [name, field(name, type)]),
 	]);
 	const doc = {
 		getElementById: (id: string) =>
@@ -205,11 +230,17 @@ function loadFormJD(): {
 				posts.push({ path, body });
 				return Promise.resolve({ ok: true, hookFailures: [] });
 			},
-			refreshNow: () => undefined,
+			refreshNow: (render: unknown) => {
+				pageRefreshes += 1;
+				refreshArgs.push(render);
+			},
 			renderPage: () => undefined,
 		},
 		document: doc,
 		addEventListener: () => undefined,
+		// The page payload the sidebar was rendered from. `doApply` reads its
+		// `menus` to decide whether the sidebar needs repainting.
+		__JOLLI_DASHBOARD__: { menus: pageMenus },
 	} as Record<string, unknown>;
 	for (const f of ["format.js", "settings.js"]) {
 		new Function("window", "document", readFileSync(new URL(`./assets/js/${f}`, import.meta.url), "utf8"))(
@@ -218,8 +249,15 @@ function loadFormJD(): {
 		);
 	}
 	// render() → wire() assigns applyBtn.onclick and the fields' on* handlers.
-	(win.JD as { renderSettings: (m: unknown) => void }).renderSettings(MODEL);
-	return { fields, applyBtn, posts };
+	(win.JD as { renderSettings: (m: unknown) => void }).renderSettings(model);
+	return {
+		fields,
+		applyBtn,
+		posts,
+		pageRefreshes: () => pageRefreshes,
+		refreshArgs: () => refreshArgs,
+		renderPage: (win.JD as { renderPage: unknown }).renderPage,
+	};
 }
 
 describe("settings.js form wiring", () => {
@@ -248,6 +286,203 @@ describe("settings.js form wiring", () => {
 		expect(body.codexEnabled).toBe(false); // seeded from MODEL, untouched
 		expect(body.aiProvider).toBe("anthropic"); // seeded, untouched
 		expect(body.dcoSignoff).toBe(true); // seeded from MODEL.others
+	});
+});
+
+/**
+ * The Advanced section — the two optional sidebar rows.
+ *
+ * Its state does NOT come from `model.settings`: the flags live at the top of the
+ * payload as `model.menus`, because the sidebar reads them on every view (see
+ * `DashboardMenus`). So this suite is what pins that `initForm` reads the whole
+ * model rather than the settings slice — a mistake tsc cannot see, and one whose
+ * symptom is a checkbox that is silently always off while the row it controls is
+ * showing.
+ */
+describe("settings.js Advanced section", () => {
+	function advancedHtml(menus?: Record<string, boolean>): string {
+		const { renderSettings, app, rail } = loadJD();
+		renderSettings(menus ? { ...MODEL, menus } : MODEL);
+		rail.get("advanced")?.onclick?.();
+		return app.innerHTML;
+	}
+
+	it("seeds each switch from model.menus, not from the settings slice", () => {
+		const html = advancedHtml({ knowledge: true, graph: false });
+		expect(html).toMatch(/data-field="dashboardKnowledgeMenuEnabled" checked/);
+		expect(html).toContain('data-field="dashboardGraphMenuEnabled"/>');
+	});
+
+	it("renders both switches off when the payload carries no menus slice", () => {
+		const html = advancedHtml();
+		expect(html).toContain('data-field="dashboardKnowledgeMenuEnabled"/>');
+		expect(html).toContain('data-field="dashboardGraphMenuEnabled"/>');
+	});
+
+	// The rows are hidden by default, so this section is where a reader learns the
+	// pages exist — and that switching one off neither stops the content being built
+	// nor closes the route. Both halves are load-bearing product text, not phrasing:
+	// without the first a user reads the switch as "stop compiling", and without the
+	// second a bookmark that still works looks like a bug.
+	it("says that switching a row off stops nothing and closes no route", () => {
+		const html = advancedHtml();
+		expect(html).toContain("nothing stops being generated");
+		expect(html).toContain("reachable by URL");
+	});
+
+	// Two names are deliberately absent. "Memory Bank" belongs to the VS Code
+	// panel's folder settings and means nothing on this surface; `jolli compile` is
+	// how the pages are produced, which a reader choosing menu rows does not need
+	// (the pages' own empty states name it). Pinned because both are the obvious
+	// thing to reach for when describing these two pages.
+	it("describes the pages without naming Memory Bank or the compile command", () => {
+		const html = advancedHtml();
+		expect(html).toContain("Show Knowledge");
+		expect(html).toContain("Show Graph");
+		const advanced = html.slice(html.indexOf("Sidebar menu"));
+		expect(advanced).not.toContain("Memory Bank");
+		expect(advanced).not.toContain("jolli compile");
+	});
+});
+
+describe("settings.js Advanced apply", () => {
+	const FIELDS = [["dashboardKnowledgeMenuEnabled", "checkbox"] as const];
+
+	it("carries both flags in the Apply payload, seeded from model.menus", () => {
+		const { applyBtn, posts } = loadFormJD({ ...MODEL, menus: { knowledge: false, graph: true } });
+		applyBtn.onclick?.();
+		const body = posts.find((post) => post.path === "/api/settings/apply")?.body;
+		expect(body?.dashboardKnowledgeMenuEnabled).toBe(false);
+		expect(body?.dashboardGraphMenuEnabled).toBe(true);
+	});
+
+	it("submits a toggled flag and repaints the page so the sidebar row appears", async () => {
+		const { fields, applyBtn, posts, pageRefreshes } = loadFormJD(
+			{ ...MODEL, menus: { knowledge: false, graph: false } },
+			FIELDS,
+		);
+		const box = fields.get("dashboardKnowledgeMenuEnabled");
+		if (box) {
+			box.checked = true;
+			box.onchange?.();
+		}
+		applyBtn.onclick?.();
+		const body = posts.find((post) => post.path === "/api/settings/apply")?.body;
+		expect(body?.dashboardKnowledgeMenuEnabled).toBe(true);
+		// The POST resolves on a microtask, so the refresh is queued behind it.
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(pageRefreshes()).toBe(1);
+	});
+
+	// The page repaint is not free — it redraws the whole view under the modal — so
+	// it must fire only for a change the sidebar can actually show. A save that
+	// moves an unrelated field must leave the page alone.
+	it("does not repaint the page when no sidebar flag moved", async () => {
+		const { fields, applyBtn, pageRefreshes } = loadFormJD({ ...MODEL, menus: { knowledge: true, graph: true } });
+		const gi = fields.get("globalInstructions");
+		if (gi) {
+			gi.checked = true;
+			gi.onchange?.();
+		}
+		applyBtn.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(pageRefreshes()).toBe(0);
+	});
+
+	// Each flag needs its own case. With only the Knowledge one covered, deleting
+	// the Graph half of the comparison outright still passed — a Graph-only save
+	// would then leave the sidebar stale until a reload.
+	it("repaints the page for a Graph-only change", async () => {
+		const { fields, applyBtn, pageRefreshes } = loadFormJD(
+			{ ...MODEL, menus: { knowledge: false, graph: false } },
+			[["dashboardGraphMenuEnabled", "checkbox"]],
+		);
+		const box = fields.get("dashboardGraphMenuEnabled");
+		if (box) {
+			box.checked = true;
+			box.onchange?.();
+		}
+		applyBtn.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(pageRefreshes()).toBe(1);
+	});
+
+	// Both flags moving in OPPOSITE directions in one save. Nothing else here
+	// distinguishes the two comparisons, so swapping them read as "unchanged" and
+	// skipped the repaint while both rows were wrong.
+	it("repaints the page when the two flags move in opposite directions at once", async () => {
+		const { fields, applyBtn, posts, pageRefreshes } = loadFormJD(
+			{ ...MODEL, menus: { knowledge: true, graph: false } },
+			[
+				["dashboardKnowledgeMenuEnabled", "checkbox"],
+				["dashboardGraphMenuEnabled", "checkbox"],
+			],
+		);
+		const knowledge = fields.get("dashboardKnowledgeMenuEnabled");
+		if (knowledge) {
+			knowledge.checked = false;
+			knowledge.onchange?.();
+		}
+		const graph = fields.get("dashboardGraphMenuEnabled");
+		if (graph) {
+			graph.checked = true;
+			graph.onchange?.();
+		}
+		applyBtn.onclick?.();
+		const body = posts.find((post) => post.path === "/api/settings/apply")?.body;
+		expect(body?.dashboardKnowledgeMenuEnabled).toBe(false);
+		expect(body?.dashboardGraphMenuEnabled).toBe(true);
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(pageRefreshes()).toBe(1);
+	});
+
+	// The comparison is against what the SIDEBAR is showing, not against the
+	// modal's own payload. Here another tab already switched Knowledge off, so the
+	// page model has moved while this modal still holds `true`: re-saving `true`
+	// looks unchanged to the modal and IS a change to the sidebar. Comparing the
+	// wrong one skipped the repaint exactly when it was needed most.
+	it("repaints the page when the sidebar has drifted from the open modal", async () => {
+		const { fields, applyBtn, pageRefreshes } = loadFormJD(
+			{ ...MODEL, menus: { knowledge: true, graph: false } },
+			[],
+			{
+				knowledge: false,
+				graph: false,
+			},
+		);
+		const gi = fields.get("globalInstructions");
+		if (gi) {
+			gi.checked = true;
+			gi.onchange?.();
+		}
+		applyBtn.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(pageRefreshes()).toBe(1);
+	});
+
+	// The page must be repainted through main.js's renderPage. Handing
+	// `refreshNow` this module's own `render` instead type-checks, passes a
+	// call-count assertion, and repaints the MODAL from a page payload — whose
+	// `settings` slice is undefined, so the whole form comes back empty.
+	it("drives the repaint through JD.renderPage, not the modal renderer", async () => {
+		const { fields, applyBtn, refreshArgs, renderPage } = loadFormJD(
+			{ ...MODEL, menus: { knowledge: false, graph: false } },
+			[["dashboardKnowledgeMenuEnabled", "checkbox"]],
+		);
+		const box = fields.get("dashboardKnowledgeMenuEnabled");
+		if (box) {
+			box.checked = true;
+			box.onchange?.();
+		}
+		applyBtn.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(refreshArgs()).toEqual([renderPage]);
 	});
 });
 

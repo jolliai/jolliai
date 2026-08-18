@@ -36,6 +36,7 @@ function baseModel(view: DashboardView): DashboardModel {
 		scope: { kind: "all" },
 		repos: [],
 		coverage: [],
+		menus: { knowledge: false, graph: false },
 	};
 }
 

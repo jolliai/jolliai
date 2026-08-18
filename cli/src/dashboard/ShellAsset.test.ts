@@ -15,6 +15,7 @@
 
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import type { DashboardMenus } from "./DashboardModel.js";
 
 interface JDNamespace {
 	renderShell: (model: unknown) => void;
@@ -1027,5 +1028,123 @@ describe("the topbar repo picker", () => {
 			[JOLLIAI, true],
 			[SITE, false],
 		]);
+	});
+});
+
+/**
+ * The sidebar's two OPTIONAL rows (Settings → Advanced).
+ *
+ * Worth its own suite for the same reason the scope cases above are: the rows are
+ * built by string concatenation into `#sbNav`, so tsc never sees them, and the
+ * failure mode is silent in both directions — a row that never appears however it
+ * is configured looks exactly like "the user left it off", and a row that ignores
+ * the flag looks exactly like the feature was never built.
+ *
+ * `data-nav-view` rather than the visible label: the label is also what the
+ * DASHBOARDS title table carries, so matching on it would pass on a page title
+ * while the row was missing.
+ */
+describe("JD.renderShell — optional nav rows", () => {
+	const navViews = (h: Harness): string[] =>
+		[...h.element("sbNav").innerHTML.matchAll(/data-nav-view="([^"]*)"/g)].map((m) => m[1]);
+
+	/**
+	 * Every `menus` literal below is typed, and that is the only thing holding the
+	 * two halves of this feature in lockstep. `shell.js` indexes `model.menus` by a
+	 * plain string (`optional: "knowledge"`), so renaming a `DashboardMenus` field
+	 * is a change tsc propagates through every TypeScript caller while leaving the
+	 * asset silently reading a key nobody sends — both rows then never appear again,
+	 * with every test still green. Typing the literal makes the rename fail HERE
+	 * first, and the assertions below fail if only the test is updated.
+	 */
+	const menus = (knowledge: boolean, graph: boolean): DashboardMenus => ({ knowledge, graph });
+
+	/** How many icons a row rendered, keyed by view — a per-row count, not a page total. */
+	const iconsPerRow = (h: Harness): Record<string, number> => {
+		const out: Record<string, number> = {};
+		for (const row of h
+			.element("sbNav")
+			.innerHTML.matchAll(/<button[^>]*data-nav-view="([^"]*)"[\s\S]*?<\/button>/g)) {
+			out[row[1]] = (row[0].match(/<svg /g) ?? []).length;
+		}
+		return out;
+	};
+
+	it("hides Knowledge and Graph when both flags are off", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ menus: menus(false, false) }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories"]);
+	});
+
+	it("shows each row only when its own flag is on, keeping NAV_MIDDLE's order", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ menus: menus(true, false) }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories", "knowledge"]);
+
+		h.JD.renderShell(model({ menus: menus(false, true) }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories", "graph"]);
+
+		h.JD.renderShell(model({ menus: menus(true, true) }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories", "knowledge", "graph"]);
+	});
+
+	// The rows carry their icon and path from the same tables the always-on rows
+	// use, so a flag that only controlled visibility of a half-built row would be
+	// worse than no flag at all.
+	it("renders a revealed row with the same path and icon markup as an always-on row", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ menus: menus(true, true) }));
+		const html = h.element("sbNav").innerHTML;
+		expect(html).toContain('data-nav-path="/knowledge"');
+		expect(html).toContain('data-nav-path="/graph"');
+		// Per ROW, not per page: the two Dashboard children are `child` rows and carry
+		// no icon of their own (the group label above them has two), so a page total
+		// cannot tell a row that lost its icon from a label that grew one.
+		expect(iconsPerRow(h)).toEqual({ stats: 0, standup: 0, memories: 1, knowledge: 1, graph: 1 });
+	});
+
+	// A payload with no `menus` at all is what a tab left open across an upgrade
+	// polls its way into, and what a hand-built model in another suite passes. It
+	// must read as HIDDEN — the same polarity config has — rather than throwing or
+	// revealing a row nobody switched on.
+	it("treats an absent menus slice as both rows hidden", () => {
+		const h = loadJD();
+		h.JD.renderShell(model());
+		expect(navViews(h)).toEqual(["stats", "standup", "memories"]);
+	});
+
+	// A slice naming only one row, or holding a non-boolean, must degrade the same
+	// way — the predicate is `=== true`, so anything unreadable is "not switched on"
+	// rather than a row appearing off the back of a truthy string.
+	it("treats a partial or non-boolean menus slice as hidden", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ menus: { knowledge: true } }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories", "knowledge"]);
+
+		h.JD.renderShell(model({ menus: { knowledge: "yes", graph: 1 } }));
+		expect(navViews(h)).toEqual(["stats", "standup", "memories"]);
+	});
+
+	// Only the ROW is gated. Landing on /graph with the flag off still renders the
+	// page's identity, because the route is deliberately left live (a bookmark is
+	// not answered with a redirect) — and a hidden row must not take the title with
+	// it.
+	it("keeps the page title of a hidden view when the page is opened directly", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ view: "graph", menus: menus(false, false) }));
+		expect(h.element("pageTitle").textContent).toBe("Graph");
+		expect(navViews(h)).toEqual(["stats", "standup", "memories"]);
+	});
+
+	// Settings is built from NAV_BOTTOM, outside the filtered loop, so no change to
+	// the predicate itself can reach it. What this does catch is the refactor that
+	// would: folding NAV_BOTTOM into NAV_MIDDLE to share the filter, which empties
+	// the pinned slot and hides its own container.
+	it("leaves the pinned Settings row outside the filtered list", () => {
+		const h = loadJD();
+		h.JD.renderShell(model({ menus: menus(false, false) }));
+		expect(h.element("sbBottom").innerHTML).toContain('data-nav-view="settings"');
+		expect(h.element("sbBottom").hidden).toBe(false);
+		expect(navViews(h)).not.toContain("settings");
 	});
 });

@@ -1700,6 +1700,24 @@ export interface CoverageNote {
 	readonly message: string;
 }
 
+/**
+ * Which OPTIONAL sidebar menu rows this machine shows — Settings → Advanced.
+ *
+ * Lives at the top of {@link DashboardModel}, not inside {@link SettingsPageModel},
+ * for two reasons that pull the same way. The sidebar is part of the SHELL, so it
+ * is rendered on every view and needs these booleans in every payload; and the
+ * Settings modal fetches a whole `DashboardModel` (`/api/model?view=settings`), so
+ * it reads them here too. One fact, one place — a copy under `settings` would be a
+ * second owner with no tie-breaker.
+ *
+ * `false` hides the ROW only. Both views stay routed (see `VIEW_PATHS` in
+ * `DashboardServer`), so a bookmark and the Knowledge → Graph jump keep working.
+ */
+export interface DashboardMenus {
+	readonly knowledge: boolean;
+	readonly graph: boolean;
+}
+
 /** Everything one page render needs. Injected inline, then refreshed over HTTP. */
 export interface DashboardModel {
 	readonly schemaVersion: number;
@@ -1711,6 +1729,8 @@ export interface DashboardModel {
 	readonly scope: DashboardScope;
 	readonly repos: ReadonlyArray<RepoOption>;
 	readonly coverage: ReadonlyArray<CoverageNote>;
+	/** Optional sidebar rows the user has switched on. Present on every view. */
+	readonly menus: DashboardMenus;
 	readonly stats?: StatsModel;
 	readonly standup?: StandupModel;
 	/** Present on the memories view only. */

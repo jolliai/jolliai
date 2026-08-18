@@ -666,6 +666,17 @@ async function defaultModelBuilder(
 	const registryRoots = new Map<string, ReadonlyArray<string>>(
 		(await readRepoRegistry(configDir)).repos.map((repo) => [repo.repoIdentity, recordedRepoPaths(repo)]),
 	);
+	// Optional sidebar rows. Not view-gated either, and for the same reason the
+	// registry read above is not: the sidebar is shell furniture rendered on EVERY
+	// view, so a flag read only on the settings view would leave the nav guessing
+	// everywhere else. One small JSON read per request, on the same order as the
+	// registry's; `loadConfigFromDir` is fail-open (an unreadable config reads as
+	// an empty one), which lands on the default-hidden state rather than throwing.
+	const menuConfig = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
+	const menus = {
+		knowledge: menuConfig.dashboardKnowledgeMenuEnabled === true,
+		graph: menuConfig.dashboardGraphMenuEnabled === true,
+	};
 	return withReadonlyDashboardDb(
 		async (db) => {
 			// A rebase/reset/squash that rewrites history away leaves the old
@@ -702,6 +713,7 @@ async function defaultModelBuilder(
 			return buildDashboardModel(db, {
 				...request,
 				registryRoots,
+				menus,
 				...(settingsModel ? { settingsModel } : {}),
 				...(knowledgeModel ? { knowledgeModel } : {}),
 				...(graphModel ? { graphModel } : {}),

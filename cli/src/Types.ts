@@ -1813,6 +1813,26 @@ export interface JolliMemoryConfig {
 	 */
 	readonly wikiRebuild?: "manual" | "auto";
 	/**
+	 * Whether `jolli dashboard`'s sidebar shows the **Knowledge** menu row (the
+	 * Memory Bank `_wiki` browser). Absent means HIDDEN — the polarity is
+	 * deliberately `=== true`, so every existing install upgrades into the
+	 * default-off state with no migration.
+	 *
+	 * Scoped to the sidebar row ALONE. `/knowledge`, `/wiki-viewer` and
+	 * `/api/wiki/*` stay routed and `jolli compile` still builds the wiki, so a
+	 * bookmark, the Knowledge → Graph jump and the iframe preview keep working
+	 * while the row is hidden. Anything about whether the wiki is BUILT lives in
+	 * `wikiRebuild` above, not here.
+	 */
+	readonly dashboardKnowledgeMenuEnabled?: boolean;
+	/**
+	 * Whether `jolli dashboard`'s sidebar shows the **Graph** menu row (the
+	 * per-repo knowledge graph). Same polarity and the same row-only scope as
+	 * {@link dashboardKnowledgeMenuEnabled} — `/graph` and `/graph-viewer` stay
+	 * routed either way.
+	 */
+	readonly dashboardGraphMenuEnabled?: boolean;
+	/**
 	 * Whether the post-commit hook prints live memory-capture progress to stdout
 	 * (so a `git commit` driven from a terminal or AI-agent session shows the
 	 * capture lifecycle inline, and blocks until it drains).

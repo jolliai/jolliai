@@ -364,6 +364,35 @@ describe("buildDashboardModel", () => {
 		}
 	});
 
+	// The optional sidebar rows. This builder is synchronous and the flags live in
+	// a file, so the server reads them and passes them in — which makes the DEFAULT
+	// the interesting case: an omitted slice must land on hidden, or a caller that
+	// has never heard of the flags switches a row on by saying nothing.
+	it("defaults both optional menu rows to hidden when the caller passes none", async () => {
+		await seed();
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(model.menus).toEqual({ knowledge: false, graph: false });
+	});
+
+	it("passes a caller's menu flags through unchanged", async () => {
+		await seed();
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					menus: { knowledge: true, graph: false },
+				}),
+			{ dbPath },
+		);
+		expect(model.menus).toEqual({ knowledge: true, graph: false });
+	});
+
 	it("exposes the price-table date", async () => {
 		await seed();
 		const model = await withDashboardDb(

@@ -53,6 +53,8 @@ function baseInput(over: Partial<SettingsApplyInput> = {}): SettingsApplyInput {
 		syncTranscripts: false,
 		dcoSignoff: false,
 		excludePatterns: "",
+		dashboardKnowledgeMenuEnabled: false,
+		dashboardGraphMenuEnabled: false,
 		...over,
 	};
 }
@@ -141,6 +143,38 @@ describe("parseSettingsApplyInput", () => {
 		expect(parseSettingsApplyInput(rawBody({ localAgentModel: "haiku" })).localAgentModel).toBe("haiku");
 	});
 
+	// The two sidebar flags are the only TRI-STATE booleans here: an absent field
+	// must stay absent, so `applySettings` leaves the stored row alone. Reading it
+	// as `false` — which every other boolean here does — let a page that predates
+	// the fields switch both rows off on a save that touched neither.
+	it("leaves an absent sidebar-menu flag undefined rather than reading it as off", () => {
+		const body = rawBody();
+		delete body.dashboardKnowledgeMenuEnabled;
+		delete body.dashboardGraphMenuEnabled;
+		const parsed = parseSettingsApplyInput(body);
+		expect(parsed.dashboardKnowledgeMenuEnabled).toBeUndefined();
+		expect(parsed.dashboardGraphMenuEnabled).toBeUndefined();
+	});
+
+	// A submitted `false` is a real answer and must survive as one, or unticking a
+	// row would be indistinguishable from not mentioning it.
+	it("carries each sidebar-menu flag independently, false included", () => {
+		const parsed = parseSettingsApplyInput(
+			rawBody({ dashboardKnowledgeMenuEnabled: true, dashboardGraphMenuEnabled: false }),
+		);
+		expect(parsed.dashboardKnowledgeMenuEnabled).toBe(true);
+		expect(parsed.dashboardGraphMenuEnabled).toBe(false);
+	});
+
+	// A non-boolean is a submission we cannot read, so it is treated as absent (keep
+	// the stored value) rather than as the `false` a truthy/`=== true` test would
+	// give it. `"on"` is the string an HTML form would send.
+	it("treats a non-boolean sidebar-menu flag as absent, not as off", () => {
+		expect(
+			parseSettingsApplyInput(rawBody({ dashboardGraphMenuEnabled: "on" })).dashboardGraphMenuEnabled,
+		).toBeUndefined();
+	});
+
 	it("rejects a submission with every agent disabled", () => {
 		const allOff = Object.fromEntries(
 			[
@@ -181,6 +215,35 @@ describe("applySettings", () => {
 		expect(config.compileExcludeFolders).toEqual(["archive", "tmp-*"]);
 		expect(config.excludePatterns).toEqual(["*.lock"]);
 		expect(config.dcoSignoff).toBe(true);
+	});
+
+	// An explicit `false` must reach disk, or unticking a row would silently keep
+	// the row — the cost of making these two fields conditional.
+	it("persists both sidebar-menu flags, including a switch back off", async () => {
+		const d = configDirWith({});
+		await applySettings(baseInput({ dashboardKnowledgeMenuEnabled: true, dashboardGraphMenuEnabled: true }), d);
+		expect(readConfig(d).dashboardKnowledgeMenuEnabled).toBe(true);
+		expect(readConfig(d).dashboardGraphMenuEnabled).toBe(true);
+
+		await applySettings(baseInput({ dashboardKnowledgeMenuEnabled: false, dashboardGraphMenuEnabled: true }), d);
+		expect(readConfig(d).dashboardKnowledgeMenuEnabled).toBe(false);
+		expect(readConfig(d).dashboardGraphMenuEnabled).toBe(true);
+	});
+
+	// The whole point of the tri-state. A submission with neither field — what a tab
+	// left open across a CLI upgrade sends, since `settings.js` is inlined into the
+	// page at load — must leave both stored rows exactly as they were. Reading them
+	// as `false` switched both off on a save the user made about something else.
+	it("leaves stored sidebar-menu flags untouched when the submission omits them", async () => {
+		const d = configDirWith({ dashboardKnowledgeMenuEnabled: true, dashboardGraphMenuEnabled: true });
+		const input = baseInput({ dcoSignoff: true });
+		delete (input as { dashboardKnowledgeMenuEnabled?: boolean }).dashboardKnowledgeMenuEnabled;
+		delete (input as { dashboardGraphMenuEnabled?: boolean }).dashboardGraphMenuEnabled;
+		await applySettings(input, d);
+		const config = readConfig(d);
+		expect(config.dcoSignoff).toBe(true);
+		expect(config.dashboardKnowledgeMenuEnabled).toBe(true);
+		expect(config.dashboardGraphMenuEnabled).toBe(true);
 	});
 
 	it("stores localAgentModel only when it differs from the default", async () => {
