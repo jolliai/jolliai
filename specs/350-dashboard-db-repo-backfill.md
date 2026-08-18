@@ -64,6 +64,8 @@ The mode rides in the import cursor because a repository that gains a second che
 - **import row counts** — the memory import's per-family counts; absent when the repository was never swept and when there was no read source to import from.
 - **error** — set only on `skipped`.
 
+**The conversation tier reports its own summary line, and states both counts outright rather than as a ratio.** It names how far back it looked, how many conversations it read, how many it skipped, and which agents the read ones came from. *Read* and *skipped* deliberately **need not add up to** *discovered* — a conversation whose instant cannot be parsed is discovered and neither — so a "18 of 24" phrasing would ask the reader to subtract and would give them the wrong answer if they did.
+
 `skipped` and `unavailable` are different words for different facts on purpose: the first is a failure to report against the repository, the second is a repository that is not here right now. A caller that renders them identically turns an unmounted drive into "migration failed".
 
 ### Progress record
@@ -181,7 +183,19 @@ The cursor advances **only when the collection saw everything and nothing stayed
 
 ### The session tier
 
-Always re-projected, never gated: a global high-water stamp would miss an old session updated out of order. The tier reads the project's shared session registry whole — every source it holds, minus the entries that registry's own retention treats as stale — and applies none of the sidebar's presentation filters (no hidden-session drop, no unread-only counting, no recency window). Entries are deduped by (source, session id) with the newest update winning, then projected with the resolved title, message count, and per-model usage where the source recorded any. The cursor is written afterwards purely as a record of progress, and only when at least one session carried an update stamp.
+Always re-projected, never gated: a global high-water stamp would miss an old session updated out of order.
+
+**This tier no longer reads only the shared session registry, and the reason is a measured blind spot.** Each per-source discoverer keeps a 48-hour staleness horizon as its default window, which is what the sidebar, the status command and post-commit generation all get by not passing anything. That default must not be widened for generation — a wider window there would write week-old unrelated conversations into a commit's stored memory, persistently, with nothing printed anywhere — so this tier passes its **own 7-day window** instead, held in a module of its own precisely so neither side can be changed by editing the other.
+
+The blind spot it closes was large: measured on a real machine, the registry held 3 conversations for one agent while that agent's own transcript directory held 64. The other 61 conversations — and every skill and tool call inside them — were invisible to the dashboard, because a registry that prunes at 48 hours was the only route to them.
+
+**Sessions may be scanned once across repositories and handed in, and the shape of that hand-off is load-bearing.** Pre-scanned sessions arrive keyed by source tag, and *presence itself* records whether a source was scanned — deliberately, rather than a separate did-I-scan flag beside the results. Two facts that must never disagree cannot disagree when one encodes the other: kept as two fields and reconciled by hand, getting it wrong in either direction was silent, because "this source found nothing" and "this source was never asked" produce an identical empty result. So a source is either scanned twice with every session discovered twice, or skipped with nothing supplied and dropped from the run entirely, with no error either way.
+
+**The distinction that does survive is empty versus absent.** An empty list is the positive claim "the scan ran and found nothing", so the per-repository loader is skipped for that source. Absent means no scan happened and the loader runs. **A caller whose scan failed must therefore report absent, never empty** — reporting empty would silently erase that source from the run.
+
+**One source is added to rather than substituted for.** The registry half of the fan-out carries that source too, as this scan's own fallback, and carries another source that has no other route at all — so the registry loader always runs and the pre-scanned sessions are concatenated onto it, with the dedupe below merging the two views of one session. Every other source's pre-scan replaces its loader outright.
+
+The tier applies none of the sidebar's presentation filters (no hidden-session drop, no unread-only counting, no recency window beyond its own scan window). Entries are deduped by (source, session id) with the newest update winning, then projected with the resolved title, message count, and per-model usage where the source recorded any. The cursor is written afterwards purely as a record of progress, and only when at least one session carried an update stamp.
 
 ### The worktree tier
 

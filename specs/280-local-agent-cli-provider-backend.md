@@ -17,7 +17,7 @@ This spec defines a third LLM execution backend, selected when the configured pr
 - The per-tool inventory of **droppable isolation flags** and the environment posture each backend applies, as the data the degradation layer consumes.
 - Running the child: the argument sanitization and working-directory environment pinning applied at the single spawn boundary, standard-output capture, standard-error tail retention, the wall-clock timeout with graceful-then-forceful termination, and the exit-code interpretation rules.
 - Parsing each tool's result into a normalized outcome (text, token counts, cost, stop reason) and classifying failures into a three-way error taxonomy.
-- Mapping the outcome into the shared LLM-call result: the rejection of an empty completion, the model attribution rule, the failure log line, and cleaning up every temporary working directory the call created.
+- Mapping the outcome into the shared LLM-call result: the rejection of an empty completion, the model attribution rule, **the single un-pinned retry a refused model earns and why it is narrowed to that one condition**, the failure log line, and cleaning up every temporary working directory the call created.
 - Fan-out serialization under this provider.
 - Mapping an auth failure into a distinct summary-error marker; the no-fallback guarantee.
 - The two re-entrancy markers the backend plants, and the set of entry points that detect them and no-op.
@@ -91,6 +91,23 @@ Three failure classes are distinguished:
 - **Setup error** — the executable is missing, too old, not a working CLI, unparseable/absent output, or a nonzero exit with no output. Not recoverable by retry.
 - **Auth error** — the tool's login has expired or is not signed in; the user must sign in. Claude Code, Codex and Cursor can produce this class; **OpenCode and Kimi Code** never do (see *Result parsing*).
 - **Transient error** — a timeout, rate-limit, or overloaded condition. Labeled for the diagnostic message only; it does **not** today drive a distinct retry-later path (the queue treats every LLM failure uniformly).
+
+### A refused model is retried once, un-pinned
+
+A **fourth** class exists as a *subtype* of the setup error above, for exactly one condition: the agent refused the model this provider pinned. A pinned model can be refused for a reason nothing on this machine can fix — an entitlement the account does not carry — and the model picker offers identifiers a given subscription may not be allowed to run, so on such a machine every single call fails.
+
+So the dispatch layer catches that one subtype and **retries once with no model pinned**, turning "this machine can no longer generate anything" into "this machine generates on the tool's own configured model" — which is exactly the pre-pinning behavior and strictly better than nothing.
+
+Four properties of that retry are each deliberate:
+
+- **It is narrowed to the refusal subtype, never to the setup class.** Retrying on any setup error would push the largest prompt this provider sends through the entire flag-degradation ladder a *second* time — up to eight full spawns for one summary that was never going to succeed — over failures (an unparseable envelope, a bad temporary directory, a crash) that have nothing to do with the pinned model.
+- **The withdrawal is not persisted.** Unlike an unrecognized flag, an entitlement can be granted later, so the next call asks for the pinned model again. (Contrast the flag store, which is remembered per tool-and-version.)
+- **It fires only when a model was actually pinned.** An un-pinned run has nothing to withdraw, so the classification requires a requested identifier to compare against.
+- **It surfaces during result parsing, downstream of the degradation ladder**, and that is what makes throwing a setup subtype safe here: parsing runs after the ladder has returned. Thrown from inside the ladder, the same class would strip an isolation flag instead.
+
+**Every tool that pins a model must classify its own refusal**, or this retry never fires for it and the machine goes down non-retryably while re-running the same doomed model. The classification that generalizes is **structural rather than phrase-based**: one tool reports its own conditions as prose and anything the API refused as a serialized envelope carrying an HTTP status in the same field, so *parsing* distinguishes them. A refusal is then a client-class status whose message **quotes the identifier that was pinned** — the quoted identifier is the discriminator — while authentication and server-fault statuses are classified off the same envelope and return **ahead** of the range check, so a server fault that happens to name a model cannot read as a refusal and hide behind a retry.
+
+**Stored metadata still never guesses.** The outcome carries the model a backend can *prove* it ran, and the dispatch layer prefers that over the pinned value. A tool that pins but reports nothing records the identifier that was **requested**, not one observed, and its requested-versus-actual warning is simply skipped — a tool that later learns to report its model should populate the field rather than leaving an alias to stand in.
 
 ### Re-entrancy child markers
 

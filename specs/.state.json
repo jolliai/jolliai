@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "d75d76862c35fdd8177bc92bd8467e45360ddbed",
-      "subject": "Add manual wiki rebuild mode gated by wikiRebuild config key",
-      "reviewedAt": "2026-08-18T19:47:24Z",
+      "revision": "c6a74a9b4ce738f3721a311456b05ee6b0a2df7a",
+      "subject": "chore(actions)(deps): bump github/codeql-action/upload-sarif",
+      "reviewedAt": "2026-08-18T19:53:12Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

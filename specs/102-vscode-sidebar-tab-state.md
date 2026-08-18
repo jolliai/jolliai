@@ -96,6 +96,24 @@ When the Status overlay is active, none of the two view-switch buttons is highli
 
 The host re-broadcasts `init` on events that are **not** sidebar reloads — notably the Working-Memory review panel's `ready` handshake, which re-runs the host's first-load path and fans `init` out to this sidebar (the panel reuses the sidebar's broadcast machinery, spec 247). Because the host's initial state always reports `activeTab: branch`, an unguarded re-init would yank a user viewing Memory Bank or Status back to Branch. A one-shot guard fixes this: **only the first `init` sets the active tab**; later `init` messages reconcile the rest of the state (enabled, configured, branch name, selection) but leave the tab alone. The same first-init tab-application also guards against a stale persisted tab id (e.g. the removed `knowledge` view) by falling back to the default `branch` when the id has no panel.
 
+### The knowledge-base staleness banner's dismissal
+
+One more piece of sidebar state, held **in host-process memory only** and deliberately not in the persisted record above. Its reset boundary is the host process's own lifetime — reloading the window forgets it — which is this surface's analog of the dashboard restarting.
+
+The banner reports that the knowledge base is behind the memories that exist. Because automatic rebuilds are off by default (159), that state is now the normal one rather than an exception, so the banner needs a dismissal that is neither permanent nor useless.
+
+**Dismissing snapshots exactly what the user was looking at** — the backlog total and the severity — and a later freshness is compared against *that snapshot*, never against a fresh recompute. Three outcomes:
+
+| A later freshness | Effect |
+| --- | --- |
+| Backlog grew, or severity escalated | The dismissal is cleared and the banner shows again |
+| Neither grew | The banner stays hidden |
+| Caught up entirely | The dismissal is cleared, so the next time it falls behind the banner shows |
+
+**Severity is ordered, not just labelled**, which is what lets an escalation re-show a dismissed banner even when the count did not move — a repository crossing the multi-day staleness threshold is more urgent at the same backlog. The never-built state folds to the lowest rank, because it never reaches the aggregate severity, which only ever reports fresh, informational or warning.
+
+The dismissal is applied to a freshness **before** it is pushed to the webview rather than inside the push, so the rule is unit-testable without a live webview.
+
 ### Reset triggers
 
 Each field has its own change triggers, and each trigger fires a dedicated push so the webview can react without a full re-init.
