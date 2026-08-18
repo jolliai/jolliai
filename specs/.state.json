@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "3715a064f04a89e838990cdedf1e5069f08765f5",
-      "subject": "Global CLI daemon for scheduled safety backups and future session data sync",
-      "reviewedAt": "2026-08-18T18:52:51Z",
+      "revision": "26267cf40ccc4c0f8c137372af971f0c1d9328eb",
+      "subject": "Skip re-projecting unchanged events in the dashboard backfill",
+      "reviewedAt": "2026-08-18T19:40:38Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

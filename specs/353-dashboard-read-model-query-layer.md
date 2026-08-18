@@ -36,28 +36,38 @@ Every payload carries the same envelope, plus exactly one view payload:
 
 | Field | Meaning |
 | --- | --- |
-| `schemaVersion` | `2`. The browser compares it against the version inlined into its own page and reloads on a mismatch rather than re-rendering. |
-| `view` | The view this payload was built for: `stats` (the activity dashboard), `standup`, `repositories`, `memories`, or `settings`. |
+| `schemaVersion` | `4`. The browser compares it against the version inlined into its own page and **reloads** on a mismatch rather than re-rendering — see *The payload version is a breaking-change counter* below. |
+| `view` | The view this payload was built for: `stats` (the activity dashboard), `standup`, `memories`, `knowledge`, `graph`, or `settings`. |
 | `tier` | `installed` or `memory` — detected from the data (below). |
 | `generatedAtMs` | The clock this payload was built against; every relative time in the page is measured from it. |
 | `timeZone` | The IANA zone every date key and hour bucket in this payload was computed in. |
-| `scope` | The **normalized** scope — a `kind` of `all` or `repo`, plus a `repoIdentity` in the second case — echoed back so the page and the numbers agree on one identity. |
-| `repos` | Every enabled repository, ordered by display name: identity, display name, checkout root, and sessions in the last 7 local days. |
+| `scope` | The **normalized** scope — a `kind` of `all` or `repo`, and in the second case a **list** of repository identities — echoed back so the page and the numbers agree. |
+| `repos` | Every repository the picker offers, ordered by display name: identity, display name, checkout root, sessions in the last 7 local days, and three optional state markers (below). |
 | `coverage` | Zero or more honesty notes, each `{ kind, message }`. |
 
-The view payloads are `stats`, `standup`, `repositories`, `memories`, `settings` — one present, the rest absent. Building the other payloads would be wasted queries, and the page only reads its own.
+The view payloads are the view names above minus the two folder-backed ones — one present, the rest absent. Building the others would be wasted queries, and the page only reads its own. The knowledge and graph views' payloads are not built here at all: they read the Memory Bank folder rather than the database (366).
+
+#### The scope is a LIST, and one field carries it
+
+A `repo` scope carries `repoIdentities`, an array — usually of one — and there is deliberately **no** singular field beside it. Two spellings of one fact would leave a reader of a scope unable to tell which one a given producer filled in, and a deep link would carry that drift silently. A `repo` kind with an **empty** list reads as *every* repository, matching a request that omitted the parameter entirely; it is not a way to select nothing.
+
+#### The picker's per-repository state markers
+
+Three optional markers, each present only when true, so an ordinary active row's shape is unchanged:
+
+- **Paused** — the repository's disable timestamp is set. Paused rows are **carried, not dropped**: pausing is an update that stamps a column rather than a delete, and those repositories keep counting in the aggregate figures, so hiding them made an all-paused dashboard read as "no repositories yet".
+- **Missing** — the recorded checkout no longer exists on disk. Also **marked rather than filtered**, for a different reason: a deleted checkout keeps its memories and those are worth reaching, so what must not happen is the row presenting itself as a working checkout when every action on it names a directory that is not there. It is also what gates the row's forget control — the page offers to remove an entry only once it can say the entry is dead.
+- **Volume unavailable** — nothing could be found because the *volume* is absent (an unplugged drive, an unmounted share) rather than because a folder was deleted. It implies missing and is never set alone. Two states rather than one, because an existence check cannot tell them apart and the row used to assert the wrong one — saying "folder missing" and offering to forget a repository that was merely unplugged. The extra ancestor walk this needs runs **only** for a row already found missing, so rendering a working repository still asks the filesystem nothing extra.
 
 ### Axis 1 — repository scope
 
-A scope is either **all enabled repositories** or **one repository**.
-
-The token naming one repository is resolved before anything reads it, in this precedence:
+A scope is either **all enabled repositories** or a **named set** of them — one or more (see *The scope is a LIST* above). Each token in that set is resolved before anything reads it, in this precedence:
 
 1. An exact **identity** match wins. It is the stored key, so it can never be shadowed by a repository merely *named* like someone else's remote.
 2. Otherwise a **display name**, accepted only when exactly one repository carries it. Two same-named repositories leave the token unresolved and log a warning rather than picking one — a plausible-looking URL showing the wrong project's numbers is worse than an unfiltered page.
 3. A row id is deliberately **not** accepted: it is assigned by insert order, so a bookmarked link could come back pointing at a different project after a database rebuild.
 
-The resolved token is then turned into a surrogate key once per query function. A token no repository matches resolves to a key that **matches nothing** — an unknown repository has no data, and widening to every repository would be a silent lie.
+Each resolved token is then turned into a surrogate key once per query function. A token no repository matches resolves to a key that **matches nothing** — an unknown repository has no data, and widening to every repository would be a silent lie. The same holds for a set: unresolvable members contribute nothing rather than relaxing the filter.
 
 ### Axis 2 — time window
 
@@ -134,18 +144,11 @@ All of it is windowed by **the call's own time when the parser that read it coul
 
   This is the same discipline as the servers' separate grouping, applied one axis over: where a figure cannot be re-derived correctly from finer rows, it is either queried at its own grouping or omitted.
 
-#### Recall usage
+#### Recall usage — RETIRED as its own payload
 
-Read from **receipts** — one row per call, written by whichever surface served it — and windowed on each receipt's own instant, so a call made days before its host session last moved lands on the right day.
+There is no recall payload on this model any more, and no Recall card to consume one. What survives is a **single row inside the tool-usage payload**: the recall tool's own call row, pulled from the untruncated set before the row cut and matched across every spelling of the tool name (see *Tool, skill and MCP usage* above). It is absent when the window holds no matching row — which also means it misses a bare command-line recall and the skill's non-model-protocol fallback, since neither produces a tool row at all.
 
-- Used calls, set-aside calls, the served percentage (zero when there were no calls), distinct memories served, and how many of those are older than **30 days** as of now.
-- Sessions that got context, counted over receipts that name a session; plus a separate count of receipts that name **none** — its own figure because "no receipt named a session at all" is a different (and much rarer) statement than "some receipt named none".
-- The session denominator is the **union** of sessions touched in the window and the sessions in-window receipts point at, deduped by identity. It has to be a union because a receipt is written the moment recall is called while the session row appears only later, so a fresh agent recalling on its first turn otherwise rendered "1 of 0". Session-less receipts are excluded from that union arm: null values compare *equal* in a set union, so every session-less receipt in the window collapsed into one phantom row per repository — a session that exists nowhere and, since the numerator skips a null session, can never be counted as covered.
-- **Skill invocations** — runs of the recall skill, counted under **every** spelling (the installed bare directory name and the plugin-namespaced `plugin:skill` form). Deliberately not folded into the call counts: a skill run that went on to recall already wrote its own receipt, so adding it would count the call twice and move the hit rate. What it adds is the gap — a skill that ran and never recalled.
-- **Calls without a receipt** — the pre-receipt history, from two independent channels: per-session MCP tool rows (blind to a source that records no tool calls), and a self-referential reference document that stamps each call with its own time (which windows exactly, but collapses a repeated query to one entry and keeps only the newest 20). They share no key that would let them be joined, so the **larger** of the two is taken — the max of two lower bounds is still a lower bound, while a sum would double-count the ordinary case. Receipted calls on the answering surface are then subtracted, clamped at zero.
-- **Skill runs with no other trace** — the recall skill taking its command-line fallback, which leaves a skill row and nothing else. Subtracted in two stages: per session, that session's own MCP rows and the receipts naming it; then, globally, the window's session-less receipts, since those are exactly the command-line recalls no session can claim. Clamped at zero throughout. Kept separate from the figure above because this population is ambiguous by construction — a skill run that recalled nothing looks identical from here.
-- **A daily series** of used / set-aside counts, plus an optional per-day `estimated` count from the reference channel alone. That estimate is a **lower bound and must be rendered as one**, and it is **zeroed for any day that carries a receipt** — from the day receipts shipped, both channels see the same call. Zeroing per day rather than globally is what lets one window hold both halves. The field is omitted (not zero) on an ordinary day, so the key does not ride every point of every series for the one machine that has any.
-- **The first receipt's day**, deliberately **unwindowed** (though still narrowed to the requested repository, like everything else here): it answers "since when has anything been recorded here", which a windowed figure cannot. Without it a 30-day chart holding one bar is indistinguishable from a broken chart. It is a day key, not an instant, because the only consumer compares it against the series' own keys — which were bucketed in this payload's zone, not the browser's.
+Everything the retired payload computed is gone with it: the used / set-aside split and served percentage, distinct memories served and their age, the session-coverage numerator and its union denominator, skill-invocation counts, the two independent no-receipt estimate channels and the larger-of-two rule, the skill-runs-with-no-other-trace subtraction, the daily used / set-aside series with its per-day lower-bound estimate, and the unwindowed first-receipt day. The receipts themselves are still written and still stored — this is a reporting surface being withdrawn, not a capture being switched off.
 
 ### The daily standup view
 
@@ -158,13 +161,16 @@ A fixed two-day board — yesterday and today, by local day boundaries — with 
 - **Insights** are present (possibly empty) from the memory tier onwards and absent below it. They are derived **at query time from each memory's own topics** — a `decision` row for each topic with non-blank decision text, a `todo` row for each topic with non-blank todo text, ordered by topic position with decisions ahead of todos. A rewritten commit's insights are reached through its alias, exactly as the decisions card does; without that an amended commit's insights would vanish here while its decisions still rendered on the other card. Rows are then re-sorted into a fixed render order: blocker, question, gotcha, todo, decision.
 - Each insight carries the instant its commit landed — the only date on record, and the right one: an unanswered question is as old as the commit that asked it.
 
-### The repositories view
+### The repositories view — RETIRED
 
-The durable registry (which repositories exist, and whether each is paused) joined against this machine's counts. Per row: identity, display name, checkout root, optional remote URL, enabled flag, memory count, session count.
+There is no repositories view and no payload for one. The page it fed is gone (356), and the registry's list now reaches the browser as the `repos` picker array in the envelope above rather than as a view of its own.
 
-- Sessions are counted live off the detail rows rather than from a stored aggregate.
-- **Memories are counted by the same two rules the memories browser applies**, or the badge and the tree report different totals for one repository: only **root** memories count (the memory store is a tree — an amend or squash files the follow-up as a child, so a plain count inflates every repository by its rewrite history), and git reachability drops roots no local branch can still reach. Reachability cannot be expressed in SQL, so hashes are fetched and filtered outside it.
-- A caller that did not pay for the reachability computation gets the unfiltered count, per repository, because that check fails open.
+Two of the retired payload's rules are worth keeping on record, because the figures they governed are no longer computed anywhere on this model and a future surface that wants them will have to re-derive them:
+
+- **Memory counts had to apply the same two rules the memories browser applies**, or a badge and the tree reported different totals for one repository: only **root** memories count (the store is a tree, so an amend or squash files the follow-up as a child and a plain count inflates every repository by its rewrite history), and git reachability drops roots no local branch can still reach. Reachability is not expressible in the query language, so hashes were fetched and filtered outside it — and a caller that did not pay for that computation got the unfiltered count, because the check fails open.
+- Session counts were derived live from the detail rows rather than from a stored aggregate.
+
+What the picker array carries instead is deliberately much smaller — sessions in the last 7 local days, plus the three state markers — because it exists to let someone *choose* a repository, not to report on one.
 
 ### The memories view
 
@@ -235,15 +241,27 @@ Built entirely from configuration plus one cheap folder-state peek — no databa
 - That state is **memoised on (launch directory, configured folder)** because computing it spawns several git subprocesses; uncached it ran on every settings fetch and, colliding with the page's own poll, could look hung. It is a **single slot**, not a table — a second key simply replaces the first, which costs nothing because one server serves one launch directory. An explicit invalidation exists for the one action that changes which folder the launch repository resolves to *without* changing the configured folder.
 - The slow figures — the local-agent availability probe, the per-repository push list, and the missing-summaries count — are deliberately **not** here.
 
-### The one model-derived field
+### No model-derived field — this layer calls no model at all
 
-The newest decision on the decisions card can carry a one-sentence `gist`, compressed at display time by a language-model call. **Nothing else in this read model calls a model** — the standup's insights, the decisions themselves, and every count on every card are derived by query.
+**Nothing in this read model calls a language model.** The standup's insights, the decisions themselves, and every count on every card are derived by query.
 
-- It runs only for the activity view, and only when that view actually produced a newest decision.
-- It is **cached for the life of the process, keyed on the commit hash *and* a fingerprint of the decision text**. A regenerated summary keeps its hash while replacing its decision, so a hash-only key served the old gist beside the new text, permanently.
-- **Failures are cached too.** Without a negative entry every poll re-attempted the call; cost is now bounded by the number of distinct decisions ever seen rather than by request volume. The cache is bounded at **256** entries with first-in eviction.
-- The call is capped at **80** output tokens and **5 seconds**, and runs at the fastest model alias unless configuration names another. That configured value is the **summarizer's** model, not a gist-specific one, so an install that chose the largest model pays its rate for a one-sentence compression — and a configured value that is present but blank is not "unset" here, so it falls through to the *summarizer's* mid-tier default rather than to the fast alias this path asks for.
-- An absent gist means "not computed, or it failed" — callers fall back to the raw decision text, which is also what a suppressed call produces. **Suppression is a transport decision** (spec 352): a cross-site reader still gets the whole payload *minus this one field*.
+That is now unconditional. A single field used to be the exception: the newest decision on the decisions card could carry a one-sentence compressed *gist*, produced by a model call at display time, with a process-lifetime cache keyed on the commit hash **and** a fingerprint of the decision text (a hash-only key served the old gist beside a regenerated decision, permanently), negative caching so a failure did not re-attempt on every poll, a bounded cache with first-in eviction, an output-token and wall-clock cap, and a transport rule that stripped just that one field from a cross-site reader. All of it is gone, along with the trimming of the decisions card that accompanied it: a decision record's text field is now its **title**.
+
+The consequence worth stating is that this layer's cost is now purely query cost. There is no per-request model spend, no cache to warm, no configured-model dependency, and nothing for the transport layer to suppress.
+
+### The payload version is a breaking-change counter
+
+The payload carries a version the browser compares against the one inlined into its own page, reloading on a mismatch instead of re-rendering. It exists for one failure: a tab left open across an upgrade polls this model and tries to render a shape that no longer exists.
+
+It is bumped only for a change that would break such a tab, and each bump names one:
+
+| To | Breaking change |
+| --- | --- |
+| 2 | The Decisions **view** was retired — its view token and payload shape removed, so an old tab would poll for a view that no longer exists |
+| 3 | The scope became a repository **list**; the singular identity field is gone, so a pre-3 tab reads nothing off every reply and silently repaints itself as all-repositories while its address still says otherwise |
+| 4 | The Recall **card** was retired and the decisions card trimmed: the recall payload is gone (a pre-4 tab reads a count straight off it and throws — and the activity view is the one view with a polling loop, so it throws again on every tick against the payload it already holds) and a decision record's text field became its title |
+
+The activity view's poll is what makes this load-bearing rather than cosmetic: without the counter, one retired field turns a stale tab into a console error every tick.
 
 ### Read failures
 

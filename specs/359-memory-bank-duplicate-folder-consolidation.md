@@ -15,7 +15,7 @@ Fold the several Memory Bank folders that hold one repository into a single surv
 - The merge: recursive copy-if-absent, the metadata union across the index, the manifest and the branch registry, the heal pass that regenerates missing human-readable copies, and the archival of the drained losers.
 - The rebuild: archiving the whole pile, recreating the base-named folder, and re-populating it from the system of record.
 - What the merge omits — the archive subtree at every depth, and the per-folder configuration, migration-progress and dirty-marker documents.
-- The base-slot hijack the rebuild's survivor computation admits.
+- The rebuild survivor being a prediction rather than an authority, the post-archival re-resolution that settles it, and the base-slot hijack that makes both necessary.
 - The degradations: a system of record that is absent at execute time, and one that is unreadable at classify time.
 - What "the system of record" resolves to, the one routing state for which resolving it raises, and why that raise never reaches the user.
 - The per-vault write lock hold, its wait budget, and the fail-visibly-on-busy discipline.
@@ -67,7 +67,9 @@ Produced by classification, consumed by execution:
 - The **case** (one of the three below).
 - The current repository's recorded name.
 - The full duplicate set.
-- The **survivor**: the folder that will remain live. For two of the cases this is a member of the duplicate set; for the rebuild case it is the base-named path, which may itself be archived and then recreated.
+- The **survivor**: the folder that will remain live. For the two merge cases this is a member of the duplicate set and is **authoritative**. For the rebuild case it is only a **prediction** — the canonical base slot, which the rebuild lands on in the ordinary case because the base is itself one of the duplicates and is archived then recreated.
+
+  **On the rebuild case the executor re-resolves the slot for real after archiving, and callers must read the survivor off the RESULT rather than off the plan.** The base slot may belong to a *different* repository that happens to share the basename — which is the very reason this repository ended up on suffixed slots in the first place — and that folder is not in the duplicate set, so it is never archived and must never be claimed.
 - The **archived** list: for two of the cases, every folder except the survivor; for the rebuild case, **every folder including the base**.
 - Counts, for the confirmation's wording: each folder's memory count, the system of record's count, the union's count, the survivor's own count, and how many the survivor stands to gain (union minus survivor).
 
@@ -106,12 +108,16 @@ The whole operation is skipped, silently and with no message, when the host did 
 
 ### Detection
 
-1. Assemble the duplicate set for the current repository. Fewer than two members: return no plan and stop.
+1. Assemble the duplicate set for the current repository. **Return no plan and stop** when there are fewer than two members, **or when the project carries the durable manual-disable opt-out.** A disabled project must offer nothing rather than offer a merge that cannot complete.
 2. For each folder, read its memory set and record its count. Accumulate the union.
 3. Read the system of record's memory set.
 4. Classify per the table above and compute the survivor, the archived list, and the counts.
 
-**Detection runs outside the lock.** Nothing about the plan is re-validated under the lock before it is executed.
+**Detection necessarily runs outside the lock, and the plan is now re-validated under it before execution.** Holding the lock across the confirmation is not an option — the modal sits between planning and executing, and the lock would block every summary write for as long as the dialog stayed open — so the folder set genuinely can change under an open confirmation: another window's sweep, a synchronization round, or a second clone's first write.
+
+So the caller **re-classifies inside the lock** and executes the freshly returned plan. When the new plan no longer matches the one the user confirmed, a typed **stale-plan** signal reaches the caller and the user is asked to refresh and confirm again — the user agreed to a *specific description*, so a changed one is a re-confirmation rather than something to act on silently.
+
+**Three fields are compared and the counts deliberately are not**: the case, the folder set and the survivor decide staleness, while the counts are display detail and the returned plan carries the fresh ones.
 
 ### Confirmation
 
@@ -159,6 +165,8 @@ The vault parent is also the vault's own version-controlled working tree, so the
 The lock is taken with the **short** wait budget — ten seconds — and polled at a fixed short interval, with the lock's modification time heartbeated while held.
 
 **When the lock is busy for the whole budget the merge fails visibly.** A typed busy signal reaches the caller, which tells the user the product is busy writing a summary right now and to click Refresh again shortly. This is deliberately the opposite of the sweep that ran moments earlier on the same click, which skips silently: the user confirmed this merge through a modal, so a silent swallow would look like Refresh did nothing.
+
+**Three typed failures, and they are distinct because the remedies differ.** Busy asks the user to retry shortly. **Stale plan** asks them to refresh and re-confirm, because what is on disk no longer matches what they agreed to. **Disabled** tells them this project is switched off — a separate type precisely so a host can tell "you disabled this project" apart from a real fault, since the user clicked Merge and a silent swallow would look like the click did nothing.
 
 Any other failure is logged and swallowed, so the re-listing the user asked for still happens.
 
