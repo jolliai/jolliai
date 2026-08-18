@@ -24,6 +24,16 @@ vi.mock("../core/GitOps.js", () => ({ probeWorktree: probeWorktreeMock }));
 const { mockStorage } = vi.hoisted(() => ({ mockStorage: { kind: "mock-storage" } }));
 vi.mock("../core/StorageFactory.js", () => ({ createStorage: vi.fn().mockResolvedValue(mockStorage) }));
 vi.mock("../core/SummaryStore.js", () => ({ setActiveStorage: vi.fn() }));
+// The CallTool handler re-checks the cutover state before a repo-scoped built-in;
+// stub it so these tests don't need real storage, and so ordering can be asserted.
+const { ensureHealMock, clearThrottleMock } = vi.hoisted(() => ({
+	ensureHealMock: vi.fn().mockResolvedValue(undefined),
+	clearThrottleMock: vi.fn(),
+}));
+vi.mock("../core/ActiveStorageHeal.js", () => ({
+	ensureActiveStorageMatchesRoute: ensureHealMock,
+	clearActiveStorageHealThrottle: clearThrottleMock,
+}));
 // The CallTool handler emits per-tool telemetry; spy on track().
 vi.mock("../core/Telemetry.js", () => ({ track: vi.fn() }));
 
@@ -93,6 +103,7 @@ vi.mock("../core/JolliMemoryPushClient.js", () => ({
 
 import { VERSION } from "../commands/CliUtils.js";
 import type { PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
+import { OrphanBranchFrozenError } from "../core/OrphanBranchStorage.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
@@ -220,6 +231,8 @@ describe("startMcpServer", () => {
 		fetchManifestMock.mockReset();
 		invokePlatformToolMock.mockReset();
 		vi.mocked(track).mockClear();
+		ensureHealMock.mockClear();
+		clearThrottleMock.mockClear();
 		// Clean baseline for the log-dir anchoring assertions below.
 		resetLogDir();
 	});
@@ -305,6 +318,24 @@ describe("startMcpServer", () => {
 		expect(JSON.parse(result.content[0].text)).toEqual({ hits: [] });
 	});
 
+	it("CallTool re-checks the cutover state before a repo-scoped built-in, and before dispatch", async () => {
+		let healedBeforeDispatch = false;
+		vi.mocked(runSearch).mockImplementationOnce(async () => {
+			healedBeforeDispatch = ensureHealMock.mock.calls.length > 0;
+			return { hits: [] };
+		});
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
+		expect(ensureHealMock).toHaveBeenCalledWith("/repo");
+		expect(healedBeforeDispatch).toBe(true);
+	});
+
+	it("CallTool does NOT re-check the cutover state for a built-in that needs no repo (list_spaces)", async () => {
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "list_spaces", arguments: {} } });
+		expect(ensureHealMock).not.toHaveBeenCalled();
+	});
+
 	it("CallTool handler returns an isError response when the handler throws", async () => {
 		vi.mocked(runSearch).mockRejectedValueOnce(new Error("boom"));
 		await startMcpServer("/repo");
@@ -315,6 +346,51 @@ describe("startMcpServer", () => {
 		};
 		expect(result.isError).toBe(true);
 		expect(JSON.parse(result.content[0].text)).toEqual({ error: "boom" });
+	});
+
+	it("CallTool self-heals and retries once when a repo-scoped tool hits the frozen branch", async () => {
+		// A cutover that landed inside the heal's throttle window leaves the tool
+		// dispatching against the frozen orphan branch. The typed error clears the
+		// back-off, re-heals (now unthrottled), and retries so the caller sees success.
+		vi.mocked(runSearch)
+			.mockRejectedValueOnce(new OrphanBranchFrozenError("orphan branch is frozen"))
+			.mockResolvedValueOnce({ hits: [] });
+		await startMcpServer("/repo");
+		const result = (await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } })) as {
+			content: { type: string; text: string }[];
+			isError?: boolean;
+		};
+		expect(clearThrottleMock).toHaveBeenCalledWith("/repo");
+		// Healed once before the first attempt, once more before the retry.
+		expect(ensureHealMock).toHaveBeenCalledTimes(2);
+		expect(runSearch).toHaveBeenCalledTimes(2);
+		expect(result.isError).toBeUndefined();
+		expect(JSON.parse(result.content[0].text)).toEqual({ hits: [] });
+	});
+
+	it("CallTool surfaces the frozen error when the single retry also fails", async () => {
+		// Two `Once`s, not a persistent reject: the retry consumes the second, and
+		// nothing leaks into the next test's runSearch.
+		vi.mocked(runSearch)
+			.mockRejectedValueOnce(new OrphanBranchFrozenError("orphan branch is frozen"))
+			.mockRejectedValueOnce(new OrphanBranchFrozenError("orphan branch is frozen"));
+		await startMcpServer("/repo");
+		const result = (await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } })) as {
+			content: { type: string; text: string }[];
+			isError?: boolean;
+		};
+		expect(clearThrottleMock).toHaveBeenCalledTimes(1);
+		expect(runSearch).toHaveBeenCalledTimes(2); // one retry, then give up
+		expect(result.isError).toBe(true);
+		expect(JSON.parse(result.content[0].text)).toEqual({ error: "orphan branch is frozen" });
+	});
+
+	it("CallTool does NOT clear the throttle or retry for a non-frozen error", async () => {
+		vi.mocked(runSearch).mockRejectedValueOnce(new Error("boom"));
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
+		expect(clearThrottleMock).not.toHaveBeenCalled();
+		expect(runSearch).toHaveBeenCalledTimes(1);
 	});
 
 	it("CallTool handler flags a structured {type:'error'} result as isError (push_memory contract parity)", async () => {

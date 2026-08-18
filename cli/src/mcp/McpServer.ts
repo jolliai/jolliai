@@ -30,9 +30,11 @@ import {
 	type Prompt,
 } from "@modelcontextprotocol/sdk/types.js";
 import { VERSION } from "../commands/CliUtils.js";
+import { clearActiveStorageHealThrottle, ensureActiveStorageMatchesRoute } from "../core/ActiveStorageHeal.js";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { probeWorktree } from "../core/GitOps.js";
 import { JolliMemoryPushClient, type PlatformToolManifestEntry } from "../core/JolliMemoryPushClient.js";
+import { OrphanBranchFrozenError } from "../core/OrphanBranchStorage.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
@@ -683,10 +685,42 @@ export function createMcpServer(runtime: McpRuntime): Server {
 			// Route backend-defined tools through the generic executor; everything
 			// else is a built-in handled by the local dispatch table.
 			const platformTool = platformByName.get(name);
-			const result =
-				platformClient && platformTool
-					? await platformClient.invokePlatformTool(platformTool, args ?? {})
-					: await dispatchTool(cwd, name, args ?? {});
+			// Repo-scoped built-ins get the storage heal (platform tools take nothing
+			// from cwd, so they can neither go stale nor throw the frozen error).
+			const repoScopedBuiltin =
+				!platformTool && TOOL_DEFINITIONS.find((t) => t.name === name)?.requiresRepo === true;
+			if (repoScopedBuiltin) {
+				// Before a repo-scoped built-in reads or writes, re-check that this
+				// long-lived process's storage still matches the repo's cutover state.
+				// A daemon (or the stdio fallback) that outlived a cutover holds a
+				// pre-cutover object bound to the now-FROZEN orphan branch: reads come
+				// back stale and the lazy catalog rebuild on the search/recall path
+				// throws "orphan branch is frozen". This heals it in place — no restart,
+				// no reconnect — and no-ops on the fast path once storage reads SQLite.
+				// Per-call, not per-connection: the reproduction is one MCP connection
+				// that spans the cutover, so an attach-time check would never fire.
+				await ensureActiveStorageMatchesRoute(cwd);
+			}
+			let result: unknown;
+			if (platformClient && platformTool) {
+				result = await platformClient.invokePlatformTool(platformTool, args ?? {});
+			} else {
+				try {
+					result = await dispatchTool(cwd, name, args ?? {});
+				} catch (err) {
+					// The heal above is throttled, so a cutover that landed INSIDE the
+					// current back-off window is invisible to it: the pre-cutover override
+					// survives and the lazy catalog write throws frozen. That throw is the
+					// proof the window is stale — forget the back-off, re-heal (now
+					// unthrottled it rebuilds against SQLite), and retry once so the caller
+					// never sees the frozen error. Only this typed error retries; anything
+					// else propagates unchanged.
+					if (!(err instanceof OrphanBranchFrozenError)) throw err;
+					clearActiveStorageHealThrottle(cwd);
+					await ensureActiveStorageMatchesRoute(cwd);
+					result = await dispatchTool(cwd, name, args ?? {});
+				}
+			}
 			// Unify the error contract across tools. `push_memory` (and any backend
 			// platform tool) reports failure as a structured `{ type: "error" }`
 			// result rather than throwing, so flag it `isError` here to match the

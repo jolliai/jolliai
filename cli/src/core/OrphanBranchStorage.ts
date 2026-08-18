@@ -11,6 +11,24 @@ import {
 import { readCutoverFence } from "./RepoProfile.js";
 import type { StorageKind, StorageProvider } from "./StorageProvider.js";
 
+/**
+ * Thrown by {@link OrphanBranchStorage.writeFiles} when the branch it holds has
+ * been frozen (or retired) by a cutover this long-lived object did not witness.
+ *
+ * Typed rather than a bare `Error` so a tool dispatcher can recognise it WITHOUT
+ * matching on message text: seeing it proves a cutover landed since the storage
+ * override was built, so the caller should forget its route-probe back-off and
+ * heal immediately rather than wait out the throttle window (JOLLI-2231). Two
+ * throw sites raise it — the per-clone fence and the shared-identity CAS row —
+ * because both mean the same thing to the caller: rebuild against the database.
+ */
+export class OrphanBranchFrozenError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "OrphanBranchFrozenError";
+	}
+}
+
 export class OrphanBranchStorage implements StorageProvider {
 	readonly kind: StorageKind = "orphan-branch";
 
@@ -37,7 +55,7 @@ export class OrphanBranchStorage implements StorageProvider {
 		// onto the frozen branch after commit.
 		const fence = await readCutoverFence(this.cwd ?? process.cwd()).catch(() => null);
 		if (fence !== null) {
-			throw new Error(
+			throw new OrphanBranchFrozenError(
 				"orphan branch is frozen (cutover fence in place) — this process holds a pre-cutover storage " +
 					"object; restart it so writes route to the database",
 			);
@@ -51,7 +69,7 @@ export class OrphanBranchStorage implements StorageProvider {
 		// unfenced repo must never be blocked by a missing or broken database.
 		const { hasCutoverRow } = await import("../dashboard/CutoverRouter.js");
 		if (await hasCutoverRow(this.cwd ?? process.cwd()).catch(() => false)) {
-			throw new Error(
+			throw new OrphanBranchFrozenError(
 				"orphan branch is retired for this repository (cutover committed) — writes route to the " +
 					"database; re-run the operation from an up-to-date surface",
 			);

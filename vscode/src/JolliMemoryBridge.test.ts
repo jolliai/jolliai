@@ -244,11 +244,26 @@ vi.mock("../../cli/src/core/KBRepoDiscoverer.js", () => ({
 
 // createStorage now routes by cutover state; pin these tests to the
 // pre-cutover default so they exercise the dual-write path they always did.
-vi.mock("../../cli/src/dashboard/CutoverRouter.js", () => ({
-	// A plain function, not vi.fn(): this suite resets mock implementations
-	// between tests, which would strip a mockResolvedValue and make the route
-	// resolve to undefined.
-	resolveCutoverRoute: async () => ({ state: "uncutover" }),
+// The route is read from a mutable holder so a test can flip it to `cutover`
+// (see the storage-cutover-heal suite) — a plain function, not vi.fn(), because
+// this suite resets mock implementations between tests, which would strip a
+// mockResolvedValue and make the route resolve to undefined. `beforeEach` resets
+// the holder to the pre-cutover default.
+const { cutoverRouteHolder } = vi.hoisted(() => ({
+	cutoverRouteHolder: {
+		current: { state: "uncutover" } as { state: string; reason?: string },
+		// When set, the mock rejects — exercises the heal's route-probe-failure path.
+		throwErr: null as Error | null,
+	},
+}));
+vi.mock("../../cli/src/dashboard/CutoverRouter.js", async (importOriginal) => ({
+	// Keep the real `routeMovesOffOrphanBranch` classifier (shared with the daemon's
+	// heal); stub only the DB-touching `resolveCutoverRoute`.
+	...(await importOriginal<typeof import("../../cli/src/dashboard/CutoverRouter.js")>()),
+	resolveCutoverRoute: async () => {
+		if (cutoverRouteHolder.throwErr) throw cutoverRouteHolder.throwErr;
+		return cutoverRouteHolder.current;
+	},
 }));
 
 vi.mock("../../cli/src/core/KBPathResolver.js", async (importOriginal) => {
@@ -432,6 +447,7 @@ vi.mock("node:fs/promises", () => ({
 // ── Import under test (after mocks) ─────────────────────────────────────────
 
 import { getAggregateWikiFreshness } from "../../cli/src/core/WikiFreshness.js";
+import { OrphanBranchFrozenError } from "../../cli/src/core/OrphanBranchStorage.js";
 import { JolliMemoryBridge } from "./JolliMemoryBridge.js";
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -498,6 +514,9 @@ function mockExecFileError(message: string, stderr?: string): void {
 describe("JolliMemoryBridge", () => {
 	beforeEach(() => {
 		vi.resetAllMocks();
+		// Pre-cutover default; the storage-cutover-heal suite flips this per test.
+		cutoverRouteHolder.current = { state: "uncutover" };
+		cutoverRouteHolder.throwErr = null;
 		mockHomedir.mockReturnValue("/mock/home");
 		resolveGitHooksDir.mockResolvedValue("/mock/hooks");
 		loadGlobalConfig.mockResolvedValue({
@@ -562,6 +581,94 @@ describe("JolliMemoryBridge", () => {
 		it("stores cwd and exposes it as a public property", () => {
 			const bridge = makeBridge();
 			expect(bridge.cwd).toBe(TEST_CWD);
+		});
+	});
+
+	// ── storage cutover heal (JOLLI-2231) ────────────────────────────────
+	//
+	// The extension host caches its storage backends for its whole lifetime. If
+	// the repo cuts over while a window is open, the caches must be dropped so the
+	// next read/write rebuilds against SQLite instead of the frozen orphan branch.
+	// getStatus() is the probe: it calls getStorage(), and swallows any rebuild
+	// error internally, so these tests can assert the heal TRIGGER (reloadStorage)
+	// without depending on the SQLite rebuild succeeding on a synthetic cwd.
+	describe("storage cutover heal", () => {
+		it("does not drop the storage caches while the repo is uncutover", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			await bridge.getStatus();
+			expect(reloadSpy).not.toHaveBeenCalled();
+		});
+
+		it("drops the storage caches once the repo has cut over", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			cutoverRouteHolder.current = { state: "cutover" };
+			await bridge.getStatus();
+			expect(reloadSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("drops the caches while the repo is fenced but not yet committed", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			cutoverRouteHolder.current = { state: "legacy-fenced" };
+			await bridge.getStatus();
+			expect(reloadSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("stops probing the route once the repo is seen cut over (one-way latch)", async () => {
+			const bridge = makeBridge();
+			cutoverRouteHolder.current = { state: "cutover" };
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			await bridge.getStatus();
+			await bridge.getStatus();
+			expect(reloadSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("leaves the caches in place when the DB is blocked (stale-but-working beats a throw)", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			cutoverRouteHolder.current = { state: "blocked", reason: "db down" };
+			await bridge.getStatus();
+			expect(reloadSpy).not.toHaveBeenCalled();
+		});
+
+		it("leaves the caches in place when the route probe fails (retries next time)", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			cutoverRouteHolder.throwErr = new Error("route probe boom");
+			await bridge.getStatus();
+			expect(reloadSpy).not.toHaveBeenCalled();
+		});
+
+		it("coalesces concurrent reads into a single route probe + reload", async () => {
+			const bridge = makeBridge();
+			cutoverRouteHolder.current = { state: "cutover" };
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			await Promise.all([bridge.getStatus(), bridge.getStatus()]);
+			expect(reloadSpy).toHaveBeenCalledTimes(1);
+		});
+
+		it("retries a store write once when it hits the frozen branch", async () => {
+			const bridge = makeBridge();
+			// The cached pre-cutover write throws frozen; healOnFrozen clears the
+			// back-off, re-probes, and retries once so the caller sees success. Route is
+			// left uncutover here so the retry's getStorage() succeeds in this synthetic
+			// env — the reload-on-cutover path itself is covered by the suite above.
+			storePlans
+				.mockRejectedValueOnce(new OrphanBranchFrozenError("orphan branch is frozen"))
+				.mockResolvedValueOnce(undefined);
+			await expect(bridge.storePlans([{ slug: "p", content: "x" }], "msg")).resolves.toBeUndefined();
+			expect(storePlans).toHaveBeenCalledTimes(2);
+		});
+
+		it("does not swallow a non-frozen write error (no heal, no retry)", async () => {
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			storePlans.mockRejectedValueOnce(new Error("disk full"));
+			await expect(bridge.storePlans([{ slug: "p", content: "x" }], "msg")).rejects.toThrow("disk full");
+			expect(storePlans).toHaveBeenCalledTimes(1);
+			expect(reloadSpy).not.toHaveBeenCalled();
 		});
 	});
 
@@ -4360,6 +4467,81 @@ describe("JolliMemoryBridge", () => {
 					"Tree hash aliases found — panel refresh recommended",
 				);
 			});
+		});
+
+		it("logs (does not throw) when the background scanTreeHashAliases fails with a non-frozen error", async () => {
+			mockExecFileSuccess("feature/test\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef: refExists
+			mockExecFileSuccess("headhash123\n"); // getHEADHash
+			mockExecFileSuccess("mergebase456\n"); // merge-base
+			mockExecFileSuccess("\n"); // resolveOwnCommitsBase → empty reflog
+			mockExecFileSuccess(
+				`commitHash1\x00fix: test\x00John\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`,
+			); // git log
+			mockExecFileSuccess("origin/feature/test\n"); // resolvePushBaseRef
+			mockExecFileSuccess("def\n"); // refExists for upstream
+			mockExecFileSuccess("\n"); // rev-list (unpushed)
+
+			getIndexEntryMap.mockResolvedValue(new Map()); // commitHash1 unmatched
+			scanTreeHashAliases.mockRejectedValue(new Error("disk full"));
+			getDiffStats.mockResolvedValueOnce({ filesChanged: 1, insertions: 1, deletions: 0 });
+
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			// The panel read itself must succeed even though its background alias write fails.
+			await expect(bridge.listBranchCommits("main")).resolves.toBeDefined();
+
+			await vi.waitFor(() => {
+				expect(warn).toHaveBeenCalledWith(
+					"commits",
+					"background tree-hash alias scan failed: %s",
+					expect.stringContaining("disk full"),
+				);
+			});
+			// A generic failure is logged, not treated as a cutover — no heal.
+			expect(reloadSpy).not.toHaveBeenCalled();
+		});
+
+		it("heals (does not log) when the background scanTreeHashAliases hits the frozen orphan branch", async () => {
+			mockExecFileSuccess("feature/test\n"); // getCurrentBranch
+			mockExecFileSuccess("abc\n"); // resolveHistoryBaseRef: refExists
+			mockExecFileSuccess("headhash123\n"); // getHEADHash
+			mockExecFileSuccess("mergebase456\n"); // merge-base
+			mockExecFileSuccess("\n"); // resolveOwnCommitsBase → empty reflog
+			mockExecFileSuccess(
+				`commitHash1\x00fix: test\x00John\x00john@example.com\x002025-03-15T10:00:00Z\x00\x00\n`,
+			); // git log
+			mockExecFileSuccess("origin/feature/test\n"); // resolvePushBaseRef
+			mockExecFileSuccess("def\n"); // refExists for upstream
+			mockExecFileSuccess("\n"); // rev-list (unpushed)
+
+			getIndexEntryMap.mockResolvedValue(new Map()); // commitHash1 unmatched
+			getDiffStats.mockResolvedValueOnce({ filesChanged: 1, insertions: 1, deletions: 0 });
+
+			// The panel read runs while the repo still looks uncutover (so its own
+			// getStorage() does not heal); the background write is what discovers the
+			// freeze. Flipping the route as the write fails models the cutover having
+			// landed inside the throttle window: the catch clears the back-off,
+			// re-probes (now cutover) and heals.
+			cutoverRouteHolder.current = { state: "uncutover" };
+			scanTreeHashAliases.mockImplementation(async () => {
+				cutoverRouteHolder.current = { state: "cutover" };
+				throw new OrphanBranchFrozenError("orphan branch is frozen");
+			});
+
+			const bridge = makeBridge();
+			const reloadSpy = vi.spyOn(bridge, "reloadStorage");
+			await expect(bridge.listBranchCommits("main")).resolves.toBeDefined();
+
+			// The frozen error triggers the heal (drops the caches), never the warn log.
+			await vi.waitFor(() => {
+				expect(reloadSpy).toHaveBeenCalledTimes(1);
+			});
+			expect(warn).not.toHaveBeenCalledWith(
+				"commits",
+				"background tree-hash alias scan failed: %s",
+				expect.anything(),
+			);
 		});
 
 		it("resolvePushBaseRef uses origin/<branch> fallback when upstream ref does not resolve", async () => {

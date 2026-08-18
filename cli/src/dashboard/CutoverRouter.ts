@@ -95,6 +95,26 @@ export type CutoverRoute =
 	| { readonly state: "cutover"; readonly record: CutoverRecord }
 	| { readonly state: "blocked"; readonly reason: string };
 
+/**
+ * True when this route has moved the system of record OFF the (freezable) orphan
+ * branch — i.e. a long-lived process holding a pre-cutover storage object must
+ * rebuild it against SQLite. Only a committed `cutover` or a pending
+ * `legacy-fenced` do so: `uncutover` keeps the orphan branch authoritative, and
+ * `blocked` means the database is unreachable, where rebuilding would only turn
+ * readable-but-stale reads into a hard throw.
+ *
+ * This is a PRODUCT rule (AGENTS.md: rules live in `cli/src`, hosts are adapters),
+ * so both the daemon's `ActiveStorageHeal` and the VS Code bridge route through
+ * it rather than each restating the state set — the two had drifted to opposite
+ * polarities of the same condition, which a fifth route state would silently
+ * break in whichever place forgot to update.
+ */
+export function routeMovesOffOrphanBranch(
+	route: CutoverRoute | null | undefined,
+): route is Extract<CutoverRoute, { state: "cutover" | "legacy-fenced" }> {
+	return route?.state === "cutover" || route?.state === "legacy-fenced";
+}
+
 /** What the database said, with "no row" and "cannot ask" kept distinct. */
 type DbAnswer =
 	| { readonly kind: "row"; readonly record: CutoverRecord }

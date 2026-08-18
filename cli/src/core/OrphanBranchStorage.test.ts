@@ -26,7 +26,7 @@ import {
 	readFileFromBranch,
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
-import { OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import { OrphanBranchFrozenError, OrphanBranchStorage } from "./OrphanBranchStorage.js";
 
 const mockedReadFile = vi.mocked(readFileFromBranch);
 const mockedBatchReadFiles = vi.mocked(batchReadFilesFromBranch);
@@ -147,8 +147,10 @@ describe("cutover fence at write time", () => {
 		fenceState.fence = { reason: "cutover", at: "t" };
 		try {
 			const storage = new OrphanBranchStorage("/repo");
-			await expect(storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m")).rejects.toThrow(
-				/frozen/,
+			// Typed, not a bare Error: the MCP dispatcher and the VS Code bridge both
+			// key their self-heal retry on `instanceof OrphanBranchFrozenError`.
+			await expect(storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m")).rejects.toBeInstanceOf(
+				OrphanBranchFrozenError,
 			);
 			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
 			expect(ensureOrphanBranch).not.toHaveBeenCalled();

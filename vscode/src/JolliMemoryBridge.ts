@@ -39,6 +39,8 @@ import {
 	savePluginSource,
 	saveSquashPending,
 } from "../../cli/src/core/SessionTracker.js";
+import { CutoverHealGate } from "../../cli/src/core/CutoverHealGate.js";
+import { OrphanBranchFrozenError } from "../../cli/src/core/OrphanBranchStorage.js";
 import { invalidateSotRouteCache } from "../../cli/src/core/SotStorageResolver.js";
 import { createStorage } from "../../cli/src/core/StorageFactory.js";
 import { recordMemoryEdit } from "../../cli/src/dashboard/ProducerHooks.js";
@@ -243,6 +245,25 @@ export class JolliMemoryBridge {
 	private readStoragePromise: Promise<StorageProvider> | null = null;
 
 	/**
+	 * One-way latch driving {@link ensureStorageMatchesCutover}: flips once the
+	 * repo is observed cut over, after which the shared {@link cutoverHealGate}
+	 * never re-probes (cutover never reverts). Held here rather than inside the
+	 * gate because this host's "already healed" fact is a plain boolean, unlike the
+	 * daemon's, which reads it off the process-global storage.
+	 */
+	private cutoverHealed = false;
+
+	/**
+	 * The shared cutover-heal state machine (throttle + in-flight coalescing +
+	 * one-way latch), wired to THIS host's apply step: drop the cached storage
+	 * promises so the next {@link getStorage} / {@link getReadStorage} rebuilds
+	 * against the current source of truth. The daemon wires the same gate to
+	 * `setActiveStorage` instead; see {@link CutoverHealGate}. Lazily built so it
+	 * can close over {@link cwd}, which the constructor sets.
+	 */
+	private cutoverHealGateInstance: CutoverHealGate | null = null;
+
+	/**
 	 * Short-lived cache for the {@link loadConfig} + {@link discoverRepos}
 	 * pair that {@link findRepoForAbsPath} hits per `.md` URI shown by the
 	 * file-decoration provider. Without this, VS Code's per-URI
@@ -291,7 +312,8 @@ export class JolliMemoryBridge {
 	}
 
 	/** Lazy-resolved write storage. See {@link storagePromise}. */
-	private getStorage(): Promise<StorageProvider> {
+	private async getStorage(): Promise<StorageProvider> {
+		await this.ensureStorageMatchesCutover();
 		if (!this.storagePromise) {
 			// Reset on rejection so the next caller gets a fresh attempt
 			// instead of awaiting the cached rejected promise forever.
@@ -304,7 +326,8 @@ export class JolliMemoryBridge {
 	}
 
 	/** Lazy-resolved read storage. See {@link readStoragePromise}. */
-	private getReadStorage(): Promise<StorageProvider> {
+	private async getReadStorage(): Promise<StorageProvider> {
+		await this.ensureStorageMatchesCutover();
 		if (!this.readStoragePromise) {
 			this.readStoragePromise = this.createReadStorage().catch((err) => {
 				this.readStoragePromise = null;
@@ -312,6 +335,90 @@ export class JolliMemoryBridge {
 			});
 		}
 		return this.readStoragePromise;
+	}
+
+	/**
+	 * Drops the storage caches when the repo cut over since they were built.
+	 *
+	 * The extension host is the product's longest-lived process, and it caches
+	 * BOTH storage backends ({@link storagePromise} / {@link readStoragePromise})
+	 * plus the system-of-record route memo for its whole lifetime. A cutover
+	 * committed by another surface (a CLI run, the dashboard auto-cutover) freezes
+	 * the orphan branch, but nothing here noticed: {@link reloadStorage} was wired
+	 * ONLY to the settings-save callback, so a window left open across a cutover
+	 * kept reading the now-frozen orphan branch (stale — silently missing every
+	 * memory written to SQLite since) and threw "orphan branch is frozen" on the
+	 * lazy catalog write behind a search/recall. That is JOLLI-2231's MCP-daemon
+	 * failure one surface over; this is its fix for this host.
+	 *
+	 * Mirrors the daemon's `ensureActiveStorageMatchesRoute`
+	 * ([ActiveStorageHeal.ts](../../cli/src/core/ActiveStorageHeal.ts)) — both wire
+	 * the shared {@link CutoverHealGate} (throttle + coalescing + one-way latch)
+	 * to their own apply step. The apply differs only because this host threads
+	 * storage explicitly rather than through `setActiveStorage`, so it drops the
+	 * caches (letting the next {@link getStorage} / {@link getReadStorage} rebuild
+	 * against SQLite) instead of swapping a process global. One-way, coalesced and
+	 * throttled: once the repo is seen cut over the latch makes every later call a
+	 * no-op, and while it is still uncutover the route probe (a read-only SQLite
+	 * open + fence read) runs at most once per window rather than on every call — a
+	 * method that awaits both {@link getReadStorage} and {@link getStorage} would
+	 * probe twice per operation otherwise.
+	 */
+	private ensureStorageMatchesCutover(): Promise<void> {
+		return this.cutoverHealGate().ensure();
+	}
+
+	/**
+	 * Lazily builds the {@link CutoverHealGate} for this bridge. Lazy so it can
+	 * close over {@link cwd} (set by the constructor) and so it is only allocated
+	 * for a bridge that actually performs a repo-scoped operation. The gate's
+	 * "already healed" fact is this host's {@link cutoverHealed} boolean, and its
+	 * apply step drops the caches; a route-probe failure or a `blocked` DB leaves
+	 * the caches in place (readable-but-stale beats a hard throw) and a later call
+	 * retries — all of which is the shared gate's contract, not restated here.
+	 */
+	private cutoverHealGate(): CutoverHealGate {
+		if (!this.cutoverHealGateInstance) {
+			this.cutoverHealGateInstance = new CutoverHealGate({
+				cwd: this.cwd,
+				isHealed: () => this.cutoverHealed,
+				applyHeal: () => {
+					this.cutoverHealed = true;
+					this.reloadStorage();
+				},
+			});
+		}
+		return this.cutoverHealGateInstance;
+	}
+
+	/**
+	 * Runs a storage-writing op, healing once if it hits the cutover fence.
+	 *
+	 * {@link ensureStorageMatchesCutover} is throttled, so a cutover that landed
+	 * INSIDE the current back-off window is invisible to it: `getStorage()` hands
+	 * back the cached pre-cutover `DualWriteStorage`, and its orphan primary throws
+	 * {@link OrphanBranchFrozenError} on the write. That throw is the proof the
+	 * window is stale — forget the back-off, re-probe (now unthrottled it latches
+	 * `cutoverHealed` and drops the caches), and retry the op once against the
+	 * SQLite-backed storage, so the caller never sees the frozen error. Only that
+	 * typed error retries; anything else propagates unchanged.
+	 *
+	 * Unlike the daemon, this host only reaches the fence on WRITE ops (its reads
+	 * are index + file reads that never trigger the lazy catalog writeback the MCP
+	 * search/recall path does). Every writer that reaches the orphan branch —
+	 * `store*`, `archivePlanForCommit` / `archiveNoteForCommit`, and the v1→v3
+	 * index migration — wraps itself here; a read that only touches the index +
+	 * files does not.
+	 */
+	private async healOnFrozen<T>(op: () => Promise<T>): Promise<T> {
+		try {
+			return await op();
+		} catch (err) {
+			if (!(err instanceof OrphanBranchFrozenError)) throw err;
+			this.cutoverHealGate().forgetBackOff();
+			await this.ensureStorageMatchesCutover();
+			return op();
+		}
 	}
 
 	private async createReadStorage(): Promise<StorageProvider> {
@@ -1223,14 +1330,34 @@ export class JolliMemoryBridge {
 				this.cwd,
 				writeStorage,
 				readStorage,
-			).then((anyFound) => {
-				if (anyFound) {
-					log.info(
+			)
+				.then((anyFound) => {
+					if (anyFound) {
+						log.info(
+							"commits",
+							"Tree hash aliases found — panel refresh recommended",
+						);
+					}
+				})
+				.catch((err) => {
+					// This is a fire-and-forget background WRITE (aliases dual-write via
+					// `writeStorage`), so its rejection has no caller to surface it — a
+					// bare `void` would leave it as an unhandled promise rejection. A
+					// cutover that froze the orphan branch is the expected failure: the
+					// alias write cannot land, so trigger the heal (subsequent ops rebuild
+					// against SQLite) and swallow — a best-effort cross-branch match is not
+					// worth failing the panel over. Anything else is logged, not thrown.
+					if (err instanceof OrphanBranchFrozenError) {
+						this.cutoverHealGate().forgetBackOff();
+						void this.ensureStorageMatchesCutover();
+						return;
+					}
+					log.warn(
 						"commits",
-						"Tree hash aliases found — panel refresh recommended",
+						"background tree-hash alias scan failed: %s",
+						String(err),
 					);
-				}
-			});
+				});
 		}
 
 		const cachedCount = commits.filter(
@@ -2532,15 +2659,17 @@ export class JolliMemoryBridge {
 			readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
 		},
 	): Promise<void> {
-		const storage = await this.getStorage();
-		const readStorage = await this.getReadStorage();
-		await storeSummary(summary, this.cwd, force, artifacts, storage, readStorage);
-		// The dashboard's `memories` rows are a projection of these files that
-		// only the post-commit worker refreshes; a webview edit (detach a
-		// conversation, remove a plan, delete a topic, regenerate) would otherwise
-		// keep serving the pre-edit memory on the local dashboard forever.
-		// Never throws — see `recordMemoryEdit`.
-		await recordMemoryEdit(this.cwd, [summary.commitHash]);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			const readStorage = await this.getReadStorage();
+			await storeSummary(summary, this.cwd, force, artifacts, storage, readStorage);
+			// The dashboard's `memories` rows are a projection of these files that
+			// only the post-commit worker refreshes; a webview edit (detach a
+			// conversation, remove a plan, delete a topic, regenerate) would otherwise
+			// keep serving the pre-edit memory on the local dashboard forever.
+			// Never throws — see `recordMemoryEdit`.
+			await recordMemoryEdit(this.cwd, [summary.commitHash]);
+		});
 	}
 
 	/**
@@ -2584,8 +2713,10 @@ export class JolliMemoryBridge {
 		commitMessage: string,
 		branch?: string,
 	): Promise<void> {
-		const storage = await this.getStorage();
-		await storePlans(planFiles, commitMessage, this.cwd, branch, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			await storePlans(planFiles, commitMessage, this.cwd, branch, storage);
+		});
 	}
 
 	/** Writes note files (orphan-branch + Memory Bank visible MD). */
@@ -2594,8 +2725,10 @@ export class JolliMemoryBridge {
 		commitMessage: string,
 		branch?: string,
 	): Promise<void> {
-		const storage = await this.getStorage();
-		await storeNotes(noteFiles, commitMessage, this.cwd, branch, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			await storeNotes(noteFiles, commitMessage, this.cwd, branch, storage);
+		});
 	}
 
 	/**
@@ -2613,14 +2746,16 @@ export class JolliMemoryBridge {
 		commitMessage: string,
 		branch?: string,
 	): Promise<void> {
-		const storage = await this.getStorage();
-		await storeReferences(
-			referenceFiles,
-			commitMessage,
-			this.cwd,
-			branch,
-			storage,
-		);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			await storeReferences(
+				referenceFiles,
+				commitMessage,
+				this.cwd,
+				branch,
+				storage,
+			);
+		});
 	}
 
 	/** Batched transcript write+delete. */
@@ -2631,8 +2766,10 @@ export class JolliMemoryBridge {
 		}>,
 		deletes: ReadonlyArray<string>,
 	): Promise<void> {
-		const storage = await this.getStorage();
-		await saveTranscriptsBatch(writes, deletes, this.cwd, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			await saveTranscriptsBatch(writes, deletes, this.cwd, storage);
+		});
 	}
 
 	/** Returns the set of commit hashes that have transcript files. */
@@ -2663,8 +2800,10 @@ export class JolliMemoryBridge {
 
 	/** Migrates a v1 index to v3 flat format. */
 	async migrateIndexToV3(): Promise<{ migrated: number; skipped: number }> {
-		const storage = await this.getStorage();
-		return migrateIndexToV3(this.cwd, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			return migrateIndexToV3(this.cwd, storage);
+		});
 	}
 
 	/** Archives a plan and associates it with a commit. */
@@ -2672,8 +2811,10 @@ export class JolliMemoryBridge {
 		slug: string,
 		commitHash: string,
 	): Promise<PlanReference | null> {
-		const storage = await this.getStorage();
-		return archivePlanForCommit(slug, commitHash, this.cwd, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			return archivePlanForCommit(slug, commitHash, this.cwd, storage);
+		});
 	}
 
 	/** Archives a note and associates it with a commit. */
@@ -2681,8 +2822,10 @@ export class JolliMemoryBridge {
 		id: string,
 		commitHash: string,
 	): Promise<NoteReference | null> {
-		const storage = await this.getStorage();
-		return archiveNoteForCommit(id, commitHash, this.cwd, storage);
+		return this.healOnFrozen(async () => {
+			const storage = await this.getStorage();
+			return archiveNoteForCommit(id, commitHash, this.cwd, storage);
+		});
 	}
 
 	// ── Git utility methods ───────────────────────────────────────────────
