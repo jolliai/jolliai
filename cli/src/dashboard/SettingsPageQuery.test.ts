@@ -74,6 +74,8 @@ describe("buildSettingsPageModel", () => {
 			expect(marked[0]?.id).toBe(localAgentToolDefaultModel(tool as LocalAgentToolId));
 		}
 		expect(m.others.dcoSignoff).toBe(false);
+		// Absent key reads as ON — the config contract is `syncSessions !== false`.
+		expect(m.sync.syncSessions).toBe(true);
 		expect(m.memoryBank.compileExcludeFolders).toBe("");
 		expect(m.memoryBank.syncTranscripts).toBe(false);
 		expect(m.memoryBank.state).toBeUndefined();
@@ -141,6 +143,12 @@ describe("buildSettingsPageModel", () => {
 		expect(m.memoryBank.syncPollIntervalSec).toBe(5400);
 		expect(m.others.excludePatterns).toBe("*.lock, dist/**");
 		expect(m.others.dcoSignoff).toBe(true);
+	});
+
+	it("reports session-statistics sync as off only when it is explicitly disabled", async () => {
+		const configDir = writeConfig({ syncSessions: false });
+		const m = await buildSettingsPageModel(configDir, undefined);
+		expect(m.sync.syncSessions).toBe(false);
 	});
 
 	it("ignores a malformed jolliUrl for the site label", async () => {

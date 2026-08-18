@@ -139,6 +139,45 @@ export interface ConversationTokenBreakdown {
  */
 export interface ParsedTurnUsage extends ConversationTokenBreakdown {
 	readonly dedupKey?: string;
+	/**
+	 * Transcript model id for THIS response, when the line carries it.
+	 *
+	 * Present so the reader can emit one {@link SessionUsageEvent} per response
+	 * without a second pass: a per-model split derived from whole-slice
+	 * aggregation cannot say WHEN each model was used, and "when" is the whole
+	 * point of the per-call record.
+	 */
+	readonly model?: string;
+}
+
+/**
+ * One counted model response: what it cost and **when it happened**.
+ *
+ * The unit every usage and billing system records, and the reason this shape
+ * exists: a session is a grouping, not a quantity. Storing one cumulative total
+ * per session with a single timestamp cannot answer "how many tokens did I use
+ * on the 1st" for any conversation that spans days — the whole session lands on
+ * whichever day it was last touched. Recording the call keeps the question
+ * answerable by a plain `GROUP BY`.
+ *
+ * `respondedAtMs` is the response's own instant, taken from the transcript line that
+ * carried it. Absent when the source's parser cannot date a line; such an event
+ * is dropped rather than dated by guesswork, because a wrong day is worse than a
+ * missing one here.
+ */
+export interface SessionUsageEvent extends ConversationTokenBreakdown {
+	readonly respondedAtMs: number;
+	/** Empty string when the transcript recorded usage without naming a model. */
+	readonly model: string;
+	/** The response's identity, when the source can name it. See {@link ParsedTurnUsage}. */
+	readonly dedupKey?: string;
+	/**
+	 * USD at the price table in force when this was recorded. Absent for an
+	 * unpriced model — absent rather than 0, because 0 reads as "free" in every
+	 * sum while the truth is "unknown". Filled by the collector, not the reader:
+	 * pricing is not the transcript's business.
+	 */
+	readonly estCostUsd?: number;
 }
 
 /** Billing provider for a conversation model — selects the pricing formula. */
@@ -241,6 +280,15 @@ export interface TranscriptReadResult {
 	 *  Powers the USD cost estimate. Absent for sources whose parser exposes no
 	 *  usage; the summed segments equal {@link usageBreakdown}. */
 	readonly usageByModel?: ReadonlyArray<ModelTokenUsage>;
+	/** One entry per counted response, each carrying its own instant — the record
+	 *  a per-day figure can actually be built from (see {@link SessionUsageEvent}).
+	 *  {@link usageByModel} is the same numbers with the time thrown away, kept
+	 *  because the summary stores the aggregate. Present-but-empty (never
+	 *  omitted) for a source whose parser can report usage at all, so a re-read
+	 *  that sees nothing datable can clear rows a better read left behind;
+	 *  absent only for sources whose parser exposes no usage. Entries the parser
+	 *  cannot date are omitted. */
+	readonly usageEvents?: ReadonlyArray<SessionUsageEvent>;
 	/** Tool calls over the slice, one bucket per distinct tool. ABSENT means the
 	 *  source's transcripts carry no tool records this runtime can read — see
 	 *  `TOOL_RECORDING_SOURCES` for which sources those are and why the list is
@@ -1860,6 +1908,23 @@ export interface JolliMemoryConfig {
 	 * path, no duplicates.
 	 */
 	readonly syncOnPush?: boolean;
+	/**
+	 * Whether SESSION STATISTICS are synced to the server. `undefined` = on.
+	 *
+	 * ⚠ Its own switch on purpose, and the reason is the largest privacy change
+	 * this product has made. Until this channel, data left a machine only for a
+	 * repo the user had explicitly bound to a Space. Session statistics go up for
+	 * EVERY repo on the machine — private projects, client work, repos the user
+	 * never intended to connect to anything — because the API key alone says where
+	 * they belong. Sessions carry a `title`, which several agents populate with the
+	 * user's own first message, and tool names include MCP server names.
+	 *
+	 * Do NOT fold this into {@link syncOnPush} or a per-repo push toggle. Those
+	 * mean "push this repo's memories", and the decision here is precisely that
+	 * statistics do not follow that rule — sharing the switch would make the
+	 * setting lie about what it controls.
+	 */
+	readonly syncSessions?: boolean;
 	/**
 	 * Whether to **auto-sync** Memory Bank to the user's private Personal
 	 * Space vault on a recurring schedule. Plan §0.7 made manual sync the

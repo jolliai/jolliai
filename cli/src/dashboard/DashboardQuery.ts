@@ -69,8 +69,18 @@ import {
 	splitDecisionBullets,
 	stripPluginPrefixSql,
 } from "./DashboardScopeUtil.js";
+import {
+	addLocalDays,
+	dayKeyToMidnight,
+	localDayKey,
+	localHour,
+	machineTimeZone,
+	startOfLocalDay,
+} from "./LocalDays.js";
 import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
 import { volumeReachable } from "./RepoForget.js";
+import { type DayPlan, planDays, readRollupSeries, TOKENS_KIND } from "./StatsRollup.js";
+import { MEMORY_LANDING_CTE, readAxisRows, readDatedUsage } from "./StatsSeries.js";
 import { WORKTREE_STATUS_MAX_AGE_MS } from "./StatsWriter.js";
 
 const log = createLogger("DashboardQuery");
@@ -110,131 +120,10 @@ const DEFAULT_RANGE: PresetRange = "month";
  */
 const MAX_CUSTOM_DAYS = 366;
 
-/** Shape of a local calendar day key, `YYYY-MM-DD`. */
-const DAY_KEY_RE = /^\d{4}-\d{2}-\d{2}$/;
 /** A session updated within this window renders as "live". */
 const LIVE_WINDOW_MS = 10 * 60 * 1000;
 /** Local hour at or after which a session counts as night-owl work. */
 const NIGHT_OWL_HOUR = 21;
-
-// ── Time-zone engine ────────────────────────────────────────────────────────
-
-/** The machine's IANA zone — the default for every query. */
-export function machineTimeZone(): string {
-	return Intl.DateTimeFormat().resolvedOptions().timeZone;
-}
-
-interface ZonedParts {
-	readonly year: number;
-	readonly month: number;
-	readonly day: number;
-	readonly hour: number;
-	readonly minute: number;
-}
-
-const partsFormatterCache = new Map<string, Intl.DateTimeFormat>();
-
-function partsFormatter(timeZone: string): Intl.DateTimeFormat {
-	let formatter = partsFormatterCache.get(timeZone);
-	if (!formatter) {
-		formatter = new Intl.DateTimeFormat("en-CA", {
-			timeZone,
-			year: "numeric",
-			month: "2-digit",
-			day: "2-digit",
-			hour: "2-digit",
-			minute: "2-digit",
-			hourCycle: "h23",
-		});
-		partsFormatterCache.set(timeZone, formatter);
-	}
-	return formatter;
-}
-
-/** Wall-clock components of `ms` in `timeZone`. */
-function zonedParts(ms: number, timeZone: string): ZonedParts {
-	const parts = partsFormatter(timeZone).formatToParts(ms);
-	const get = (type: string) => Number.parseInt(parts.find((p) => p.type === type)?.value ?? "0", 10);
-	return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
-}
-
-/** Local calendar day of `ms` as `YYYY-MM-DD`. */
-export function localDayKey(ms: number, timeZone: string): string {
-	const p = zonedParts(ms, timeZone);
-	return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
-}
-
-/** Local hour (0–23) of `ms`. */
-export function localHour(ms: number, timeZone: string): number {
-	return zonedParts(ms, timeZone).hour;
-}
-
-/**
- * Epoch-ms of local midnight at the start of the day containing `ms`.
- *
- * `Intl` can only map epoch → wall clock; this inverts it by guessing the UTC
- * value of the wall-clock midnight and correcting by the observed error. Two
- * iterations settle every real zone including DST transitions: the first
- * correction lands within the zone's offset step, the second removes any
- * residue from a transition between guess and target. (On a "spring forward"
- * day where 00:00 does not exist, this lands on the earliest existing instant
- * of the day — exactly what a day boundary should be.)
- */
-function localMidnight(year: number, month: number, day: number, timeZone: string): number {
-	let guess = Date.UTC(year, month - 1, day);
-	for (let i = 0; i < 3; i++) {
-		const seen = zonedParts(guess, timeZone);
-		const error =
-			Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute) - Date.UTC(year, month - 1, day);
-		if (error === 0) break;
-		guess -= error;
-	}
-	return guess;
-}
-
-export function startOfLocalDay(ms: number, timeZone: string): number {
-	const target = zonedParts(ms, timeZone);
-	return localMidnight(target.year, target.month, target.day, timeZone);
-}
-
-/**
- * Epoch-ms of local midnight starting the day `key` (`YYYY-MM-DD`) names, or
- * `undefined` when `key` is not a real local day.
- *
- * The round-trip check is the validation: `Date.UTC` happily normalises
- * 2026-02-31 into March 3rd, so a request for a day that does not exist would
- * otherwise silently return data for a different one. Comparing the resolved
- * instant's own day key against the input rejects exactly that case — and
- * costs nothing on the overwhelmingly common valid input.
- */
-function dayKeyToMidnight(key: string, timeZone: string): number | undefined {
-	if (!DAY_KEY_RE.test(key)) return undefined;
-	const ms = localMidnight(
-		Number.parseInt(key.slice(0, 4), 10),
-		Number.parseInt(key.slice(5, 7), 10),
-		Number.parseInt(key.slice(8, 10), 10),
-		timeZone,
-	);
-	return localDayKey(ms, timeZone) === key ? ms : undefined;
-}
-
-/**
- * Start of the local day `n` days after the day containing `ms`. Steps through
- * midday rather than adding exact 24 h multiples, so 23- and 25-hour DST days
- * cannot skip or repeat a day.
- */
-export function addLocalDays(ms: number, days: number, timeZone: string): number {
-	let cursor = startOfLocalDay(ms, timeZone);
-	const step = days >= 0 ? 1 : -1;
-	for (let i = 0; i !== days; i += step) {
-		// ±24 h from midnight, then +12 h INTO the target day: lands mid-day in
-		// the neighbouring day whether it is 23, 24 or 25 hours long, and
-		// startOfLocalDay snaps back to its midnight. (A ±36 h jump would
-		// overshoot a whole day when stepping backwards.)
-		cursor = startOfLocalDay(cursor + step * 86_400_000 + 43_200_000, timeZone);
-	}
-	return cursor;
-}
 
 // ── Range resolution ────────────────────────────────────────────────────────
 
@@ -573,115 +462,6 @@ const TOPIC_INSIGHTS_CTE = `WITH topic_insights AS (
 	   AND TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> ''
 )`;
 
-/**
- * Where a memory LANDED: the commit its work sits on today, and that commit's
- * committer date.
- *
- * **One of TWO spellings of that rule.** This one is for callers that need the
- * landing as DATA — the `category` axis windows on `at_ms`, and
- * {@link buildMemoryCards} needs both `at_ms` and `live_hash`. Callers that only
- * need to know which memory belongs to a commit they already have use
- * {@link MEMORY_FOR_COMMIT} instead, and the choice between them is a measured
- * performance fact, not a style preference — see that constant's note.
- *
- * The three queries here join it on `commit_hash`, a REAL column, which is what
- * keeps it cheap (38 ms against the pre-alias query's 43 ms on a 165 MB
- * database). `live_hash` is a COALESCE and therefore unindexable: joining on
- * THAT is what cost 3,146 ms.
- *
- * A hash rewritten after it was summarized leaves the memory filed under the
- * PRE-rewrite hash while `commits` moves on to the new one, so `m.commit_hash`
- * alone answers neither question. `commit_aliases` maps the surviving hash back
- * (`old_hash` -> the memory's `target_hash`), which is the direction
- * {@link commitsInRange} and {@link buildDecisionsCard} enter from; this CTE
- * walks it BACKWARDS, from the memory to whichever live commit points at it.
- *
- * Two consequences that are the whole reason it exists:
- *
- * - **`live_hash` is what a reachability check has to be asked about.** The
- *   memory's own hash was rewritten away, so `isReachable` answers `false` for
- *   it forever — dropping a memory from the feed that `memoriesCreated`, which
- *   enters from the live commit, has just counted.
- * - **`at_ms` is the LANDED committer date.** The old fallback went straight to
- *   `m.commit_date_ms`, which is `CommitSummary.commitDate` — an AUTHOR date
- *   (`%aI`), while every window in this file is a committer-date window. For a
- *   rebase or a cherry-pick those are different days, and for a rewritten
- *   commit the fallback was not an edge case but the permanent state: no
- *   `commits` row will ever carry the memory's own hash again. `commit_date_ms`
- *   survives as the third choice, for a memory whose commit this database has
- *   not collected at all.
- *
- * **The alias sub-select is grouped, and the JOIN onto `commits` is what keeps
- * that honest.** A memory rewritten more than once collects an alias row per
- * rewrite, and `live_hash`/`at_ms` have to come from ONE of them — but only
- * aliases whose commit still EXISTS survive that join, and
- * `pruneUnreachableCommits` deletes every superseded link in the chain, so the
- * group is normally a single row. `MAX(c.committed_at_ms)` picks the newest for
- * the window before it converges, and `c.hash` rides along as a bare column,
- * which SQLite documents as coming from that same max row. Two live commits
- * aliasing one memory at the identical millisecond is the only case that would
- * make the pair ambiguous, and it resolves to a real commit either way.
- *
- * **`cm` wins over `al` when both resolve.** A tree-hash alias is not proof the
- * memory moved: cherry-picking a commit onto two branches gives it aliases while
- * its own commit is still very much alive, and that memory belongs to its own
- * commit. So the alias is consulted only when nothing carries the memory's own
- * hash — the same order as `getSummary`'s direct-then-alias lookup.
- *
- * `parent_hash IS NULL` for the same reason every caller states it: `memories`
- * holds one row per GENERATION.
- */
-const MEMORY_LANDING_CTE = `WITH memory_landing AS (
-	SELECT m.repo_id, m.commit_hash,
-	       COALESCE(cm.hash, al.live_hash, m.commit_hash) AS live_hash,
-	       COALESCE(cm.committed_at_ms, al.at_ms, m.commit_date_ms) AS at_ms
-	  FROM memories m
-	  LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
-	  LEFT JOIN (
-	      SELECT a.repo_id, a.target_hash, c.hash AS live_hash, MAX(c.committed_at_ms) AS at_ms
-	        FROM commit_aliases a
-	        JOIN commits c ON c.repo_id = a.repo_id AND c.hash = a.old_hash
-	       GROUP BY a.repo_id, a.target_hash
-	  ) al ON al.repo_id = m.repo_id AND al.target_hash = m.commit_hash
-	 WHERE m.parent_hash IS NULL
-)`;
-
-/**
- * The same landing rule as {@link MEMORY_LANDING_CTE}, read from the COMMIT end:
- * "which memory belongs to this commit". Joins as
- * `JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})`, with the
- * commit aliased `c`.
- *
- * **Two spellings of one rule is a deliberate, measured exception**, so the
- * numbers matter. The CTE exposes `live_hash` as a COALESCE — a computed column,
- * which SQLite cannot index — so an axis that enters from `commits` and joins
- * `ml.live_hash = c.hash` re-scans the whole materialised CTE per commit. On the
- * author's 165 MB database (1,123 memories / 2,434 commits / 87 aliases), the
- * branch axis measured:
- *
- * - joining the CTE on `live_hash`: **3,146 ms** (`MATERIALIZED` hint: 94 ms)
- * - this predicate: **1.1 ms**, against 0.9 ms for the pre-alias query it replaces
- *
- * `buildSeries` runs twice per render (the window and its predecessor), so the
- * CTE spelling was a ~6 s page. The axes that keep the CTE — `category` and
- * `buildMemoryCards` — join it on `commit_hash`, a REAL column, and measured
- * 38 ms against the old query's 43 ms.
- *
- * **`NOT EXISTS` is what makes this safe, and it is the `cm`-beats-`al`
- * precedence written from the other side.** Without it the alias branch fires
- * while the memory's own commit row is still present, so the pre-rewrite commit
- * matches the memory directly AND the live one matches it through the alias —
- * measured 2x on a synthetic prune-window fixture. With it, exactly one commit
- * claims each memory in every state: the memory's own row while it survives, the
- * aliasing commit once `pruneUnreachableCommits` has removed it. All four
- * variants were verified to return byte-identical rows on the real database.
- */
-const MEMORY_FOR_COMMIT = `m.commit_hash = c.hash
-	     OR (m.commit_hash = (SELECT a.target_hash FROM commit_aliases a
-	                           WHERE a.repo_id = c.repo_id AND a.old_hash = c.hash)
-	         AND NOT EXISTS (SELECT 1 FROM commits c2
-	                          WHERE c2.repo_id = c.repo_id AND c2.hash = m.commit_hash))`;
-
 const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_tokens + row.cached_tokens;
 
 // ── Stats page ──────────────────────────────────────────────────────────────
@@ -710,187 +490,124 @@ interface SeriesResult {
 }
 
 /**
- * The 14-day series along one dimension. `model`/`agent` read session usage;
- * `branch`/`ticket` read the memory-enriched commit columns (and silently fall
- * back to `model` below the memory tier, so a stale URL cannot render an empty
- * chart pretending to be data).
+ * The token card's segments, placed on the day each response happened.
  *
- * **Every memory-driven axis filters `m.parent_hash IS NULL`.** `memories` holds
- * one row per GENERATION, not per memory: amending or squashing a commit leaves
- * its predecessor behind as a child row carrying the same cost, so an unfiltered
- * SUM bills one piece of work once per rewrite. `parent_hash IS NULL` is the
- * repo-wide spelling of "current generation" (`MemoriesQuery.ts`,
- * {@link TOPIC_INSIGHTS_CTE} above, `buildMemoryCards` below) — never "has no
- * children", which is a different set.
+ * Reads the same two sources the spend axes do, through the same plan: settled
+ * days come out of the rollup's `tokens` kind, the rest out of
+ * {@link readDatedUsage}. Keeping the two halves on one plan is what makes the
+ * card's total equal the sum of its own bars — the failure this replaces put a
+ * three-day conversation's whole token count on the day it ended.
+ */
+function readTokenTotals(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	timeZone: string,
+	plan: DayPlan,
+): TokenBreakdown {
+	const perDay = new Map<string, { input: number; output: number; cached: number }>();
+	for (const day of plan.dayKeys) perDay.set(day, { input: 0, output: 0, cached: 0 });
+
+	for (const row of readRollupSeries(db, timeZone, TOKENS_KIND, plan.cached, scope)) {
+		const cell = perDay.get(row.day);
+		if (!cell) continue;
+		if (row.series_key === "input") cell.input += row.value;
+		else if (row.series_key === "output") cell.output += row.value;
+		else if (row.series_key === "cached") cell.cached += row.value;
+	}
+	if (plan.live.size > 0) {
+		for (const row of readDatedUsage(db, scope, plan.liveFromMs, plan.liveToMs)) {
+			const day = localDayKey(row.bucket_at_ms, timeZone);
+			if (!plan.live.has(day)) continue;
+			const cell = perDay.get(day);
+			if (!cell) continue;
+			cell.input += row.input;
+			cell.output += row.output;
+			cell.cached += row.cached;
+		}
+	}
+
+	let input = 0;
+	let output = 0;
+	let cached = 0;
+	for (const cell of perDay.values()) {
+		input += cell.input;
+		output += cell.output;
+		cached += cell.cached;
+	}
+	// Rounded at emission rather than per row, for the reason `buildSeries`
+	// records: a cached day sums pre-aggregated subtotals while a live day sums
+	// raw rows, and the apportioning axes make both fractional.
+	return {
+		input: Math.round(input),
+		output: Math.round(output),
+		cached: Math.round(cached),
+		perDay: [...perDay.entries()].map(([date, v]) => ({
+			date,
+			input: Math.round(v.input),
+			output: Math.round(v.output),
+			cached: Math.round(v.cached),
+		})),
+	};
+}
+
+/**
+ * One dimension's per-day series over the window `plan` was cut for.
  *
- * The INNER JOIN on `commits` is NOT a substitute, though it looks like one: it
- * drops only predecessors whose commit row is gone, and `commits` deliberately
- * retains unreachable rows (see the `isReachable` filter on `memoriesCreated`).
- * Measured on a real database before this filter existed: the ticket axis read
- * $150.97 against a true $92.93 (1.6x) and the LEFT-JOINed category axis read
- * $3,490.47 against $366.03 (9.5x).
+ * The window arrives as the PLAN and not as a `fromMs`/`toMs` pair: `plan.dayKeys`
+ * is already every local day in it, produced by the same walk this used to repeat
+ * — and repeating it meant two ways of deciding which days a chart has, one of
+ * which could disagree with the cache's own split.
  *
- * **And every memory-driven axis resolves a rewritten commit, by one of the two
- * spellings of the landing rule.** `category` windows on the landing DATE, so it
- * carries {@link MEMORY_LANDING_CTE}; `branch` and `ticket` only need the memory
- * that belongs to a commit they already have in hand, so they enter from
- * `commits` with {@link MEMORY_FOR_COMMIT}. That split is a measured performance
- * fact — the CTE spelling made the branch axis a 3,146 ms query — and NOT an
- * invitation to unify them the other way.
- *
- * What neither spelling may become is the naive repair. Joining plain
- * `m.commit_hash = c.hash` drops a rewritten commit's memory outright (its hash
- * moved, the memory's did not) — that is the bug this PR fixes, where `branch`
- * and `ticket` lost spend that Memory Activity and Decisions, both of which walk
- * the alias, went on counting. But adding a bare `OR c.hash = al.target_hash`
- * trades the hole for a double count: until `pruneUnreachableCommits` sweeps,
- * the pre-rewrite commit row is still there and matches the memory directly
- * while the live one matches it through the alias, so one piece of work bills
- * twice (measured 2x). `MEMORY_FOR_COMMIT`'s `NOT EXISTS` is precisely what
- * closes that, and it is why the predicate is longer than it looks like it
- * needs to be.
+ * See {@link ./StatsSeries.ts} for the axis SQL itself and the rules it encodes
+ * (`m.parent_hash IS NULL`, and the two spellings of the rewritten-commit landing
+ * rule); the numbers here are that reader's rows, bucketed.
  */
 function buildSeries(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	dimension: SeriesDimension,
 	tier: AdoptionTier,
-	fromMs: number,
-	toMs: number,
 	timeZone: string,
+	plan: DayPlan,
 ): SeriesResult {
 	// Memory-only axes fall back to `model` below the memory tier, so a stale URL
 	// renders real data instead of an empty chart pretending to be one.
+	//
+	// The fallback is resolved HERE and never reaches the cache: it is a display
+	// decision, and a repo that crosses the tier later must not find its stored
+	// `branch` days holding model data.
 	const memoryOnly = dimension === "branch" || dimension === "ticket" || dimension === "category";
 	const effective: SeriesDimension = memoryOnly && tier === "installed" ? "model" : dimension;
 
-	interface UsageRow {
-		readonly at_ms: number;
-		readonly key: string;
-		readonly tokens: number;
-		readonly cost: number;
-	}
-	let rows: ReadonlyArray<UsageRow>;
-	if (effective === "model") {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
-		rows = db
-			.prepare(
-				`SELECT s.updated_at_ms AS at_ms, u.model AS key,
-				        u.input_tokens + u.output_tokens + u.cached_tokens AS tokens,
-				        COALESCE(u.est_cost_usd, 0) AS cost
-				   FROM session_model_usage u JOIN sessions s ON s.event_id = u.session_event_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "agent") {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "repo_id");
-		rows = db
-			.prepare(
-				`SELECT updated_at_ms AS at_ms, source AS key,
-				        input_tokens + output_tokens + cached_tokens AS tokens,
-				        COALESCE(est_cost_usd, 0) AS cost
-				   FROM sessions WHERE updated_at_ms >= ? AND updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "project") {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
-		rows = db
-			.prepare(
-				`SELECT s.updated_at_ms AS at_ms, r.repo_name AS key,
-				        s.input_tokens + s.output_tokens + s.cached_tokens AS tokens,
-				        COALESCE(s.est_cost_usd, 0) AS cost
-				   FROM sessions s JOIN repos r ON r.id = s.repo_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "category") {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "m.repo_id");
-		// One row per TOPIC, with the commit's tokens shared across its topics —
-		// category belongs to a topic, and the old per-commit mode erased every
-		// category that never won a commit's vote (security and docs vanished
-		// entirely on this repo's data). Sharing keeps the axis summing to the
-		// real total, the property the mode existed to protect; the cost
-		// figures are apportioned by design, not exact per-topic spend.
-		// The LEFT JOIN keeps memories with no topics on the axis: their window
-		// COUNT(*) is 1 and their whole spend lands in '(uncategorised)'.
-		//
-		// `parent_hash IS NULL` — see the note above `buildSeries`. This axis is
-		// where the double-count was worst (measured 9.5x) precisely because the
-		// LEFT JOIN keeps predecessors whose commit row is gone.
-		rows = db
-			.prepare(
-				`${MEMORY_LANDING_CTE}
-				 SELECT ml.at_ms AS at_ms,
-				        COALESCE(t.category, '(uncategorised)') AS key,
-				        COALESCE(m.tokens, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS tokens,
-				        COALESCE(m.est_cost_usd, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY m.repo_id, m.commit_hash) AS cost
-				   FROM memories m
-				   JOIN memory_landing ml ON ml.repo_id = m.repo_id AND ml.commit_hash = m.commit_hash
-				   LEFT JOIN memory_topics t ON t.repo_id = m.repo_id AND t.commit_hash = m.commit_hash
-				  WHERE m.tokens IS NOT NULL
-				    AND m.parent_hash IS NULL
-				    AND ml.at_ms >= ? AND ml.at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else if (effective === "branch") {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
-		// `commit_branches` now holds ONE row per commit — the branch it was
-		// committed on — so this axis answers "what did the work on this branch
-		// cost", which is the per-PR question, and a commit counts once.
-		//
-		// **The apportioning division is kept deliberately even though the divisor
-		// is 1 for anything this build wrote.** It is the transition safeguard: a
-		// database written by an older client still holds that client's per-branch
-		// `git rev-list` UNION (every commit on `main` also listed under every
-		// feature branch based off it) until the first sweep re-projects each commit.
-		// Unapportioned against those rows, one 10k-token commit on a repo with five
-		// such branches would add 60k tokens — and 6x the cost — to the day. Dividing
-		// keeps the reading sane until the rows converge, then costs nothing.
-		// Removing it would make THIS build the one that reads a mid-transition
-		// database wrong while an older client read it correctly.
-		rows = db
-			.prepare(
-				`SELECT c.committed_at_ms AS at_ms, br.name AS key,
-				        COALESCE(m.tokens, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS tokens,
-				        COALESCE(m.est_cost_usd, 0) * 1.0
-				          / COUNT(*) OVER (PARTITION BY c.repo_id, c.hash) AS cost
-				   FROM commits c
-				   JOIN commit_branches b ON b.commit_id = c.id
-				   JOIN branches br ON br.id = b.branch_id
-				   JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})
-				  WHERE m.tokens IS NOT NULL AND m.parent_hash IS NULL
-				    AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	} else {
-		const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
-		rows = db
-			.prepare(
-				`SELECT c.committed_at_ms AS at_ms, COALESCE(m.ticket_id, '(no ticket)') AS key,
-				        COALESCE(m.tokens, 0) AS tokens, COALESCE(m.est_cost_usd, 0) AS cost
-				   FROM commits c
-				   JOIN memories m ON m.repo_id = c.repo_id AND (${MEMORY_FOR_COMMIT})
-				  WHERE m.tokens IS NOT NULL AND m.parent_hash IS NULL
-				    AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}`,
-			)
-			.all(fromMs, toMs, ...filter.params) as UsageRow[];
-	}
-
 	const seriesByDay = new Map<string, { tokens: number; cost: number; bySeries: Map<string, number> }>();
-	for (let dayStart = fromMs; dayStart < toMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		seriesByDay.set(localDayKey(dayStart, timeZone), { tokens: 0, cost: 0, bySeries: new Map() });
-	}
+	for (const day of plan.dayKeys) seriesByDay.set(day, { tokens: 0, cost: 0, bySeries: new Map() });
 	const seriesKeys = new Set<string>();
-	for (const row of rows) {
-		const bucket = seriesByDay.get(localDayKey(row.at_ms, timeZone));
-		if (!bucket) continue;
-		bucket.tokens += row.tokens;
-		bucket.cost += row.cost;
-		bucket.bySeries.set(row.key, (bucket.bySeries.get(row.key) ?? 0) + row.tokens);
-		seriesKeys.add(row.key);
+	const add = (day: string, key: string, tokens: number, cost: number) => {
+		const bucket = seriesByDay.get(day);
+		if (!bucket) return;
+		bucket.tokens += tokens;
+		bucket.cost += cost;
+		bucket.bySeries.set(key, (bucket.bySeries.get(key) ?? 0) + tokens);
+		seriesKeys.add(key);
+	};
+
+	// Settled days come out of the cache; the rest are computed. The two sets are
+	// disjoint by construction, and the live pass filters on day MEMBERSHIP rather
+	// than on the range — see DayPlan for why the range alone is not enough.
+	//
+	// Both halves ultimately read `readAxisRows`: the cache was built through it,
+	// and the live pass calls it directly. That is not a tidiness rule — the
+	// `category` and `branch` axes divide by a window `COUNT(*)`, so a second
+	// query with a differently-shaped join would make a cached day and a live day
+	// disagree by an apportioning fraction that nothing would ever flag.
+	for (const row of readRollupSeries(db, timeZone, effective, plan.cached, scope)) {
+		add(row.day, row.series_key, row.value, row.cost_usd);
+	}
+	if (plan.live.size > 0) {
+		for (const row of readAxisRows(db, scope, effective, plan.liveFromMs, plan.liveToMs)) {
+			const day = localDayKey(row.bucket_at_ms, timeZone);
+			if (plan.live.has(day)) add(day, row.key, row.tokens, row.cost);
+		}
 	}
 	return {
 		series: [...seriesByDay.entries()].map(([date, b]) => ({
@@ -901,7 +618,17 @@ function buildSeries(
 			// day's error under half a token.
 			tokens: Math.round(b.tokens),
 			estCostUsd: b.cost,
-			bySeries: Object.fromEntries([...b.bySeries.entries()].map(([k, v]) => [k, Math.round(v)])),
+			// Sorted, because insertion order is not the same on both halves of a
+			// plan: the cache returns a day's series ordered by `series_key`, while a
+			// live day arrives in whatever order the axis query emits. Object key
+			// order survives `JSON.stringify` all the way to the browser, so without
+			// this a day's legend would silently reorder itself the moment that day
+			// settled — same numbers, visibly different chart.
+			bySeries: Object.fromEntries(
+				[...b.bySeries.entries()]
+					.sort(([a], [c]) => (a < c ? -1 : a > c ? 1 : 0))
+					.map(([k, v]) => [k, Math.round(v)]),
+			),
 		})),
 		seriesKeys: [...seriesKeys].sort(),
 		seriesDimension: effective,
@@ -1105,32 +832,31 @@ function buildStats(
 		? windowSessions.filter((s) => inWindow(s.updated_at_ms))
 		: sessionsInRange(db, scope, window.startMs, window.endMs);
 
-	const rangeCached = rangeSessions.reduce((sum, s) => sum + s.cached_tokens, 0);
+	// The plan splits the window into days already settled in the rollup cache and
+	// days that still have to be computed. Resolved per window, because a plan is
+	// only valid for the range it was cut for — the prior window below cuts its
+	// own.
+	const plan = planDays(db, timeZone, window.startMs, window.endMs, nowMs);
 
 	// "Tokens" — input/output/cache over the range, day-bucketed for the card's
-	// chart. Reuses `rangeSessions`, already swept above, rather than a second
-	// query.
-	const perDayTokens = new Map<string, { input: number; output: number; cached: number }>();
-	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		perDayTokens.set(localDayKey(dayStart, timeZone), { input: 0, output: 0, cached: 0 });
-	}
-	for (const s of rangeSessions) {
-		const cell = perDayTokens.get(localDayKey(s.updated_at_ms, timeZone));
-		if (cell) {
-			cell.input += s.input_tokens;
-			cell.output += s.output_tokens;
-			cell.cached += s.cached_tokens;
-		}
-	}
-	const tokenBreakdown: TokenBreakdown = {
-		input: rangeSessions.reduce((sum, s) => sum + s.input_tokens, 0),
-		output: rangeSessions.reduce((sum, s) => sum + s.output_tokens, 0),
-		cached: rangeCached,
-		perDay: [...perDayTokens.entries()].map(([date, v]) => ({ date, ...v })),
-	};
+	// chart, placed on the day each response actually happened.
+	//
+	// NOT from `rangeSessions`, and that is a different answer rather than a
+	// cheaper one: a session carries one cumulative total under a single
+	// timestamp, so a conversation spanning three days put all of its tokens on
+	// the last one. `rangeSessions` still answers everything that is genuinely
+	// about sessions — how many there were, when the machine was last active —
+	// and nothing about how much they spent.
+	//
+	// One consequence worth stating: a usage line the parser cannot date is
+	// counted in the session's own totals but dropped from the events (see
+	// `readTranscript`), so these figures can sit a hair BELOW the session-level
+	// ones. That is the right side to err on for a per-DAY card — an undatable
+	// token has no day to be shown on.
+	const tokenBreakdown = readTokenTotals(db, scope, timeZone, plan);
 
 	// Cost/token series along the requested dimension, over the range.
-	const seriesResult = buildSeries(db, scope, dimension, tier, window.startMs, window.endMs, timeZone);
+	const seriesResult = buildSeries(db, scope, dimension, tier, timeZone, plan);
 
 	// Cost vs the immediately preceding window of equal length — the Spend card's
 	// own self-trend, and BOTH ends are the same series the card draws.
@@ -1143,7 +869,8 @@ function buildStats(
 	// disagree — the series reads `session_model_usage`, not `sessions`. A
 	// self-trend is only worth printing if it trends the number it sits next to.
 	const priorRangeFrom = window.startMs - (window.endMs - window.startMs);
-	const priorSeries = buildSeries(db, scope, dimension, tier, priorRangeFrom, window.startMs, timeZone);
+	const priorPlan = planDays(db, timeZone, priorRangeFrom, window.startMs, nowMs);
+	const priorSeries = buildSeries(db, scope, dimension, tier, timeZone, priorPlan);
 	const priorDrawn = drawnCost(priorSeries);
 	const costTrendPct =
 		priorDrawn > 0 ? Math.round(((drawnCost(seriesResult) - priorDrawn) / priorDrawn) * 100) : undefined;

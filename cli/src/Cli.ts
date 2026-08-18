@@ -29,10 +29,16 @@ const MCP_DAEMON_COMMAND = "mcp-serve";
 
 /**
  * The hidden machine-global daemon subcommand, restated for the same reason:
- * `GlobalDaemon.ts` owns the canonical constant, but it also pulls in the
- * daemon's full dependency graph (storage, the scheduler, the backup task),
- * which is exactly what this file's static import list must stay leaf-only to
- * avoid — see `isBareMcpInvocation`. A test pins both spellings.
+ * `GlobalDaemonProtocol.ts` owns the canonical constant, and a static import of
+ * ANY module is what this file's fast path must not grow — see
+ * `isBareMcpInvocation`. A test pins both spellings.
+ *
+ * The constant used to live in `GlobalDaemon.ts`, whose graph is the daemon's
+ * whole world (storage, the scheduler, the backup task, the session sync's push
+ * client); it moved to the protocol module so the five spawn triggers stop
+ * paying for that. This copy stays regardless: the trigger is not the only reader
+ * of the name, the routing check below runs before Commander exists, and one
+ * pinned literal is cheaper here than a module load.
  */
 const GLOBAL_DAEMON_COMMAND = "global-daemon";
 const GLOBAL_DAEMON_ENSURE_COMMAND = "global-daemon-ensure";

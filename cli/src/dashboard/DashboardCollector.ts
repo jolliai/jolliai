@@ -477,6 +477,23 @@ export async function sessionEventFromInfo(
 	try {
 		const read = await sessionContent.read();
 		const models: StatsModelUsage[] = toStatsModelUsage(read.usageByModel ?? []);
+		// Priced here, beside the aggregate, from the SAME model→provider mapping the
+		// aggregate was priced with — the two read the same transcript lines, so a
+		// response and the model bucket it belongs to are two views of one fact and
+		// must not be able to carry different prices.
+		//
+		// `estimateModelCostUsd` happens to key on the model id alone today, which
+		// would make any provider here produce the same number. Writing one in
+		// anyway (this used to say `"anthropic"` unconditionally) turns that
+		// implementation detail into the thing the guarantee rests on: the day
+		// pricing splits by provider — a same-named model billed differently on
+		// Bedrock or Vertex — the aggregate would move and the per-response rows
+		// would silently stay behind.
+		const providerOf = new Map((read.usageByModel ?? []).map((m) => [m.model, m.provider]));
+		const usageEvents = (read.usageEvents ?? []).map((e) => {
+			const cost = estimateModelCostUsd({ ...e, provider: providerOf.get(e.model) ?? "unknown" });
+			return { ...e, ...(cost !== null ? { estCostUsd: cost } : {}) };
+		});
 		const first = read.entries[0]?.timestamp;
 		const last = read.entries[read.entries.length - 1]?.timestamp;
 		const startedAtMs = first ? Date.parse(first) : Number.NaN;
@@ -505,6 +522,11 @@ export async function sessionEventFromInfo(
 			...(models.length > 0
 				? { models, tokenCoverage: "full" as const, pricesAsOf: PRICES_AS_OF }
 				: { tokenCoverage: "sessions-only" as const }),
+			// Forwarded whenever the reader says this source is usage-capable,
+			// including an EMPTY set: a re-read that can see usage but nothing
+			// datable must clear the rows an earlier, better read left behind —
+			// `undefined` alone means "this source records none" and leaves them.
+			...(read.usageEvents !== undefined && { usageEvents }),
 			// Forwarded only when an extractor actually answered. An empty array means
 			// "called no tools" and is worth storing; absence means "this source cannot
 			// report them", and the two must not collapse.

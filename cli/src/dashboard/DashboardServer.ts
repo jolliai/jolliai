@@ -149,6 +149,7 @@ import {
 	countMissingForCwd,
 	parseSettingsApplyInput,
 	SettingsValidationError,
+	setSyncSessions,
 } from "./SettingsMutations.js";
 import { buildSettingsPageModel, clearLaunchRepoStateCache } from "./SettingsPageQuery.js";
 
@@ -1788,6 +1789,10 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			await handleSetPush(res, b);
 			return;
 		}
+		if (url.pathname === "/api/settings/set-sync-sessions") {
+			await handleSetSyncSessions(res, b);
+			return;
+		}
 		if (url.pathname === "/api/settings/signin") {
 			await handleSignIn(res);
 			return;
@@ -1869,6 +1874,25 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 		} catch (err) {
 			log.warn("set-push failed: %s", errMsg(err));
 			sendJson(res, 500, { error: "could not change push setting" });
+		}
+	}
+
+	/**
+	 * Settings → Sync to Jolli: the machine-wide session-statistics switch. Applies
+	 * immediately, like `set-push` above and unlike the batched `apply` — the two
+	 * were the same tab's identical-looking switches with different rules.
+	 */
+	async function handleSetSyncSessions(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+		if (typeof body.enabled !== "boolean") {
+			sendJson(res, 400, { error: "enabled (boolean) is required" });
+			return;
+		}
+		try {
+			const result = await setSyncSessions(body.enabled, configDir ?? getGlobalConfigDir());
+			sendJson(res, 200, { ok: true, syncSessions: result.syncSessions });
+		} catch (err) {
+			log.warn("set-sync-sessions failed: %s", errMsg(err));
+			sendJson(res, 500, { error: "could not change the session-statistics setting" });
 		}
 	}
 

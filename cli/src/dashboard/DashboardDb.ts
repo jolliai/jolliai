@@ -37,7 +37,14 @@ import {
 	RECALL_RECEIPTS_DDL,
 	REPOS_DELETE_ALLOWED_DDL,
 	SCHEMA_MIGRATIONS_DDL,
+	SESSION_USAGE_EVENTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
+	STATS_DAILY_DAY_INDEX_DDL,
+	STATS_DAILY_DDL,
+	SYNC_KEYSET_INDEX_DDL,
+	SYNC_STAMP_DDL,
+	SYNC_STAMP_INDEX_DDL,
+	SYNC_STAMP_NULL_BACKFILL_DDL,
 	TOOL_CALL_TIME_DDL,
 } from "./SotSchema.js";
 
@@ -56,7 +63,27 @@ const log = createLogger("DashboardDb");
  * the fourth `context` kind; entry 3 adds `events_raw.failed_kind` so an event
  * parked by an older build that did not know its type can be un-parked by one
  * that does; entry 4 adds `session_tool_use.last_call_at_ms`; entry 5 adds the
- * `schema_migrations` log.
+ * `schema_migrations` log; entry 6 drops the `repos_no_delete` trigger;
+ * entry 7 is the session-statistics sync, whose seven DDL constants are
+ * concatenated into ONE entry rather than appended one per step: the per-row
+ * sync stamps that let an outbound sync select what changed, the
+ * `session_usage_events` table (one row per model response, because a session's
+ * cumulative total under a single timestamp cannot be split across the days the
+ * conversation actually spanned), the `stats_daily` rollup cache plus the
+ * `commits.written_at_ms` that detects a stale day, the stamp and keyset indexes
+ * those two need, and the backfill that gives every stamp a number.
+ *
+ * ONE entry because the intermediate versions those steps produced (8 through 13)
+ * exist on no database anybody will ever ship or receive — they were this
+ * branch's own development history, and a version the release cannot reach is
+ * bookkeeping nobody can act on. That merge is only legal because the feature has
+ * not shipped; once it has, the append-only rule below takes over and the next
+ * feature's steps must each be their own entry. The cost of getting this wrong is
+ * concrete and was measured here: `buildRollupQuietly` stops maintaining the
+ * daily cache the moment the file's number exceeds the build's, so five of those
+ * seven steps — three index entries, an ALTER and a backfill, none of which can
+ * introduce a table an older build cannot see — would each have disabled that
+ * cache on every older build for nothing.
  *
  * Bumping it is NOT a cross-surface event any more, and that is the one thing
  * worth knowing about it: nothing refuses a database over this number (see the
@@ -82,7 +109,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 7;
+export const DASHBOARD_SCHEMA_VERSION = 8;
 
 /**
  * NOTE ON COMPATIBILITY, because its absence here is a decision.
@@ -328,6 +355,37 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 	{ name: "TOOL_CALL_TIME_DDL", ddl: TOOL_CALL_TIME_DDL },
 	{ name: "SCHEMA_MIGRATIONS_DDL", ddl: SCHEMA_MIGRATIONS_DDL },
 	{ name: "REPOS_DELETE_ALLOWED_DDL", ddl: REPOS_DELETE_ALLOWED_DDL },
+	{
+		// The seven steps the session-statistics sync was developed in, in the order
+		// they were written, concatenated verbatim. Concatenated rather than rewritten
+		// so this entry is provably the same statement sequence a machine that took
+		// the granular path already ran — see `DASHBOARD_SCHEMA_VERSION` for why they
+		// are one entry, and note the redundancy that proves the point: `STATS_DAILY_DDL`
+		// already creates the `(tz, day)` index inline, so the index constant after it
+		// is a second `CREATE INDEX IF NOT EXISTS` over the same object. It stays,
+		// because "identical to what already ran" is worth more here than tidiness.
+		//
+		// ⚠ Nothing here may be a DATA cleanup, and the reason is measured. A schema
+		// step is idempotent or guarded, so a database that already ran this entry is
+		// already in the target state; a DELETE has to EXECUTE to mean anything, and
+		// the log is keyed by NAME — so a database with an `applied` row for this name
+		// skips it in silence. Appending one was tried: on a real database it left
+		// 10,631 junk rows and 550 stale cache rows untouched and the page bit-for-bit
+		// unfixed, and there is no repair either, because forcing a re-run dies on
+		// `duplicate column name: written_at_ms` at the first ALTER while
+		// `--mark-migration` just re-establishes the skip. While this entry is
+		// unreleased the affected databases are developers' own, so such data is
+		// cleared by hand instead.
+		name: "SESSION_STATS_SYNC_DDL",
+		ddl:
+			SYNC_STAMP_DDL +
+			SESSION_USAGE_EVENTS_DDL +
+			STATS_DAILY_DDL +
+			STATS_DAILY_DAY_INDEX_DDL +
+			SYNC_STAMP_INDEX_DDL +
+			SYNC_KEYSET_INDEX_DDL +
+			SYNC_STAMP_NULL_BACKFILL_DDL,
+	},
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

@@ -53,8 +53,17 @@ import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, FileWrite, StoredTranscript, SummaryIndex } from "../Types.js";
 import { type DashboardDbHandle, inTransaction } from "./DashboardDb.js";
-import { commitDateMs, markdownTitle, remountRepo, reportOffTypeNumerics, tryParse } from "./SotImport.js";
+import {
+	commitDateMs,
+	markdownTitle,
+	remountRepo,
+	reportOffTypeNumerics,
+	tryParse,
+	upsertCommitAlias,
+} from "./SotImport.js";
 import { REORDER_OFFSET } from "./SotSchema.js";
+import { forgetRollupDays } from "./StatsRollup.js";
+import { MEMORY_LANDED_AT_SQL } from "./StatsSeries.js";
 
 const log = createLogger("SotWrite");
 
@@ -252,11 +261,19 @@ function branchFromMemories(db: DashboardDbHandle, repoId: number, key: string):
 
 /** Lands node deletes, upserts, repositioning, re-grounding and remount. */
 function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, nowMs: number): void {
+	// Collected before the deletes, because a deleted row cannot tell anyone
+	// which cached day it used to contribute to, and a deletion leaves no write
+	// stamp for the rollup's staleness check to find. This is the one direction
+	// the cache must be told about; everything else it works out for itself.
+	const deletedDays: number[] = [];
 	for (const hash of c.summaryDeletes) {
+		const row = db.prepare(MEMORY_LANDED_AT_SQL).get(repoId, hash) as { at_ms: number | null } | undefined;
+		if (row?.at_ms != null) deletedDays.push(row.at_ms);
 		// The self-FK cascades: deleting a node takes its stored subtree with it,
 		// which is the plan's "pruning is a whole-tree decision".
 		db.prepare("DELETE FROM memories WHERE repo_id = ? AND commit_hash = ?").run(repoId, hash);
 	}
+	forgetRollupDays(db, deletedDays);
 	if (c.summaryTrees.length === 0) return;
 
 	// Phase 1 of the sibling reorder: every parent whose child SET this batch
@@ -393,7 +410,30 @@ function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, now
 		`UPDATE memories SET parent_hash = NULL, child_pos = NULL
 		  WHERE repo_id = ? AND parent_hash = ? AND child_pos >= ${REORDER_OFFSET}`,
 	);
-	for (const parent of rewritten) reground.run(repoId, parent);
+	// The days those rows land on, read BEFORE the update, and the second
+	// direction the rollup cache cannot work out for itself.
+	//
+	// `parent_hash IS NULL` is the "current generation" predicate every memory
+	// axis filters on, so re-grounding a parked child ADDS it to those axes — and
+	// changes the `COUNT(*)` divisor the category axis apportions by. Yet this
+	// statement touches no column carrying a write stamp, so the staleness check
+	// sees nothing. Nor can it be left to the batch's own writes: a regrounded row
+	// belongs to a DIFFERENT commit than the trees being landed, so its day is
+	// typically not among the days those writes invalidate.
+	const regroundedDays: number[] = [];
+	const regroundTargets = db.prepare(
+		`SELECT m.commit_hash FROM memories m
+		  WHERE m.repo_id = ? AND m.parent_hash = ? AND m.child_pos >= ${REORDER_OFFSET}`,
+	);
+	const landedAt = db.prepare(MEMORY_LANDED_AT_SQL);
+	for (const parent of rewritten) {
+		for (const { commit_hash } of regroundTargets.all(repoId, parent) as ReadonlyArray<{ commit_hash: string }>) {
+			const row = landedAt.get(repoId, commit_hash) as { at_ms: number | null } | undefined;
+			if (row?.at_ms != null) regroundedDays.push(row.at_ms);
+		}
+		reground.run(repoId, parent);
+	}
+	forgetRollupDays(db, regroundedDays);
 
 	remountRepo(db, repoId);
 }
@@ -405,22 +445,30 @@ function landSummaries(db: DashboardDbHandle, repoId: number, c: Classified, now
  * empty-tree early return.
  */
 function landAliases(db: DashboardDbHandle, repoId: number, c: Classified, nowMs: number): void {
+	// An alias MOVES a memory between calendar days: `MEMORY_LANDED_AT_MS` falls
+	// through to `al.at_ms` once the memory's own commit row is gone, so the row
+	// stops being counted on the day it used to sit on and starts being counted on
+	// the aliasing commit's. `commit_aliases` carries no write stamp, so those days
+	// have to be forgotten explicitly — the destination is usually covered by the
+	// aliasing commit's own projection, but relying on that makes correctness
+	// depend on an ORDERING between two independent write paths.
+	//
+	// Which days those are is `upsertCommitAlias`'s answer, shared with the
+	// import's alias pass: it asks the landing query before and after the write,
+	// for every memory the alias touches — including the one a RETARGET drops,
+	// which this loop used to leave stale.
+	const movedDays: number[] = [];
 	for (const [oldHash, target] of c.aliases) {
-		// The FK requires the target memory to exist; an alias pointing at a
-		// node this database has never seen is dropped with a log line — same
-		// tolerance the orphan gave it.
-		const exists = db
-			.prepare("SELECT 1 AS ok FROM memories WHERE repo_id = ? AND commit_hash = ?")
-			.get(repoId, target) as { ok?: number } | undefined;
-		if (!exists) {
+		const outcome = upsertCommitAlias(db, repoId, oldHash, target, nowMs);
+		// An alias pointing at a node this database has never seen is dropped with a
+		// log line — the same tolerance the orphan gave it.
+		if (!outcome.stored) {
 			log.info("dropping alias %s -> %s (no such memory row)", oldHash, target);
 			continue;
 		}
-		db.prepare(
-			`INSERT INTO commit_aliases (repo_id, old_hash, target_hash, created_ms) VALUES (?, ?, ?, ?)
-			 ON CONFLICT(repo_id, old_hash) DO UPDATE SET target_hash = excluded.target_hash`,
-		).run(repoId, oldHash, target, nowMs);
+		movedDays.push(...outcome.days);
 	}
+	forgetRollupDays(db, movedDays);
 }
 
 /** Lands transcript rows + their session projection. */

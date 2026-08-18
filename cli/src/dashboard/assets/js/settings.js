@@ -99,6 +99,11 @@ window.JD = window.JD || {};
 		pushRepos: null,
 		pushError: null,
 		pushStatus: null, // { repoIdentity, text, kind } — last per-repo toggle result
+		// The machine-wide session-statistics switch. NOT part of `form`: like the
+		// per-repo toggles beside it, it writes on change instead of on Apply, so
+		// it must not count towards the form's dirty state.
+		syncSessions: true,
+		syncStatus: null, // { text, kind } — last session-statistics toggle result
 		missing: undefined,
 		notice: null,
 		error: null,
@@ -120,6 +125,7 @@ window.JD = window.JD || {};
 		var a = s.agents || {};
 		var sum = s.summary || {};
 		var mb = s.memoryBank || {};
+		var syncCfg = s.sync || {};
 		var others = s.others || {};
 		var form = {
 			globalInstructions: a.globalInstructions || "default",
@@ -148,6 +154,8 @@ window.JD = window.JD || {};
 			form[pair[0]] = a[pair[0]] !== false;
 		});
 		state.originalGi = a.globalInstructions || "default";
+		// Immediate switch, so it is seeded beside the form rather than inside it.
+		state.syncSessions = syncCfg.syncSessions !== false;
 		return form;
 	}
 
@@ -524,10 +532,15 @@ window.JD = window.JD || {};
 	}
 
 	function syncSection(sum) {
+		// Both outbound streams are named in the sign-in verdict — the line that says
+		// what being signed in is FOR. It used to say "ready to push memories",
+		// which names one of the two and reads as a denial of the other. What each
+		// stream IS, and how far its switch reaches, is left to the two blocks
+		// below: restating it here only put the same sentence on screen twice.
 		var head = sum.signedIn
-			? '<div class="set-status ok"><span>✓</span> Signed in — ready to push memories</div>' +
+			? '<div class="set-status ok"><span>✓</span> Signed in — ready to push session statistics and memories</div>' +
 				'<div class="set-row set-row-inline"><button type="button" class="cta ghost sm" data-action="signout">Sign Out</button></div>'
-			: '<p class="section-hint">Sign in to push memories to Jolli cloud.</p>' +
+			: '<p class="section-hint">Sign in to push session statistics and memories to Jolli cloud. Nothing leaves this machine until you do.</p>' +
 				'<div class="set-row set-row-inline"><button type="button" class="cta sm" data-action="signin"' +
 				(state.busy === "signin" ? " disabled" : "") +
 				">" +
@@ -571,9 +584,35 @@ window.JD = window.JD || {};
 
 		return (
 			block("Account", head) +
+			// Machine-wide, so it sits ABOVE the per-repo list rather than under it:
+			// this switch is not one of the repos, and burying it below a list that
+			// grows with every tracked repo is what made it hard to find in Others.
 			block(
-				"Outbound push per repo",
-				'<p class="section-hint">Every repository on this machine that Jolli tracks. Turning one <strong>off</strong> keeps capturing its memory locally but blocks all outbound sync (auto and manual). New repos are allowed by default. <strong>Each toggle applies immediately</strong> — no “Apply Changes” needed. Re-enabling a repo syncs its retained backlog on that repo’s next activity (right away for the repo you’re currently in). (Local-only repos with no git remote are managed from within the repo instead.)</p>' +
+				"Session statistics — for the whole machine",
+				// Immediate, like the per-repo switches below: this tab used to hold
+				// one switch that waited for "Apply Changes" and a list of
+				// identical-looking ones that did not, which is a difference no row
+				// on screen can show. Both write on change now, and both report the
+				// result on a status line under the row they belong to.
+				'<label class="set-toggle-row"><span class="set-toggle-text"><span class="set-toggle-label">Sync session statistics</span><span class="set-hint">' +
+					"Sends usage — tokens, cost, and which AI tools ran — to your Jolli organization, so the web" +
+					" dashboard can chart it. <strong>Covers every repository Jolli is enabled in on this machine</strong>," +
+					" connected to a Space or not, whatever the per-repository switches below say — a repository you turned" +
+					" off with <code>jolli disable</code> is left out, and stays out: what it recorded before you turned it" +
+					" off is not uploaded later either. <strong>Conversation text is never sent</strong> — but" +
+					" session <em>titles</em> are, and many AI tools use your first message as the title; tool names include" +
+					" any MCP servers you use." +
+					'</span></span><input type="checkbox" class="set-switch" data-sync-sessions="1"' +
+					(state.syncSessions !== false ? " checked" : "") +
+					"/></label>" +
+					(state.syncStatus
+						? '<div class="set-push-status ' + state.syncStatus.kind + '">' + esc(state.syncStatus.text) + "</div>"
+						: ""),
+			) +
+			block(
+				"Memories — per repository",
+				'<p class="section-hint">Turning a repository <strong>off</strong> keeps capturing its memories locally and blocks only the outbound sync — automatic and manual alike. Turn it back on and the retained backlog goes up on that repo’s next activity, right away for the repo you’re in now.</p>' +
+					'<p class="section-hint">Every repository Jolli tracks on this machine is listed here, and a new one is allowed by default. A repo with no git remote is local-only and is managed from inside the repo instead.</p>' +
 					list,
 			)
 		);
@@ -809,6 +848,9 @@ window.JD = window.JD || {};
 			localFolder: f.localFolder,
 			compileExcludeFolders: f.compileExcludeFolders,
 			syncTranscripts: f.syncTranscripts === true,
+			// `syncSessions` is deliberately absent: it has its own immediate endpoint,
+			// and the server leaves an unmentioned value alone. Submitting the field
+			// here would let a batched Apply undo a toggle made after the page loaded.
 			dcoSignoff: f.dcoSignoff === true,
 			excludePatterns: f.excludePatterns,
 			dashboardKnowledgeMenuEnabled: f.dashboardKnowledgeMenuEnabled === true,
@@ -834,6 +876,7 @@ window.JD = window.JD || {};
 				// stale per-row toggle status.
 				state.pushError = null;
 				state.pushStatus = null;
+				state.syncStatus = null;
 				render(model);
 			};
 		});
@@ -872,6 +915,9 @@ window.JD = window.JD || {};
 		Array.prototype.forEach.call(document.querySelectorAll("#" + MOUNT + " [data-action]"), (btn) => {
 			btn.onclick = () => doAction(model, btn.getAttribute("data-action"));
 		});
+
+		var syncBox = document.querySelector("#" + MOUNT + " [data-sync-sessions]");
+		if (syncBox) syncBox.onchange = () => toggleSyncSessions(model, syncBox.checked === true);
 
 		Array.prototype.forEach.call(document.querySelectorAll("#" + MOUNT + " [data-push]"), (box) => {
 			box.onchange = () =>
@@ -1057,6 +1103,32 @@ window.JD = window.JD || {};
 		return isCurrent
 			? "Enabled — syncing retained memory now ✓"
 			: "Enabled ✓ — backlog will sync on this repo's next activity";
+	}
+
+	/**
+	 * The machine-wide session-statistics switch — immediate-apply, in the same
+	 * shape as `togglePush` below: post, report under the row, and on failure say
+	 * plainly that nothing changed and put the checkbox back where it was.
+	 */
+	function toggleSyncSessions(model, enabled) {
+		JD.post("/api/settings/set-sync-sessions", { enabled: enabled })
+			.then((data) => {
+				state.syncSessions = data.syncSessions !== false;
+				state.syncStatus = {
+					text: state.syncSessions
+						? "Enabled — session statistics upload from every repository on this machine ✓"
+						: "Disabled — nothing is uploaded, on any repository ✓",
+					kind: "ok",
+				};
+				render(model);
+			})
+			.catch(() => {
+				state.syncStatus = {
+					text: "Couldn't change session-statistics sync — see logs. No change was made.",
+					kind: "err",
+				};
+				render(model);
+			});
 	}
 
 	function togglePush(model, repoIdentity, disabled, isCurrent) {

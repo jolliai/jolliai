@@ -157,6 +157,7 @@ import { wikiRebuildIsAuto } from "../core/WikiRebuildMode.js";
 import { maybeAutoCutover } from "../dashboard/AutoCutover.js";
 import { opportunisticSnapshot } from "../dashboard/Backup.js";
 import { recordCommitsFromWorker } from "../dashboard/ProducerHooks.js";
+import { runSessionSync } from "../dashboard/SessionSyncRunner.js";
 import { buildKnowledgeGraph } from "../graph/GraphBuilder.js";
 import { deriveSourceTag } from "../install/DistPathResolver.js";
 import { applyConfiguredLogLevel, createLogger, errMsg, getJolliMemoryDir, setLogDir } from "../Logger.js";
@@ -978,6 +979,24 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		// underneath it.
 		if (summariesLandedThisRun) await warmBriefingCache(cwd);
 		if (summariesLandedThisRun) await maybeAutoCutover(cwd, { throttle: true });
+
+		// Session statistics sync — **outside** the "did any summary land" check
+		// above, and deliberately so: most sessions never produce a commit at all,
+		// and gating on new summaries would mean a machine only ever syncs the
+		// conversations that happened to end in one.
+		//
+		// ⚠ Fire-and-forget, never awaited. Everything above this line runs under a
+		// five-minute lock, and one network round trip inside that window delays
+		// every other worker on the machine. The run throttles itself, does its own
+		// gating, and swallows its own failures — see `runSessionSync`.
+		//
+		// This trigger covers the command-line user who commits but never opens an
+		// editor. The one that covers the rest is the global daemon's `session-sync`
+		// task (`GlobalDaemon.defaultTasks`) — which is what makes the reasoning
+		// above hold, since a commit-only trigger would reach exactly the sessions
+		// that ended in a commit whatever it is nested under. Both go through the
+		// same throttle, so having two costs nothing.
+		void runSessionSync().catch(() => undefined);
 	} finally {
 		// Backstops (idempotent): cover the early-return and mid-run-throw paths
 		// where the explicit releases above didn't run. worker.lock is released

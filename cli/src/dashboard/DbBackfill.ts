@@ -82,6 +82,8 @@ import {
 	resolveProtectNewerThanMs,
 	type SotImportResult,
 } from "./SotImport.js";
+import { buildRollupQuietly, forgetRollupDays } from "./StatsRollup.js";
+import { MEMORY_LANDED_AT_SQL } from "./StatsSeries.js";
 import { applyToDb, countStuckEvents, pruneProjectedEvents } from "./StatsWriter.js"; // recordRepoGraph parked — see SotSchema
 
 const log = createLogger("DbBackfill");
@@ -692,11 +694,55 @@ export function pruneUnreachableCommits(
 		.filter((hash) => !reachable.has(hash))
 		.map((hash) => ({ hash }));
 	if (stale.length === 0) return 0;
+	// Read before deleting: the cached day a commit contributed to is derived
+	// from its own timestamp, and once the row is gone there is nothing left to
+	// ask. Staleness is otherwise detected from write stamps, which a deletion
+	// leaves none of — so this is the one direction the cache has to be told
+	// about rather than being able to work out.
+	const staleDays = db
+		.prepare(
+			`SELECT committed_at_ms FROM commits
+			  WHERE repo_id = (SELECT id FROM repos WHERE repo_identity = ?)
+			    AND hash IN (${stale.map(() => "?").join(", ")})`,
+		)
+		.all(repoIdentity, ...stale.map((row) => row.hash)) as ReadonlyArray<{ committed_at_ms: number }>;
+	// The commit rows are gone, but their memories survive (a rewritten commit's
+	// row is a DUPLICATE of the surviving one, kept by design), so each of those
+	// memories MOVES to another calendar day and the day it moves TO must be
+	// forgotten as well — otherwise it keeps serving a number that omits the
+	// memory, for ever, since an old day gets no further writes to rebuild it.
+	//
+	// ⚠ Asked through `MEMORY_LANDED_AT_SQL`, AFTER the delete, and never by
+	// restating the rule here. It was restated — as `commit_date_ms`, on the
+	// reasoning that the landing expression "falls back to `commit_date_ms`" once
+	// the commit row is gone — and that drops the middle term: the real rule is
+	// `COALESCE(cm.committed_at_ms, al.at_ms, m.commit_date_ms)`, and a PRUNE IS
+	// THE ALIAS CASE. A rebased commit's memory lands on the aliasing commit's
+	// `committed_at_ms`, while `commit_date_ms` is the AUTHOR date — up to 400 days
+	// away in this repo's own rebase fixture. So the wrong day was forgotten and
+	// the day that actually changed was not. Running the query after the delete is
+	// what makes it answer the post-delete landing without this code having to know
+	// which of the three terms wins.
+	const repoRow = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(repoIdentity) as
+		| { id?: number }
+		| undefined;
+	const repoId = repoRow?.id;
 	const remove = db.prepare(
 		"DELETE FROM commits WHERE repo_id = (SELECT id FROM repos WHERE repo_identity = ?) AND hash = ?",
 	);
 	inTransaction(db, () => {
 		for (const row of stale) remove.run(repoIdentity, row.hash);
+		const landedDays: number[] = [];
+		if (repoId !== undefined) {
+			const landedAt = db.prepare(MEMORY_LANDED_AT_SQL);
+			for (const { hash } of stale) {
+				const landed = landedAt.get(repoId, hash) as { at_ms: number | null } | undefined;
+				if (landed?.at_ms != null) landedDays.push(landed.at_ms);
+			}
+		}
+		// Both directions in one call: the day each memory STOPPED being counted on
+		// is the pruned commit's own day, already in `staleDays`.
+		forgetRollupDays(db, [...staleDays.map((row) => row.committed_at_ms), ...landedDays]);
 	});
 	log.info("pruned %d unreachable commits for %s", stale.length, repoIdentity);
 	return stale.length;
@@ -1231,7 +1277,16 @@ function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSessio
 	);
 }
 
-/** Wraps events in envelopes and applies them in small batches. */
+/**
+ * Wraps events in envelopes and applies them in small batches.
+ *
+ * ⚠ Every batch opts out of the rollup settle (`skipRollup`). A backfill calls
+ * this a dozen times over hundreds of batches, and each batch's writes mark the
+ * days it just touched stale — so left on, the pass rebuilds the same newest
+ * days once per batch (measured at ~945 ms for a 14-day settle) and keeps only
+ * the last one. `dbBackfillRepo` settles once at the end instead; the other two
+ * callers here write only registry rows, which no spend axis reads.
+ */
 function applyBatches(
 	db: DashboardDbHandle,
 	events: ReadonlyArray<StatsEvent>,
@@ -1245,7 +1300,7 @@ function applyBatches(
 		const batch: StatsEventEnvelope[] = events
 			.slice(start, start + BATCH_SIZE)
 			.map((event) => ({ event, producerKind }));
-		const result = applyToDb(db, batch, { producerKind, now });
+		const result = applyToDb(db, batch, { producerKind, now, skipRollup: true });
 		applied += result.projected;
 		// Reported, not just discarded: an event that stayed pending did NOT
 		// reach the projection tables, so a caller whose cursor would skip the
@@ -1929,6 +1984,12 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 			// hold, exactly as on the writer path.
 			const pruned = pruneProjectedEvents(db, now);
 			if (pruned > 0) log.debug("pruned %d projected event rows for %s", pruned, repo.repoName);
+
+			// The rollup settle every `applyToDb` normally does, hoisted out of the
+			// batch loop to here — once for the whole pass, against its final state.
+			// See `applyBatches` for why per batch is quadratic. Quiet and derived, so
+			// a failure here costs a slower page and never the backfill.
+			buildRollupQuietly(db, { now });
 
 			const mode = isBootstrap ? "bootstrapped" : "recovered";
 			log.info("%s %s: %d events applied", mode, repo.repoName, applied);

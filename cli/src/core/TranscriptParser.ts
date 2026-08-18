@@ -122,6 +122,13 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			// the reader counts only the first. Omitted when the id is absent so the
 			// line still counts rather than being silently dropped.
 			...(usage.id && { dedupKey: usage.id }),
+			// Carried per line so the reader can date each response's model without
+			// a second whole-slice pass. `parseUsageByModel` still exists for the
+			// aggregate; both read `extractClaudeUsage`, so they cannot disagree.
+			// Omitted rather than emitted empty when the line names no model — the
+			// aggregate buckets those under an empty id, and inventing that value
+			// here would put it in front of every caller instead of one.
+			...(usage.model && { model: usage.model }),
 		};
 	}
 

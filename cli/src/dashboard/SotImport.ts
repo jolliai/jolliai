@@ -48,6 +48,8 @@ import { importTakesPath } from "./ImportablePaths.js";
 import { cursorFingerprint, type ImportCursor, readImportStateRow, writeImportState } from "./ImportState.js";
 import { existingWorktrees, type RegisteredRepo } from "./RepoRegistry.js";
 import { REORDER_OFFSET } from "./SotSchema.js";
+import { forgetRollupDays } from "./StatsRollup.js";
+import { MEMORY_LANDED_AT_SQL } from "./StatsSeries.js";
 
 const log = createLogger("SotImport");
 
@@ -666,6 +668,89 @@ function pruneTable(
 	});
 	log.debug("pruned %d stale row(s) from %s", stale.length, table);
 	return stale.length;
+}
+
+/** What {@link upsertCommitAlias} did, and which cached days it invalidated. */
+export interface AliasUpsert {
+	/** False when the target has no memory row — the FK would refuse the insert. */
+	readonly stored: boolean;
+	/**
+	 * Landing days to hand to `forgetRollupDays`. Never empty when `stored` and
+	 * the alias actually moved something; may contain repeats, which that function
+	 * de-duplicates per zone.
+	 */
+	readonly days: ReadonlyArray<number>;
+}
+
+/**
+ * Records one tree-hash alias AND reports every cached day it moved.
+ *
+ * Shared by the two writers — `landAliases` in `SotWrite` and the import's alias
+ * pass below — because the days-to-forget rule is the interesting half and a
+ * second copy of it drifts silently: `commit_aliases` carries no write stamp the
+ * rollup's staleness test can see (`readSourcesWrittenSince` reads
+ * `memories.written_at_ms` and `commits.written_at_ms` only), so a day this
+ * function fails to name serves a wrong number until something unrelated is
+ * written on it. The import used to name none at all.
+ *
+ * ⚠ Asked BEFORE and AFTER the insert, of every memory whose landing this touches
+ * — rather than deriving the destination. `MEMORY_LANDED_AT_MS` is a COALESCE over
+ * three terms, so which one wins moves as aliases come and go, and the previous
+ * shape of this code only ever reasoned about the INCOMING target: a retarget
+ * (`old_hash` already pointing somewhere else) dropped the OUTGOING target back
+ * onto its own `commit_date_ms` and left that day cached without it. Asking the
+ * same query twice needs no reasoning about which term won.
+ *
+ * The `before` read of the target doubles as the FK precondition, exactly as it
+ * did before: a memory row that is not there answers `undefined`, not a null day.
+ */
+export function upsertCommitAlias(
+	db: DashboardDbHandle,
+	repoId: number,
+	oldHash: string,
+	targetHash: string,
+	nowMs: number,
+): AliasUpsert {
+	const landedAt = db.prepare(MEMORY_LANDED_AT_SQL);
+	const previous = (
+		db.prepare("SELECT target_hash FROM commit_aliases WHERE repo_id = ? AND old_hash = ?").get(repoId, oldHash) as
+			| { target_hash?: string }
+			| undefined
+	)?.target_hash;
+	// The outgoing target only when it is a DIFFERENT memory: re-landing the same
+	// pair is the common case (every index.json write replays the whole map) and
+	// changes nothing.
+	const affected = previous !== undefined && previous !== targetHash ? [targetHash, previous] : [targetHash];
+	const dayOf = (hash: string): number | undefined => {
+		const row = landedAt.get(repoId, hash) as { at_ms: number | null } | undefined;
+		return row?.at_ms ?? undefined;
+	};
+
+	const days: number[] = [];
+	let targetExists = false;
+	for (const hash of affected) {
+		const row = landedAt.get(repoId, hash) as { at_ms: number | null } | undefined;
+		if (hash === targetHash) targetExists = row !== undefined;
+		if (row?.at_ms != null) days.push(row.at_ms);
+	}
+	if (!targetExists) return { stored: false, days: [] };
+
+	db.prepare(
+		`INSERT INTO commit_aliases (repo_id, old_hash, target_hash, created_ms) VALUES (?, ?, ?, ?)
+		 ON CONFLICT(repo_id, old_hash) DO UPDATE SET target_hash = excluded.target_hash`,
+	).run(repoId, oldHash, targetHash, nowMs);
+
+	for (const hash of affected) {
+		const day = dayOf(hash);
+		if (day !== undefined) days.push(day);
+	}
+	if (previous !== undefined && previous !== targetHash) {
+		// Not an error — the schema allows it and a cross-source import can produce
+		// it — but `scanTreeHashAliases` skips a hash it has already aliased, so it
+		// should not arise from this machine's own scanning.
+		log.info("alias %s retargeted %s -> %s", oldHash, previous, targetHash);
+	}
+	return { stored: true, days };
 }
 
 /**
@@ -1491,24 +1576,26 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 	// null, not an empty set: a null index means "unreadable", and index.json is
 	// the only source of the alias map, so a corrupt read must not prune it away.
 	const liveAliases = index ? new Set(Object.keys(index.commitAliases ?? {})) : null;
+	// Through the same helper `landAliases` uses, so the "which cached days did
+	// this move" rule has one spelling. It also carries the FK precondition this
+	// pass used to ask for itself: asked of the DATABASE, not of a parsed-summary
+	// set, because after a resume the target's row may have been written by an
+	// earlier run whose in-memory state this process never saw — the row's
+	// existence is the only predicate the FK actually respects.
+	const aliasDays: number[] = [];
 	inChunkedTransactions(db, aliasEntries, ([oldHash, targetHash]) => {
-		// Asked of the DATABASE, not of a parsed-summary set: `commit_aliases` has
-		// a real FK onto `memories`, and after a resume the target's row may have
-		// been written by an earlier run whose in-memory state this process never
-		// saw. The row's existence is the only predicate the FK actually respects.
-		const target = db
-			.prepare("SELECT 1 AS ok FROM memories WHERE repo_id = ? AND commit_hash = ?")
-			.get(repoId, targetHash) as { ok?: number } | undefined;
-		if (!target) {
+		const outcome = upsertCommitAlias(db, repoId, oldHash, targetHash, nowMs);
+		if (!outcome.stored) {
 			skip("alias", `${oldHash} → ${targetHash} (target has no node)`);
 			return;
 		}
-		db.prepare(
-			`INSERT INTO commit_aliases (repo_id, old_hash, target_hash, created_ms) VALUES (?, ?, ?, ?)
-			 ON CONFLICT(repo_id, old_hash) DO UPDATE SET target_hash = excluded.target_hash`,
-		).run(repoId, oldHash, targetHash, nowMs);
+		aliasDays.push(...outcome.days);
 		aliases++;
 	});
+	// Outside the chunked transactions: this pass had no invalidation at all, so an
+	// import landing aliases into a database that already holds a rollup left those
+	// days serving numbers from before the rewrite.
+	forgetRollupDays(db, aliasDays);
 
 	// ── docs: plans first (plan_progress trigger depends on them) ──────────
 	let docs = 0;

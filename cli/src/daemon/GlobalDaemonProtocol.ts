@@ -33,6 +33,21 @@ import { normalizePathForCompareOn } from "../core/PathUtils.js";
 export const GLOBAL_DAEMON_PROTOCOL = 1;
 
 /**
+ * The hidden subcommand name the daemon runs under.
+ *
+ * Here rather than in `GlobalDaemon.ts` for the reason it was already
+ * documented with: it is shared with the TRIGGER that spawns it, and a trigger
+ * needs the string, not the daemon. Importing it from the implementation module
+ * put `GlobalDaemon`'s whole dependency graph — `node:net`, the backup path's
+ * `node:sqlite`, and now the session sync's push client — behind every one of
+ * `EnsureGlobalDaemon`'s five call sites, four of which are on a critical path
+ * (`post-commit`, `SessionStart`, both plugin bootstraps). Nothing in that graph
+ * is reachable from a trigger, and a trigger that only wants to spawn a
+ * subprocess should not pay to load it.
+ */
+export const GLOBAL_DAEMON_COMMAND = "global-daemon";
+
+/**
  * How long a trigger waits for `hello` before giving up on the version check.
  *
  * Deliberately NOT `HANDSHAKE_TIMEOUT_MS` (10 s). This handshake runs on the

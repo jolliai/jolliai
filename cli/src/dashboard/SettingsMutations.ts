@@ -76,6 +76,17 @@ export interface SettingsApplyInput {
 	readonly localFolder: string;
 	readonly compileExcludeFolders: string;
 	readonly syncTranscripts: boolean;
+	/**
+	 * TRI-STATE, for the same reason as the two Advanced rows below: the Settings
+	 * page no longer submits this field at all. Session-statistics sync is an
+	 * IMMEDIATE switch now ({@link setSyncSessions} / `/api/settings/set-sync-sessions`),
+	 * so every other switch in the Sync to Jolli tab behaves like the per-repo
+	 * ones beside it. `undefined` therefore means "leave the stored value alone",
+	 * and a two-state read here would have this save silently undo a toggle the
+	 * user flipped moments earlier — including one flipped from an older page
+	 * still submitting it.
+	 */
+	readonly syncSessions?: boolean;
 	readonly dcoSignoff: boolean;
 	readonly excludePatterns: string;
 	/**
@@ -179,6 +190,7 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 	if (!AGENT_FIELDS.some((f) => agents[f])) {
 		throw new SettingsValidationError("At least one AI agent must be enabled");
 	}
+	const syncSessions = asOptionalBool(body.syncSessions);
 	const knowledgeMenu = asOptionalBool(body.dashboardKnowledgeMenuEnabled);
 	const graphMenu = asOptionalBool(body.dashboardGraphMenuEnabled);
 	const maxTokensRaw = body.maxTokens;
@@ -202,7 +214,8 @@ export function parseSettingsApplyInput(body: Record<string, unknown>): Settings
 		dcoSignoff: asBool(body.dcoSignoff),
 		excludePatterns: asString(body.excludePatterns),
 		// `asOptionalBool`, never `asBool` — see `SettingsApplyInput` for why these
-		// two must be able to say "the submission did not mention me".
+		// three must be able to say "the submission did not mention me".
+		...(syncSessions !== undefined ? { syncSessions } : {}),
 		...(knowledgeMenu !== undefined ? { dashboardKnowledgeMenuEnabled: knowledgeMenu } : {}),
 		...(graphMenu !== undefined ? { dashboardGraphMenuEnabled: graphMenu } : {}),
 	};
@@ -261,6 +274,25 @@ async function ensureLocalFolder(localFolder: string): Promise<void> {
 	const status = await checkLocalFolder(localFolder);
 	if (status === "ok" || status === "empty") return;
 	throw new SettingsValidationError(LOCAL_FOLDER_ERRORS[status](localFolder.trim()));
+}
+
+/**
+ * Settings → Sync to Jolli: flip the machine-wide session-statistics switch and
+ * persist it right away, the way the per-repo push toggles beside it already do.
+ *
+ * It is its own endpoint rather than a field of the batched save because the two
+ * kinds of control sat in one tab looking identical and behaving differently —
+ * one switch took effect on the next click, its neighbours only after "Apply
+ * Changes". The write is a one-field merge inside the config lock, so it cannot
+ * clobber a concurrent save of the rest of the form. Returns the value that was
+ * stored, which is what the page renders the checkbox from.
+ */
+export async function setSyncSessions(
+	enabled: boolean,
+	configDir: string = getGlobalConfigDir(),
+): Promise<{ readonly syncSessions: boolean }> {
+	await updateConfigTransactionalScoped(() => ({ update: { syncSessions: enabled }, result: undefined }), configDir);
+	return { syncSessions: enabled };
 }
 
 /**
@@ -331,6 +363,9 @@ export async function applySettings(
 			compileExcludeFolders: splitCsv(input.compileExcludeFolders),
 			syncTranscripts: input.syncTranscripts,
 			dcoSignoff: input.dcoSignoff,
+			// Conditional for the same reason as the two Advanced rows below: this
+			// field has its own immediate endpoint and is normally absent here.
+			...(input.syncSessions !== undefined ? { syncSessions: input.syncSessions } : {}),
 			// Conditional, unlike every other boolean above — an absent field must
 			// leave the stored row alone rather than switch it off. See
 			// `SettingsApplyInput` for the failure this closes.

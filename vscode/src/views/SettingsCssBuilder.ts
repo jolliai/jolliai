@@ -135,6 +135,11 @@ export function buildSettingsCss(): string {
     color: var(--vscode-descriptionForeground);
     margin-top: 2px;
   }
+  /* A hint long enough to split into two reads as one wall of text at the 2px
+     gap above — that gap sets a hint off from its label, not from another hint. */
+  .settings-label .hint + .hint {
+    margin-top: 7px;
+  }
 
   /* ── Inputs ── */
   input[type="text"],

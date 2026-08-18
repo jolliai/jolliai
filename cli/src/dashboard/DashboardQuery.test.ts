@@ -22,16 +22,11 @@ import type {
 	ToolUsageRow,
 } from "./DashboardModel.js";
 import { MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
-import {
-	addLocalDays,
-	buildDashboardModel,
-	buildToolUsagePage,
-	localDayKey,
-	localHour,
-	machineTimeZone,
-	type QueryOptions,
-	startOfLocalDay,
-} from "./DashboardQuery.js";
+
+/** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
+const SH = "Asia/Shanghai";
+
+import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
 import { volumeReachable } from "./RepoForget.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
@@ -188,56 +183,6 @@ async function applySummaryEvents(
 	);
 }
 
-const SH = "Asia/Shanghai"; // UTC+8, no DST
-const LA = "America/Los_Angeles"; // DST
-
-describe("time-zone engine", () => {
-	it("assigns a 23:30 UTC session to the NEXT local day in Asia/Shanghai", () => {
-		const ms = Date.parse("2026-07-29T23:30:00Z"); // 07:30 on the 30th in Shanghai
-		expect(localDayKey(ms, SH)).toBe("2026-07-30");
-		expect(localDayKey(ms, "UTC")).toBe("2026-07-29");
-	});
-
-	it("computes local midnight boundaries, not UTC ones", () => {
-		const ms = Date.parse("2026-07-30T10:00:00Z");
-		// Shanghai midnight of Jul 30 = Jul 29 16:00 UTC.
-		expect(startOfLocalDay(ms, SH)).toBe(Date.parse("2026-07-29T16:00:00Z"));
-		expect(startOfLocalDay(ms, "UTC")).toBe(Date.parse("2026-07-30T00:00:00Z"));
-	});
-
-	it("handles the 23-hour spring-forward day in America/Los_Angeles", () => {
-		// 2026-03-08: DST starts, 02:00 → 03:00. The day is 23 hours long.
-		const midnight = startOfLocalDay(Date.parse("2026-03-08T20:00:00Z"), LA);
-		expect(localDayKey(midnight, LA)).toBe("2026-03-08");
-		const nextMidnight = addLocalDays(midnight, 1, LA);
-		expect(localDayKey(nextMidnight, LA)).toBe("2026-03-09");
-		expect(nextMidnight - midnight).toBe(23 * 3_600_000);
-	});
-
-	it("handles the 25-hour fall-back day", () => {
-		// 2026-11-01: DST ends. The day is 25 hours long.
-		const midnight = startOfLocalDay(Date.parse("2026-11-01T20:00:00Z"), LA);
-		const nextMidnight = addLocalDays(midnight, 1, LA);
-		expect(nextMidnight - midnight).toBe(25 * 3_600_000);
-	});
-
-	it("addLocalDays walks backwards too", () => {
-		const ms = Date.parse("2026-07-30T10:00:00Z");
-		expect(localDayKey(addLocalDays(ms, -1, SH), SH)).toBe("2026-07-29");
-		expect(localDayKey(addLocalDays(ms, 0, SH), SH)).toBe("2026-07-30");
-	});
-
-	it("localHour reports the wall-clock hour in the requested zone", () => {
-		const ms = Date.parse("2026-07-29T23:30:00Z");
-		expect(localHour(ms, SH)).toBe(7); // 07:30 next day
-		expect(localHour(ms, "UTC")).toBe(23);
-	});
-
-	it("machineTimeZone returns a resolvable IANA name", () => {
-		expect(() => new Intl.DateTimeFormat("en", { timeZone: machineTimeZone() })).not.toThrow();
-	});
-});
-
 describe("buildDashboardModel", () => {
 	let dir: string;
 	let dbPath: string;
@@ -334,6 +279,105 @@ describe("buildDashboardModel", () => {
 			{ producerKind: "cli", dbPath },
 		);
 	}
+
+	/**
+	 * A session whose per-response rows are INCOMPLETE must be counted by its
+	 * session-level total, not by the part it has.
+	 *
+	 * The rule this pins used to be an existence test (`NOT EXISTS (…events…)`)
+	 * where the question is completeness, and the difference was silent loss.
+	 * Measured on a real database: one session of 2,048,519 tokens had a single
+	 * event row worth 52,020, so 97.5% of it appeared nowhere — 2,775,239 tokens
+	 * and $23.39 missing from a 30-day window. A partial row set is reachable by
+	 * construction, not a parser defect: `projectSession` replaces the rows
+	 * wholesale (so a read cut short by a `beforeTimestamp` cutoff writes only its
+	 * slice), while `projectCommitSummary` restores `sessions` and
+	 * `session_model_usage` to the full figures and has no write for this table.
+	 *
+	 * Both arms are asserted together, because the two failures are opposite: a
+	 * predicate that is not the exact complement of the other either drops the
+	 * partial session's remainder or counts the complete one twice.
+	 */
+	it("counts a session with partial usage rows by its session total, and a complete one by its rows", async () => {
+		const partialDay = Date.parse("2026-07-28T10:00:00Z");
+		const completeDay = Date.parse("2026-07-20T10:00:00Z");
+		await applySummaryEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w",
+						enabledAt: "t",
+					},
+				},
+				// Its rows account for 100 of 1000 — the shape a truncated read leaves.
+				session({
+					sessionId: "partial",
+					updatedAtMs: partialDay,
+					models: undefined,
+					inputTokens: 1000,
+					outputTokens: 0,
+					cachedTokens: 0,
+					usageEvents: [
+						{
+							respondedAtMs: partialDay,
+							model: "claude-opus-5",
+							input: 100,
+							output: 0,
+							cached: 0,
+							dedupKey: "p1",
+						},
+					],
+				}),
+				// Its rows account for all 500.
+				session({
+					sessionId: "complete",
+					updatedAtMs: partialDay,
+					models: undefined,
+					inputTokens: 500,
+					outputTokens: 0,
+					cachedTokens: 0,
+					usageEvents: [
+						{
+							respondedAtMs: completeDay,
+							model: "claude-opus-5",
+							input: 500,
+							output: 0,
+							cached: 0,
+							dedupKey: "c1",
+						},
+					],
+				}),
+			],
+			{ dbPath, producerKind: "cli" },
+		);
+
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "stats",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					dimension: "model",
+					range: "month",
+				}),
+			{ dbPath },
+		);
+		const perDay = new Map(model.stats?.tokenBreakdown.perDay.map((d) => [d.date, d.input]) ?? []);
+
+		// 1500, not 600 (the partial session's remainder dropped) and not 2000
+		// (both arms counting it).
+		expect(model.stats?.tokenBreakdown.input).toBe(1500);
+		// The complete one is placed on its RESPONSE's day, eight days before the
+		// session was last touched — the distribution this table exists for.
+		expect(perDay.get("2026-07-20")).toBe(500);
+		// The partial one falls back whole onto its session day.
+		expect(perDay.get("2026-07-28")).toBe(1000);
+	});
 
 	it("serves every group-by axis, and falls back to model for memory-only axes at tier 0", async () => {
 		await seed();

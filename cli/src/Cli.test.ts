@@ -3,7 +3,7 @@ import { describe, expect, it, vi } from "vitest";
 import { isBareMcpInvocation, isDetachedDaemonInvocation } from "./Cli.js";
 import { MCP_DAEMON_COMMAND, MCP_NO_DAEMON_ENV } from "./commands/McpCommand.js";
 import { GLOBAL_DAEMON_ENSURE_COMMAND } from "./daemon/EnsureGlobalDaemon.js";
-import { GLOBAL_DAEMON_COMMAND } from "./daemon/GlobalDaemon.js";
+import { GLOBAL_DAEMON_COMMAND } from "./daemon/GlobalDaemonProtocol.js";
 
 describe("isBareMcpInvocation", () => {
 	it("routes the bare `jolli mcp` a host spawns per session", () => {

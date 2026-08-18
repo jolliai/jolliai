@@ -1009,6 +1009,41 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 	}
 }
 
+/**
+ * Uploads pending session statistics now, bypassing both the throttle and a
+ * backend silence.
+ *
+ * ⚠ This is the documented way out of a silence, and it has to exist for the
+ * silence to be defensible. A 403/404/412 stops one backend scope for 24h, which
+ * is right while the server is still refusing and wrong the moment the operator
+ * fixes it — and the only alternative was hand-editing
+ * `session-push-channel.json`. `force` is what turns "wait until tomorrow" into
+ * "say so and try again", and the run reports which it did.
+ *
+ * Lives on `doctor` rather than as a command of its own for the same reason
+ * `--mark-migration` does: it is a repair for a state the automatic path cannot
+ * argue itself out of, not part of anyone's normal day.
+ */
+export async function runSessionSyncNow(): Promise<void> {
+	const { runSessionSync } = await import("../dashboard/SessionSyncRunner.js");
+	// No cwd: the channel is cross-repo, so this run covers the whole machine and
+	// withholds the repos `jolli disable` is set on row by row — including the one
+	// the user typed this in, if it is one of them.
+	const outcome = await runSessionSync({ force: true });
+	if (outcome.status === "done") {
+		console.log(
+			outcome.rows === 0
+				? "✓ Session statistics are up to date — nothing new to upload."
+				: `✓ Uploaded ${outcome.rows} row(s) in ${outcome.batches} batch(es).`,
+		);
+		return;
+	}
+	// Not an exception and not silent: every reason here is either the user's own
+	// setting or an answer from the server, and both are things they can act on.
+	console.log(`✗ Session statistics were not uploaded: ${outcome.reason}`);
+	if (outcome.status === "failed") process.exitCode = 1;
+}
+
 /** Registers the `doctor` sub-command on the given Commander program. */
 export function registerDoctorCommand(program: Command): void {
 	program
@@ -1027,6 +1062,10 @@ export function registerDoctorCommand(program: Command): void {
 		.option("--from <path>", "With --recover: restore the database from this snapshot file")
 		.option("--schema-log", "Print the database's migration log (who ran what, when, and how it went)")
 		.option("--mark-migration <name>", "Record one migration as applied by other means (see --schema-log)")
+		.option(
+			"--sync-sessions",
+			"Upload pending session statistics now, ignoring the throttle and any 24h backend silence",
+		)
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(
 			async (options: {
@@ -1038,6 +1077,7 @@ export function registerDoctorCommand(program: Command): void {
 				from?: string;
 				schemaLog?: boolean;
 				markMigration?: string;
+				syncSessions?: boolean;
 			}) => {
 				setLogDir(options.cwd);
 				log.info("Running 'doctor' command");
@@ -1050,6 +1090,10 @@ export function registerDoctorCommand(program: Command): void {
 				// `--schema-log` would reasonably conclude it did nothing.
 				if (options.schemaLog === true || options.markMigration) {
 					await runSchemaLog({ mark: options.markMigration });
+					return;
+				}
+				if (options.syncSessions === true) {
+					await runSessionSyncNow();
 					return;
 				}
 				await runDoctor(

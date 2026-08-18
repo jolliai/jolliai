@@ -42,8 +42,8 @@ import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { createLogger, errMsg } from "../Logger.js";
 import { resolveCliInvocation } from "../util/CliEntry.js";
 import { spawnHidden } from "../util/Subprocess.js";
-import { GLOBAL_DAEMON_COMMAND } from "./GlobalDaemon.js";
 import {
+	GLOBAL_DAEMON_COMMAND,
 	GLOBAL_HELLO_TIMEOUT_MS,
 	type GlobalDaemonHello,
 	globalSocketPath,

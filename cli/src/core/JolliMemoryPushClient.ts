@@ -381,6 +381,108 @@ export interface BatchPushAttachment {
 	readonly docId?: number;
 }
 
+/**
+ * The server's cursor is BEHIND the one the client sent, so this backend is
+ * missing a range the client believes it already delivered. Raised for `409` +
+ * `error: "cursor_ahead"`, carrying the server's own cursor to fall back to.
+ *
+ * The case it exists for is mundane and otherwise silent: a user pushes to a dev
+ * backend, then points the same install at prod. The local cursor still says
+ * "delivered up to T" while prod has nothing, so without this the range before T
+ * would never be sent anywhere again. A wiped, rolled-back or restored-from-
+ * backup server is the same shape.
+ *
+ * ⚠ A server with NO record must answer this too, not 200 — see
+ * `SessionSyncRunner` for why "no opinion" is the one reading that loses data.
+ */
+export class SessionCursorAheadError extends Error {
+	constructor(readonly serverCursor: Readonly<Record<string, SessionPushCursor | number | null>>) {
+		super("the server is missing a range this client considers delivered");
+		this.name = "SessionCursorAheadError";
+	}
+}
+
+/**
+ * How far one table has been delivered — the wire form of `TableCursor`.
+ *
+ * `key` is the PRIMARY KEY of the last row accepted, in the order the client's
+ * `KEYSET_COLUMNS` declares, and it exists because a millisecond is not a unique
+ * position: rows written together share a stamp, and when more of them share one
+ * than a batch holds, a stamp-only cursor cannot get past that millisecond at
+ * all. The server stores and returns the pair verbatim; it never has to
+ * interpret `key`, only keep it beside its stamp.
+ *
+ * An EMPTY key means the start of that millisecond, so a position carrying only
+ * a stamp is a valid position on the same scale — see `SessionPushResult.cursor`
+ * for why the wire still has to read one.
+ */
+export interface SessionPushCursor {
+	readonly stamp: number;
+	readonly key: ReadonlyArray<string>;
+}
+
+/**
+ * This backend does not have the session endpoint — a `404`, or a 2xx whose body
+ * is not JSON (a single-page app answering an unknown route with its
+ * `index.html`, which is what production actually did).
+ *
+ * ⚠ A CLASS, deliberately, and never a regex over the message. It replaces a
+ * `/HTTP 404/` test in `SessionSyncRunner`, which was fragile by construction:
+ * a non-2xx here is raised as `errorMessage(json) ?? \`HTTP ${status}\``, so any
+ * backend or gateway that answers 404 with a JSON error body (`{"error":"Not
+ * Found"}` is the normal shape) produced the message `Not Found` — with no
+ * status in it, no match, and therefore NO 24h silence: the channel then retried
+ * a missing endpoint every 30 minutes for ever, logging one `info` line each
+ * time. 403 and 426 already had status-keyed classes; these two are the ones that
+ * were left to string matching.
+ */
+export class SessionEndpointMissingError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionEndpointMissingError";
+	}
+}
+
+/**
+ * The server made a binding a precondition for the session channel (`412`).
+ *
+ * Should be unreachable — session statistics need no Space, since the API key
+ * already carries the organisation. Its own class for the same reason as
+ * {@link SessionEndpointMissingError}: it is the branch that has to be FINDABLE
+ * rather than retried into the ground, and a 412 is the response most likely of
+ * all to carry the server's own explanatory prose in `message` — which is
+ * exactly what made a `/HTTP 412/` regex miss it.
+ */
+export class SessionPreconditionFailedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionPreconditionFailedError";
+	}
+}
+
+/** The session channel's request envelope. `tables` carries local column names verbatim. */
+export interface SessionPushPayload {
+	/** 1 — this channel's only protocol. `cursor` is `{stamp, key}` throughout. */
+	readonly version: 1;
+	readonly clientId: string;
+	/** Client progress, per table — reconciled by the server on every request. */
+	readonly cursor: Readonly<Record<string, SessionPushCursor>>;
+	readonly tables: Readonly<Record<string, ReadonlyArray<Record<string, unknown>>>>;
+}
+
+export interface SessionPushResult {
+	readonly accepted: Readonly<Record<string, number>>;
+	/**
+	 * The server's cursor AFTER this batch. The client adopts it as-is.
+	 *
+	 * A bare `number` is accepted and read as `{stamp, key: []}`. The CLI and the
+	 * backend deploy independently, so this is wire tolerance rather than a
+	 * migration: a backend that echoes only a stamp keeps working, at the cost of
+	 * re-delivering one millisecond per pass into an upsert.
+	 */
+	readonly cursor: Readonly<Record<string, SessionPushCursor | number | null>>;
+}
+
 export class JolliMemoryPushClient {
 	private readonly fetchImpl: typeof fetch;
 	private readonly baseUrlOverride?: string;
@@ -581,6 +683,77 @@ export class JolliMemoryPushClient {
 			summaryJsonDocId: json.summaryJsonDocId,
 			...(jmSpace !== undefined ? { jmSpace } : {}),
 		};
+	}
+
+	/**
+	 * Sends one session-sync batch.
+	 *
+	 * ⚠ This channel's failures do NOT mean what the memory push's do, and reusing
+	 * that mapping would produce a user-visible regression in an unrelated place.
+	 * `push()` treats 401/403/412 as "the binding was refused" and clears the
+	 * cached repo→Space binding; this channel never consults a binding at all (the
+	 * API key already carries the org, so nothing has to be bound for session
+	 * statistics to have a home). Clearing that cache here would make `jolli
+	 * status` and the editors' Space panel re-probe, and briefly show a degraded
+	 * Space — over a failure that has nothing to do with Spaces.
+	 *
+	 * So: 403 and 404 are "not enabled here", to be silenced machine-wide by the
+	 * caller; 412 should be impossible and is treated the same way but logged as a
+	 * warning, because seeing one means the server has made a binding a
+	 * precondition after all.
+	 */
+	async pushSessions(payload: SessionPushPayload): Promise<SessionPushResult> {
+		const { status, json, parseFailed } = await this.call<{
+			error?: string;
+			message?: string;
+			accepted?: Record<string, number>;
+			cursor?: Record<string, SessionPushCursor | number | null>;
+		}>("POST", "/api/push/jollimemory/sessions", payload);
+		if (status === 409 && json.error === "cursor_ahead") {
+			throw new SessionCursorAheadError(json.cursor ?? {});
+		}
+		if (status === 401) throw new NotAuthenticatedError();
+		if (status === 403) throw new PermissionDeniedError(errorMessage(json));
+		if (status === 426)
+			throw new ClientOutdatedError(json.message ?? "Client outdated — update the CLI/extension.");
+		// 404 and 412 are classified HERE, by status, and the two lines are the whole
+		// point: the caller silences a scope for 24h on either, and it used to decide
+		// that by matching `/HTTP 404/` and `/HTTP 412/` against the message raised on
+		// the generic line below. That message is `errorMessage(json)` whenever the
+		// body carries one, so a backend answering 404 with `{"error":"Not Found"}` —
+		// the ordinary gateway shape — produced `Not Found`, matched neither regex, and
+		// got retried every 30 minutes for ever. A status is not a substring of prose;
+		// keep these keyed on the number.
+		if (status === 404)
+			throw new SessionEndpointMissingError(
+				errorMessage(json) ?? "HTTP 404 — the backend does not implement /api/push/jollimemory/sessions",
+			);
+		if (status === 412) throw new SessionPreconditionFailedError(errorMessage(json) ?? `HTTP ${status}`);
+		if (status < 200 || status >= 300) throw new Error(errorMessage(json) ?? `HTTP ${status}`);
+		if (parseFailed) {
+			// ⚠ THE most important check on this path, and it was the one missing.
+			// A single-page app answers an unknown route with 200 and its index.html,
+			// so a backend that has not deployed this endpoint is indistinguishable
+			// from one that has — the defensive parse in `call` turns that HTML into
+			// `{}`, `accepted` and `cursor` both read as empty, the caller falls back
+			// to its own high-water mark, and the cursor advances over rows that
+			// reached nobody. Measured against production: every request answered
+			// `200` with `<!doctype html>`, the channel reported success for months,
+			// and nothing had ever been ingested.
+			//
+			// Every other method here already checks this. Failing loudly costs a
+			// retry; not checking costs the data silently, which is the one outcome
+			// a sync must never have.
+			// Same CLASS as a 404, because it means the same thing: this deployment
+			// does not have the endpoint. Raising it as a bare `Error` left the caller
+			// recognising it by the phrase "may not implement this endpoint", which is
+			// the same fragility as the status regexes above one step removed.
+			throw new SessionEndpointMissingError(
+				`Malformed (non-JSON) response from /api/push/jollimemory/sessions (HTTP ${status}) — ` +
+					"the backend may not implement this endpoint",
+			);
+		}
+		return { accepted: json.accepted ?? {}, cursor: json.cursor ?? {} };
 	}
 
 	/**

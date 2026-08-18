@@ -12,6 +12,7 @@ import {
 	parseSettingsApplyInput,
 	type SettingsApplyInput,
 	SettingsValidationError,
+	setSyncSessions,
 	syncAllReposHooks,
 } from "./SettingsMutations.js";
 import { maskApiKey } from "./SettingsPageQuery.js";
@@ -175,6 +176,20 @@ describe("parseSettingsApplyInput", () => {
 		).toBeUndefined();
 	});
 
+	// `syncSessions` is tri-state for the same reason, and absent from every
+	// submission the current page makes: it is an immediate switch now, so a
+	// batched save must not speak for it.
+	it("leaves an absent syncSessions undefined rather than reading it as off", () => {
+		expect(parseSettingsApplyInput(rawBody()).syncSessions).toBeUndefined();
+	});
+
+	// An older page still submits it, and that answer is honoured either way.
+	it("carries a submitted syncSessions through, false included", () => {
+		expect(parseSettingsApplyInput(rawBody({ syncSessions: true })).syncSessions).toBe(true);
+		expect(parseSettingsApplyInput(rawBody({ syncSessions: false })).syncSessions).toBe(false);
+		expect(parseSettingsApplyInput(rawBody({ syncSessions: "on" })).syncSessions).toBeUndefined();
+	});
+
 	it("rejects a submission with every agent disabled", () => {
 		const allOff = Object.fromEntries(
 			[
@@ -244,6 +259,21 @@ describe("applySettings", () => {
 		expect(config.dcoSignoff).toBe(true);
 		expect(config.dashboardKnowledgeMenuEnabled).toBe(true);
 		expect(config.dashboardGraphMenuEnabled).toBe(true);
+	});
+
+	// The failure this closes: the switch writes immediately, so a form saved
+	// afterwards must not carry a stale copy of it back to disk.
+	it("leaves a stored syncSessions untouched when the submission omits it", async () => {
+		const d = configDirWith({ syncSessions: false });
+		await applySettings(baseInput({ dcoSignoff: true }), d);
+		expect(readConfig(d).dcoSignoff).toBe(true);
+		expect(readConfig(d).syncSessions).toBe(false);
+	});
+
+	it("still honours a syncSessions an older page submits", async () => {
+		const d = configDirWith({ syncSessions: false });
+		await applySettings(baseInput({ syncSessions: true }), d);
+		expect(readConfig(d).syncSessions).toBe(true);
 	});
 
 	it("stores localAgentModel only when it differs from the default", async () => {
@@ -589,5 +619,23 @@ describe("checkLocalFolder", () => {
 		const filePath = join(dir, "a-file.txt");
 		writeFileSync(filePath, "x");
 		expect(await checkLocalFolder(filePath)).toBe("not-a-dir");
+	});
+});
+
+describe("setSyncSessions", () => {
+	// The immediate switch behind /api/settings/set-sync-sessions. A one-field
+	// merge, so it cannot clobber the rest of a config a batched save is editing.
+	it("writes the switch and leaves every other field alone", async () => {
+		const d = configDirWith({ syncSessions: true, dcoSignoff: true, model: "opus" });
+		expect(await setSyncSessions(false, d)).toEqual({ syncSessions: false });
+		let config = readConfig(d);
+		expect(config.syncSessions).toBe(false);
+		expect(config.dcoSignoff).toBe(true);
+		expect(config.model).toBe("opus");
+
+		expect(await setSyncSessions(true, d)).toEqual({ syncSessions: true });
+		config = readConfig(d);
+		expect(config.syncSessions).toBe(true);
+		expect(config.model).toBe("opus");
 	});
 });

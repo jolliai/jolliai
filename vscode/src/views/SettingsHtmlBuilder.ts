@@ -250,7 +250,8 @@ export function buildSettingsHtml(nonce: string): string {
       <div class="settings-row column">
         <label class="settings-label">
           Outbound push per repo
-          <span class="hint">Every repository on this machine that Jolli tracks. Turning one <strong>off</strong> keeps capturing its memory locally but blocks all outbound sync (auto and manual). New repos are allowed by default. <strong>Each toggle applies immediately</strong> — no “Apply Changes” needed. Re-enabling a repo syncs its retained backlog on that repo’s next activity (right away for the repo you’re currently in). (Local-only repos with no git remote are managed from within the repo instead.)</span>
+          <span class="hint">Turning a repository <strong>off</strong> keeps capturing its memories locally and blocks only the outbound sync — automatic and manual alike. Turn it back on and the retained backlog goes up on that repo’s next activity, right away for the repo you’re in now.</span>
+          <span class="hint">Every repository Jolli tracks on this machine is listed here, and a new one is allowed by default. <strong>These toggles apply immediately</strong> — no “Apply Changes” needed. A repo with no git remote is local-only and is managed from inside the repo instead.</span>
         </label>
         <div id="pushControlList" class="push-control-list">
           <div class="hint" id="pushControlEmpty">Loading…</div>

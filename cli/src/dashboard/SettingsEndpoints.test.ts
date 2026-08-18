@@ -198,6 +198,34 @@ describe("POST /api/settings/set-push validation", () => {
 	});
 });
 
+describe("POST /api/settings/set-sync-sessions", () => {
+	function readConfig(): Record<string, unknown> {
+		return JSON.parse(readFileSync(join(configDir, "config.json"), "utf-8"));
+	}
+
+	it("400s a non-boolean enabled", async () => {
+		const port = await startServer();
+		const res = await post(port, "/api/settings/set-sync-sessions", {});
+		expect(res.status).toBe(400);
+		expect((await jbody(res)).error).toMatch(/enabled/);
+	});
+
+	// Immediate, like set-push above: the config file carries the new value as
+	// soon as the request returns, with no Apply in between.
+	it("writes the switch on the spot, both ways, leaving the rest of the config alone", async () => {
+		const port = await startServer();
+		const off = await post(port, "/api/settings/set-sync-sessions", { enabled: false });
+		expect(off.status).toBe(200);
+		expect((await jbody(off)).syncSessions).toBe(false);
+		expect(readConfig().syncSessions).toBe(false);
+		expect(readConfig().localFolder).toBeTruthy();
+
+		const on = await post(port, "/api/settings/set-sync-sessions", { enabled: true });
+		expect(on.status).toBe(200);
+		expect(readConfig().syncSessions).toBe(true);
+	});
+});
+
 describe("POST /api/settings/probe-local-agent validation", () => {
 	it("400s a missing tool", async () => {
 		const port = await startServer();

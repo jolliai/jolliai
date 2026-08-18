@@ -176,6 +176,39 @@ describe("forgetRepo", () => {
 		expect(await countIn("commits", keptId)).toBe(1);
 	});
 
+	/**
+	 * `stats_daily` has no foreign key to `repos`, so `repoChildTables` cannot see
+	 * it and nothing refuses the `DELETE FROM repos` — the rows just stay.
+	 *
+	 * Left behind they are wrong NUMBERS rather than a stale cache: a cached day
+	 * expires when a source row is WRITTEN, a delete writes nothing, and the
+	 * `built` sentinel is stored once per day rather than per repo, so the day
+	 * keeps reading as settled and keeps serving them. The all-repos scope emits no
+	 * repo filter at all, so a forgotten repo's spend would count there for ever.
+	 */
+	it("clears the forgotten repo's rollup cache, which no foreign key reaches", async () => {
+		const goneId = await seedRepoWithChildren("local:aaa");
+		const keptId = await seedRepoWithChildren("local:bbb");
+		writeRegistry([entry({ repoIdentity: "local:aaa" })]);
+		await withDb((db) => {
+			const insert = db.prepare(
+				`INSERT INTO stats_daily (repo_id, tz, day, kind, series_key, value, cost_usd, built_at_ms, updated_at_ms)
+				 VALUES (?, 'UTC', '2026-08-17', ?, ?, 10, 0.5, 1, 1)`,
+			);
+			insert.run(goneId, "model", "sonnet");
+			insert.run(keptId, "model", "sonnet");
+			// The per-DAY sentinel, which belongs to no repo and must survive: the
+			// day's remaining rows are still correct, so recomputing it buys nothing.
+			insert.run(0, "built", "");
+		});
+
+		await forgetRepo("local:aaa", { configDir, dbPath });
+
+		expect(await countIn("stats_daily", goneId)).toBe(0);
+		expect(await countIn("stats_daily", keptId)).toBe(1);
+		expect(await countIn("stats_daily", 0)).toBe(1);
+	});
+
 	it("reports zeros for an identity nothing on this machine knows", async () => {
 		await withDb(() => undefined);
 		const result = await forgetRepo("local:never-seen", { configDir, dbPath });

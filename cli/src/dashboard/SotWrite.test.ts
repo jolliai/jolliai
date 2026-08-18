@@ -502,6 +502,129 @@ describe("no-op writes that still harvest", () => {
 		]);
 	});
 
+	it("forgets both cached days an alias moves a memory between", async () => {
+		// An alias is the one write that MOVES a memory between calendar days: the
+		// landing rule falls through to the aliasing commit's committer date once the
+		// memory's own commit row is gone. `commit_aliases` carries no write stamp, so
+		// the rollup's staleness scan cannot see it — both the day it leaves and the
+		// day it arrives on have to be forgotten here, or the memory is counted twice
+		// (once in each day's cached copy) until something unrelated rebuilds them.
+		const { localDayKey, machineTimeZone } = await import("./LocalDays.js");
+		const tz = machineTimeZone();
+		// The memory's own `commitDate`, i.e. where it lands with no commit row.
+		const leaves = Date.parse("2026-07-01T00:00:00.000Z");
+		// The surviving commit's COMMITTER date — deliberately a different day.
+		const arrives = Date.parse("2026-07-15T12:00:00.000Z");
+		await storage.writeFiles([file(`summaries/${H("a")}.json`, summary(H("a")))], "m");
+		await withDashboardDb(
+			(db) => {
+				const repoId = (db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(REPO) as { id: number })
+					.id;
+				db.prepare(
+					`INSERT INTO commits (event_id, repo_id, hash, branch, message, committed_at_ms, written_at_ms)
+					 VALUES (?, ?, ?, 'main', 'm', ?, ?)`,
+				).run(`commit:${H("9")}`, repoId, H("9"), arrives, arrives);
+				const settle = db.prepare(
+					`INSERT INTO stats_daily (repo_id, tz, day, kind, series_key, value, cost_usd, built_at_ms, updated_at_ms)
+					 VALUES (?, ?, ?, 'model', 'sonnet', 1, 0, 1, 1)`,
+				);
+				settle.run(repoId, tz, localDayKey(leaves, tz));
+				settle.run(repoId, tz, localDayKey(arrives, tz));
+			},
+			{ dbPath },
+		);
+
+		await storage.writeFiles(
+			[
+				file("index.json", {
+					version: 3,
+					entries: [{ commitHash: H("a"), parentCommitHash: null }],
+					commitAliases: { [H("9")]: H("a") },
+				}),
+			],
+			"m",
+		);
+
+		expect(await rows("SELECT day FROM stats_daily")).toEqual([]);
+	});
+
+	it("forgets the day a RETARGETED alias drops its previous target back onto", async () => {
+		// The gap the shared `upsertCommitAlias` closed. Retargeting `old_hash` moves
+		// the INCOMING target onto the aliasing commit's day — which this loop always
+		// handled — and simultaneously drops the OUTGOING one back to its own
+		// `commit_date_ms`. That second day used to be named nowhere: the previous
+		// target was never read, `commit_aliases` carries no stamp the rollup's
+		// staleness scan can see, and an old day gets no further writes — so its
+		// cached copy served a count missing that memory indefinitely.
+		const { localDayKey, machineTimeZone } = await import("./LocalDays.js");
+		const tz = machineTimeZone();
+		// Where a memory with no commit row of its own lands: its own `commitDate`.
+		// THREE distinct days, and that is what gives this case its teeth: the two
+		// memories must not share a fallback day, or the old code's "read the
+		// incoming target" would have named the outgoing one's day by coincidence.
+		const aFallback = Date.parse("2026-07-01T00:00:00.000Z");
+		const bFallback = Date.parse("2026-06-10T00:00:00.000Z");
+		// The aliasing commit's COMMITTER date — deliberately a third day.
+		const aliased = Date.parse("2026-07-15T12:00:00.000Z");
+		await storage.writeFiles(
+			[
+				file(`summaries/${H("a")}.json`, summary(H("a"))),
+				file(`summaries/${H("b")}.json`, summary(H("b"), { commitDate: "2026-06-10T00:00:00.000Z" })),
+			],
+			"m",
+		);
+		await withDashboardDb(
+			(db) => {
+				const repoId = (db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(REPO) as { id: number })
+					.id;
+				db.prepare(
+					`INSERT INTO commits (event_id, repo_id, hash, branch, message, committed_at_ms, written_at_ms)
+					 VALUES (?, ?, ?, 'main', 'm', ?, ?)`,
+				).run(`commit:${H("9")}`, repoId, H("9"), aliased, aliased);
+			},
+			{ dbPath },
+		);
+		const index = (target: string) =>
+			file("index.json", {
+				version: 3,
+				entries: [
+					{ commitHash: H("a"), parentCommitHash: null },
+					{ commitHash: H("b"), parentCommitHash: null },
+				],
+				commitAliases: { [H("9")]: target },
+			});
+
+		// First landing: `a` is the target, so it sits on the aliased day.
+		await storage.writeFiles([index(H("a"))], "m");
+		// Settle a cached day for each landing this retarget will touch, AFTER the
+		// first alias landed so it is not swept by that write's own invalidation.
+		await withDashboardDb(
+			(db) => {
+				const repoId = (db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(REPO) as { id: number })
+					.id;
+				const settle = db.prepare(
+					`INSERT INTO stats_daily (repo_id, tz, day, kind, series_key, value, cost_usd, built_at_ms, updated_at_ms)
+					 VALUES (?, ?, ?, 'model', 'sonnet', 1, 0, 1, 1)`,
+				);
+				settle.run(repoId, tz, localDayKey(aFallback, tz));
+				settle.run(repoId, tz, localDayKey(bFallback, tz));
+				settle.run(repoId, tz, localDayKey(aliased, tz));
+			},
+			{ dbPath },
+		);
+
+		// The retarget.
+		await storage.writeFiles([index(H("b"))], "m");
+
+		expect(await rows("SELECT old_hash, target_hash FROM commit_aliases")).toEqual([
+			{ old_hash: H("9"), target_hash: H("b") },
+		]);
+		// All three are gone: `b` left its own fallback day, both memories crossed the
+		// aliased day, and `a` came back to ITS fallback day — that last one is what
+		// used to survive, holding a count that no longer included `a`.
+		expect(await rows("SELECT day FROM stats_daily")).toEqual([]);
+	});
+
 	it("delete of index/catalog/v5-marker changes nothing", async () => {
 		await storage.writeFiles(
 			[

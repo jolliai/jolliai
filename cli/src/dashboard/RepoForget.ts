@@ -110,6 +110,13 @@ interface RepoChildTable {
  * after the schema change that caused it. `SotSchema`'s own test pins the derived
  * set, so a new referencing table shows up as a visible test edit instead.
  *
+ * ⚠ The derivation's guarantee is exactly as wide as the foreign keys, so a
+ * repo-scoped table with NO foreign key is invisible to it — and fails SILENTLY
+ * rather than loudly, because nothing then refuses the `DELETE FROM repos`. There
+ * is one today, `stats_daily`, deleted by hand in {@link deleteRepoRows}; adding
+ * another means adding it there. See that call site for why the silence is worse
+ * than the loud failure this list was written to prevent.
+ *
  * Sorted for determinism — the deletion order is irrelevant (every one of them is
  * a child of `repos`, and their own children cascade), but a stable order keeps
  * the assertion and the log line stable.
@@ -148,6 +155,30 @@ function deleteRepoRows(
 		for (const { table, column } of children) {
 			childRowsDeleted += changed(db.prepare(`DELETE FROM "${table}" WHERE "${column}" = ?`).run(row.id));
 		}
+		// `stats_daily` by hand, because the derived list above CANNOT reach it: that
+		// list is every table with a foreign key to `repos(id)`, and this one
+		// deliberately has none (it is a rebuilt cache, and nothing here should
+		// cascade — see its DDL). So the "a table added later shows up as a test
+		// edit" guarantee does not cover it, and a table with no FK must be handled
+		// explicitly. Any future one too.
+		//
+		// Leaving it behind is not a stale-cache annoyance but WRONG NUMBERS, for
+		// two compounding reasons. A cached day is invalidated by source rows being
+		// WRITTEN, and a delete leaves no write stamp — while the `built` sentinel is
+		// stored once per DAY rather than per repo, so the day stays "settled" and
+		// keeps serving these rows. And `scopeFilter` emits no WHERE clause at all
+		// for the all-repos scope, so a forgotten repo's spend would keep counting
+		// there for ever (an old day gets no further writes to rebuild it).
+		// Worse still, `repos.id` is `INTEGER PRIMARY KEY` without AUTOINCREMENT, so
+		// SQLite hands the next repo `max(id) + 1` — forget the highest id and a
+		// brand-new repo INHERITS these rows, which puts the ghost inside a
+		// single-repo view too.
+		//
+		// Not counted in `childRowsDeleted`: that number is documented as rows from
+		// the tables referencing `repos.id`, and `DashboardServer` reads it as "was
+		// there anything to remove". A derived row must not be able to answer yes to
+		// that on its own.
+		db.prepare("DELETE FROM stats_daily WHERE repo_id = ?").run(row.id);
 	}
 	const repoRowDeleted = row !== undefined && changed(db.prepare("DELETE FROM repos WHERE id = ?").run(row.id)) > 0;
 	// Not gated on `row`: an identity whose only trace is an unprojected event has

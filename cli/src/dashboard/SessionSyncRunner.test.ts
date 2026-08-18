@@ -1,0 +1,779 @@
+/**
+ * The runner's contract, exercised against a real database and a fake server.
+ *
+ * The cases that matter here are the ones where a wrong choice loses data
+ * silently: a cursor that never comes down when the backend changes, a throttle
+ * mark that only records successes, a gate that reads the wrong switch.
+ */
+
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { type JolliMemoryPushClient, SessionCursorAheadError } from "../core/JolliMemoryPushClient.js";
+import {
+	MIN_ATTEMPT_INTERVAL_MS,
+	readSessionPushChannel,
+	type TableCursor,
+	writeSessionPushChannel,
+} from "../core/SessionPushCursor.js";
+import { type DashboardDbHandle, withDashboardDb } from "./DashboardDb.js";
+
+const NOW = Date.UTC(2026, 7, 12, 12, 0, 0);
+
+/**
+ * A cursor at the START of one millisecond — the empty key.
+ *
+ * The position a bare stamp denotes, so a case that only cares about the
+ * millisecond can say so without spelling a key. The fake servers here
+ * deliberately ANSWER with bare numbers: the wire tolerates a backend that
+ * echoes no tie-breaker, and that path must keep working.
+ */
+const at = (stamp: number): TableCursor => ({ stamp, key: [] });
+
+const h = vi.hoisted(() => ({
+	loadConfig: vi.fn(),
+	readRepoRegistryStrict: vi.fn(),
+	isRepoDisabled: vi.fn(),
+	getDashboardDbPath: vi.fn(),
+	canUseDashboardDb: vi.fn(),
+	log: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
+}));
+
+// Only `createLogger` is replaced: `errMsg` is what turns a thrown value into the
+// reason string every branch below reports, so a wholesale mock would assert
+// against text the production code never produces.
+vi.mock("../Logger.js", async (orig) => ({
+	...(await orig<Record<string, unknown>>()),
+	createLogger: () => h.log,
+}));
+
+vi.mock("../core/SessionTracker.js", async (orig) => ({
+	...(await orig<Record<string, unknown>>()),
+	loadConfig: h.loadConfig,
+}));
+
+// The two halves of "which repos are switched off". Mocked rather than driven
+// through real `profile.json` files because the predicate itself is
+// `RepoRegistry`'s to test — here the question is only what the runner does with
+// its answer.
+vi.mock("./RepoRegistry.js", async (orig) => ({
+	...(await orig<Record<string, unknown>>()),
+	readRepoRegistryStrict: h.readRepoRegistryStrict,
+	isRepoDisabled: h.isRepoDisabled,
+}));
+
+vi.mock("./DashboardDb.js", async (orig) => ({
+	...(await orig<Record<string, unknown>>()),
+	getDashboardDbPath: h.getDashboardDbPath,
+	canUseDashboardDb: h.canUseDashboardDb,
+}));
+
+/** A client whose two used methods are stubs. */
+function fakeClient(over: Partial<JolliMemoryPushClient> = {}): JolliMemoryPushClient {
+	return {
+		resolveBaseUrl: async () => "https://acme.jolli.ai",
+		pushSessions: async () => ({ accepted: {}, cursor: {} }),
+		...over,
+	} as unknown as JolliMemoryPushClient;
+}
+
+describe("session sync runner", () => {
+	let dir: string;
+	let dbPath: string;
+	let configDir: string;
+
+	beforeEach(async () => {
+		vi.clearAllMocks();
+		// The runner states each stable skip reason once per PROCESS, and a vitest
+		// file is one process for every case in it — so without this, a reason
+		// reported by an earlier case would be missing from a later one's log.
+		const { resetSessionSyncReportMemo } = await import("./SessionSyncRunner.js");
+		resetSessionSyncReportMemo();
+		dir = mkdtempSync(join(tmpdir(), "jolli-syncrun-"));
+		dbPath = join(dir, "dashboard.db");
+		configDir = join(dir, "cfg");
+		h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x" });
+		h.readRepoRegistryStrict.mockResolvedValue({ version: 1, repos: [] });
+		h.isRepoDisabled.mockReturnValue(false);
+		h.getDashboardDbPath.mockReturnValue(dbPath);
+		h.canUseDashboardDb.mockReturnValue(true);
+	});
+
+	afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+	const run = async (over: Record<string, unknown> = {}) => {
+		const { runSessionSync } = await import("./SessionSyncRunner.js");
+		return runSessionSync({ nowMs: NOW, configDir, force: true, client: fakeClient(), ...over });
+	};
+
+	async function seedSession(writtenAtMs = NOW): Promise<void> {
+		await withDashboardDb(
+			(db: DashboardDbHandle) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+				 VALUES ('https://github.com/acme/widgets', 'widgets', '/w', 1)`,
+				).run();
+				db.prepare(
+					`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, written_at_ms)
+				 VALUES ('e1', 1, 'claude', 's1', ?, ?)`,
+				).run(NOW, writtenAtMs);
+			},
+			{ dbPath },
+		);
+	}
+
+	/** `count` sessions with strictly increasing sync stamps. */
+	async function seedMany(count: number): Promise<void> {
+		await withDashboardDb(
+			(db: DashboardDbHandle) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+					 VALUES ('https://github.com/acme/widgets', 'widgets', '/w', 1)`,
+				).run();
+				for (let i = 0; i < count; i++) {
+					db.prepare(
+						`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, written_at_ms)
+						 VALUES (?, 1, 'claude', ?, ?, ?)`,
+					).run(`e${i}`, `s${i}`, NOW, 1_000 + i);
+				}
+			},
+			{ dbPath },
+		);
+	}
+
+	/** Puts `identities` in the registry, so `isRepoDisabled` gets asked about them. */
+	function registered(...identities: string[]): void {
+		h.readRepoRegistryStrict.mockResolvedValue({
+			version: 1,
+			repos: identities.map((repoIdentity, i) => ({
+				repoIdentity,
+				repoName: `r${i}`,
+				worktreeRoot: `/w${i}`,
+				enabledAt: "2026-08-12T00:00:00.000Z",
+			})),
+		});
+	}
+
+	/** A second repo with one session, so a filter can be seen to keep one and drop one. */
+	async function seedSecondRepo(): Promise<void> {
+		await withDashboardDb(
+			(db: DashboardDbHandle) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+					 VALUES ('https://github.com/acme/gadgets', 'gadgets', '/g', 1)`,
+				).run();
+				db.prepare(
+					`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, written_at_ms)
+					 VALUES ('e2', 2, 'claude', 's2', ?, ?)`,
+				).run(NOW, NOW);
+			},
+			{ dbPath },
+		);
+	}
+
+	describe("gates", () => {
+		it("sends nothing when syncSessions is off", async () => {
+			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", syncSessions: false });
+			await seedSession();
+			const push = vi.fn();
+			expect(await run({ client: fakeClient({ pushSessions: push } as never) })).toMatchObject({
+				status: "skipped",
+			});
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("sends nothing when not signed in", async () => {
+			h.loadConfig.mockResolvedValue({});
+			expect(await run()).toMatchObject({ status: "skipped", reason: "not signed in" });
+		});
+
+		it("withholds a disabled repository's rows whatever triggered the run", async () => {
+			// `jolli disable` is a ROW FILTER here, not a gate: this run has no cwd at
+			// all (the daemon's shape), and the rows must still stay put. The gate this
+			// replaced could only answer for the repo that triggered the run, so a
+			// commit in any OTHER repo shipped this one's backlog.
+			await seedSession();
+			registered("https://github.com/acme/widgets");
+			h.isRepoDisabled.mockReturnValue(true);
+			const push = vi.fn();
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("still sends every OTHER repo's rows", async () => {
+			// The failure the old gate had in the other direction: one switched-off
+			// repo stopped the whole machine's statistics.
+			await seedSession();
+			await seedSecondRepo();
+			registered("https://github.com/acme/widgets", "https://github.com/acme/gadgets");
+			h.isRepoDisabled.mockImplementation(
+				(repo: { repoIdentity: string }) => repo.repoIdentity === "https://github.com/acme/widgets",
+			);
+			// Typed parameter so the captured call keeps its shape — `vi.fn(async () =>
+			// …)` infers an empty tuple for `calls`.
+			const push = vi.fn(async (_payload: { tables: { sessions?: Array<{ repo_identity: string }> } }) => ({
+				accepted: {},
+				cursor: {},
+			}));
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+			const sent = push.mock.calls[0]?.[0];
+			expect(sent?.tables.sessions?.map((r) => r.repo_identity)).toEqual(["https://github.com/acme/gadgets"]);
+		});
+
+		it("sends nothing when the registry cannot be read", async () => {
+			// Fail CLOSED, the one read in this module that does. Degrading to
+			// "nothing is disabled" would upload statistics from a repo whose owner
+			// switched the product off, and no later run can take that back.
+			await seedSession();
+			h.readRepoRegistryStrict.mockRejectedValue(new Error("EACCES"));
+			const push = vi.fn();
+			expect(await run({ client: fakeClient({ pushSessions: push } as never) })).toMatchObject({
+				status: "skipped",
+			});
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("skips whole on a runtime that cannot open the database", async () => {
+			// A Node without flag-free `node:sqlite`, or a machine that never enabled
+			// the dashboard. The rows stay put and the next capable runtime sends
+			// them, so this is a skip rather than a failure — and it says so, because
+			// otherwise it is indistinguishable from a machine with nothing new.
+			h.canUseDashboardDb.mockReturnValue(false);
+			await seedSession();
+			const push = vi.fn();
+			expect(await run({ client: fakeClient({ pushSessions: push } as never) })).toMatchObject({
+				status: "skipped",
+				reason: "runtime cannot open the database",
+			});
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("sends for a repo with push turned off, and for one with no binding", async () => {
+			// The decision this channel is built on: statistics do not follow the
+			// memory push's rules. `syncOnPush: false` is that rule, and it must not
+			// reach here — otherwise the switch in Settings would be lying.
+			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", syncOnPush: false });
+			await seedSession();
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(push).toHaveBeenCalledTimes(1);
+		});
+	});
+
+	describe("cursors", () => {
+		it("adopts the server's cursor after a successful batch", async () => {
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => ({ accepted: {}, cursor: { sessions: 4_242 } }),
+				} as never),
+			});
+			const state = readSessionPushChannel(configDir);
+			// Stored as a keyset even though the server answered with a bare number:
+			// an empty key IS "the start of that millisecond", so nothing downstream
+			// has to know which shape the answer arrived in.
+			expect(state.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(4_242) });
+		});
+
+		it("walks the cursor DOWN on 409 and re-sends that range", async () => {
+			// The whole reason the mechanism exists: pushing to one backend, then
+			// pointing the install at a fresh one. The local cursor still claims the
+			// range was delivered, and only lowering it sends that range anywhere.
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
+				},
+				configDir,
+			);
+			const seen: Array<Record<string, TableCursor>> = [];
+			const push = vi.fn(async (payload: { cursor: Record<string, TableCursor> }) => {
+				seen.push(payload.cursor);
+				if (seen.length === 1) throw new SessionCursorAheadError({ sessions: 500 });
+				return { accepted: { sessions: 1 }, cursor: { sessions: 1_000 } };
+			});
+
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(outcome.status).toBe("done");
+			expect(seen[0]).toEqual({ sessions: at(999_999) });
+			// The server's number, adopted and re-sent in this protocol's shape.
+			expect(seen[1]).toEqual({ sessions: at(500) });
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]).toEqual({
+				sessions: at(1_000),
+			});
+		});
+
+		it("treats a null server cursor as lower than anything, not as no opinion", async () => {
+			// A brand-new or wiped backend has no record. Reading that as "no
+			// opinion" and continuing from our own high-water mark is exactly how the
+			// range before it never reaches that backend at all.
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
+				},
+				configDir,
+			);
+			let calls = 0;
+			const push = vi.fn(async () => {
+				calls++;
+				if (calls === 1) throw new SessionCursorAheadError({ sessions: null });
+				return { accepted: {}, cursor: { sessions: 1_000 } };
+			});
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			// The cursor was cleared, so the second attempt is a first run again.
+			expect(calls).toBe(2);
+		});
+
+		it("keeps each backend's progress separate", async () => {
+			await seedSession();
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://dev.jolli.ai": { sessions: at(7) } },
+				},
+				configDir,
+			);
+			await run({
+				client: fakeClient({ pushSessions: async () => ({ accepted: {}, cursor: { sessions: 99 } }) } as never),
+			});
+			const state = readSessionPushChannel(configDir);
+			expect(state.byOrigin["https://dev.jolli.ai"]).toEqual({ sessions: at(7) });
+			expect(state.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(99) });
+		});
+
+		it("gives up after two consecutive rejections instead of spinning", async () => {
+			await seedSession(1_000);
+			const push = vi.fn(async () => {
+				throw new SessionCursorAheadError({ sessions: 1 });
+			});
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(outcome.status).toBe("failed");
+			expect(push.mock.calls.length).toBeLessThanOrEqual(3);
+		});
+
+		it("resets progress when the local database was rebuilt", async () => {
+			// A rebuilt database re-derives rows whose stamps can be BELOW the stored
+			// cursor — rows no cursor would ever select again, with nothing to report
+			// it.
+			const { ensureInstanceId } = await import("./Backup.js");
+			await withDashboardDb(ensureInstanceId, { dbPath });
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					dbInstanceId: "a-different-database",
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
+				},
+				configDir,
+			);
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(push).toHaveBeenCalledTimes(1);
+			expect((push.mock.calls[0] as unknown as [{ cursor: unknown }])[0].cursor).toEqual({});
+		});
+
+		it("makes no request at all on a first run with nothing to send", async () => {
+			// The empty-batch reconciliation buys one request per throttle window so
+			// a client whose cursor sits above every local row still hears from the
+			// server. It must NOT fire on a machine that has never synced: there is
+			// no cursor to reconcile, so the request could only be empty in both
+			// directions.
+			await withDashboardDb(() => undefined, { dbPath });
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(push).not.toHaveBeenCalled();
+			expect(outcome).toEqual({ status: "done", batches: 0, rows: 0 });
+		});
+
+		it("binds to the database's identity on first sight, and keeps the cursor it already had", async () => {
+			// Recording the id is not the same event as noticing a rebuild: the first
+			// run has nothing to compare against, so it must adopt the id and leave
+			// the progress alone. Clearing here would re-send the whole first-run
+			// window to a backend that already has it, every time a machine upgraded
+			// into this build.
+			await seedSession(1_000);
+			await withDashboardDb(
+				(db: DashboardDbHandle) =>
+					db.prepare("INSERT OR REPLACE INTO schema_meta (key, value) VALUES ('instance-id', 'db-1')").run(),
+				{ dbPath },
+			);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
+				},
+				configDir,
+			);
+
+			await run();
+			const first = readSessionPushChannel(configDir);
+			expect(first.dbInstanceId).toBe("db-1");
+			expect(first.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(999_999) });
+
+			// And the same database on the next run is not a rebuild either.
+			await run();
+			const second = readSessionPushChannel(configDir);
+			expect(second.dbInstanceId).toBe("db-1");
+			expect(second.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(999_999) });
+		});
+	});
+
+	describe("what it reports", () => {
+		/** True when some call's format string carries `text`. */
+		const said = (calls: Array<unknown[]>, text: string): boolean => calls.some((c) => String(c[0]).includes(text));
+
+		it("says why it is not uploading for each gate, instead of returning silently", async () => {
+			// The failure this exists for: a switched-off toggle, an invalid key and a
+			// silenced backend were all indistinguishable from a healthy machine with
+			// nothing new to send — in the log, in the channel file, everywhere.
+			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", syncSessions: false });
+			await run();
+			expect(said(h.log.info.mock.calls, "syncSessions is off")).toBe(true);
+		});
+
+		it("says so when there is no API key", async () => {
+			h.loadConfig.mockResolvedValue({});
+			await run();
+			expect(said(h.log.info.mock.calls, "no API key configured")).toBe(true);
+		});
+
+		it("says so when a repository is being withheld", async () => {
+			registered("https://github.com/acme/widgets");
+			h.isRepoDisabled.mockReturnValue(true);
+			await run();
+			// `said` matches the FORMAT string, so the count is asserted separately.
+			expect(said(h.log.info.mock.calls, "withholding %d disabled repository")).toBe(true);
+			expect(h.log.info.mock.calls.some((c) => String(c[0]).includes("withholding") && c[1] === 1)).toBe(true);
+		});
+
+		it("states a stable reason ONCE per process, not once per trigger", async () => {
+			// Every trigger on the machine asks again, and the answer holds for hours.
+			// One line is the signal; forty-eight is a reason to stop reading the file.
+			h.loadConfig.mockResolvedValue({ jolliApiKey: "sk-jol-x", syncSessions: false });
+			await run();
+			await run();
+			await run();
+			expect(h.log.info.mock.calls.filter((c) => String(c[0]).includes("syncSessions is off"))).toHaveLength(1);
+		});
+
+		it("states a reason again once the memo has overflowed, instead of growing forever", async () => {
+			// Every other memo key is a constant; the catch-all keys on the message,
+			// which is arbitrary text. In the global daemon that set lives as long as
+			// the machine is up, so it is capped — and overflowing degrades it to
+			// "state this reason again", never to a leak and never to a lost line.
+			const saidBoomZero = () => h.log.info.mock.calls.filter((c) => c[1] === "boom 0").length;
+			h.loadConfig.mockRejectedValue(new Error("boom 0"));
+			await run();
+			await run();
+			expect(saidBoomZero()).toBe(1);
+
+			// Enough distinct reasons to fill the cap, at which point the memo starts over.
+			for (let i = 1; i <= 64; i++) {
+				h.loadConfig.mockRejectedValue(new Error(`boom ${i}`));
+				await run();
+			}
+			h.loadConfig.mockRejectedValue(new Error("boom 0"));
+			await run();
+			expect(saidBoomZero()).toBe(2);
+		});
+
+		it("warns, with the scope, when a backend refuses the channel", async () => {
+			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new PermissionDeniedError("scope not enabled");
+					},
+				} as never),
+			});
+			expect(said(h.log.warn.mock.calls, "refused this channel")).toBe(true);
+			// `flat()` + `toContain` rather than `some((c) => c.includes(scope))`, and the
+			// reason is CodeQL rather than taste: that spelling reads to
+			// `js/incomplete-url-substring-sanitization` as a URL literal inside a
+			// containment check, even though the receiver is the ARGS ARRAY — where
+			// `includes` is exact equality, not a substring test. The scope travels as its
+			// own `%s` argument (see the `log.warn` call), so both forms assert the same
+			// exact match; this one just cannot be misread as a host check.
+			//
+			// ⚠ Do NOT "fix" it by parsing and comparing `new URL(entry).host`: that
+			// accepts `http://` and `https://acme.jolli.ai/tenant` too, and the scoped-URL
+			// case below exists precisely because those are DIFFERENT scopes.
+			expect(h.log.warn.mock.calls.flat()).toContain("https://acme.jolli.ai");
+		});
+
+		it("warns on a 401 rather than leaving an invalid key to retry forever in silence", async () => {
+			// Not silenced — a key is re-issued by the user — so this one repeats every
+			// half hour with nothing to show for it unless it says something.
+			const { NotAuthenticatedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new NotAuthenticatedError("bad key");
+					},
+				} as never),
+			});
+			expect(said(h.log.warn.mock.calls, "rejected our credentials")).toBe(true);
+		});
+
+		it("records the bypass when a forced run overrides a silence", async () => {
+			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new PermissionDeniedError("scope not enabled");
+					},
+				} as never),
+			});
+			h.log.info.mockClear();
+			await run({ client: fakeClient({ pushSessions: async () => ({ accepted: {}, cursor: {} }) } as never) });
+			expect(said(h.log.info.mock.calls, "retrying anyway (forced)")).toBe(true);
+		});
+	});
+
+	describe("throttle and failure marks", () => {
+		it("records the attempt even when the request fails", async () => {
+			// ⚠ The opposite of the cursors, which only move on success. This is a
+			// throttle: recording only successes makes every trigger retry a request
+			// that is going to fail the same way.
+			await seedSession();
+			const outcome = await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new Error("network down");
+					},
+				} as never),
+			});
+			expect(outcome.status).toBe("failed");
+			expect(readSessionPushChannel(configDir).lastAttemptAtMs).toBe(NOW);
+		});
+
+		it("silences the refusing SCOPE for a day after a 403, not the machine", async () => {
+			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new PermissionDeniedError("scope not enabled");
+					},
+				} as never),
+			});
+			const state = readSessionPushChannel(configDir);
+			expect(state.silencedByScope["https://acme.jolli.ai"]).toBeGreaterThan(NOW);
+
+			// And an ordinary (unforced) run does not even reach the client.
+			const push = vi.fn();
+			const { runSessionSync } = await import("./SessionSyncRunner.js");
+			const outcome = await runSessionSync({
+				nowMs: NOW + MIN_ATTEMPT_INTERVAL_MS,
+				configDir,
+				client: fakeClient({ pushSessions: push } as never),
+			});
+			expect(outcome).toEqual({ status: "skipped", reason: "silenced" });
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("silences a 404 whose body carries the server's own message", async () => {
+			// The end of the bug the CLASSES were introduced for. The runner used to
+			// decide this by matching `/HTTP 404/` against the error message, while the
+			// client raises `errorMessage(json)` whenever the body has one — so a
+			// gateway answering `{"error":"Not Found"}` produced `Not Found`, matched
+			// nothing, and the channel retried a missing endpoint every 30 minutes
+			// indefinitely. Nothing about the message is asserted here on purpose: the
+			// point of the fix is that the message stopped being the contract.
+			const { SessionEndpointMissingError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new SessionEndpointMissingError("Not Found");
+					},
+				} as never),
+			});
+			expect(readSessionPushChannel(configDir).silencedByScope["https://acme.jolli.ai"]).toBeGreaterThan(NOW);
+		});
+
+		it("silences a 412 whose body carries prose instead of a status", async () => {
+			// Same fix, on the branch whose whole purpose is to be findable: a 412 is
+			// the response most likely to carry the server's own explanation, so the
+			// old `/HTTP 412/` match was the least likely of the two to ever fire.
+			const { SessionPreconditionFailedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new SessionPreconditionFailedError("this deployment requires a binding");
+					},
+				} as never),
+			});
+			expect(readSessionPushChannel(configDir).silencedByScope["https://acme.jolli.ai"]).toBeGreaterThan(NOW);
+		});
+
+		it("leaves a DIFFERENT backend running while one is silenced", async () => {
+			// The bug this replaced: one machine-wide mark, so a 403 from a
+			// misconfigured deployment stopped a healthy one too — and re-pointing the
+			// key at the healthy one changed nothing for 24h.
+			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					resolveBaseUrl: async () => "https://refuses.jolli.ai",
+					pushSessions: async () => {
+						throw new PermissionDeniedError("scope not enabled");
+					},
+				} as never),
+			});
+
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+			const { runSessionSync } = await import("./SessionSyncRunner.js");
+			const outcome = await runSessionSync({
+				nowMs: NOW + MIN_ATTEMPT_INTERVAL_MS,
+				configDir,
+				client: fakeClient({ pushSessions: push } as never),
+			});
+
+			expect(outcome.status).toBe("done");
+			expect(push).toHaveBeenCalled();
+		});
+
+		it("lets an explicit forced run through a silence", async () => {
+			// A user who has just fixed the server must not be told to wait a day; the
+			// throttle-only bypass left editing the state file as the only way out.
+			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
+			await seedSession();
+			await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new PermissionDeniedError("scope not enabled");
+					},
+				} as never),
+			});
+
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(outcome.status).toBe("done");
+			expect(push).toHaveBeenCalled();
+		});
+
+		it("keeps two tenants on one origin apart", async () => {
+			// `x-tenant-slug` comes off the same path segment this key does, so a
+			// cursor cannot be filed against a tenant the rows did not go to.
+			await seedSession();
+			await run({
+				client: fakeClient({
+					resolveBaseUrl: async () => "https://one.jolli.ai/alpha",
+					pushSessions: async () => ({ accepted: {}, cursor: { sessions: 11 } }),
+				} as never),
+			});
+			await run({
+				client: fakeClient({
+					resolveBaseUrl: async () => "https://one.jolli.ai/beta",
+					pushSessions: async () => ({ accepted: {}, cursor: { sessions: 22 } }),
+				} as never),
+			});
+
+			const state = readSessionPushChannel(configDir);
+			expect(state.byOrigin["https://one.jolli.ai/alpha"]).toEqual({ sessions: at(11) });
+			expect(state.byOrigin["https://one.jolli.ai/beta"]).toEqual({ sessions: at(22) });
+		});
+
+		it("resumes from a legacy bare-origin cursor on the first scoped run", async () => {
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(777) } },
+				},
+				configDir,
+			);
+			const seen: Array<Record<string, TableCursor>> = [];
+			await run({
+				client: fakeClient({
+					resolveBaseUrl: async () => "https://acme.jolli.ai/tenant",
+					pushSessions: async (p: { cursor: Record<string, TableCursor> }) => {
+						seen.push(p.cursor);
+						return { accepted: {}, cursor: {} };
+					},
+				} as never),
+			});
+			// Read from the legacy key, written under the scoped one.
+			expect(seen[0]).toEqual({ sessions: at(777) });
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai/tenant"]).toBeDefined();
+		});
+
+		it("does not run again inside the throttle window", async () => {
+			await seedSession();
+			await run();
+			const push = vi.fn();
+			const { runSessionSync } = await import("./SessionSyncRunner.js");
+			const outcome = await runSessionSync({
+				nowMs: NOW + 1_000,
+				configDir,
+				client: fakeClient({ pushSessions: push } as never),
+			});
+			expect(outcome).toMatchObject({ status: "skipped", reason: "throttled" });
+			expect(push).not.toHaveBeenCalled();
+		});
+
+		it("keeps a stable clientId across runs", async () => {
+			await seedSession();
+			await run();
+			const first = readSessionPushChannel(configDir).clientId;
+			await run();
+			expect(readSessionPushChannel(configDir).clientId).toBe(first);
+			expect(first).not.toBe("");
+		});
+	});
+
+	it("batches through the backlog and stops when the remainder is short", async () => {
+		await seedMany(250);
+		const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+
+		const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+		// 200 + 50, then done: selection is `>=`, so a loop that waited for an empty
+		// batch would re-send the boundary row until the per-run ceiling.
+		expect(outcome).toMatchObject({ status: "done", batches: 2 });
+		const sent = push.mock.calls as unknown as Array<[{ tables: { sessions: unknown[] } }]>;
+		expect(sent[0][0].tables.sessions).toHaveLength(200);
+		expect(sent[1][0].tables.sessions).toHaveLength(51);
+	});
+
+	it("stops at the per-run ceiling instead of draining a whole backlog at once", async () => {
+		// A first run on a long-used machine can be thousands of rows, and a
+		// background run is not the place to make dozens of serial requests. Stopping
+		// early is not a failure — the cursor is what makes the rest someone else's
+		// turn.
+		const { MAX_BATCHES_PER_RUN } = await import("./SessionSyncRunner.js");
+		await seedMany(2_100);
+		const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+
+		const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+		expect(outcome).toMatchObject({ status: "done", batches: MAX_BATCHES_PER_RUN });
+	});
+});

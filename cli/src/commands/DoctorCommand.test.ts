@@ -31,7 +31,10 @@ const h = vi.hoisted(() => ({
 	install: vi.fn(),
 	inspectPlugins: vi.fn(),
 	resolveProjectDir: vi.fn(),
+	runSessionSync: vi.fn(),
 }));
+
+vi.mock("../dashboard/SessionSyncRunner.js", () => ({ runSessionSync: h.runSessionSync }));
 
 vi.mock("../core/GitOps.js", () => ({
 	orphanBranchExists: h.orphanBranchExists,
@@ -1075,6 +1078,79 @@ describe("doctor — parked events", () => {
 		} finally {
 			restoreHome();
 			rmSync(home, { recursive: true, force: true });
+		}
+	});
+});
+
+describe("doctor --sync-sessions", () => {
+	// `process.exitCode` is process-global, and the reset hooks above belong to the
+	// FIRST describe in this file — so they do not run here. Two cases below assert
+	// on it, and `runDoctor` sets it to 1 on any warning, so without this they read
+	// whichever value an earlier block left behind rather than what this command
+	// did: the skip case failed while the code under test was correct.
+	beforeEach(() => {
+		process.exitCode = undefined;
+	});
+
+	afterEach(() => {
+		process.exitCode = undefined;
+	});
+
+	/** Captures stdout for one call and hands back what was printed. */
+	async function run(outcome: unknown): Promise<string> {
+		const { runSessionSyncNow } = await import("./DoctorCommand.js");
+		h.runSessionSync.mockResolvedValue(outcome);
+		const logs: string[] = [];
+		const spy = vi.spyOn(console, "log").mockImplementation((m) => void logs.push(String(m)));
+		try {
+			await runSessionSyncNow();
+			return logs.join("\n");
+		} finally {
+			spy.mockRestore();
+		}
+	}
+
+	it("routes the flag to the upload instead of running the whole diagnostic", async () => {
+		// The flag is a different command wearing `doctor`'s clothes: the ordinary
+		// run probes hooks, the registry and the queue, and none of that is what a
+		// user typing `--sync-sessions` is waiting for. It also returns straight
+		// after, so no diagnostic output follows the upload's one line.
+		h.runSessionSync.mockResolvedValue({ status: "done", batches: 0, rows: 0 });
+		const lines = await runDoctor(["--sync-sessions", "--cwd", "/repo"]);
+		// No cwd on the call: the channel is cross-repo, so this covers the whole
+		// machine and withholds the disabled repos row by row rather than skipping
+		// the run because the user happened to type it inside one.
+		expect(h.runSessionSync).toHaveBeenCalledWith({ force: true });
+		expect(lines.join("\n")).toContain("up to date");
+	});
+
+	it("forces the run, so a fixed backend does not have to wait out its silence", async () => {
+		await run({ status: "done", batches: 2, rows: 40 });
+		expect(h.runSessionSync).toHaveBeenCalledWith({ force: true });
+	});
+
+	it("reports what was uploaded", async () => {
+		expect(await run({ status: "done", batches: 2, rows: 40 })).toContain("Uploaded 40 row(s) in 2 batch(es)");
+	});
+
+	it("says so when there was nothing to send, rather than printing a bare success", async () => {
+		expect(await run({ status: "done", batches: 0, rows: 0 })).toContain("up to date");
+	});
+
+	it("names a skip reason instead of exiting quietly", async () => {
+		// Every reason is either the user's own setting or the server's answer, so
+		// this is the one output that makes the command worth typing.
+		const out = await run({ status: "skipped", reason: "syncSessions is off" });
+		expect(out).toContain("syncSessions is off");
+		expect(process.exitCode).not.toBe(1);
+	});
+
+	it("exits non-zero on a failure, so a script can tell", async () => {
+		try {
+			expect(await run({ status: "failed", reason: "network down" })).toContain("network down");
+			expect(process.exitCode).toBe(1);
+		} finally {
+			process.exitCode = 0;
 		}
 	});
 });

@@ -106,6 +106,7 @@ const VALID_CONFIG_KEYS = [
 	"localFolder",
 	"aiProvider",
 	"syncTranscripts",
+	"syncSessions",
 	"syncPollIntervalSec",
 	"syncOnPush",
 	"localAgentTool",
@@ -190,6 +191,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "kimiEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
+		key === "syncSessions" ||
 		key === "syncOnPush"
 	) {
 		const lower = raw.toLowerCase();
@@ -359,6 +361,19 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "syncTranscripts",
 		type: "boolean",
 		description: "Include raw AI conversation transcripts in cloud sync (default: false)",
+	},
+	{
+		key: "syncSessions",
+		type: "boolean",
+		// Spelled out because this switch does not follow the rule the two around it
+		// follow. `syncTranscripts` and `syncOnPush` are about a repo whose memories
+		// the user chose to push; this one covers EVERY repo Jolli is enabled in,
+		// bound to a Space or not. Until it existed, the dashboard's Sync tab was the
+		// only place it could be turned off — not this command, not the editors — which
+		// is a thin opt-out for the one channel that uploads from repositories the
+		// user never connected to anything.
+		description:
+			"Sync session statistics (tokens, cost, tool names, session titles) to your Jolli organization, for every repo on this machine (default: true)",
 	},
 	{
 		key: "syncOnPush",

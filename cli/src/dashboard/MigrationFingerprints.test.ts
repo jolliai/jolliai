@@ -45,6 +45,15 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	["TOOL_CALL_TIME_DDL", "6393ea338cd8"],
 	["SCHEMA_MIGRATIONS_DDL", "151c9e7a7af7"],
 	["REPOS_DELETE_ALLOWED_DDL", "52561786c1b7"],
+	// The seven unreleased steps the session-statistics sync was developed in,
+	// merged into one entry before shipping — see `DASHBOARD_SCHEMA_VERSION`. That
+	// is legal exactly once, while nothing has the old bytes: a machine that ran an
+	// intermediate build of this branch has the seven old names in its log and no
+	// row for this one, so it re-runs the entry and dies on `duplicate column` at
+	// the first ALTER. `jolli doctor --mark-migration SESSION_STATS_SYNC_DDL` is
+	// the documented repair, and it is the reason no further merge may happen after
+	// the first release.
+	["SESSION_STATS_SYNC_DDL", "e0c166639049"],
 ];
 
 describe("migration fingerprints", () => {

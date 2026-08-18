@@ -12,7 +12,8 @@
 
 import type { Command } from "commander";
 import { ensureGlobalDaemon, GLOBAL_DAEMON_ENSURE_COMMAND } from "../daemon/EnsureGlobalDaemon.js";
-import { GLOBAL_DAEMON_COMMAND, runGlobalDaemon } from "../daemon/GlobalDaemon.js";
+import { runGlobalDaemon } from "../daemon/GlobalDaemon.js";
+import { GLOBAL_DAEMON_COMMAND } from "../daemon/GlobalDaemonProtocol.js";
 
 export function registerGlobalDaemonCommand(program: Command): void {
 	program

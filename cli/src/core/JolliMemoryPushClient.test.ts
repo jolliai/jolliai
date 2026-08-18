@@ -14,6 +14,8 @@ import {
 	NotAuthenticatedError,
 	PermissionDeniedError,
 	type PlatformToolManifestEntry,
+	SessionEndpointMissingError,
+	SessionPreconditionFailedError,
 } from "./JolliMemoryPushClient.js";
 
 const KEY = "sk-jol-test"; // parseJolliApiKey may return null for a plain key → baseUrlOverride supplies the URL
@@ -1166,5 +1168,122 @@ describe("invokePlatformTool", () => {
 		expect(capturedMethod).toBe("POST");
 		expect(capturedUrl).toBe("https://jolli.ai/api/mcp/tools/list_tickets");
 		expect(capturedBody).toBe(JSON.stringify({ status: "open" }));
+	});
+});
+
+describe("pushSessions", () => {
+	const payload = { version: 1, clientId: "c1", cursor: {}, tables: {} } as const;
+
+	it("rejects a 2xx whose body is not JSON, instead of reading it as an empty success", async () => {
+		// The failure this was found by, in production. A single-page app answers an
+		// unknown route with 200 and its index.html, so a backend that never
+		// deployed this endpoint looks exactly like one that did: `call`'s defensive
+		// parse turns the HTML into `{}`, `accepted` and `cursor` both read empty,
+		// the runner falls back to its own high-water mark, and the cursor advances
+		// over rows nobody received. Measured against the live backend — every
+		// request 200 + `<!doctype html>`, the channel reporting success, nothing
+		// ever ingested.
+		const c = client(async () => textResponse(200, "<!doctype html><html><title>Jolli</title></html>"));
+		await expect(c.pushSessions(payload)).rejects.toThrow(/Malformed \(non-JSON\) response/);
+	});
+
+	it("raises a non-JSON 2xx as SessionEndpointMissingError, the class that silences the channel", async () => {
+		// The runner silences a scope for 24h on this CLASS. It used to match the
+		// phrase "may not implement this endpoint" instead, which made the wording
+		// load-bearing; the class is what carries the meaning now.
+		const c = client(async () => textResponse(200, "<!doctype html>"));
+		await expect(c.pushSessions(payload)).rejects.toBeInstanceOf(SessionEndpointMissingError);
+	});
+
+	it("classifies a 404 by STATUS, even when the body carries a message of its own", async () => {
+		// The bug this pins. A non-2xx is raised as `errorMessage(json)` whenever the
+		// body has one, so a gateway answering `{"error":"Not Found"}` produced the
+		// message `Not Found` — which the runner's `/HTTP 404/` regex did not match.
+		// No silence, and the channel retried a missing endpoint every 30 minutes for
+		// ever, one `info` line at a time.
+		await expect(
+			client(async () => jsonResponse(404, { error: "Not Found" })).pushSessions(payload),
+		).rejects.toBeInstanceOf(SessionEndpointMissingError);
+		// And with no body at all, where the old regex did work.
+		await expect(client(async () => jsonResponse(404, {})).pushSessions(payload)).rejects.toBeInstanceOf(
+			SessionEndpointMissingError,
+		);
+	});
+
+	it("classifies a 412 by STATUS, for the same reason", async () => {
+		// A 412 is the response most likely of all to carry the server's own prose,
+		// so a `/HTTP 412/` match was the least likely to fire — on the one branch
+		// whose whole purpose is to be FINDABLE rather than retried into the ground.
+		await expect(
+			client(async () => jsonResponse(412, { message: "this deployment requires a binding" })).pushSessions(
+				payload,
+			),
+		).rejects.toBeInstanceOf(SessionPreconditionFailedError);
+	});
+
+	it("accepts a valid but empty JSON body", async () => {
+		// `{}` is a real answer from a backend that ingested nothing and holds no
+		// cursor — not a parse failure, and must not be treated as one.
+		const c = client(async () => jsonResponse(200, {}));
+		await expect(c.pushSessions(payload)).resolves.toEqual({ accepted: {}, cursor: {} });
+	});
+
+	it("returns the server's counts and cursor when it answers properly", async () => {
+		const c = client(async () =>
+			jsonResponse(200, { accepted: { sessions: 3 }, cursor: { sessions: { stamp: 9, key: ["e1"] } } }),
+		);
+		await expect(c.pushSessions(payload)).resolves.toEqual({
+			accepted: { sessions: 3 },
+			cursor: { sessions: { stamp: 9, key: ["e1"] } },
+		});
+	});
+
+	it("carries the server's cursor on a 409 so the client can walk back down", async () => {
+		const c = client(async () => jsonResponse(409, { error: "cursor_ahead", cursor: { sessions: null } }));
+		await expect(c.pushSessions(payload)).rejects.toMatchObject({
+			name: "SessionCursorAheadError",
+			serverCursor: { sessions: null },
+		});
+	});
+
+	it("carries an empty cursor when the 409 names none, rather than an absent one", async () => {
+		// The caller adopts `serverCursor` unconditionally, so the shape has to be
+		// uniform: `{}` means "the server mentioned no table", which each table
+		// then answers from what the client already had. An `undefined` here would
+		// reach `adoptCursor` as a missing argument instead.
+		const c = client(async () => jsonResponse(409, { error: "cursor_ahead" }));
+		await expect(c.pushSessions(payload)).rejects.toMatchObject({
+			name: "SessionCursorAheadError",
+			serverCursor: {},
+		});
+	});
+
+	it("names the status when a 412 carries no prose of its own", async () => {
+		// The reason is reported to the user and recorded beside the 24h silence, so
+		// a bodyless refusal must still say what happened rather than silence a
+		// backend with an empty explanation.
+		const c = client(async () => jsonResponse(412, {}));
+		await expect(c.pushSessions(payload)).rejects.toThrow("HTTP 412");
+	});
+
+	it("raises any other non-2xx as a plain Error, which the runner retries", async () => {
+		// Deliberately NOT one of the classified errors: a 500 is a backend having a
+		// bad day, and silencing the scope for 24h over one would be the opposite of
+		// what a transient failure calls for.
+		const c = client(async () => jsonResponse(500, { error: "boom" }));
+		await expect(c.pushSessions(payload)).rejects.toThrow("boom");
+		await expect(c.pushSessions(payload)).rejects.not.toBeInstanceOf(SessionEndpointMissingError);
+	});
+
+	it("maps 401 / 403 / 426 to their own errors", async () => {
+		await expect(client(async () => jsonResponse(401, {})).pushSessions(payload)).rejects.toBeInstanceOf(
+			NotAuthenticatedError,
+		);
+		await expect(client(async () => jsonResponse(403, {})).pushSessions(payload)).rejects.toBeInstanceOf(
+			PermissionDeniedError,
+		);
+		await expect(client(async () => jsonResponse(426, {})).pushSessions(payload)).rejects.toBeInstanceOf(
+			ClientOutdatedError,
+		);
 	});
 });

@@ -523,6 +523,94 @@ describe("schema creation", () => {
 	});
 });
 
+describe("sync-stamp backfill", () => {
+	// The stamps arrived as a migration over databases that already had rows, and
+	// the whole promise is that the FIRST sync selects what business time would
+	// have selected. A fresh database proves none of that — its tables are empty
+	// when the entry runs — so this stops at the version before the stamps, seeds
+	// the rows a real machine would have, and then migrates the rest of the way.
+	async function migrateFromBeforeStamps(seed: (db: DashboardDbHandle) => void): Promise<DashboardDbHandle> {
+		const { DatabaseSync } = await import("node:sqlite");
+		const raw = new DatabaseSync(dbPath) as unknown as DashboardDbHandle;
+		// Everything up to (not including) SESSION_STATS_SYNC_DDL — the entry that
+		// carries the sync stamps — located by NAME rather than a hard-coded count: a
+		// migration appended ahead of it would otherwise silently change which version
+		// this seeds, and the seeded rows are the whole point of the test.
+		const stampIndex = MIGRATIONS.findIndex((m) => m.name === "SESSION_STATS_SYNC_DDL");
+		for (let slot = 0; slot < stampIndex; slot++) raw.exec(MIGRATIONS[slot].ddl);
+		raw.prepare("INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)").run(String(stampIndex));
+		// The log is what `migrateDashboardDb` decides from once its own entry
+		// (`SCHEMA_MIGRATIONS_DDL`) has run — the version stamp only speaks for a
+		// database with no log table at all. Seeding the entries above as applied is
+		// therefore what makes this a database at that version rather than one whose
+		// every entry looks unrun.
+		for (let slot = 0; slot < stampIndex; slot++) recordMigrationAsApplied(raw, MIGRATIONS[slot].name);
+		seed(raw);
+		migrateDashboardDb(raw);
+		return raw;
+	}
+
+	it("dates pre-existing rows from their business clock, not from 'now'", async () => {
+		const raw = await migrateFromBeforeStamps((db) => {
+			db.exec(
+				"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES ('r', 'jolli', '/w', 1)",
+			);
+			db.exec(
+				`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms)
+				 VALUES ('s1', 1, 'claude', 'sess-1', 1000)`,
+			);
+			db.exec(
+				`INSERT INTO session_model_usage (session_event_id, model, input_tokens, output_tokens, cached_tokens)
+				 VALUES ('s1', 'claude-opus-4-8', 1, 2, 3)`,
+			);
+			db.exec(
+				`INSERT INTO session_tool_use (session_event_id, tool_name, kind, calls)
+				 VALUES ('s1', 'Read', 'builtin', 4)`,
+			);
+			db.exec(
+				`INSERT INTO recall_receipts (receipt_id, repo_id, at_ms, surface, hit, commit_count)
+				 VALUES ('rc1', 1, 2000, 'cli', 1, 0)`,
+			);
+		});
+		try {
+			const one = (sql: string) => (raw.prepare(sql).get() as { v: number }).v;
+			// The session's own clock, and the parent's for its two child tables —
+			// so a cursor placed by business time sees exactly these rows.
+			expect(one("SELECT written_at_ms AS v FROM sessions")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM session_model_usage")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM session_tool_use")).toBe(1000);
+			expect(one("SELECT updated_at_ms AS v FROM recall_receipts")).toBe(2000);
+			// Commits are stamped 0 on purpose: "written before we tracked this",
+			// which is exactly right for a row that has not changed since and never
+			// makes a settled rollup day look stale.
+			expect(readSchemaVersion(raw)).toBe(DASHBOARD_SCHEMA_VERSION);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("survives a child row whose parent session is gone", async () => {
+		// The column is NOT NULL, so the backfill's subquery returning NULL would
+		// abort the migration — and an aborted migration is a database nobody can
+		// open. COALESCE is what keeps an orphan cheap: it lands on 0.
+		const raw = await migrateFromBeforeStamps((db) => {
+			db.exec("PRAGMA foreign_keys = OFF");
+			db.exec(
+				`INSERT INTO session_model_usage (session_event_id, model, input_tokens, output_tokens, cached_tokens)
+				 VALUES ('missing', 'claude-opus-4-8', 1, 2, 3)`,
+			);
+		});
+		try {
+			expect((raw.prepare("SELECT updated_at_ms AS v FROM session_model_usage").get() as { v: number }).v).toBe(
+				0,
+			);
+			expect(readSchemaVersion(raw)).toBe(DASHBOARD_SCHEMA_VERSION);
+		} finally {
+			raw.close();
+		}
+	});
+});
+
 describe("transactional migration runner", () => {
 	it("rolls a failed entry back — the version does not move and a retry succeeds", async () => {
 		// A conflicting object makes the entry fail part-way through, after it has

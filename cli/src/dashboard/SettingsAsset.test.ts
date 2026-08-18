@@ -97,6 +97,7 @@ const MODEL = {
 				],
 			},
 		},
+		sync: { syncSessions: true },
 		memoryBank: { localFolder: "/mem/bank", compileExcludeFolders: "archive", syncTranscripts: false },
 		others: { dcoSignoff: true, excludePatterns: "*.lock" },
 	},
@@ -126,7 +127,16 @@ describe("settings.js renderSettings", () => {
 		expect(app.innerHTML).toContain("Opus");
 
 		go("sync");
-		expect(app.innerHTML).toContain("Outbound push per repo");
+		// The signed-OUT prompt names both outbound streams (the signed-in verdict
+		// is asserted below) — saying only "memories" reads as a denial that
+		// anything else is sent.
+		expect(app.innerHTML).toContain("Sign in to push session statistics and memories");
+		// …and each block heading carries its own scope, which is the pair the two
+		// switches differ on.
+		expect(app.innerHTML).toContain("Session statistics — for the whole machine");
+		expect(app.innerHTML).toContain("Memories — per repository");
+		// The session-statistics switch lives on THIS tab, not on Others.
+		expect(app.innerHTML).toContain("Sync session statistics");
 
 		go("bank");
 		expect(app.innerHTML).toContain("Folder Path");
@@ -135,10 +145,19 @@ describe("settings.js renderSettings", () => {
 		go("others");
 		expect(app.innerHTML).toContain("Exclude Patterns");
 		expect(app.innerHTML).toContain("Sign commits with DCO");
+		expect(app.innerHTML).not.toContain("Sync session statistics");
 
 		go("advanced");
 		expect(app.innerHTML).toContain("Show Knowledge");
 		expect(app.innerHTML).toContain("Show Graph");
+	});
+
+	it("names both outbound streams in the signed-in verdict", () => {
+		const { renderSettings, app, rail } = loadJD();
+		const summary = { ...MODEL.settings.summary, signedIn: true };
+		renderSettings({ ...MODEL, settings: { ...MODEL.settings, summary } });
+		rail.get("sync")?.onclick?.();
+		expect(app.innerHTML).toContain("Signed in — ready to push session statistics and memories");
 	});
 
 	it("survives a settings payload missing optional sections, still rendering each section's own content", () => {
@@ -150,7 +169,7 @@ describe("settings.js renderSettings", () => {
 		const markers: Record<string, string> = {
 			agents: "Claude Code",
 			summary: "Provider",
-			sync: "Outbound push per repo",
+			sync: "Memories — per repository",
 			bank: "Folder Path",
 			others: "Exclude Patterns",
 			advanced: "Show Knowledge",
@@ -189,6 +208,8 @@ function loadFormJD(
 ): {
 	fields: Map<string, FieldStub>;
 	applyBtn: { onclick?: () => void };
+	/** The Sync tab's immediate session-statistics switch. */
+	syncBox: { checked: boolean; onchange?: () => void };
 	posts: { path: string; body: Record<string, unknown> }[];
 	/** How many times doApply asked the PAGE to repaint (the sidebar refresh). */
 	pageRefreshes: () => number;
@@ -202,6 +223,9 @@ function loadFormJD(
 	const refreshArgs: unknown[] = [];
 	const app = { innerHTML: "", insertAdjacentHTML: () => undefined };
 	const applyBtn: { onclick?: () => void } = {};
+	// The Sync tab's immediate switch. It is reached by `querySelector`, not by the
+	// `[data-field]` sweep, precisely because it is NOT part of the form.
+	const syncBox: { checked: boolean; onchange?: () => void } = { checked: true };
 	const field = (name: string, type: string): FieldStub => ({
 		getAttribute: (n: string) => (n === "data-field" ? name : null),
 		type,
@@ -218,7 +242,7 @@ function loadFormJD(
 		getElementById: (id: string) =>
 			id === "settingsModalBody" ? app : id === "applyBtn" ? applyBtn : { innerHTML: "", textContent: "" },
 		querySelectorAll: (sel: string) => (sel.includes("[data-field]") ? [...fields.values()] : []),
-		querySelector: () => null,
+		querySelector: (sel: string) => (sel.includes("[data-sync-sessions]") ? syncBox : null),
 		addEventListener: () => undefined,
 		createElement: () => ({ innerHTML: "" }),
 		body: { innerHTML: "" },
@@ -253,12 +277,35 @@ function loadFormJD(
 	return {
 		fields,
 		applyBtn,
+		syncBox,
 		posts,
 		pageRefreshes: () => pageRefreshes,
 		refreshArgs: () => refreshArgs,
 		renderPage: (win.JD as { renderPage: unknown }).renderPage,
 	};
 }
+
+describe("settings.js session-statistics switch", () => {
+	// The unification this replaced: one switch on the Sync tab waited for "Apply
+	// Changes" while the identical-looking per-repo ones beside it did not. Both
+	// write on change now, so the switch must POST its own endpoint…
+	it("posts immediately on change instead of waiting for Apply", () => {
+		const { syncBox, posts } = loadFormJD();
+		syncBox.checked = false;
+		syncBox.onchange?.();
+		expect(posts).toEqual([{ path: "/api/settings/set-sync-sessions", body: { enabled: false } }]);
+	});
+
+	// …and must stay OUT of the batched save, or an Apply made afterwards would
+	// carry the pre-toggle value back to disk.
+	it("is absent from the Apply payload", () => {
+		const { applyBtn, posts } = loadFormJD();
+		applyBtn.onclick?.();
+		const apply = posts.find((p) => p.path === "/api/settings/apply");
+		expect(apply).toBeDefined();
+		expect(apply?.body).not.toHaveProperty("syncSessions");
+	});
+});
 
 describe("settings.js form wiring", () => {
 	it("captures edits and assembles the Apply payload from the controlled form", () => {

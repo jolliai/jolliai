@@ -15,7 +15,14 @@
  */
 
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
-import type { LocalAgentToolId, RecallOutcome, ToolCallCount, ToolCallKind, TranscriptSource } from "../Types.js";
+import type {
+	LocalAgentToolId,
+	RecallOutcome,
+	SessionUsageEvent,
+	ToolCallCount,
+	ToolCallKind,
+	TranscriptSource,
+} from "../Types.js";
 
 /**
  * Version stamped on every event written to `events_raw`. Bump when an event's
@@ -58,6 +65,21 @@ export interface SessionUpsertedEvent {
 	readonly tokenCoverage?: TokenCoverage;
 	readonly pricesAsOf?: string;
 	readonly models?: ReadonlyArray<StatsModelUsage>;
+	/**
+	 * One entry per counted model response, each carrying its own instant.
+	 *
+	 * REPLACES the stored set when present, on the same terms as {@link models}:
+	 * a re-read attributing usage to fewer responses must not leave the extras
+	 * behind. `undefined` means this producer could not see per-response usage
+	 * (only the Claude parser can today) and leaves existing rows alone; an
+	 * empty array means it saw usage but nothing datable, which REPLACES the
+	 * stored set with nothing so a transcript rewrite cannot leave stale rows.
+	 *
+	 * {@link models} is the same numbers with the time thrown away. Both are
+	 * carried because the summary stores the aggregate, but only this one can be
+	 * placed on a calendar — see `SESSION_USAGE_EVENTS_DDL`.
+	 */
+	readonly usageEvents?: ReadonlyArray<SessionUsageEvent>;
 	/**
 	 * Tool calls observed in the session's transcript. REPLACES the stored set
 	 * when present; `undefined` means "this producer could not see tools" and
@@ -569,6 +591,22 @@ export interface SettingsMemoryBank {
 	readonly repoLabel?: string;
 }
 
+/**
+ * The Sync to Jolli tab's own fields. Sign-in state is NOT here (it comes from
+ * `summary.signedIn`, which the AI Summary tab needs too) and neither is the
+ * per-repo push list, which loads from its own endpoint.
+ */
+export interface SettingsSync {
+	/**
+	 * Session statistics sync — see `JolliMemoryConfig.syncSessions`. Seeds the
+	 * switch's initial position only: the page writes this one through
+	 * `/api/settings/set-sync-sessions` on change and never submits it with the
+	 * batched save, so that every switch on the tab applies immediately (the
+	 * per-repo ones beside it always did).
+	 */
+	readonly syncSessions: boolean;
+}
+
 /** The Others tab. */
 export interface SettingsOthers {
 	readonly dcoSignoff: boolean;
@@ -583,6 +621,7 @@ export interface SettingsOthers {
 export interface SettingsPageModel {
 	readonly agents: SettingsAgents;
 	readonly summary: SettingsSummary;
+	readonly sync: SettingsSync;
 	readonly memoryBank: SettingsMemoryBank;
 	readonly others: SettingsOthers;
 }

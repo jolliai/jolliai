@@ -157,6 +157,12 @@ export async function buildSettingsPageModel(
 			localAgentModel: config.localAgentModel ?? "",
 			localAgentModels: localAgentModels(),
 		},
+		sync: {
+			// Default ON, so an absent key reads as enabled — matching the config
+			// contract (`syncSessions !== false`). Rendering an absent key as OFF
+			// would show every user a switch that disagrees with what is happening.
+			syncSessions: config.syncSessions !== false,
+		},
 		memoryBank: {
 			...(config.localFolder ? { localFolder: config.localFolder } : {}),
 			compileExcludeFolders: config.compileExcludeFolders ? config.compileExcludeFolders.join(", ") : "",
