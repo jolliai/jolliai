@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-One SQLite database per machine backs every memory and activity surface: this spec covers where that file lives, how a writable open creates and tightens it, the exact schema it carries at the current version, and the append-only ladder that raises an older file to it — including the refusal to touch a file stamped ahead of the running build and the silent no-op every writer becomes on a runtime that cannot load the database module unflagged.
+One SQLite database per machine backs every memory and activity surface: this spec covers where that file lives, how a writable open creates and tightens it, the exact schema it carries at the current version, and the append-only ladder that raises an older file to it — a ladder whose entries are identified by name rather than by position, which records every touch in a log inside the database itself, which compares that log against the build reading it and only ever *warns*, and which deliberately contains **no compatibility gate at all**: a file stamped ahead of the running build is opened and written normally. It also covers the silent no-op every writer becomes on a runtime that cannot load the database module unflagged.
 
 ## Scope
 
@@ -12,10 +12,13 @@ One SQLite database per machine backs every memory and activity surface: this sp
 - The two ways in — a writable handle and a read-only handle — and everything each applies to the connection: per-connection pragmas, the write-lock wait, and the open-time retry.
 - The lifecycle call that creates a missing file *or* brings an existing one's schema forward, and the one condition under which it stays silent.
 - The complete schema as a data contract: every table, primary key, unique constraint, check, foreign key and index, split into its two halves.
-- The current schema version, the append-only migration ladder, and the transaction discipline each step runs under.
-- The refusal to open a database stamped with a newer schema version, and which of the two entry points enforces it.
+- The current schema version, what it is derived from, and the append-only migration ladder — its name-based identity, its execution order, and the transaction discipline each step runs under.
+- The log the ladder writes inside the database, its four outcomes, and the two cases whose rows are inference rather than observation.
+- Drift verification: what is compared, when it runs, the three deliberate silences, and why the answer is a warning and never a refusal.
+- **The deliberate absence of a compatibility gate** — no version floor, no "the file is newer than me" error — the one log line that replaces it, and the reasons a gate was implemented and removed.
+- The one repair that remains for a state a name key cannot fix alone.
 - The runtime-floor verdict: what the check actually compares, and everything that degrades through it.
-- The one table that carries a trigger, and what that trigger prevents.
+- The trigger the baseline installs, the entry that drops it again, and what still protects a repository's rows without it.
 - The transaction helper's deliberate absence of an application-level retry.
 
 **Out of scope (boundaries):**
@@ -45,7 +48,11 @@ Both sidecars are created by the engine itself, under the process umask, wheneve
 
 ### Schema version
 
-The current version is **5**, recorded as the value of key `schema_version` in `schema_meta`. A database with no `schema_meta` table reads as version **0**.
+The current version is **7**, recorded as the value of key `schema_version` in `schema_meta`. A database with no `schema_meta` table reads as version **0**.
+
+The number is a hand-maintained constant that **must equal the number of entries in the ladder** — appending a migration means raising it by one — and a test pins the two together, so two branches that each append one collide loudly in continuous integration rather than silently on disk. It cannot be written as a reference to the ladder's own length, because the ladder is declared after it.
+
+**Raising it is no longer a cross-surface release event**, and that is the one thing worth knowing about it: nothing refuses a database over this number (see *No compatibility gate*), so an appended entry costs an upgrade to nobody.
 
 ### `schema_meta` keys
 
@@ -208,7 +215,9 @@ Two entry points exist, and the split is enforced by the engine rather than by c
 6. Apply the write-lock wait as a busy timeout.
 7. **Writable opens only:** force mode `0600` on the database and on each sidecar that is present. This must run *after* the open, because the engine creates the file at the process umask and before the open there is nothing to change. A missing sidecar is the normal case and is silently tolerated; any other failure is a warning.
 
-The writable entry point then reads the stored version, **refuses a database stamped ahead of this build**, migrates, and finally runs the caller's work with the handle still open, closing it afterwards. The read-only entry point runs the caller's work directly.
+The writable entry point then reads the stored version, **warns once per process if the file's format is ahead of this build and proceeds anyway**, verifies the migration log for drift, migrates, and finally runs the caller's work with the handle still open, closing it afterwards. The read-only entry point runs the caller's work directly.
+
+A separate **repair** entry point exists for the recovery path and must never migrate — it opens a writable handle over a database whose schema state is exactly what is in question.
 
 ### Creating the file, or bringing an existing one forward
 
@@ -220,36 +229,97 @@ A single lifecycle call answers "does a current database exist here?" and makes 
    - If the version is at or above this build's, return.
    - Otherwise open a writable handle that does nothing, which migrates it.
 
-Guarding on *existence* alone was not enough: migration only runs from a writable open, so a database left by an older build in a directory where nothing else opens a writable handle was never migrated, and the first query for a table this build expects failed outright. A database *newer* than this build is left strictly alone, because there is no downgrade and the writable open would refuse it anyway.
+Guarding on *existence* alone was not enough: migration only runs from a writable open, so a database left by an older build in a directory where nothing else opens a writable handle was never migrated, and the first query for a table this build expects failed outright. A database *newer* than this build is left alone by this call because there is nothing for it to do — not because anything would refuse it; a writable open on such a file succeeds.
+
+The short-circuit asks "has this file reached at least this build's version?", which is deliberately not the same question as "is it exactly this build's version": a file ahead of this build needs no work here either.
 
 ### The migration ladder
 
-The ladder is append-only. Index 0 takes an empty database to version 1; each later entry takes version N to N+1. A shipped entry is never edited.
+The ladder is append-only. The first entry takes an empty database to version 1; each later entry takes version N to N+1. A shipped entry is never edited.
+
+**Identity is the entry's NAME, not its position.** The loop applies whichever names the file's own log does not already carry. That is what makes two branches each appending an entry a non-event after a merge — both are in the list, so both get applied — where position-as-identity let the second-merged one be skipped forever with the file stamped as complete. Consequences, all three load-bearing:
+
+- A name may be **added**, but never changed and never removed. Renaming one makes every existing database read it as never applied, re-run it, and fail on a duplicate object. A test pins the list, in order.
+- **Order is still execution order, and is protected only socially**: append, never insert into the middle and never reorder. An entry placed ahead of ones a database has already applied would run out of order — a column added before its table exists.
+- Because an entry can now be applied to a file already past it, the version stamp is raised to the **greater** of the stored value and this entry's target, never set to the target outright. Stamping it down would re-run everything after it.
 
 | To version | Step |
 | --- | --- |
-| 1 | The whole activity half, then the delete-refusing trigger on `repos`, then the whole memory half |
-| 2 | Create `recall_receipts` and its index |
-| 3 | Register `skill` as a fourth context kind |
-| 4 | Add the nullable `failed_kind` column to the ingest log |
-| 5 | Add the nullable `last_call_at_ms` column to the tool-use table |
+| 1 | The whole activity half, then the delete-refusing trigger on the repository table, then the whole memory half |
+| 2 | Create the recall-receipts table and its index |
+| 3 | Register the skill kind as a fourth context kind |
+| 4 | Add the nullable parked-event-kind column to the ingest log |
+| 5 | Add the nullable per-call timestamp column to the tool-use table |
+| 6 | **Create the migration log table and its name index** |
+| 7 | **Drop the delete-refusing trigger the first entry installed** |
+
+The last two are what this topic's own bookkeeping rests on, and the ordering has one awkward consequence stated under *The log* below: on a fresh database the first five entries run before the table that records them exists.
+
+Entry 7 is appended rather than edited out of the first entry, because a shipped entry's bytes are frozen and every existing database has already applied that one. So the baseline still creates the trigger, still carries its original argument for it, and this entry supersedes it.
 
 Migration proceeds as follows:
 
-1. Read the stored version. If it already meets or exceeds this build's, return without touching anything.
+1. Read the stored version **and the log**, and build the set of names already done — every row whose outcome is `applied` or `baseline`. Entries whose names are in that set are not re-run.
 2. Turn foreign keys **off**, outside any transaction — inside one the setting is a silent no-op. The current ladder does not need this, and it applies cleanly at either setting; it is insurance for a future step that rebuilds a table.
 3. For each missing version step:
    - Begin an **immediate** transaction.
    - **Re-read the stored version inside the write lock.** Two writers that opened around a version bump both read the old version before either migrated; the loser parks on the immediate transaction until the winner commits, and replaying the winner's step would then die on a duplicate object — an error the lock-contention retry correctly refuses to treat as contention. If the stored version has already advanced past this step, commit and skip it.
-   - Run the step's statements, write the new version into `schema_meta` in the **same** transaction, and commit.
-   - On any failure, roll back (tolerating a rollback that itself fails, because the engine may already have aborted) and propagate the original error.
+   - Run the step's statements, record an `applied` row, write the new version into `schema_meta` in the **same** transaction, and commit.
+   - On any failure, roll back (tolerating a rollback that itself fails, because the engine may already have aborted), record a `failed` row, and propagate the original error. Recording the failure is best-effort and must never mask the failure itself — the log table may not exist yet.
 4. In a `finally`, turn foreign keys back **on**. A handle left with them off would make every cascading delete in the caller's remaining work silently stop working.
 
 Bundling the version bump with the step is what makes a crash mid-step safe: the version only advances for a step that completed, so the next open retries it. Without that, a crash partway through building the baseline could leave a half-built schema that every later open would skip.
 
-### Refusing a newer schema
+### The log
 
-A writable open reads the stored version and throws when it is greater than this build's, naming the found version, this build's version, and the two ways out (upgrade, or delete the file and let it be rebuilt). Because every surface that opens this file applies its own version comparison, the first surface to migrate locks every older one out of the machine-global file until it is upgraded too — which is why the version is a cross-surface release event rather than a local edit, and why a step that can be answered by a defensive *read* is preferred over one that needs a version bump.
+Every touch of every entry is appended as one row inside the database, carrying: a monotonic sequence number; the array position the entry ran at (**diagnostic only** — nothing decides anything from it, and it is kept because "slot 5" is what a bug report says out loud); the entry's name; an outcome; the identity of the surface that did it, as a client kind and version pair — the thing a user would go and upgrade; the instant; the duration; and **the full text of the statements that ran**.
+
+Four outcomes, none interchangeable:
+
+| Outcome | Meaning |
+| --- | --- |
+| `applied` | This pass watched the entry run |
+| `failed` | This pass attempted it and it raised |
+| `skipped` | The fence found the file already past this entry, so nothing ran |
+| `baseline` | **Inference, not observation** — see below |
+
+**A reading of the log has three answers, and they are not interchangeable either**: rows; no log table at all; or a table that is present and cannot be read. The third is never folded into the second.
+
+**Two kinds of row are inference rather than observation, and the log says which.** A database that predates the log has no rows, so the version stamp is the only evidence of what ran, and the names are taken from *this build's* list at those positions — a guess, and wrong in exactly the case a position key was wrong. Those rows are marked `baseline` rather than `applied` for that reason. A log that is present but **unreadable** gets no seed rows at all: writing inference into a table whose shape this build cannot read is how a half-written log gets manufactured.
+
+**The entry that creates the log table cannot record the entries that ran before it.** On a fresh database the earlier entries run before there is anywhere to put their rows, so those rows are held and written by the creating entry — inside its transaction, ahead of its own row, so sequence order still reads as history. They stay `applied`, because this pass did watch them run. If the creating entry then fails, the held rows go with it, and that is recoverable rather than lost: the file is left at a version with no log table, which the next pass reads as a pre-log database and seeds from the stamp. The only cost is that those rows come back as inference — which is the honest description of what is then known.
+
+**Only the most recent `failed` row per name is kept.** A persistently broken database is re-opened on every commit, and appending per open grew the log without bound — each failed row stores the entry's full statement text, which for the baseline is tens of kilobytes, and both the drift check and the migration loop re-read the whole table on every open. A failed row is diagnostic and is not evidence any later pass reads, so the newest attempt is all that is useful.
+
+### Drift verification
+
+On **every** writable open — including the ones that migrate nothing, because drift is precisely the state where the version stamp says "finished" and the content disagrees — each logged entry's stored statement text is compared **byte for byte** against what this build carries under that name. A disagreement is logged, at most once per name per process, naming the entry, its position, the surface that applied it, the date, and this build's identity. A logged name this build does not carry at all is also warned about: it means another build — very likely from an unmerged branch — has touched this file, which is the most useful clue available.
+
+**The answer is always a warning. Nothing here refuses, and turning it back into a refusal is a mistake with a measured cost:** the comparison is byte-exact while the majority of the baseline entry's text is comments, so re-wrapping a single comment would make every existing database refuse writes. A test catches the same disagreement on the author's machine, before it ships, where the fix is free.
+
+Three deliberate silences:
+
+- **No log table at all** → nothing to check. The entry that creates that table is itself in the ladder, so the first run on any existing database reaches this before the table exists.
+- **A name with no `applied` row anywhere** → pass. Databases that predate the log have rows for nothing, so the check cannot reach backwards, only forwards. Seeded `baseline` rows are skipped too — they are a guess by construction, so comparing against them would report drift that was never observed. Note the test is "no `applied` row *anywhere*", not "the newest row is not `applied`": a later `skipped` or `failed` row must not bury an earlier observation.
+- **A table that is present and unreadable** → not a silence but its own warning, once per process, because every comparison below it would be vacuous rather than passing.
+
+### No compatibility gate
+
+**This layer does not decide whether a database may be used.** There is no compatibility floor, no version gate, and no "the file is newer than me" error: a writable open succeeds whatever the file says. Additive columns read back as their defaults and unknown tables are never touched. The single trace is one log line, emitted **once per process**, when the file's format number is ahead of this build — so that "this surface could not see everything" is at least visible afterwards.
+
+A gate existed and was removed. Three reasons, in the order they were learned:
+
+- **The format number cannot answer the question.** It moves only with schema changes, so it misses the change that actually corrupts data — a newly required field inside a stored payload, a re-encoded text column — while faithfully blocking the additive upgrades that are harmless. Wrong in both directions.
+- **Refusing costs more than it protects.** Most of the processes that open this file are long-lived, and they are: one tool server per agent-host session, the machine-global editor bridge, the per-project bridge, the dashboard's own server, and the editor extension host. Short-lived command-line and hook invocations are the remainder. A version gate stopped every long-lived one on every additive bump — measured: five tool servers plus the dashboard plus the extension host all reporting the same error, for a change that added two tables and five nullable columns.
+- **Compatibility is a relationship between the shipped artifacts.** The command line and the plugins are built from one source tree and released on one version line, and the backend already gates per surface on its product version. A hard incompatibility belongs there — stated in the numbers a user installed and can update — not in a number only this file knows.
+
+Two floor keys and a per-entry "breaking" flag were each implemented and removed. A floor that is not zero makes a purely additive migration *reduce* compatibility, and the format number cannot see a semantic change that touches no schema at all.
+
+### The one repair that remains
+
+A diagnostic command can record a single named entry as applied, carrying **this** build's statement text. It is what clears a drift warning, and what adopts an entry applied by other means — the state a name key cannot fix alone, where the log lost a row while that entry's column still exists, so a normal open would re-run it into a duplicate-object failure.
+
+It **appends** rather than updating, because the log is the evidence: the row that disagreed stays visible, and the newest `applied` row is what the check reads. It returns a failure for a name this build does not carry, since there is no statement text to accept. Without it the only way out of a false positive would be deleting the database — and what that costs is why the escape hatch exists at all: other processes may hold the file open, and the memory half is the only copy there is.
 
 ### Transactions
 
@@ -282,19 +352,26 @@ For the database file, as seen by a writable open:
 | From | Trigger | To |
 | --- | --- | --- |
 | Absent | Writable open | Created at the process umask, then tightened to `0600` inside a `0700` directory, then migrated to the current version |
-| Version 0–4 | Writable open | Each missing step applied in its own immediate transaction, version stamped per step |
-| Current version | Writable open | Untouched; modes re-asserted |
-| Newer than this build | Writable open | Refused with a version-naming error; the file is not modified |
-| Newer than this build | Read-only open | **Opened and read anyway** — no version check exists on that path |
+| Behind this build | Writable open | Every entry whose name the log does not already carry is applied, each in its own immediate transaction, the version stamped per entry |
+| Behind this build, with no log table | Writable open | The log's rows are seeded from the version stamp as `baseline` inference, then the remaining entries apply |
+| Behind this build, log present but unreadable | Writable open | Warned once per process; **no** seed rows written; migration proceeds from the version stamp alone |
+| Current version | Writable open | No entry runs; modes re-asserted; drift still verified |
+| **Newer than this build** | Writable open | **Opened and written normally.** One warning per process that the format is ahead; the file is not otherwise modified |
+| Newer than this build | Read-only open | Opened and read |
+| A logged entry whose text disagrees with this build's | Writable open | Warned once per name per process; **nothing is refused and nothing is re-run** |
+| A logged entry this build does not carry | Writable open | Warned once per name per process |
+| An entry that raises | Writable open | Rolled back, the most recent failed row for that name replaced, the original error propagated |
 | Any | Open below the runtime floor | Refused before the file is touched |
 
 ## Notable Behavior
 
 - **The runtime-floor error tells the user to do something that cannot work.** Its message offers "upgrade the runtime, or run with the experimental flag" — but the gate that produced it compares the runtime's version string and nothing else, so supplying that flag on a runtime between the module's introduction and the flag-free floor leaves the verdict unchanged and the same error is raised again. The error itself is reachable (the long-lived server process raises it explicitly, and any ungated open would too); it is the *second half of its remedy* that is dead. (Surprising; reality.)
-- **The read-only entry point never refuses a newer schema.** Only writable opens compare the version, so a reader on an older build opens a database migrated by a newer one and fails later, per query, on whatever it does not recognise. The surfaces that must not guess (routing, migration-state reporting) each carry their own version comparison rather than relying on the store.
+- **Neither entry point refuses a newer schema, and that is now the whole rule rather than an asymmetry.** A reader *or* a writer on an older build opens a database migrated by a newer one and may fail later, per query, on whatever it does not recognise — with one warning per process as the only trace. This replaced a writable-only refusal; the surfaces that must not guess each carry their own comparison rather than relying on this layer, and re-adding a gate in any of them is a regression.
 - **The lifecycle call swallows every read failure except a version answer.** Corruption, a permission error and a sidecars-only residue are all indistinguishable "return silently" outcomes there, chosen precisely because none is a migration's job; the caller's own open is where the user finds out. (Notable.)
 - **A missing version table is read as version 0, and so is a corrupt one.** The version read swallows every error and answers 0, so a damaged file is taken for an empty one and the first baseline statement is what actually fails — which is deliberate, since that statement's error is far better than one this read could produce. (Notable.)
-- **The one surviving trigger refuses to delete a repository row, ever.** Repository rows are never deleted — disabling is an update of a timestamp column — and every other table references them with the default no-action rule, so a stray delete would already error where data exists. The trigger is what covers the zero-data case, and it survives the otherwise-absolute no-triggers rule because it encodes no business rule that can change, has no ordering relationship with any other trigger, and what it prevents is not a wrong value but the irreversible loss of every memory belonging to a repository. (Notable.)
+- **The schema now carries no triggers at all, and the one that used to be the exception is created and then dropped by the same ladder.** The first entry installs a trigger refusing any delete of a repository row, and the last entry drops it — so a database built from scratch passes through a state where it exists. Its original argument is still in the baseline's own text and is now historical.
+
+  What still protects a repository's rows is not a trigger: every child table references the repository table with the default no-action rule and foreign keys are enabled on **both** the writable and the read-only connection, so deleting a repository that owns any row still fails with a constraint error. The zero-data case — the one the trigger uniquely covered — is now deletable, which is what a removal path addressing a repository by identity needs. Disabling remains an update of a timestamp column and is a different operation from removal. (Notable; the reversal is deliberate.)
 - **Owner-only file modes are re-asserted on every writable open, but the sidecars usually are not covered by them.** The engine creates the sidecars when a write session starts, which is generally after the mode pass has already run, so the enclosing `0700` directory — not the file mode — is the boundary that actually holds. (Notable.)
 - **Foreign keys are per-connection and default off.** Every open sets them, because a connection that forgot to would silently break every cascading delete in the schema — pruning a repository would leave orphaned rows behind rather than failing.
 - **The editor host is expected to lose write races, and that is the design.** Its 400 ms wait is short enough that a contended write is dropped rather than freezing the interface; the data is re-derivable and its next periodic tick tries again. (Notable.)

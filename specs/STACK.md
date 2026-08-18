@@ -18,8 +18,9 @@ Five deliverables, two of which are npm workspaces. One product model, one share
 |---|---|---|---|---|
 | `@jolli.ai/cli` | `cli/` | Vite multi-entry lib build + `tsc` declarations | **Yes** — npm workspace | `0.99.11` |
 | `jollimemory-vscode` | `vscode/` | esbuild → CJS bundles | **Yes** — npm workspace | `0.99.11` |
-| Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.2` (`.claude-plugin/plugin.json`) |
-| Codex plugin | `codex-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.1` (`.codex-plugin/plugin.json`) |
+| Claude Code plugin | `claude-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.3` (`.claude-plugin/plugin.json`) |
+| Codex plugin | `codex-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.2` (`.codex-plugin/plugin.json`) |
+| Cursor plugin | `cursor-plugin/plugins/jolli/` | esbuild → CJS (`scripts/build.mjs`) | **Build only** — not a workspace | `1.0.0` (`.cursor-plugin/plugin.json`) |
 | Jolli Memory IntelliJ plugin | `intellij/` | Gradle / Kotlin (`ai.jolli.jollimemory`) | **No** — independent build | `0.99.11` |
 
 Root `package.json` (`"name": "jollimemory"`, `"version": "0.99.0"`, `"private": true`) declares
@@ -34,9 +35,10 @@ root does not touch the IntelliJ plugin. It has its own CI workflow
 (`.github/workflows/build-intellij.yaml`) and its own gate (§5.4). One root script does reach into
 `intellij/`, but it is a developer launcher rather than a build stage: `intellij:sandbox` (§4.5).
 
-The two AI-host plugins are the deliverables that are **build targets without being workspaces**:
-`claude-plugin/plugins/jolli/` and `codex-plugin/plugins/jolli/`, each built by its own
-`node <plugin>/plugins/jolli/scripts/build.mjs`. Both are wired into the root `build` chain (§4) and
+The AI-host plugins are the deliverables that are **build targets without being workspaces** —
+`claude-plugin/plugins/jolli/`, `codex-plugin/plugins/jolli/` and `cursor-plugin/plugins/jolli/`,
+each built by its own `node <plugin>/plugins/jolli/scripts/build.mjs`. Read the current set off the
+root `build` chain rather than from a number here; it has grown twice. Both are wired into the root `build` chain (§4) and
 therefore gated by `npm run all`, but neither has a `clean`/`typecheck`/`lint`/`test` stage of its own
 and neither has a publish workflow (§7). What covers them instead lives in the CLI suite —
 `CodexPluginManifest.test.ts` and `CodexPluginSkills.test.ts` — plus each build script's own
@@ -72,7 +74,7 @@ working rather than a mistake.
   **major then minor** — a major-only check would admit 22.5 and throw at import.
 - `intellij/.../bridge/NodeRuntime.kt` → `MIN_SUPPORTED_MAJOR = 22`, `MIN_SUPPORTED_MINOR = 13`
   (major *and* minor, for the same reason).
-- esbuild `target: "node22"` in the VS Code config and both plugin build scripts.
+- esbuild `target: "node22"` in the VS Code config and every plugin build script.
 
 That floor is a multi-place lockstep: the published-package engines range, the shared runtime
 constant, the JVM host's own minimum, the editor host's engines range, and every esbuild target must
@@ -199,7 +201,10 @@ re-install. `postbuild` chmods `dist/Cli.js` to `0o755`.
 `PrePushHook`, `PrePushWorker`, `QueueWorker`) plus two asset trees,
 `dist/graph-assets/` (the knowledge-graph viz runtime) and `dist/dashboard-assets/` (the dashboard's
 HTML/CSS/JS), both minified here and copied verbatim by every downstream consumer; the `tsc` step
-emits declarations. Externals: `@anthropic-ai/sdk`, `commander`, `open`, `semver`, `node:*`.
+emits declarations. The graph-asset copier is a **shared** script at the repo root
+(`scripts/copy-graph-assets.mjs`, promoted there from the VS Code workspace once more than one
+surface needed it); the VS Code build invokes it with a `--vscode-only` flag, and the root exposes it
+as `npm run copy-graph-assets` for running it by hand. Externals: `@anthropic-ai/sdk`, `commander`, `open`, `semver`, `node:*`.
 
 ### 4.4 VS Code extension — deploy and reload
 
@@ -302,13 +307,14 @@ Each stage fans out across the two npm workspaces:
 | Stage | Expansion (root `package.json`) |
 |---|---|
 | `clean` | `npm run clean -w @jolli.ai/cli && npm run clean -w vscode` |
-| `build` | `npm run build -w @jolli.ai/cli && npm run build:claude-plugin && npm run build:codex-plugin && npm run build -w vscode` |
+| `build` | `npm run build -w @jolli.ai/cli && npm run build:claude-plugin && npm run build:codex-plugin && npm run build:cursor-plugin && npm run build -w vscode` |
 | `typecheck` | `npm run typecheck -w @jolli.ai/cli && npm run typecheck -w vscode` |
 | `lint` | `npm run lint -w @jolli.ai/cli && npm run lint -w vscode` |
 | `test` | `npm run test -w @jolli.ai/cli && npm run test:acceptance -w @jolli.ai/cli && npm run test -w vscode` |
 
 `build:claude-plugin` = `node claude-plugin/plugins/jolli/scripts/build.mjs`; `build:codex-plugin` =
-`node codex-plugin/plugins/jolli/scripts/build.mjs`.
+`node codex-plugin/plugins/jolli/scripts/build.mjs`; `build:cursor-plugin` =
+`node cursor-plugin/plugins/jolli/scripts/build.mjs`.
 
 This gate is also declared **machine-readably**, in the tree's one committed piece of `.jolli/`:
 `.jolli/agents.json` sets `verify.gate: ["npm run all"]`, `verify.scope: "repo-root"`,
@@ -343,7 +349,7 @@ CI runs the identical command: `.github/workflows/build-vscode.yaml` ("CI - CLI 
 ### 5.2 Per-workspace and single-stage variants
 
 Every stage has a per-workspace entry point at the root: `build:cli`, `build:claude-plugin`,
-`build:codex-plugin`,
+`build:codex-plugin`, `build:cursor-plugin`,
 `build:vscode`, `typecheck:cli`, `typecheck:vscode`, `lint:cli`, `lint:vscode`, `lint:fix`,
 `test:cli` (unit **+** acceptance), `test:vscode`, `test:acceptance`.
 
@@ -532,9 +538,13 @@ figure you are quoted as a measurement with a date on it. The shape of the cost 
 that has not changed: profiling showed a handful of files carrying ~96% of the runtime against a
 **~14 ms median file**, and every one of them drives real `git` subprocesses or real filesystem/lock
 work. The slow tier is exactly that set — read its current membership off `SLOW_TEST_FILES`, which has
-grown repeatedly since the split landed, most recently by the six `dashboard/` cutover files (they are not
+grown repeatedly since the split landed: by the six `dashboard/` cutover files (they are not
 "SQLite tests": each seeds a real repo and drives `git` through cutover, and `CutoverEngine.test.ts` is
-now the single heaviest file in the suite). The tiers split on exactly that line:
+now the single heaviest file in the suite), and most recently by the real-`git` half of the
+filesystem git-layout reader — which earns its place for the same reason as everything else in the
+list rather than for a new one. **Do not quote a file count for either tier from this document**; the
+list is the only current answer, and every count of it that has been written down has gone stale.
+The tiers split on exactly that line:
 
 | Script | Vitest invocation | Files | Coverage |
 |---|---|---|---|

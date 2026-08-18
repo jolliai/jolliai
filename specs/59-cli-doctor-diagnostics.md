@@ -35,6 +35,8 @@ The message portion may itself span multiple lines (the dist-paths probe uses an
 
 - `jolli doctor` — run all probes in diagnostic mode. Faults are reported but not changed.
 - `jolli doctor --cwd <dir>` — operate against `<dir>` instead of the auto-resolved git repository root.
+- `jolli doctor --schema-log` — print the machine-level database's migration log: who ran what, when, and how it went, plus the names whose recorded statement text disagrees with this build's (spec 347). A report, not a repair.
+- `jolli doctor --mark-migration <name>` — record one named migration as applied by other means, carrying this build's own statement text. The one repair that remains for a state the log's name key cannot fix alone; the mechanics, the four reasons it can decline, and why it appends rather than updates are owned by spec 347. **The repair implies the report**, so this form also prints the log — otherwise a user who ran it would reasonably conclude it had done nothing.
 
 ### Probes (in execution order)
 
@@ -113,7 +115,9 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
 
    This is a **no-load** probe: `ok` means "installed and version-compatible", **not** "loaded successfully". A plugin whose entry point is broken, whose import throws, or whose registration throws is still version-compatible and reads `ok` here — the loader rejects it separately and warns at load time. The row wording says "installed, compatible" rather than "working" precisely to avoid overstating what was verified. This probe has no fixer.
 
-13. **Database backup** — the health of the machine-level memory database's snapshots (spec 349). Always the **last** row. Six outcomes, and only one of them carries a fixer:
+13. **Global daemon** — whether the machine-global resident process is up (spec 365). Two outcomes and no fixer: healthy, naming the process id, its version and whole hours of uptime; or `warn` "not running — scheduled work falls back to commit-time triggers". It is **context for the backup row below, never a substitute for it**: the process being up says nothing about whether any snapshot succeeded, and the probe is given a several-second budget precisely because a busy process is the likeliest reason it cannot answer quickly.
+
+14. **Database backup** — the health of the machine-level memory database's snapshots (spec 349). Six outcomes, and only one of them carries a fixer:
 
     | Condition | Verdict | Message | Fixer |
     | --- | --- | --- | --- |
@@ -130,6 +134,12 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
     - **The last-success timestamp lives inside the database**, so a runtime below the database floor (spec 347), a missing database file, or one that cannot be read all leave it unknown — which reads as `warn` "no snapshot taken yet" on a machine that may have taken many.
 
     Staleness is the only one of these a command can repair by itself, which is exactly why it is the only one marked fixable: an unrepairable `fail` makes the whole command exit non-zero on an otherwise healthy install — a week without a commit is enough — with nothing the user can run to change it. An invalid folder or an unreachable drive needs a human, and a snapshot attempt would simply fail again.
+
+15. **Repo registry** — entries naming a checkout that is no longer on disk. A `warn`, never a `fail`, and that distinction is this command's own contract: this command reports *faults*, and a stale entry breaks nothing — it costs every sweep a pass and puts a dead row in the dashboard's repository picker, which is worth saying and is not worth a non-zero exit on an otherwise healthy machine. The message lists **every** entry, uncapped, because this is a diagnostic the user ran on purpose, the repair is irreversible, and the list is the only thing they have to decide with; it shrinks to nothing after the first repair. A registry that cannot be read at all is its own row.
+
+16. **Parked events** — ingest-log entries that never projected.
+
+**The roster is not fixed, and the backup row is no longer last.** Rows have been appended after it, so nothing downstream should assume a terminal position; what is stable is that each probe contributes its own row and that the summary line follows all of them.
 
 **The alarming database-file combination is not a probe here.** The state where the database is gone but its write-ahead sidecars remain (spec 348) is detected by other surfaces — it is one of the reasons the status command's memory-database row reports as unavailable, and it is what the recovery listing prints as the database's file state (spec 60) — but no `doctor` probe reads it, and no verdict in this report changes because of it. A user in that state sees the System-of-record probe fail with the reason **only if this repository is fenced**; an un-fenced repository is still authoritatively backed by its orphan branch, so that probe reads `ok` and the whole report is silent about the missing database.
 

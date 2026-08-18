@@ -14,7 +14,7 @@ Taking a verified point-in-time copy of the machine-level memory database into a
 - Verification, and its position **before** anything old is deleted.
 - The two collectors (age, size), the two floors that outrank them, and the separate cap on the retention-exempt class.
 - Where age comes from, and the fallback when it cannot be read.
-- The opportunistic entry point, the two call sites that constitute the whole schedule, and what it stamps beyond the snapshot itself.
+- The opportunistic entry point, every caller that constitutes the schedule — the resident process that asks on a clock, the two opportunistic sites, and the one repair — and what it stamps beyond the snapshot itself.
 - The health verdict this produces for the diagnostics command, including which state is repairable by a command.
 - Save-time validation of the two configuration keys.
 - Restore: its refusal, its two verification points, the sidecar removal ordering, the abandoned-temp sweep, and the fixed order of recovery sources it heads.
@@ -122,12 +122,17 @@ This is the only self-contained way a snapshot happens. It:
 3. **Only when operating on the machine-default database**, stamps that identity into both deletion-detection witnesses (348) — regardless of whether the snapshot itself was created, skipped or failed, because the witness has to exist before an incident.
 4. Catches everything: an open that fails (contention, a schema stamped ahead of this build) becomes `failed` with a reason, never an exception.
 
-**There is no daemon; two call sites are the entire schedule:**
+**The schedule is now a resident process plus two opportunistic call sites, and the resident one is primary:**
 
-- the dashboard launch path, after its routing attempt — placed there rather than in the long-lived server because taking a snapshot needs a writable handle, which runs schema migrations, and the server is the one process whose build can lag;
+- **the machine-global resident daemon**, which asks this entry point once at startup and hourly thereafter. It is the only caller that runs when nobody is using the product, which is what makes the daily gate below reachable for a user who does not commit — exactly the user whose newest copy is oldest. It holds no schedule of its own: it asks, and the daily gate answers (365);
+- the dashboard launch path, late in its startup sequence — placed there rather than in the long-lived server because taking a snapshot needs a writable handle, which runs schema migrations, and the server is the one process whose build can lag;
 - the post-commit queue worker, after its drain has committed and only when that drain produced new memories.
 
-A third caller exists but is a repair, not a schedule: the diagnostics command's fixer for a stale-backup verdict.
+The two opportunistic call sites are **not** redundant now that a resident process exists: it is absent on any runtime below the database floor, on a machine where no surface has triggered it yet, and for the window between an upgrade retiring one and the next trigger starting its replacement (365). On such a machine they remain the entire schedule, which is what they were before.
+
+A further caller exists but is a repair, not a schedule: the diagnostics command's fixer for a stale-backup verdict.
+
+**A source comment at the post-commit call site still describes this as the "no daemon" schedule.** It predates the resident process and is historical; the schedule above is what runs.
 
 ### The health verdict
 

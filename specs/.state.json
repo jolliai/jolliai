@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "e94d5cbc01ab67daae68f3fe4fec949f7500611b",
-      "subject": "Update specs for the f184549f..3d45b46b delta",
-      "reviewedAt": "2026-08-13T04:24:58Z",
+      "revision": "3715a064f04a89e838990cdedf1e5069f08765f5",
+      "subject": "Global CLI daemon for scheduled safety backups and future session data sync",
+      "reviewedAt": "2026-08-18T18:52:51Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

@@ -62,14 +62,19 @@ Anchoring matters more here than on any other hook, because this handler joins t
 
 ### Briefing-cache record
 
-A small per-project cache file keyed by:
+A small per-project cache file, **single-slot per project**, keyed by:
 
 - The branch name.
 - The HEAD commit hash at the time the briefing was generated.
+- **The identity of the agent-host surface that generated it.**
 
 Plus the cached briefing text and an ISO timestamp of when it was generated.
 
-The cache hit rule is exact equality on both branch name and HEAD hash.
+The cache hit rule is exact equality on **all three**. The host identity is part of the key because the briefing ends with a host-specific hint naming how to ask for a fuller recall, and each host's form is inert in the others: keyed on branch and commit alone, whichever host started first would hand every other host a command it cannot run until the next commit rolled the key. A record written before this component existed carries no value for it, matches no live host, and therefore reads as a miss — one regenerated briefing per project, and no migration.
+
+**The slot is single, so in a project used from two hosts they take turns evicting each other** rather than each keeping an entry. The host check makes that a miss-and-regenerate — correct but slower — instead of a hit on the wrong syntax.
+
+**The write goes through a temporary file and a rename in the same directory**, because there are now **two** writers: this handler, and a warming pass the post-commit worker runs after a drain that produced new memories. That pass runs detached and can therefore land mid-read of a session starting at the same moment. A torn read degrades safely — the parse fails and the reader treats it as a miss — but "safely" there means silently doing the slow thing on exactly the commit that just warmed the cache, which is the case the warming exists for.
 
 ### Output
 
@@ -164,12 +169,19 @@ The briefing is a fixed line-by-line layout:
 
 ### Branch / HEAD detection
 
-- Branch name comes from the source-control "current branch" query, returning a trimmed string or null on failure.
-- HEAD hash comes from the source-control "rev-parse HEAD" query, returning a trimmed string or null on failure.
+Both facts are read **straight off the filesystem first**, and the source-control subprocess is kept only as the fallback.
+
+- A repository layout is resolved from the working directory by walking to the directory that holds the version-control metadata entry, yielding that worktree's own metadata directory and the shared one (equal in a plain checkout, different in a linked worktree).
+- The branch name is read from the reference the worktree's own HEAD file points at; the HEAD hash from that reference, or from the HEAD file directly when it holds a hash rather than a pointer.
+- **Every one of these answers null rather than guessing**, and each caller keeps its subprocess path for exactly those cases: a layout the reader does not recognise, a reference format it does not parse, and — the important one — **any environment that redirects where version control looks**. Version control exports such redirection for every hook process, and a detached child inherits it, so the repository a subprocess would resolve is then *not* the one containing the working directory. Since the whole point of the filesystem reader is to agree with the subprocess it replaces, it declines outright whenever such a redirection is present.
+
+This is a latency change, not a behavioral one: the fallback produces the same answers. **Why it matters here** is that this is the handler a human waits on before the agent host shows a prompt, and roughly nine tenths of its in-process time used to be version-control subprocesses — each around ten to fifteen milliseconds of process creation, on a path whose entire useful work is reading two files and a cached record. Three of those spawns were the *same* shared-metadata-directory query, because three separate modules each memoized it privately. On one platform each additional spawn also inflates the *next* process launch, so the spawns cost more than the sum of their own durations.
+
+The reader is deliberately not a version-control implementation and must not become one; a caller that reads a non-null layout as "this is a repository" is entitled to that, because the reader confirms it rather than merely matching the shape.
 
 ### Cache invalidation
 
-The cache is invalidated implicitly: any change that advances HEAD on the current branch produces a different cache key. Switching branches produces a different cache key. The cache file therefore does not need explicit deletion; new entries simply do not match it.
+The cache is invalidated implicitly: any change that advances HEAD on the current branch produces a different cache key, as does switching branches, and as does starting the session from a different agent-host surface. The cache file therefore does not need explicit deletion; new entries simply do not match it. Because the slot is single, a non-matching entry is overwritten rather than accumulated.
 
 A cache record is also discarded by the reader (treated as a miss) if:
 
@@ -192,9 +204,9 @@ The cache file itself is not garbage-collected by this handler.
 | ---------------------------------- | ---------------------------------------------------------------- | ------------------------------------------------------------- |
 | Top-level failure                  | Any error escaping the main routine.                             | Logged; nothing emitted.                                      |
 | Repository manually disabled       | The repo-wide manual-disable flag is set.                        | Logged; the composer is never entered; nothing emitted.       |
-| Manual-disable read is slow        | The flag read's source-control query, worktree enumeration, or lock wait is slow. | **Not bounded by the deadline** — the read sits outside the race, so it can push session start past the 500-millisecond contract. |
+| Manual-disable read is slow        | The repository's profile has not yet converged, so the read also enumerates worktrees for a legacy marker and takes a lock to persist the migrated decision. Once converged it is one file read, and its path resolution no longer spawns a subprocess. | **Not bounded by the deadline** — the read sits outside the race, so on that first migrating run it can push session start past the 500-millisecond contract. |
 | Composition timeout                | Composition exceeds the hard 500-millisecond deadline.           | Composition's partial work is discarded; nothing emitted.     |
-| Branch / HEAD lookup failure       | Source-control query returns non-zero or empty.                  | Treated as missing data; "no briefing" path.                  |
+| Branch / HEAD lookup failure       | The filesystem reader declined or answered null **and** the fallback source-control query returned non-zero or empty. | Treated as missing data; "no briefing" path. A declining filesystem reader on its own is not a failure — it is the fallback's cue. |
 | Index load failure                 | The index payload is missing or fails to parse.                  | "No briefing" path.                                           |
 | Summary load failure               | The latest summary payload fails to load or parse.               | Treated as "no topic title, no decisions"; briefing still composed using only index data. |
 | Plans-registry load failure        | The plans file is missing or fails to parse.                     | Treated as no plan titles; briefing still composed.           |
@@ -229,7 +241,7 @@ The summary store and plans registry are read-only inputs from this handler's pe
 - **Briefing-cache write is non-fatal.** A failure to persist the cache is silently swallowed; the next invocation will simply recompose.
 - **This handler emits the branch briefing and nothing else.** The reminders and the provider seed it used to carry now belong entirely to the agent-plugin's session bootstrap. Because this handler both turns the reminder switch off *and* passes a neutral surface identity that fails each reminder's own plugin guard, the reminders are unreachable here in two independent ways — a defence-in-depth arrangement, not redundancy by accident. (Notable; a moved responsibility.)
 - **The composer is shared but its two inclusion switches are independent.** The same routine serves this handler (briefing only) and the plugin bootstrap (reminders always, briefing conditionally). Surface identity is passed in rather than read from a build stamp, so neither caller's path depends on how the running build is stamped. (Notable.)
-- **The 500 ms ceiling covers the composition, not the whole handler.** The manual-disable read runs *before* the deadline race is set up, so a slow repository-root query, a first-invocation worktree enumeration, or a lock wait can push session start past the 500-millisecond contract. The contract as written applies to composition only; the gate is the one piece of per-invocation cost outside it. (Surprising; a genuine hole in the stated performance guarantee.)
+- **The 500 ms ceiling still covers the composition rather than the whole handler, but what leaks past it is now a first-run cost rather than a per-invocation one.** The manual-disable read runs before the deadline race is set up, and it has two regimes. Once the repository's profile has converged — the switch present and the retired key gone — the read is one path resolution plus one file read, and the path resolution is now answered from the filesystem rather than by a subprocess. While the profile has *not* converged, the same read still enumerates the repository's worktrees for a legacy marker and takes a lock to persist the migrated decision, and that work is still outside the race. So the hole is real but bounded: it is paid once per repository, on the first run that migrates it, not on every session start. (Narrowed; previously a per-invocation hole.)
 - **The manual-disable gate precedes composition, so a disabled repository emits nothing and reads nothing.** No index load, no summary load, no plans-registry read, no cache read or write. (Notable.)
 - **The project root is anchored to the enclosing worktree, and this is the handler where that mattered most.** The payload's working directory (or the runtime's) is resolved up to the worktree root before anything joins the per-project state directory onto it. Three sites do that join — the dismiss marker, the plans registry, and the briefing cache — and the cache write *creates* the directory, so an unanchored subdirectory session did not just read the wrong plans file, it left a real stray state directory behind inside the checkout. A path no worktree encloses still resolves to itself, so a non-repository working directory behaves exactly as before. (Surprising; a real regression-closer — see spec 311.)
 - **The local-agent-child guard is environment-only, and is the first thing evaluated.** It runs ahead of the standard-input read, the log-directory setup, and the manual-disable gate, so a nested generation session costs one log line and nothing else. It deliberately consults only the inherited environment and not the working-directory marker, for two reasons that hold specifically here: this handler is launched by the agent CLI Jolli itself spawned, so the environment always carries the marker, and keeping the marker-file probe opt-in per call site means the guard cannot be flipped by unrelated stubbing of filesystem checks. (Notable; channel rationale owned by spec 280.)

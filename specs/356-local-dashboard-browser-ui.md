@@ -14,7 +14,7 @@ The no-build browser application the local dashboard serves: a page-per-view app
 - The render dispatch: shell first, then exactly one view renderer.
 - The shell: the navigation list and its gating, the range control and its calendar popover, the scope chip, the coverage footer, and the tier attribute.
 - Link construction — which parameters survive a click and which are deliberately dropped.
-- The four page views' behavior, and which of their controls re-render locally versus re-fetch.
+- Each page view's behavior, and which of their controls re-render locally versus re-fetch.
 - The **Settings modal**: how it opens, what it fetches, its controlled form and dirty gate, its per-section lazy loads, its immediate-apply toggles, its non-gating availability probe, and the client state that survives a close.
 - The periodic refresh loop: which view it runs on, what it does on a schema mismatch, and what it does on failure.
 - How the mutation token is obtained and which requests carry it.
@@ -24,7 +24,7 @@ The no-build browser application the local dashboard serves: a page-per-view app
 
 - Every route this application calls, the security checks each is subject to, and how the document is assembled — spec 352. This spec covers only what the browser does with what it is given.
 - The payloads it renders and every figure in them — spec 353. Field meanings are not restated here.
-- The write protocol behind those payloads (spec 354) and the registry the Repositories view lists (spec 355).
+- The write protocol behind those payloads (spec 354) and the repository registry (spec 355), which no view lists any more — its list became the topbar picker.
 - The mutation semantics behind the Settings actions — masked-key reuse on save, the cross-repository hook sweep, folder validation rules — spec 363; the access boundary those endpoints sit behind and the backfill's concurrency guard — spec 352; the push toggles' machine-global store and per-row wording — spec 310. Sign-in's browser flow, the memory-bank migration, the manual sync and the backfill engine itself have their own topics.
 - Visual design: colors, spacing, iconography, and the individual element structure of any card.
 
@@ -86,7 +86,7 @@ Page-specific parameters (a memory's hash, its owning repository, a page cursor)
 
 The shell renders first, then a per-view renderer. The application container is given the card-grid layout only for the activity view; the standup board supplies its own three-column layout and must not sit inside another grid. Settings has **no** entry in this table — it is a modal.
 
-**An unrecognised view falls back to the activity renderer.** Unreachable at HEAD, on two counts: only the four routed page views can be inlined into a page render, and the refresh loop re-asks for the view the page already has, so the reply can only echo it back. The fallback would also not be a graceful one — the activity renderer dereferences its own payload unconditionally, so a fifth view would throw rather than degrade. (Unreachable; one added route is all that stands between it and being reached.)
+**An unrecognised view falls back to the activity renderer.** Unreachable at HEAD, on two counts: only a routed page view can be inlined into a page render, and the refresh loop re-asks for the view the page already has, so the reply can only echo it back. The fallback would also not be a graceful one — the activity renderer dereferences its own payload unconditionally, so an unrecognised view would throw rather than degrade. (Unreachable; one added route with no renderer is all that stands between it and being reached.)
 
 ### The shell
 
@@ -94,8 +94,9 @@ Rendered on every render, including every refresh tick.
 
 - **Page title and subtitle** per view; the document title is set to match.
 - **A tier attribute** on the root element, which the stylesheet keys the synced chip and the locked-preview treatments off, so the shell reflects the adoption tier with no branching in the view modules. **The synced chip is the only chip left on that attribute**: a second topbar chip stating that the server runs locally and nothing leaves the machine has been removed from both the markup and the stylesheet, so the page no longer asserts that property anywhere in its own interface — it merely holds.
-- **The navigation list**: a Dashboard group rendered flat under a non-interactive group label with two children (the activity dashboard and the daily standup), then Memories, then Repositories. **Settings is pinned to the sidebar's bottom edge in its own slot**, a sibling of the scrolling list rather than its last row — a persistent destination.
-- **Gating**: the Dashboard group's two children and Memories are marked disabled when no repository is enabled, mirroring the service's own redirect. Repositories is never gated — it is the row that opens the gate, so it must stay reachable with zero repositories. The disable exists only so a click does not visibly bounce through a redirect; the redirect is the enforcement.
+- **The navigation list**: a Dashboard group rendered flat under a non-interactive group label with two children (the activity dashboard and the daily standup), then Memories, then Knowledge, then Graph. **Settings is pinned to the sidebar's bottom edge in its own slot**, a sibling of the scrolling list rather than its last row — a persistent destination, and the only entry with no page path of its own.
+- **Gating is gone, and its absence follows the service.** Rows used to be marked disabled when no repository was enabled, mirroring the service's own redirect so that a dead row and a redirect could not disagree; the never-gated row below them was the one that opened the gate. That row is retired, so the gate has nowhere to send anyone and the service no longer redirects — every row is therefore always enabled, and "nothing enabled yet" is rendered as a state on the page the user lands on.
+- **Knowledge and Graph are scoped by a different repository set from every row above them** — the Memory Bank folder's, not the registry's — which is why neither participates in the topbar repository picker.
 - **Every navigation is a full page load, not a client-side swap**, so every view is deep-linkable and reload-safe. The rows are **buttons that assign a location**, not anchors — so the destinations are real URLs but the sidebar itself supports no middle-click, no open-in-new-tab, and no hover target. (In the memories tree the same is true of a row click; the one genuine anchor in the application is the upstream reference link.)
 - **A sidebar click drops both the range and the repository scope.** The sidebar changes *page*, and every page's default is all repositories; a single-repository scope is only ever established by an explicit act on one repository (a per-row button, or a memory deep link), and carrying it through the sidebar made it permanent, since nothing on any page offers a way back.
 - **The Settings row is intercepted before navigation**: it opens the modal in place. The client therefore never issues a request for a settings page path (which the service does not route).
@@ -142,11 +143,22 @@ Three columns — Yesterday, Today, Risks — plus a context strip and a draft s
 - The context strip states **whose** commits are shown, in both directions and never silently: an identity chip when filtered, and an explicit "every author — no git identity configured" chip when not. It also shows up to three ticket chips derived from the two days' commits, and a chip stating outright what is missing (step progress) rather than inventing a status.
 - **The draft sheet is the page's actual product.** Its markdown is built to match the columns exactly (the same TODO/risk routing), rendered into an **editable** textarea, copied to the clipboard on open *and* on the button, and its subtitle leads with the unfiltered warning when there is one — what you are about to paste containing a teammate's commit matters more than where the lines came from. Escape closes it, bound as an assignment rather than an accumulating listener so the refresh tick replaces the handler instead of stacking another.
 
-### Repositories
+### Knowledge
 
-Lists the registered repositories with their memory badge and one action each: Go to dashboard (once a repository has memories — it already reads real activity, so the row collapses to the one action that matters), Pause (a setup-phase action), or Resume. A busy row shows a working state; a failure renders a callout. The empty state instructs the reader to run the enable command inside the target repository.
+Browses the human-readable wiki layer of the Memory Bank folder — **not** the machine-level database, which carries no wiki. A repository picker selects which folder to browse, and the file list beneath it is the browsable pages that repository's compile step produced. Selecting one loads it into a sandboxed frame served by a companion route.
 
-**Nothing here starts or polls a job.** Pause and resume are single requests that finish within the request, so this view shows no progress and rejoins nothing.
+Two identity facts govern this view and are the whole reason it is separate from the rest of the application:
+
+- **The repository key here is the Memory Bank folder's own directory name**, a different identity space from the registry the other views are scoped by. Both companion routes resolve that key back to a folder by matching it against the discovered folder list, and **never** by joining caller input into a path — so a key containing traversal segments cannot escape the root.
+- **A source-commit link inside a rendered page jumps to the memory that produced it**, and the link carries the owning repository's *registry* scope token rather than the folder directory name, so the jump scopes correctly even when two repositories share a display name.
+
+### Graph
+
+The per-repository knowledge graph. This page is **only** the sandboxed frame — it carries no application chrome of its own — so the "which repository" control lives inside the visualisation's own header rather than in the shell. That control self-navigates the frame to another repository, carrying the current theme, and immediately before navigating it posts the chosen repository to the parent page so the outer URL tracks the frame's repository; without that, a refresh, bookmark or shared link would reopen the previous one. The message is one-way and carries only the repository key, and **the parent validates it against its own list**, so nothing in the page trusts the frame.
+
+A repository with no graph yet gets a friendly page carrying the command to build one, deliberately served as a success rather than an error so the frame shows guidance instead of a browser failure.
+
+**The retired Repositories view.** A page listing registered repositories with a memory badge and a pause/resume action per row used to exist. It is gone: its path is unrouted, its token is not accepted, its sidebar row is removed, and its module is no longer part of the asset inventory. Nothing redirects to it. Its list became the topbar repository picker; its pause/resume actions were **removed outright**, not relocated. "No repository is enabled yet" is now a state the activity dashboard renders rather than a place to be sent, and enabling one is done in the target repository rather than here. (A Decisions page was retired the same way earlier, folded into Memories, and likewise kept only its redirect.)
 
 ### Memories
 
@@ -260,7 +272,8 @@ A fire-and-forget beacon, preferring the browser's beacon transport so the event
 | Memories tree | "Load more" fails | Loaded rows kept; footer becomes a retry |
 | Memories tree | Row click | Navigation carrying the hash and the **owning** repository, page scope untouched |
 | Context dialog | Row activation | Loading → fetched body as preformatted text, or a message naming the status |
-| Repositories row | Pause / Resume | Busy → request → model refetch → re-render (or an error callout) |
+| Knowledge repository picker | Selection | Loads that folder's page list; selecting a page loads it into the sandboxed frame |
+| Graph in-frame repository switcher | Selection | The frame self-navigates, carrying the theme, and posts the key to the parent so the outer URL tracks it |
 
 ## Notable / Surprising Behavior
 
@@ -300,6 +313,7 @@ A fire-and-forget beacon, preferring the browser's beacon transport so the event
 
 - Every route called here, the checks each is subject to, page assembly, and the token's minting and inlining are owned by spec 352.
 - Every payload rendered here, and the meaning of every figure in it, is owned by spec 353 — including the two facts this application renders around: the tier that never reaches its third value, and the insight kinds that are never produced.
-- The registry the Repositories view lists and acts on is owned by spec 355.
+- The repository registry is owned by spec 355. No view lists or acts on it any more: its list became the topbar repository picker, and the retired view's pause/resume actions were **removed outright** rather than relocated. (Settings does carry a per-repository push toggle, but that is a different control governing outbound publishing, not whether a repository is enabled.)
+- The Memory Bank folder layout the Knowledge and Graph views browse — its discovery, its per-repository root, and the visible wiki layer a compile step regenerates wholesale — is owned by the Memory Bank and wiki topics. This view only enumerates and renders what is there, and guards every read independently because that layer is rewritten wholesale rather than patched.
 - The settings mutation semantics behind Apply — masked-key reuse, the cross-repository hook sweep, folder validation, and what the modal's own migrate hint gets wrong — are owned by spec 363; the access boundary its endpoints sit behind and the backfill's concurrency guard by spec 352; the per-repository push toggles' store, row contents and per-row wording by spec 310; and sign-in's browser flow, the migrate routine, the sync round and the backfill engine by their own topics. This spec owns only the modal as client behaviour: its open sequence, its controlled form and dirty gate, its lazy loads and their guard, the probe that gates nothing, and the state that survives a close.
 - Telemetry buffering, consent, and whether a forwarded event is recorded at all are owned by the telemetry topic; this spec covers only what the page emits and when.
