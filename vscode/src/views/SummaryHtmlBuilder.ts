@@ -518,7 +518,10 @@ export function buildPropTable(
 	// is the correct file count for the whole commit.
 	const fileCount = totalFiles;
 
-	const summaryByModel = summary.llm?.model ?? "—";
+	// `||`, not `??`: an empty model means "the tool reported none and none was
+	// pinned" (see callLocalAgent), and a nullish check would let it through to
+	// the footer as a blank where the em dash belongs.
+	const summaryByModel = summary.llm?.model || "—";
 	// A legacy/partial `llm` object (the orphan branch is append-only, so an old
 	// record can carry an `llm` block predating these fields) would make the sum
 	// NaN and render "NaN tokens" — guard each field the way the conversation

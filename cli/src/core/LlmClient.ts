@@ -624,7 +624,6 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		log.warn("Local-agent call has unfilled placeholders for action=%s: %s", options.action, missing.join(", "));
 	}
 	const prompt = fillTemplate(entry.template, options.params);
-	const model = resolveModelId(options.model);
 	// NOTE: options.maxTokens is intentionally NOT threaded here — the Claude
 	// Code CLI has no per-call output-token cap flag, so the API path's
 	// max_tokens budget (and the resulting `stopReason === "max_tokens"`
@@ -747,11 +746,18 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		}
 
 		// Prefer the model the tool reported actually running over anything we
-		// resolved. Claude Code names it (`modelUsage`); codex, cursor-agent,
-		// opencode and kimi do not, so those fall back to the pinned value if there
-		// is one and to the config alias otherwise — a guess, but the only value
-		// available, and the same one every other provider records.
-		const resultModel = outcome.model ?? (effectiveModel || model);
+		// resolved. Claude Code names it (`modelUsage`); no other backend does, so
+		// those fall back to the pinned value, and to `""` — UNKNOWN — when nothing
+		// was pinned (`inherit`, an unpinned tool, or a pin withdrawn after a
+		// refusal).
+		//
+		// It deliberately does NOT fall back to `model`. That is an ANTHROPIC api id
+		// resolved from a different setting, so recording it here claimed a codex run
+		// had been performed by `claude-sonnet-4-6` — a plausible-looking id from a
+		// namespace that never ran, which is worse than admitting we do not know.
+		// `""` reaches every consumer intact: all four metadata producers use `??`,
+		// which is NULLISH, so an empty string is carried rather than replaced.
+		const resultModel = outcome.model ?? effectiveModel;
 
 		// Verify rather than assume. Pinning a model is only worth anything if a
 		// request that was NOT honoured is visible: a silently upgraded model is
@@ -796,12 +802,14 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 		// tool's own subscription rather than a jollimemory-metered key. `model` is
 		// logged beside it because cost is only interpretable next to the tier that
 		// produced it, and for an unpinned tool this line is the only place the
-		// tool's own model choice becomes observable at all.
+		// tool's own model choice becomes observable at all — spelled "unknown" when
+		// nothing was pinned, since this line used to assert a resolved Anthropic id
+		// in the first place a diagnostician looks.
 		log.info(
 			"Local-agent completion: action=%s tool=%s model=%s cost=$%s in=%d out=%d cached=%d%s",
 			options.action,
 			tool,
-			resultModel,
+			resultModel || "unknown (the tool's own choice)",
 			outcome.costUsd.toFixed(4),
 			outcome.inputTokens,
 			outcome.outputTokens,

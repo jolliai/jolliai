@@ -147,7 +147,10 @@ function printSummary(summary: CommitSummary): void {
 	}
 
 	if (summary.llm) {
-		const llmStr = `${summary.llm.model}  |  Tokens: ${summary.llm.inputTokens}\u2191 ${summary.llm.outputTokens}\u2193  |  Latency: ${summary.llm.apiLatencyMs}ms`;
+		// Empty means the tool reported no model and none was pinned — see
+		// callLocalAgent. Printing it raw left a gap where a name belongs.
+		const modelLabel = summary.llm.model || "unknown model";
+		const llmStr = `${modelLabel}  |  Tokens: ${summary.llm.inputTokens}\u2191 ${summary.llm.outputTokens}\u2193  |  Latency: ${summary.llm.apiLatencyMs}ms`;
 		console.log(`  Model:   ${llmStr}`);
 	}
 

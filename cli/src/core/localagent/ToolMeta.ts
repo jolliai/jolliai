@@ -252,12 +252,18 @@ export const ALL_LOCAL_AGENT_MODEL_IDS: ReadonlyArray<string> = [
  * default, the empty string, and anything no pinned tool offers; the trimmed
  * value otherwise.
  *
- * The single authority for that question, because every surface that accepts a
- * model has to answer it and they had each answered it differently — the
- * dashboard rejected an unknown id outright, the VS Code host dropped it, and
- * `configure --set` stored the default literally where both panels stored it as
- * absent. Those disagree about what `config.json` should look like for the same
- * user intent, which is the drift this module exists to prevent.
+ * The authority for the two SETTINGS PANELS, which had answered it differently
+ * from each other — the dashboard rejected an unknown id outright where the VS
+ * Code host dropped it.
+ *
+ * `configure --set` deliberately does NOT call this: it stores what was typed
+ * VERBATIM, explicit default included, because typing a model's name is a choice
+ * where selecting the default option in a picker is the absence of one. So one
+ * config key really does have two persistence semantics by entry point, and that
+ * is a decision (see specs/62), not drift this function failed to remove. It
+ * matters more now than it used to: codex's ids are dated slugs, so when a
+ * default rotates, an absent value follows it while a literal one stays pinned to
+ * the model that used to be the default.
  *
  * Dropping rather than rejecting an unknown id is deliberate: every surface that
  * reaches this is a dropdown or a validated flag, so an unrecognised value means

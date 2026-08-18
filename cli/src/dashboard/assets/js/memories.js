@@ -727,7 +727,7 @@ window.JD = window.JD || {};
 			detail.files.length +
 			" files" +
 			(detail.summarizedBy
-				? " · Summary by " + esc(detail.summarizedBy.model) + " · " + JD.fmtTokens(detail.summarizedBy.tokens) + " tokens to write it"
+				? " · Summary by " + esc(detail.summarizedBy.model || "an unreported model") + " · " + JD.fmtTokens(detail.summarizedBy.tokens) + " tokens to write it"
 				: "") +
 			"</div>";
 

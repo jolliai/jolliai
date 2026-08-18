@@ -1778,9 +1778,14 @@ describe("callLlm — local-agent", () => {
 	});
 
 	// No backend but claude-code names the model it ran, so for an UNPINNED tool
-	// the alias is the only value available — a guess, but not a silently wrong
-	// one. (A pinned tool has a better answer: see the pinned-model test below.)
-	it("falls back to the resolved alias when the backend reports no model", async () => {
+	// there is no value available — and the honest record is none. This used to
+	// fall back to `resolveModelId(options.model)`, defended as "a guess, but not a
+	// silently wrong one". It was silently wrong: that setting names an ANTHROPIC
+	// api model for the direct/proxy providers and never reaches this one, so the
+	// record claimed an opencode run had been performed by `claude-haiku-4-5-…`.
+	// A plausible id from a namespace that never ran is worse than an empty one,
+	// which is the same rule this repo applies to empty-but-successful reads.
+	it("records no model at all when the backend reports none and nothing was pinned", async () => {
 		const stub: LocalAgentBackend = {
 			id: "opencode",
 			discoverExecutable: async () => ({ file: "/x/opencode", version: "0.1.0" }),
@@ -1812,7 +1817,9 @@ describe("callLlm — local-agent", () => {
 			__localAgentRun: async () => "ignored-by-stub",
 		});
 
-		expect(result.model).toBe("claude-haiku-4-5-20251001");
+		// `model: "haiku"` is deliberately set and deliberately ignored — proving the
+		// Anthropic namespace does not leak in through this door.
+		expect(result.model).toBe("");
 	});
 
 	// An agent CLI that does not recognise a flag exits non-zero BEFORE running,
@@ -2616,6 +2623,11 @@ describe("callLlm — local-agent model pinning", () => {
 		// Never persisted: an entitlement can be granted later, so the next call
 		// must ask for the pinned model again.
 		expect(await loadUnsupportedFlagIds("codex", "0.137.0")).toEqual(new Set());
+		// What gets RECORDED after the pin is withdrawn: nothing. codex reports no
+		// model of its own, so "unknown" is the honest answer. This used to be the
+		// resolved ANTHROPIC id (`claude-sonnet-4-6`), which claimed a codex run had
+		// been performed by a model from a namespace that never ran.
+		expect(result.model).toBe("");
 	});
 
 	it("does not retry a refusal that was not about the model", async () => {
