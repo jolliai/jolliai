@@ -127,6 +127,7 @@ Two windows are in play: the **selected** window, and a fixed **84-day** (12-wee
 - **Capture counts**: `totalCommits` is every commit in the window regardless of reachability (it answers "what did I do"), while the captured count is reachability-filtered and counts commits that have a memory **row at all** — including one reached through a rewrite alias, since a rebased commit's memory stays filed under its pre-rewrite hash. Using turns/tokens instead would count a sparse-but-real memory as a gap. The captured count and the decisions card are absent (not zero) below the memory tier, so the card can render a dash instead of asserting a real zero.
 - **Decisions card**: decisions mined from the window's commit memories — a count, the number of distinct repositories they came from, the newest one, and a per-day count series. Its per-day map is seeded across the window like the token series.
 - **Tool usage** and **recall usage**, below.
+- **A spend self-trend** — estimated cost against the immediately preceding window of equal length. Both ends are summed over the same series, **along the same dimension**, by the same rule the card's headline uses, so the arrow trends the number it is printed beside rather than a differently-derived one. Absent, not zero, when the previous window drew no cost to compare against.
 
 #### Tool, skill and MCP usage
 
@@ -141,6 +142,9 @@ All of it is windowed by **the call's own time when the parser that read it coul
 
   - **A per-row agent share carries CALLS ONLY, never a session count.** A session belongs to exactly one agent, so both figures partition cleanly *at the grouping they were counted at* — but a session count does not survive being re-summed at a coarser one, and this breakdown appears at three groupings. A session that called two of a server's tools is one session for the server and two rows in the per-tool grouping, which is exactly the double-count the servers' own separate grouping exists to avoid. Carrying a number that is exact on the skill rows and a double count on the server rows would be worse than carrying none.
   - **The per-kind agent totals do carry sessions**, because they come from their own distinct-count grouping rather than from a re-sum — so they are answering a question that was actually asked of the database, not one reconstructed from rows.
+  - **Those two per-kind totals have NO READER at HEAD.** They fed a card-level "by agent" header line that was removed for restating what every row already names through its own per-row breakdown. They are still computed and still shipped, and are recorded here for exactly that reason: a payload field with no consumer is otherwise a contract that drifts unnoticed. Keeping them makes restoring the line a render change and nothing else. (Unreachable; deliberate.)
+
+**The row cut is coupled to the browser's own scroll cap, and the two must stay equal.** Paging is driven by the total counts rather than by the client re-deriving a page size — but past that cap the activity view's polling loop carries the current list forward and **slices it back to this width**, presenting the result as what a freshly opened card shows. So the constant is no longer cosmetic: if the two disagree, the poll silently collapses a list the user had expanded.
 
   This is the same discipline as the servers' separate grouping, applied one axis over: where a figure cannot be re-derived correctly from finer rows, it is either queried at its own grouping or omitted.
 

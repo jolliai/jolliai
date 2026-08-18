@@ -1,9 +1,9 @@
 {
   "branches": {
     "main": {
-      "revision": "26267cf40ccc4c0f8c137372af971f0c1d9328eb",
-      "subject": "Skip re-projecting unchanged events in the dashboard backfill",
-      "reviewedAt": "2026-08-18T19:40:38Z",
+      "revision": "d75d76862c35fdd8177bc92bd8467e45360ddbed",
+      "subject": "Add manual wiki rebuild mode gated by wikiRebuild config key",
+      "reviewedAt": "2026-08-18T19:47:24Z",
       "actor": "doug.schroeder",
       "skill": "specs-update"
     }

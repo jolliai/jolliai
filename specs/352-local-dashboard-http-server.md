@@ -152,6 +152,10 @@ Notes on the table:
 
 The telemetry beacon is dispatched **before** the token gate; every other POST is token-gated first.
 
+**`/api/wiki/rebuild`** — the on-demand knowledge-base rebuild, and the one route that **answers before its work is done**. The sweep it starts is multi-minute and model-bearing, so it must not hold the handler: the route sets a process-local in-flight flag, starts the whole-machine compile as fire-and-forget, and answers **202** immediately. The flag is cleared in the tail whatever the outcome, and a second request while it is set is refused **409** rather than starting a concurrent sweep. Progress is not reported here — the page polls the wiki-freshness route, whose in-flight field reflects the same flag. A failure inside the detached sweep is logged and reaches the caller **not at all**, because the caller was answered minutes earlier; the freshness poll going quiet is the only signal.
+
+This route exists because the automatic triggers are off by default: the rebuild mode gates every git-driven ingest, so on a default install this and the editor's equivalent are how a rebuild happens at all (159, 62).
+
 **`/api/telemetry`** — no token. Reads and JSON-parses the body, and forwards the event only when the body is an object, its `event` is a registered event name, **and** that name is one of the four dashboard-UI events (`dashboard_opened`, `dashboard_view_switched`, `range_changed`, `chart_split_changed`), stamping it with the `web-local` surface; `properties` defaults to an empty object when absent or non-object. **It answers `204` unconditionally** — an unreadable body, an oversized body, a non-object payload, an unregistered name, and a successfully forwarded event are all indistinguishable to the caller. (Deliberate: a beacon must never learn to retry.)
 
 For every other POST, in order:
@@ -170,6 +174,7 @@ For every other POST, in order:
 | `/api/settings/set-push` | `repoIdentity`, `disabled` (boolean), `isCurrentRepo` (optional) | **400** `{"error":"repoIdentity is required"}`; **400** `{"error":"disabled (boolean) is required"}`; **500** `{"error":"could not change push setting"}`; **200** `{"ok":true,"disabled":<boolean>,"recoveredFromCorrupt"?:true}` |
 | `/api/settings/signin` | — | **200** `{"ok":true}`; **400** `{"error":<reason>}`, including the timeout message after **5 minutes** waiting for the browser callback |
 | `/api/settings/signout` | — | **200** `{"ok":true}`; **500** `{"error":"could not sign out"}` |
+| `/api/wiki/rebuild` | — | **400** naming the missing AI provider and pointing at Settings when no credential resolves; **409** when a rebuild is already running; else **202** — see below |
 | `/api/settings/generate-missing` | — | **400** `{"error":"the dashboard was not started inside a git repository"}`; **409** `{"error":"a summary generation is already running — wait for it to finish"}`; **500** `{"error":"could not generate summaries"}`; **200** `{"ok":true,"generated":<n>,"errors":<n>,"total":<n>}` |
 | `/api/settings/probe-local-agent` | `tool` | **400** `{"error":"tool is required"}`; **500** `{"error":"could not probe the local agent"}`; **200** `{"ok":true,"usable":<boolean>}` |
 | `/api/settings/migrate` | — | **200** with the migration result; **400** `{"error":<result message>, …result}` on a failed/partial result; **500** `{"ok":false,"message":"could not migrate the Memory Bank"}` |

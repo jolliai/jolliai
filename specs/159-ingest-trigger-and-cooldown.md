@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-A repo-wide topic-knowledge-base ingest is enqueued at most once per cooldown window per project, with a force-bypass for merge events, a manual command-line surface that drains a single repo or sweeps all knowledge-bank repos, and a recovery rule that never burns the cooldown on a failed enqueue.
+A repo-wide topic-knowledge-base ingest is enqueued at most once per cooldown window per project, with a force-bypass for merge events, a manual command-line surface that drains a single repo or sweeps all knowledge-bank repos, and a recovery rule that never burns the cooldown on a failed enqueue — **and, ahead of all of it, a configuration mode that by default stops every automatic trigger from enqueueing anything at all.**
 
 ## Scope
 
@@ -10,6 +10,7 @@ A repo-wide topic-knowledge-base ingest is enqueued at most once per cooldown wi
 
 - The per-project cooldown record: how it is read, how it is updated, the window length, the timestamp format, and the parsing tolerance for malformed values.
 - The enqueue function called by every automatic trigger: cooldown check, force bypass, the queue write contract it delegates to, and the cooldown update ordering.
+- **The rebuild-mode gate that now stands in front of every automatic trigger**, where it sits, and why the default value inverts what this topic used to describe.
 - The trigger-source tag attached to each enqueued operation and carried through to telemetry.
 - The non-throwing contract: every failure path returns a falsy "not enqueued" outcome and leaves the cooldown record unchanged.
 - The command-line ingest entry point and its two modes — single-repo drain and all-repos sweep — together with their flag matrix, exit codes, output lines, credential precondition, and serialisation lock.
@@ -89,6 +90,16 @@ Updating the cooldown record:
 2. Writes an object containing a single field — the supplied instant formatted as ISO-8601 — atomically to the cooldown file.
 
 The update never reads the existing record; the new value fully replaces it. There is no concept of "extending" or "resetting back" the cooldown — every successful update is a full write of one timestamp.
+
+### The rebuild-mode gate sits at the call sites, not in the enqueue
+
+A configuration key selects when the topic knowledge base and its graph are rebuilt: **manual** or **auto**. **An absent key means manual, so this is the default on every existing install**, and the predicate deliberately tests for `auto` so no migration was needed.
+
+The gate is applied by each **automatic caller**, not inside the enqueue function — which is why the enqueue's own contract below is unchanged and still describes exactly what happens once a caller decides to proceed. Three callers carry it: the post-commit queue drain (gated together with its own "something was committed this run" condition), the post-merge hook, and the back-fill engine (gated together with "at least one memory was generated" and with not being a dry run).
+
+**The consequence is an inversion of what this topic otherwise describes**: on a default install no git operation — commit, merge, rebase, amend, squash — enqueues an ingest, so the cooldown window, the force bypass and the recovery rule are all reachable only from the manual surface or from an install that opted into `auto`. The manual command-line entry points and the dashboard's and editor's on-demand rebuild are **not** gated: they are the user asking outright.
+
+Recall and commit search are unaffected in either mode, because they read the per-commit memories rather than the topic pages.
 
 ### Enqueue contract
 
