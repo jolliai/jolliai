@@ -454,6 +454,20 @@ export interface CommitGitOperation {
 	 * id when absent.
 	 */
 	readonly traceId?: string;
+	/**
+	 * The agent session (`CLAUDE_CODE_SESSION_ID`) whose process executed this
+	 * git operation, captured at enqueue time from the hook's inherited env.
+	 *
+	 * This is authorship evidence the ledger cannot supply on its own: a session
+	 * running in worktree A that commits into worktree B leaves no cwd trace in
+	 * B, so B's drain would attribute the commit to nothing. The worker uses this
+	 * to add that session as a candidate and, when the forward ledger has not yet
+	 * recorded a B-ownership edge (the edit and the commit happened in one turn,
+	 * before the Stop hook ran), to synthesize the owner lower bound from the
+	 * session's own transcript. Absent for a plain-terminal / GUI commit and for
+	 * hosts that advertise no session id — see [AgentSessionEnv.ts](./core/AgentSessionEnv.js).
+	 */
+	readonly executingSessionId?: string;
 }
 
 /**

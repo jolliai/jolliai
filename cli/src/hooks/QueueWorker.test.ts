@@ -29,6 +29,15 @@ vi.mock("../core/GitOps.js", () => ({
 	resolveWorktreeRootOrNull: vi.fn((cwd: string) => cwd),
 }));
 
+// Keep `scanOwnerEdges` (used real below) and every other export, but stub the
+// executing-session backfill so the wiring tests can assert loadSessionTranscripts
+// calls it without driving a real ~/.claude/projects scan. Its own behavior is
+// covered directly in ClaudeOwnerScan.test.ts.
+vi.mock("../core/ClaudeOwnerScan.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/ClaudeOwnerScan.js")>()),
+	backfillExecutingSessionOwnership: vi.fn().mockResolvedValue(undefined),
+}));
+
 vi.mock("../core/RepoProfile.js", () => ({
 	// Pre-cutover default: no fence (plain fn — survives mock resets).
 	readCutoverFence: async () => null,
@@ -585,7 +594,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scanOwnerEdges } from "../core/ClaudeOwnerScan.js";
+import { backfillExecutingSessionOwnership, scanOwnerEdges } from "../core/ClaudeOwnerScan.js";
 import { type ClaudeOwnerEdge, claudeOwnersPath, recordClaudeOwners } from "../core/ClaudeOwnership.js";
 import { claudeSessionsForRepo } from "../core/ClaudeSessionDiscoverer.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
@@ -5761,6 +5770,39 @@ describe("QueueWorker", () => {
 				const result = await __test__.loadSessionTranscripts(cwd, { claudeEnabled: false });
 
 				expect(result.allSessions.some((s) => s.sessionId === "off-1")).toBe(false);
+			});
+		});
+
+		// ─── Executing-session backfill (甲): a commit run by a Claude session that
+		// authored files in THIS worktree from another checkout leaves no cwd trace
+		// here, and if the edit + commit happened in one turn the Stop hook has not
+		// recorded it yet. loadSessionTranscripts backfills that session's ownership
+		// from `op.executingSessionId` before the owner lookup, so the commit is
+		// attributed to its author instead of nothing.
+		describe("executing-session backfill", () => {
+			beforeEach(() => {
+				vi.mocked(backfillExecutingSessionOwnership).mockClear().mockResolvedValue(undefined);
+			});
+
+			it("backfills the executing session's ownership before resolving owners", async () => {
+				await withLedgerHome(async () => {
+					await __test__.loadSessionTranscripts(cwd, {}, undefined, "exec-sid");
+					expect(backfillExecutingSessionOwnership).toHaveBeenCalledWith("exec-sid", cwd);
+				});
+			});
+
+			it("does not backfill when no executing session id is present", async () => {
+				await withLedgerHome(async () => {
+					await __test__.loadSessionTranscripts(cwd, {});
+					expect(backfillExecutingSessionOwnership).not.toHaveBeenCalled();
+				});
+			});
+
+			it("does not backfill when claudeEnabled is false", async () => {
+				await withLedgerHome(async () => {
+					await __test__.loadSessionTranscripts(cwd, { claudeEnabled: false }, undefined, "exec-sid");
+					expect(backfillExecutingSessionOwnership).not.toHaveBeenCalled();
+				});
 			});
 		});
 

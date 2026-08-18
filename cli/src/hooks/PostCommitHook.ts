@@ -13,6 +13,7 @@
 import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { currentAgentSessionId } from "../core/AgentSessionEnv.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
@@ -112,6 +113,10 @@ export function postCommitEntry(cwd: string): { commitHash: string } | null {
 	// drains this commit — unifying the hook's logs, the worker's logs, and the
 	// outbound LLM/push calls under one id across the process boundary.
 	const traceId = getCurrentTraceId();
+	// The session that ran this commit, if the hook inherited its env. Stamped so
+	// the detached worker can attribute a cross-worktree commit to its authoring
+	// session even when the forward ledger has no cwd trace of it in this checkout.
+	const executingSessionId = currentAgentSessionId();
 	const op: GitOperation = {
 		type: opType,
 		commitHash,
@@ -120,6 +125,7 @@ export function postCommitEntry(cwd: string): { commitHash: string } | null {
 		commitSource,
 		createdAt: new Date().toISOString(),
 		...(traceId && { traceId }),
+		...(executingSessionId && { executingSessionId }),
 	};
 
 	// Write queue entry synchronously (post-commit hook must return quickly)

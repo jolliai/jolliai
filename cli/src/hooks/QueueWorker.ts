@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { isAntigravityInstalled } from "../core/AntigravityDetector.js";
 import { discoverAntigravitySessions } from "../core/AntigravitySessionDiscoverer.js";
 import { readAntigravityTranscript } from "../core/AntigravityTranscriptReader.js";
+import { backfillExecutingSessionOwnership } from "../core/ClaudeOwnerScan.js";
 import { claudeSessionsOwnedBy } from "../core/ClaudeOwnership.js";
 import { resolveClientKind } from "../core/ClientHeader.js";
 import { isClineCliInstalled } from "../core/ClineCliDetector.js";
@@ -2035,7 +2036,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 				cwd,
 				pipelineStart,
 				{ fromRef: oldHash, toRef: op.commitHash },
-				{ commitType: "amend", commitSource },
+				{ commitType: "amend", commitSource, executingSessionId: op.executingSessionId },
 				op.createdAt,
 				op.branch,
 			);
@@ -2060,7 +2061,7 @@ async function executePipeline(cwd: string, op: CommitGitOperation, force = fals
 		conversationTokenBreakdown,
 		conversationModels,
 		consumedTranscripts,
-	} = await loadSessionTranscripts(cwd, config, op.createdAt);
+	} = await loadSessionTranscripts(cwd, config, op.createdAt, op.executingSessionId);
 
 	// Step 5: Get git diff and stats (moved before guard to enable diff-only summaries)
 	stepStart = now();
@@ -3342,7 +3343,11 @@ async function handleAmendPipeline(
 	cwd: string,
 	pipelineStart: number,
 	diffOverride?: { readonly fromRef: string; readonly toRef: string },
-	metadata?: { readonly commitType?: CommitType; readonly commitSource?: CommitSource },
+	metadata?: {
+		readonly commitType?: CommitType;
+		readonly commitSource?: CommitSource;
+		readonly executingSessionId?: string;
+	},
 	beforeTimestamp?: string,
 	branchHint?: string,
 ): Promise<void> {
@@ -3384,7 +3389,7 @@ async function handleAmendPipeline(
 		conversationTokenBreakdown,
 		conversationModels,
 		consumedTranscripts,
-	} = await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp);
+	} = await loadSessionTranscripts(cwd, amendConfig, beforeTimestamp, metadata?.executingSessionId);
 
 	// Get git diff and stats. diffOverride (Scenario 1) provides oldHash->newHash
 	// (the actual amend delta); default HEAD~1..HEAD is the full amended diff.
@@ -3908,6 +3913,7 @@ async function loadSessionTranscripts(
 	cwd: string,
 	config: JolliMemoryConfig,
 	beforeTimestamp?: string,
+	executingSessionId?: string,
 ): Promise<{
 	allSessions: ReadonlyArray<{ sessionId: string; transcriptPath: string; source?: TranscriptSource }>;
 	sessionTranscripts: SessionTranscript[];
@@ -3940,6 +3946,16 @@ async function loadSessionTranscripts(
 	// wrote `/private/var/…` into the ledger. An unnormalised lookup matches
 	// nothing, silently, and the whole feature does nothing.
 	const ownerRoot = resolveStateRoot(cwd);
+	// (甲) A commit executed by a Claude session that authored files in THIS
+	// worktree from another checkout leaves no cwd trace here; when the edit and
+	// the commit happened in one turn, the Stop hook that would record it has not
+	// run yet either. Scan that session's own transcript now — through the same
+	// `scanOwnerEdges` the Stop hook uses — so the lookup below sees the authored
+	// edge. A session that only ran `git commit` without authoring under this root
+	// records nothing, and is correctly attributed to nothing.
+	if (executingSessionId && config.claudeEnabled !== false) {
+		await backfillExecutingSessionOwnership(executingSessionId, cwd);
+	}
 	const ledgerOwned = config.claudeEnabled === false ? [] : await claudeSessionsOwnedBy(ownerRoot);
 	// transcriptPath → this owner's lower bound, threaded into `readAllTranscripts`
 	// below. It seeds a session's first read (no saved cursor yet) instead of

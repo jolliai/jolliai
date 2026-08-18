@@ -1,4 +1,4 @@
-import { mkdtemp, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -12,13 +12,27 @@ vi.mock("./GitOps.js", async (importOriginal) => ({
 	resolveWorktreeRootOrNull: vi.fn((cwd: string) => cwd),
 }));
 
-import { scanOwnerEdges, scanOwnersWithCursor } from "./ClaudeOwnerScan.js";
-import { loadClaudeOwners } from "./ClaudeOwnership.js";
+import {
+	backfillExecutingSessionOwnership,
+	resolveClaudeTranscriptPath,
+	scanOwnerEdges,
+	scanOwnersWithCursor,
+} from "./ClaudeOwnerScan.js";
+import { claudeSessionsOwnedBy, loadClaudeOwners } from "./ClaudeOwnership.js";
 import { loadExtractorCursorLine, saveExtractorCursor } from "./SessionTracker.js";
 
 /** One transcript line carrying a cwd and a timestamp. */
 function line(cwd: string, ts: string): string {
 	return JSON.stringify({ cwd, timestamp: ts, message: { role: "user", content: "hi" } });
+}
+
+/** An assistant tool_use line: one `tool` call whose `input[key]` names a file. */
+function toolLine(cwd: string, ts: string, tool: string, key: string, path: string): string {
+	return JSON.stringify({
+		cwd,
+		timestamp: ts,
+		message: { role: "assistant", content: [{ type: "tool_use", name: tool, input: { [key]: path } }] },
+	});
 }
 
 // Identity roots: each cwd's first path segment pair is its "worktree root".
@@ -130,6 +144,159 @@ describe("scanOwnerEdges", () => {
 			const { edges } = scanOwnerEdges([line("/whatever", "2026-08-17T10:00:00.000Z")], 0);
 			expect(edges.size).toBe(0);
 		});
+	});
+});
+
+describe("scanOwnerEdges — edited-file ownership", () => {
+	it("records an edge for the worktree root of a file the session EDITED, on top of the cwd edge", () => {
+		const lines = [toolLine("/repo/a", "2026-08-17T10:00:00.000Z", "Edit", "file_path", "/repo/b/src/x.ts")];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect([...edges.keys()].sort()).toEqual(["/repo/a", "/repo/b"]);
+		expect(edges.get("/repo/b")?.firstSeenLine).toBe(0);
+	});
+
+	it("recognizes Write, MultiEdit, and NotebookEdit as authoring a file", () => {
+		const cases: Array<[string, string, string]> = [
+			["Write", "file_path", "/repo/b/w.ts"],
+			["MultiEdit", "file_path", "/repo/b/m.ts"],
+			["NotebookEdit", "notebook_path", "/repo/b/n.ipynb"],
+		];
+		for (const [tool, key, path] of cases) {
+			const { edges } = scanOwnerEdges(
+				[toolLine("/repo/a", "2026-08-17T10:00:00.000Z", tool, key, path)],
+				0,
+				roots,
+			);
+			expect(edges.has("/repo/b")).toBe(true);
+		}
+	});
+
+	it("does NOT create an edge for a file that was only READ (read-only tools author nothing)", () => {
+		for (const tool of ["Read", "Grep", "Glob", "Bash"]) {
+			const { edges } = scanOwnerEdges(
+				[toolLine("/repo/a", "2026-08-17T10:00:00.000Z", tool, "file_path", "/repo/b/x.ts")],
+				0,
+				roots,
+			);
+			expect([...edges.keys()]).toEqual(["/repo/a"]);
+		}
+	});
+
+	it("resolves a relative edited path against the line cwd", () => {
+		// join("/repo/a/sub", "../../b/x.ts") === "/repo/b/x.ts" → dirname "/repo/b"
+		const lines = [toolLine("/repo/a/sub", "2026-08-17T10:00:00.000Z", "Edit", "file_path", "../../b/x.ts")];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect(edges.has("/repo/b")).toBe(true);
+	});
+
+	it("merges an edited-file edge into the cwd edge when they share a root", () => {
+		const lines = [toolLine("/repo/a", "2026-08-17T10:00:00.000Z", "Edit", "file_path", "/repo/a/x.ts")];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect([...edges.keys()]).toEqual(["/repo/a"]);
+		expect(edges.get("/repo/a")?.firstSeenLine).toBe(0);
+	});
+
+	it("stamps the EDITING line as firstSeenLine for the edited root", () => {
+		const lines = [
+			line("/repo/a", "2026-08-17T10:00:00.000Z"),
+			toolLine("/repo/a", "2026-08-17T10:01:00.000Z", "Edit", "file_path", "/repo/b/x.ts"),
+		];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect(edges.get("/repo/a")?.firstSeenLine).toBe(0);
+		expect(edges.get("/repo/b")?.firstSeenLine).toBe(1);
+	});
+
+	it("ignores an edited path whose directory resolves to no worktree root", () => {
+		const lines = [toolLine("/repo/a", "2026-08-17T10:00:00.000Z", "Edit", "file_path", "/tmp/scratch/x.ts")];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect([...edges.keys()]).toEqual(["/repo/a"]);
+	});
+
+	it("tolerates malformed content blocks and non-string paths without a spurious edge", () => {
+		// content is an array of junk: a null block, a text block, a tool_use with no
+		// name, an Edit with no input, and an Edit whose file_path is not a string.
+		const lines = [
+			JSON.stringify({
+				cwd: "/repo/a",
+				timestamp: "2026-08-17T10:00:00.000Z",
+				message: {
+					role: "assistant",
+					content: [
+						null,
+						{ type: "text", text: "thinking" },
+						{ type: "tool_use", input: { file_path: "/repo/b/x.ts" } },
+						{ type: "tool_use", name: "Edit" },
+						{ type: "tool_use", name: "Edit", input: { file_path: 42 } },
+					],
+				},
+			}),
+		];
+		const { edges } = scanOwnerEdges(lines, 0, roots);
+		expect([...edges.keys()]).toEqual(["/repo/a"]);
+	});
+});
+
+describe("resolveClaudeTranscriptPath", () => {
+	it("finds <projectsDir>/<any>/<sessionId>.jsonl", async () => {
+		const projects = await mkdtemp(join(tmpdir(), "jolli-proj-"));
+		const proj = join(projects, "-Users-me-repo");
+		await mkdir(proj);
+		const transcript = join(proj, "sid-1.jsonl");
+		await writeFile(transcript, "", "utf-8");
+		expect(await resolveClaudeTranscriptPath("sid-1", projects)).toBe(transcript);
+	});
+
+	it("returns null when no project directory holds the session", async () => {
+		const projects = await mkdtemp(join(tmpdir(), "jolli-proj2-"));
+		await mkdir(join(projects, "-Users-me-repo"));
+		expect(await resolveClaudeTranscriptPath("missing", projects)).toBeNull();
+	});
+
+	it("returns null when the projects directory does not exist", async () => {
+		expect(await resolveClaudeTranscriptPath("sid", join(tmpdir(), "jolli-no-such-dir-xyz"))).toBeNull();
+	});
+});
+
+describe("backfillExecutingSessionOwnership", () => {
+	const NOW = "2026-08-17T10:00:00.000Z";
+	/** An assistant Edit line: cwd=`cwd`, editing the absolute path `file`. */
+	const editLine = (cwd: string, file: string) =>
+		JSON.stringify({
+			cwd,
+			timestamp: NOW,
+			message: { role: "assistant", content: [{ type: "tool_use", name: "Edit", input: { file_path: file } }] },
+		});
+
+	it("records an owner edge for a worktree the executing session EDITED but never cd'd into", async () => {
+		const global = await mkdtemp(join(tmpdir(), "jolli-exec-g-"));
+		const worktreeB = await mkdtemp(join(tmpdir(), "jolli-exec-b-"));
+		const transcript = join(global, "exec.jsonl");
+		// Session sat in /elsewhere/A the whole time, but authored a file under B.
+		await writeFile(transcript, `${editLine("/elsewhere/A", join(worktreeB, "x.ts"))}\n`, "utf-8");
+
+		await backfillExecutingSessionOwnership("exec-1", worktreeB, global, async () => transcript);
+
+		const owned = await claudeSessionsOwnedBy(worktreeB, global);
+		expect(owned.map((o) => o.sessionId)).toEqual(["exec-1"]);
+	});
+
+	it("records NOTHING for B when the session neither entered nor authored under B", async () => {
+		const global = await mkdtemp(join(tmpdir(), "jolli-exec-g2-"));
+		const worktreeB = await mkdtemp(join(tmpdir(), "jolli-exec-b2-"));
+		const transcript = join(global, "exec2.jsonl");
+		// cwd and edit are both under /elsewhere/A — no evidence for B.
+		await writeFile(transcript, `${editLine("/elsewhere/A", "/elsewhere/A/x.ts")}\n`, "utf-8");
+
+		await backfillExecutingSessionOwnership("exec-2", worktreeB, global, async () => transcript);
+
+		expect(await claudeSessionsOwnedBy(worktreeB, global)).toEqual([]);
+	});
+
+	it("is a no-op when the executing session's transcript cannot be located", async () => {
+		const global = await mkdtemp(join(tmpdir(), "jolli-exec-g3-"));
+		const worktreeB = await mkdtemp(join(tmpdir(), "jolli-exec-b3-"));
+		await backfillExecutingSessionOwnership("gone", worktreeB, global, async () => null);
+		expect(await loadClaudeOwners(global)).toEqual({ version: 1, sessions: {} });
 	});
 });
 
