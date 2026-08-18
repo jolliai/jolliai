@@ -30,6 +30,15 @@ export function buildSettingsScript(): string {
   const localAgentToolSelect = document.getElementById('localAgentTool');
   const localAgentModelSelect = document.getElementById('localAgentModel');
   const localAgentModelRow = document.getElementById('localAgentModelRow');
+  // The model the user actually chose, kept SEPARATE from the select's current
+  // selection. A tool switch re-points that selection at the new tool's default
+  // so the row displays something valid — a presentation decision. But the select
+  // is also what a save reads, so submitting it made merely visiting another tool
+  // in the picker overwrite a pin the user never edited: pick codex, change your
+  // mind, and claude-code's opus saves as sonnet. Worse for a tool that pins
+  // nothing, where the row is hidden and nothing on screen showed it happening.
+  // Written only by a load and by the user changing the model select.
+  var storedLocalAgentModel = '';
   const localAgentStatus = document.getElementById('localAgentStatus');
   // Two Jolli API key inputs (jolli-ok and jolli-nokey cards) — kept in sync.
   const jolliApiKeyInput = document.getElementById('jolliApiKey');
@@ -448,7 +457,7 @@ export function buildSettingsScript(): string {
       maxTokens: maxTokensInput.value,
       aiProvider: aiProviderSelect.value,
       localAgentTool: localAgentToolSelect.value,
-      localAgentModel: localAgentModelSelect ? localAgentModelSelect.value : '',
+      localAgentModel: storedLocalAgentModel,
       jolliApiKey: getActiveJolliApiKeyValue(),
       claudeEnabled: claudeEnabledInput.checked,
       codexEnabled: codexEnabledInput.checked,
@@ -479,7 +488,7 @@ export function buildSettingsScript(): string {
       maxTokensInput.value !== initialState.maxTokens ||
       aiProviderSelect.value !== initialState.aiProvider ||
       localAgentToolSelect.value !== initialState.localAgentTool ||
-      (localAgentModelSelect && localAgentModelSelect.value !== initialState.localAgentModel) ||
+      storedLocalAgentModel !== initialState.localAgentModel ||
       getActiveJolliApiKeyValue() !== initialState.jolliApiKey ||
       claudeEnabledInput.checked !== initialState.claudeEnabled ||
       codexEnabledInput.checked !== initialState.codexEnabled ||
@@ -547,12 +556,33 @@ export function buildSettingsScript(): string {
     localAgentModelRow.classList.toggle('hidden', visible === 0);
     // After a tool switch the previously-selected model may belong to the old
     // tool. Fall back to the option MARKED default, never to the first one: the
-    // list is ordered to match the Anthropic model picker a few rows up, so the
-    // default sits in the middle and position carries no meaning. First-visible
-    // survives only for a tool that somehow marks none.
-    if (visible > 0 && !selectedStillVisible) {
-      var fallback = defaultVisibleValue !== null ? defaultVisibleValue : firstVisibleValue;
-      if (fallback !== null) localAgentModelSelect.value = fallback;
+    // list is ordered by capability with the default in the middle, so position
+    // carries no meaning. First-visible survives only for a tool that somehow
+    // marks none.
+    var target = selectedStillVisible
+      ? localAgentModelSelect.value
+      : (defaultVisibleValue !== null ? defaultVisibleValue : firstVisibleValue);
+    if (visible > 0 && target !== null) selectVisibleModelOption(target);
+  }
+
+  // Selects the given value on the option belonging to the CURRENT tool, rather
+  // than by assigning to select.value.
+  //
+  // Every pinned tool offers the inherit choice, so the document really does
+  // contain more than one option carrying that value, differing only in data-tool
+  // and label. Assigning select.value picks the FIRST match by spec — which is
+  // another tool's, now hidden and disabled — so a codex user with inherit stored
+  // had the row load reading "Use Claude Code's own setting". The submitted value
+  // was right either way, which is exactly why it needed catching here: nothing
+  // downstream could notice.
+  function selectVisibleModelOption(value) {
+    var tool = localAgentToolSelect.value;
+    for (var i = 0; i < localAgentModelSelect.options.length; i++) {
+      var o = localAgentModelSelect.options[i];
+      if (o.value === value && o.getAttribute('data-tool') === tool) {
+        localAgentModelSelect.selectedIndex = i;
+        return;
+      }
     }
   }
 
@@ -655,7 +685,10 @@ export function buildSettingsScript(): string {
     syncLocalAgentModelRow(); checkDirty(); clearSaveFeedback(); probeLocalAgent();
   });
   if (localAgentModelSelect) {
-    localAgentModelSelect.addEventListener('change', function() { checkDirty(); clearSaveFeedback(); });
+    localAgentModelSelect.addEventListener('change', function() {
+      storedLocalAgentModel = localAgentModelSelect.value;
+      checkDirty(); clearSaveFeedback();
+    });
   }
   aiProviderSelect.addEventListener('change', function() {
     checkDirty(); clearSaveFeedback(); syncProviderCard(); syncLocalAgentModelRow();
@@ -760,7 +793,7 @@ export function buildSettingsScript(): string {
         maxTokens: maxVal.length > 0 ? Number(maxVal) : null,
         aiProvider: aiProviderSelect.value,
         localAgentTool: localAgentToolSelect.value,
-        localAgentModel: localAgentModelSelect ? localAgentModelSelect.value : '',
+        localAgentModel: storedLocalAgentModel,
         jolliApiKey: getActiveJolliApiKeyValue().trim(),
         claudeEnabled: claudeEnabledInput.checked,
         codexEnabled: codexEnabledInput.checked,
@@ -883,6 +916,10 @@ export function buildSettingsScript(): string {
         // select holding a value this tool cannot accept, and the sync is what
         // corrects it to the tool's own default. Filtering first would instead
         // leave the bad value in place.
+        // Seeded unconditionally, empty string included: an absent stored value
+        // means "no preference", and leaving whatever the select happened to hold
+        // would submit the first option as if the user had chosen it.
+        storedLocalAgentModel = msg.settings.localAgentModel || '';
         if (localAgentModelSelect && msg.settings.localAgentModel) {
           localAgentModelSelect.value = msg.settings.localAgentModel;
         }

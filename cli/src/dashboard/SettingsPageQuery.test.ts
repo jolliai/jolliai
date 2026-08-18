@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { JolliMemoryConfig } from "../Types.js";
+import { localAgentToolDefaultModel } from "../core/localagent/ToolMeta.js";
+import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
 import { buildSettingsPageModel, maskApiKey } from "./SettingsPageQuery.js";
 
 let dir: string;
@@ -55,13 +56,23 @@ describe("buildSettingsPageModel", () => {
 		expect(m.summary.apiKeyMasked).toBe("");
 		expect(m.summary.localAgentTool).toBe("claude-code");
 		expect(m.summary.localAgentTools.some((t) => t.id === "claude-code")).toBe(true);
-		// The EFFECTIVE model, not the stored one: the default is stored as absent,
-		// and a picker rendered from "" would have nothing selected.
-		expect(m.summary.localAgentModel).toBe("sonnet");
+		// The RAW stored value, not a resolved one — nothing is stored here, so the
+		// page gets "" and resolves it against the marked default itself. Sending a
+		// resolved value made an untouched save destructive; see the round-trip
+		// test below.
+		expect(m.summary.localAgentModel).toBe("");
 		// Keyed by tool because switching the picker is a client-side state change
 		// that never refetches this payload. Only pinned tools appear.
 		expect(m.summary.localAgentModels["claude-code"]?.length).toBeGreaterThan(0);
-		expect(m.summary.localAgentModels.codex).toBeUndefined();
+		expect(m.summary.localAgentModels.codex?.length).toBeGreaterThan(0);
+		expect(m.summary.localAgentModels.opencode).toBeUndefined();
+		// Each pinned tool marks its OWN default, so the page never has to know
+		// which tool a default belongs to.
+		for (const [tool, models] of Object.entries(m.summary.localAgentModels)) {
+			const marked = models.filter((x) => x.isDefault);
+			expect(marked).toHaveLength(1);
+			expect(marked[0]?.id).toBe(localAgentToolDefaultModel(tool as LocalAgentToolId));
+		}
 		expect(m.others.dcoSignoff).toBe(false);
 		expect(m.memoryBank.compileExcludeFolders).toBe("");
 		expect(m.memoryBank.syncTranscripts).toBe(false);
@@ -105,7 +116,9 @@ describe("buildSettingsPageModel", () => {
 		expect(m.summary.model).toBe("opus");
 		// `model` is the Anthropic-API setting and must NOT leak into the
 		// local-agent picker — different namespaces, deliberately separate fields.
-		expect(m.summary.localAgentModel).toBe("sonnet");
+		// `model` is a different namespace and must never appear here.
+		expect(m.summary.localAgentModel).not.toBe("opus");
+		expect(m.summary.localAgentModel).toBe("");
 		expect(m.summary.maxTokens).toBe(4096);
 		expect(m.summary.apiKeyMasked).toBe("sk-ant-abcde****mnop");
 	});
@@ -177,11 +190,27 @@ describe("buildSettingsPageModel — local-agent model", () => {
 		expect(m.summary.localAgentModel).toBe("haiku");
 	});
 
-	it("treats a blank stored model as the default", async () => {
-		// A hand-edited or half-written config must not leave the picker unselected.
+	it("hands back a stored model the tool in force does not offer, rather than resolving it away", async () => {
+		// The round trip this endpoint has to keep non-destructive. The page submits
+		// what it was given unless the user picks something, and the mutation stores
+		// that — so resolving here would make merely OPENING Settings under codex
+		// erase a claude-code pin, and under a tool that pins nothing it would do it
+		// with no row on screen at all. Resolution for display is the page's job,
+		// against `localAgentModels[tool]` and its `isDefault` marker.
+		for (const tool of ["codex", "opencode"] as const) {
+			const configDir = writeConfig({ aiProvider: "local-agent", localAgentTool: tool, localAgentModel: "opus" });
+			const m = await buildSettingsPageModel(configDir, undefined);
+			expect(m.summary.localAgentModel).toBe("opus");
+		}
+	});
+
+	it("passes a blank stored model through as blank", async () => {
+		// A hand-edited or half-written config is "no preference", and the page
+		// selects the marked default for it. Resolving it here would store that
+		// default literally on the next save.
 		const configDir = writeConfig({ aiProvider: "local-agent", localAgentModel: "   " });
 		const m = await buildSettingsPageModel(configDir, undefined);
-		expect(m.summary.localAgentModel).toBe("sonnet");
+		expect(m.summary.localAgentModel).toBe("   ");
 	});
 
 	it("carries the inherit escape hatch in the offered choices", async () => {

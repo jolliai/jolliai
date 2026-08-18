@@ -15,8 +15,8 @@
  */
 
 import {
-	DEFAULT_LOCAL_AGENT_MODEL,
 	LOCAL_AGENT_TOOLS,
+	localAgentToolDefaultModel,
 	localAgentToolModels,
 } from "../../../cli/src/core/localagent/ToolMeta.js";
 import { GLOBAL_INSTRUCTIONS_PROMPT } from "../../../cli/src/install/GlobalInstructionsInstaller.js";
@@ -41,10 +41,13 @@ const LOCAL_AGENT_MODEL_OPTIONS = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof
 	.flatMap((id) =>
 		localAgentToolModels(id).map(
 			(m) =>
-				// `data-default` rather than position: the list is ordered to match the
-				// Anthropic picker, so the default is no longer first and the row's
-				// fallback must not infer it from order.
-				`<option value="${m.id}" data-tool="${id}"${m.id === DEFAULT_LOCAL_AGENT_MODEL ? ' data-default="true"' : ""}>${escapeHtml(m.label)}</option>`,
+				// `data-default` rather than position: each list is ordered to match a
+				// capability ramp, so the default is not first and the row's fallback
+				// must not infer it from order. Compared against THIS tool's default,
+				// never one global constant — a shared constant marks nothing for
+				// every tool but the one it belongs to, and `syncLocalAgentModelRow`
+				// would then fall back to the first (cheapest) option after a switch.
+				`<option value="${m.id}" data-tool="${id}"${m.id === localAgentToolDefaultModel(id) ? ' data-default="true"' : ""}>${escapeHtml(m.label)}</option>`,
 		),
 	)
 	.join("\n          ");

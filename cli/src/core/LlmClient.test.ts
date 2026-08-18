@@ -22,6 +22,7 @@ import { registerBackend } from "./localagent/BackendRegistry.js";
 import { runInvocation } from "./localagent/LocalAgentRunner.js";
 import type { OptionalFlag } from "./localagent/OptionalFlags.js";
 import { loadUnsupportedFlagIds } from "./localagent/OptionalFlags.js";
+import { localAgentToolDefaultModel } from "./localagent/ToolMeta.js";
 import {
 	LocalAgentAuthError,
 	type LocalAgentBackend,
@@ -1688,7 +1689,7 @@ describe("callLlm — local-agent", () => {
 		);
 	});
 
-	// The four UNPINNED tools still receive no model id — each runs whatever its
+	// The three UNPINNED tools still receive no model id — each runs whatever its
 	// own CLI is configured with, and an empty model tells the backend to emit no
 	// model flag at all. Their model-name spaces are not ones jollimemory knows,
 	// and none of them reports the model it ran, so a pinned model there would be
@@ -1698,7 +1699,7 @@ describe("callLlm — local-agent", () => {
 	// `options.model` is set on every case so the assertion cannot pass merely
 	// because nothing was configured — an alias reaching one of these would be the
 	// regression.
-	it.each(["codex", "cursor-agent", "opencode", "kimi"] as const)(
+	it.each(["cursor-agent", "opencode", "kimi"] as const)(
 		"passes an empty model to %s so the tool's own configured default is used",
 		async (toolId) => {
 			let seenModel: string | undefined;
@@ -1776,14 +1777,15 @@ describe("callLlm — local-agent", () => {
 		expect(result.model).toBe("claude-opus-5[1m]");
 	});
 
-	// codex/cursor-agent/opencode/kimi name no model in their output, so the alias
-	// remains the only value available — a guess, but not a silently wrong one.
+	// No backend but claude-code names the model it ran, so for an UNPINNED tool
+	// the alias is the only value available — a guess, but not a silently wrong
+	// one. (A pinned tool has a better answer: see the pinned-model test below.)
 	it("falls back to the resolved alias when the backend reports no model", async () => {
 		const stub: LocalAgentBackend = {
-			id: "codex",
-			discoverExecutable: async () => ({ file: "/x/codex", version: "0.1.0" }),
+			id: "opencode",
+			discoverExecutable: async () => ({ file: "/x/opencode", version: "0.1.0" }),
 			buildInvocation: (_exe, req) => ({
-				file: "/x/codex",
+				file: "/x/opencode",
 				args: [],
 				stdin: req.prompt,
 				env: {},
@@ -1805,7 +1807,7 @@ describe("callLlm — local-agent", () => {
 			action: "recap",
 			params: { commitMessage: "m", topicsSummary: "t" },
 			aiProvider: "local-agent",
-			localAgentTool: "codex",
+			localAgentTool: "opencode",
 			model: "haiku",
 			__localAgentRun: async () => "ignored-by-stub",
 		});
@@ -2383,14 +2385,44 @@ describe("callLlm — local-agent model pinning", () => {
 	});
 
 	it("sends no model to a tool that is not pinned, whatever is configured", async () => {
-		// The four unpinned tools keep deferring to their own configuration — a
-		// claude-code alias must never reach a codex invocation.
+		// An unpinned tool keeps deferring to its own configuration — one tool's
+		// alias must never reach another tool's invocation.
 		const seen: { req?: LocalAgentRequest } = {};
-		registerBackend(recordingStub("codex", seen));
+		registerBackend(recordingStub("opencode", seen));
 
-		await call({ localAgentTool: "codex", localAgentModel: "haiku" });
+		await call({ localAgentTool: "opencode", localAgentModel: "haiku" });
 
 		expect(seen.req?.model).toBe("");
+	});
+
+	it("sends codex its own pinned model, and its own default when none is stored", async () => {
+		// The half of pinning that only exists once a SECOND tool is pinned: the
+		// stored value is one field shared by every tool, so codex has to resolve it
+		// against its own list and fall back to its own default. Before this, an
+		// unrecognised value fell back to claude-code's `sonnet` — an id codex
+		// answers with a 400.
+		const explicit: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("codex", explicit));
+		await call({ localAgentTool: "codex", localAgentModel: "gpt-5.6-luna" });
+		expect(explicit.req?.model).toBe("gpt-5.6-luna");
+
+		const fallback: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("codex", fallback));
+		await call({ localAgentTool: "codex", localAgentModel: undefined });
+		expect(fallback.req?.model).toBe(localAgentToolDefaultModel("codex"));
+
+		// A claude-code alias carried over in the shared field resolves to codex's
+		// default, never to itself.
+		const foreign: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("codex", foreign));
+		await call({ localAgentTool: "codex", localAgentModel: "haiku" });
+		expect(foreign.req?.model).toBe(localAgentToolDefaultModel("codex"));
+
+		// And the escape hatch still reaches codex.
+		const inherit: { req?: LocalAgentRequest } = {};
+		registerBackend(recordingStub("codex", inherit));
+		await call({ localAgentTool: "codex", localAgentModel: "inherit" });
+		expect(inherit.req?.model).toBe("");
 	});
 
 	it("hands the requested model to the parser, and undefined when none was sent", async () => {
@@ -2478,8 +2510,9 @@ describe("callLlm — local-agent model pinning", () => {
 	});
 
 	it("checks nothing when the tool reports no model of its own", async () => {
-		// codex, cursor-agent, opencode and kimi name no model, so there is nothing
-		// to compare — and they are never pinned in the first place.
+		// Every backend but claude-code names no model, so there is nothing to
+		// compare against. For codex that now matters: it IS pinned, so its recorded
+		// model is the id we requested rather than one we observed.
 		registerBackend(recordingStub("claude-code", {}));
 
 		await call({ localAgentModel: "haiku" });
@@ -2539,6 +2572,50 @@ describe("callLlm — local-agent model pinning", () => {
 		// The retry withdrew the request, so neither warning may blame the tool for
 		// running something else — we are the ones who stopped asking.
 		expectNoModelWarning();
+	});
+
+	it("retries un-pinned for a SECOND pinned tool, not just for claude-code", async () => {
+		// The composition the per-tool work exists to make possible, and neither half
+		// proves it alone: CodexBackend's tests show a refusal is classified, and the
+		// claude-code case above shows the retry fires — but only a codex run proves
+		// resolveLocalAgentModel hands codex a non-empty model in the first place,
+		// which is what makes `localModel` truthy and the retry reachable at all.
+		const seen: string[] = [];
+		registerBackend({
+			id: "codex",
+			discoverExecutable: async () => ({ file: "/x/codex", version: "0.137.0" }),
+			buildInvocation: (_exe, req) => {
+				seen.push(req.model);
+				return { file: "/x/codex", args: [], stdin: "P", env: {}, cwd: "/tmp" };
+			},
+			parseResult: (_stdout, requestedModel) => {
+				if (requestedModel) {
+					throw new LocalAgentModelRefusedError(
+						`Codex refused the model '${requestedModel}': 400 not supported with a ChatGPT account`,
+					);
+				}
+				return {
+					text: "SUMMARY",
+					inputTokens: 1,
+					outputTokens: 1,
+					cachedTokens: 0,
+					costUsd: 0,
+					stopReason: "end_turn",
+				};
+			},
+			isPresent: () => true,
+		});
+
+		const result = await call({ localAgentTool: "codex", localAgentModel: "gpt-5.6-sol" });
+
+		expect(seen).toEqual(["gpt-5.6-sol", ""]);
+		expect(result.text).toBe("SUMMARY");
+		// The pin was withdrawn, so nothing may warn that the tool ran the wrong
+		// model — we are the ones who stopped asking.
+		expectNoModelWarning();
+		// Never persisted: an entitlement can be granted later, so the next call
+		// must ask for the pinned model again.
+		expect(await loadUnsupportedFlagIds("codex", "0.137.0")).toEqual(new Set());
 	});
 
 	it("does not retry a refusal that was not about the model", async () => {

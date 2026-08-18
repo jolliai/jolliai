@@ -608,11 +608,37 @@ describe("SettingsWebviewPanel", () => {
 						openCodeEnabled: false,
 						excludePatterns: "dist, node_modules",
 						compileExcludeFolders: "archive, tmp-*",
-						// The default is stored as absent, so the payload has to carry
-						// the EFFECTIVE value — a picker rendered from "" would show
-						// nothing selected and then submit a cleared field.
-						localAgentModel: "sonnet",
+						// The RAW stored value: absent means "no preference", and the
+						// webview selects the option marked default for the tool in
+						// force. Resolving it here would make an untouched save write
+						// that default literally, and — under a different tool, or one
+						// that pins nothing — overwrite a pin with no row on screen.
+						localAgentModel: "",
 					}),
+				}),
+			);
+		});
+
+		it("sends a stored model the tool in force does not offer, rather than resolving it away", async () => {
+			// The round trip the panel has to keep non-destructive — the mirror of the
+			// dashboard case. `opus` belongs to claude-code; under codex the row still
+			// shows codex's default, but what comes back on save is `opus`.
+			mockLoadConfigFromDir.mockResolvedValue({
+				aiProvider: "local-agent",
+				localAgentTool: "codex",
+				localAgentModel: "opus",
+				claudeEnabled: true,
+			});
+
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+
+			expect(postMessage).toHaveBeenCalledWith(
+				expect.objectContaining({
+					command: "settingsLoaded",
+					settings: expect.objectContaining({ localAgentModel: "opus" }),
 				}),
 			);
 		});

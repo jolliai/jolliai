@@ -71,7 +71,7 @@ export interface SettingsApplyInput {
 	readonly apiKey: string;
 	readonly jolliApiKey: string;
 	readonly localAgentTool: LocalAgentToolId;
-	/** `DEFAULT_LOCAL_AGENT_MODEL` (the default) is stored as unset, like `model`. */
+	/** The submitted tool's OWN default is stored as unset, like `model`. */
 	readonly localAgentModel: string;
 	readonly localFolder: string;
 	readonly compileExcludeFolders: string;
@@ -291,7 +291,7 @@ export async function applySettings(
 			localAgentTool: input.localAgentTool,
 			// One shared rule for what reaches disk, so this surface, the VS Code
 			// panel and `configure --set` cannot disagree about the same intent.
-			localAgentModel: normalizeStoredLocalAgentModel(input.localAgentModel),
+			localAgentModel: normalizeStoredLocalAgentModel(input.localAgentTool, input.localAgentModel),
 			localFolder: input.localFolder.trim() || undefined,
 			compileExcludeFolders: splitCsv(input.compileExcludeFolders),
 			syncTranscripts: input.syncTranscripts,

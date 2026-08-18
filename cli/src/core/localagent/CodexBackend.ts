@@ -6,6 +6,7 @@ import {
 	type Invocation,
 	LocalAgentAuthError,
 	type LocalAgentBackend,
+	LocalAgentModelRefusedError,
 	type LocalAgentOutcome,
 	type LocalAgentRequest,
 	LocalAgentSetupError,
@@ -41,17 +42,111 @@ interface CodexEvent {
 /** Longest failure reason carried into the thrown message. */
 const MAX_REASON_CHARS = 300;
 
+/** The API error envelope codex nests, as a JSON STRING, inside a failure reason. */
+interface CodexApiError {
+	status?: number;
+	error?: { message?: string };
+}
+
+/**
+ * The API error codex serialised into `raw`, or null when `raw` is codex's own
+ * prose.
+ *
+ * Codex reports two structurally different kinds of failure through the same
+ * field, and that structure — not any phrase — is what tells them apart. Its own
+ * conditions arrive as plain text ("Your workspace is out of credits.", captured
+ * in `__fixtures__/codex/out-of-credits.json`), while anything the API refused
+ * arrives as a serialised envelope carrying an HTTP status
+ * (`__fixtures__/codex/model-refused.json`). Parsing therefore classifies without
+ * guessing at wording, which matters because the wording is not a contract and
+ * the assistant text routinely contains the word "error".
+ *
+ * The `status` check is what makes a false positive implausible: an assistant
+ * message that merely happens to be valid JSON does not carry an HTTP status.
+ */
+function parseCodexApiError(raw: string): (CodexApiError & { status: number }) | null {
+	const trimmed = raw.trim();
+	// Fast path only, NOT a guard: `JSON.parse` already rejects codex's prose by
+	// throwing, and a bare literal like `123` is rejected by the status check
+	// below. Nothing here depends on this line for correctness.
+	if (!trimmed.startsWith("{")) return null;
+	try {
+		const parsed = JSON.parse(trimmed) as CodexApiError;
+		// The narrowed return type is what lets the caller read `status` without a
+		// `?? 0` fallback that could never fire — dead code in a classifier is a
+		// branch nothing can ever test.
+		return typeof parsed?.status === "number" ? (parsed as CodexApiError & { status: number }) : null;
+	} catch {
+		return null;
+	}
+}
+
 /**
  * Builds the error for a codex-reported failure, classified on the reason codex
- * itself gave.
+ * itself gave, and on `requestedModel` when we pinned one.
  *
- * Deliberately never `LocalAgentSetupError`: that class alone drives LlmClient's
+ * Deliberately never a bare `LocalAgentSetupError`: that class drives LlmClient's
  * optional-flag degradation, and no run-time failure codex reports this way is
  * about argv — degrading would strip an isolation flag and hit the same wall.
  * See OptionalFlags.ts.
+ *
+ * `LocalAgentModelRefusedError` is the ONE exception, and it is safe for a
+ * structural reason rather than a stylistic one: it is thrown from `parseResult`,
+ * which LlmClient calls AFTER `runWithFlagDegradation` has already returned, so
+ * it cannot re-enter the ladder. It lands in the same place claude's 404 does,
+ * and buys the same thing — one un-pinned retry instead of a machine that can no
+ * longer generate anything.
+ *
+ * The refusal test is `requestedModel` appearing in the API's own message, not a
+ * phrase match, for the same reason the parse above is structural: we verify what
+ * we ASKED for. Measured, codex answers a model it will not run with
+ * `400 The '<id>' model is not supported when using Codex with a ChatGPT account`
+ * or `400 The '<id>' model requires a newer version of Codex` — two phrasings for
+ * one condition, and neither is a contract. Requiring `requestedModel` also means
+ * an un-pinned run can never be classified this way, which is right: there is
+ * nothing to un-pin, so the retry would be pure waste.
  */
-function codexFailure(rawReason: string): Error {
+function codexFailure(rawReason: string, requestedModel?: string): Error {
 	const reason = rawReason.slice(0, MAX_REASON_CHARS);
+	// Parsed from the FULL reason, never the truncated one — the cap is for the
+	// message shown to the user, and applying it first could cut a valid envelope
+	// in half and silently lose the classification.
+	const api = parseCodexApiError(rawReason);
+	if (api) {
+		const status = api.status;
+		const detail = api.error?.message ?? "";
+		// Does the server's own message quote the model we asked for? This, not the
+		// status number, is the discriminator — a client error naming the exact
+		// identifier we sent is about that identifier.
+		const namesOurModel = Boolean(requestedModel) && detail.includes(`'${requestedModel}'`);
+		// 401 is auth unconditionally: an unauthenticated request is rejected before
+		// any model is resolved, so it cannot name one, and a message that somehow
+		// did would still not make re-authenticating the wrong advice.
+		if (status === 401) return new LocalAgentAuthError(`Codex auth error: ${reason}`);
+		if (status === 429 || (status >= 500 && status < 600)) {
+			return new LocalAgentTransientError(`Codex run failed: ${reason}`);
+		}
+		// A 4xx quoting the pinned model. The measured status is 400 for both
+		// refusal phrasings; the range is what keeps the safety net if codex
+		// re-codes the condition, and the asymmetry justifies the breadth — a false
+		// positive costs one un-pinned retry, a false negative costs every summary
+		// on the machine.
+		//
+		// 403 reaches here on purpose, and it is the case this ordering exists for.
+		// "Authenticated but not entitled to X" is exactly what an entitlement
+		// refusal is, and classifying it as auth is worse than merely unhelpful:
+		// `LocalAgentAuthError` drives AuthRemediation to tell the user to run
+		// `codex login`, SessionStartHook re-shows that every session until a
+		// generation succeeds, and the un-pin retry that WOULD make one succeed
+		// never fires. A user whose plan lacks a tier would be told to re-login
+		// forever. A 403 that does NOT name our model still falls through to auth
+		// below, which is the reading that is right when the session really is the
+		// problem.
+		if (status >= 400 && status < 500 && namesOurModel) {
+			return new LocalAgentModelRefusedError(`Codex refused the model '${requestedModel}': ${reason}`);
+		}
+		if (status === 403) return new LocalAgentAuthError(`Codex auth error: ${reason}`);
+	}
 	return /log ?in|logged in|unauthori|authenticat/i.test(reason)
 		? new LocalAgentAuthError(`Codex auth error: ${reason}`)
 		: new LocalAgentTransientError(`Codex run failed: ${reason}`);
@@ -168,7 +263,7 @@ export class CodexBackend implements LocalAgentBackend {
 		return { file: exe.file, args, stdin: "", env, cwd };
 	}
 
-	parseResult(stdout: string): LocalAgentOutcome {
+	parseResult(stdout: string, requestedModel?: string): LocalAgentOutcome {
 		let text = "";
 		let inputTokens = 0;
 		let outputTokens = 0;
@@ -207,7 +302,7 @@ export class CodexBackend implements LocalAgentBackend {
 			// and "out of credits" names no login word, so parseResult returned
 			// text:"" and the caller stored an empty summary over a good one.
 			if (type === "turn.failed") {
-				throw codexFailure(ev.message ?? ev.error?.message ?? trimmed);
+				throw codexFailure(ev.message ?? ev.error?.message ?? trimmed, requestedModel);
 			}
 			if (/error/i.test(type)) {
 				// First one wins: the earliest reason is the root cause, and a later
@@ -238,7 +333,7 @@ export class CodexBackend implements LocalAgentBackend {
 		// what puts codex's own words in front of the user.) Text present means
 		// codex recovered, and the error event is dropped on the floor.
 		if (failureReason !== undefined && text.trim() === "") {
-			throw codexFailure(failureReason);
+			throw codexFailure(failureReason, requestedModel);
 		}
 		return { text, inputTokens, outputTokens, cachedTokens, costUsd: 0, stopReason: null };
 	}

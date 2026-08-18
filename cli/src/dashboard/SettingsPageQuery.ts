@@ -19,12 +19,7 @@
 
 import { getProjectRootDir } from "../core/GitOps.js";
 import { extractRepoName, resolveMemoryBankState } from "../core/KBPathResolver.js";
-import {
-	DEFAULT_LOCAL_AGENT_MODEL,
-	effectiveLocalAgentModel,
-	LOCAL_AGENT_TOOLS,
-	localAgentToolModels,
-} from "../core/localagent/ToolMeta.js";
+import { LOCAL_AGENT_TOOLS, localAgentToolDefaultModel, localAgentToolModels } from "../core/localagent/ToolMeta.js";
 import { describeMemoryBank } from "../core/MemoryBankStatusText.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
 import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
@@ -93,7 +88,12 @@ function localAgentModels(): Readonly<
 	for (const id of Object.keys(LOCAL_AGENT_TOOLS) as LocalAgentToolId[]) {
 		const models = localAgentToolModels(id);
 		if (models.length > 0) {
-			out[id] = models.map((m) => (m.id === DEFAULT_LOCAL_AGENT_MODEL ? { ...m, isDefault: true } : m));
+			// Compared against THIS tool's own default, never one global constant:
+			// each pinned tool's ids are its CLI's namespace, so a shared constant
+			// marks nothing for every tool but the one it belongs to — and the page
+			// falls back to `isDefault` when the stored value does not fit the tool.
+			const fallback = localAgentToolDefaultModel(id);
+			out[id] = models.map((m) => (m.id === fallback ? { ...m, isDefault: true } : m));
 		}
 	}
 	return out;
@@ -112,6 +112,10 @@ export async function buildSettingsPageModel(
 	const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
 
 	const memoryBankState = await resolveLaunchRepoState(launchCwd, config);
+	// One expression for the tool, shared by the row the page renders and by the
+	// model resolution below: the effective model is tool-dependent now, so a
+	// second `?? "claude-code"` here could disagree with the picker it labels.
+	const localAgentTool: LocalAgentToolId = config.localAgentTool ?? "claude-code";
 
 	return {
 		agents: {
@@ -141,13 +145,16 @@ export async function buildSettingsPageModel(
 			signedIn: Boolean(config.authToken),
 			hasJolliKey: Boolean(config.jolliApiKey),
 			...(jolliSiteLabel(config) ? { jolliSiteLabel: jolliSiteLabel(config) } : {}),
-			localAgentTool: config.localAgentTool ?? "claude-code",
+			localAgentTool: localAgentTool,
 			localAgentTools: localAgentTools(),
-			// The EFFECTIVE value, resolved by the shared helper rather than by a
-			// local `|| DEFAULT`: an id this build does not know has to render as
-			// the default too, or the page shows one model while holding another
-			// and every later save is rejected for a field nobody edited.
-			localAgentModel: effectiveLocalAgentModel(config.localAgentModel),
+			// The RAW stored value, deliberately NOT resolved here. The page resolves
+			// it for DISPLAY against `localAgentModels[tool]` and its `isDefault`
+			// marker, and submits this value back untouched unless the user picks
+			// something. Sending the resolved value instead made the round trip
+			// destructive: a stored id the shown tool does not offer came back as
+			// that tool's default and was then written to disk, so merely visiting
+			// another tool in the picker erased a pin the user never edited.
+			localAgentModel: config.localAgentModel ?? "",
 			localAgentModels: localAgentModels(),
 		},
 		memoryBank: {

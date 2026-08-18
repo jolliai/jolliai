@@ -464,20 +464,26 @@ window.JD = window.JD || {};
 		// a "claude-code" string test: the server sends the map so the set of pinned
 		// tools stays a server-side fact.
 		var models = (sum.localAgentModels || {})[current] || [];
-		// What is DISPLAYED must be what gets SUBMITTED. `opt()` marks selected by
-		// strict equality, so a value matching no option (an empty string from a
-		// payload without the field, or a model belonging to the tool we just
-		// switched away from) selects nothing and the browser silently shows the
-		// FIRST option — which is Haiku, since the list is ordered to match the
-		// Anthropic picker and the default sits in the middle. The form would still
-		// hold the old value, and the save would land on something the user never
-		// saw. Resolve to the server-marked default instead, and write it back so
-		// state and display agree.
+		// Resolve for DISPLAY only. `opt()` marks selected by strict equality, so a
+		// value matching no option (an empty string from a payload without the
+		// field, or a model belonging to the tool we just switched away from)
+		// selects nothing and the browser silently shows the FIRST option — which
+		// is the cheapest model, since every list (claude-code's and codex's alike)
+		// is ordered by capability with its default in the middle. Resolve to the
+		// server-marked default instead.
+		//
+		// Deliberately NOT written back into `f`. The form state is what gets
+		// SUBMITTED, and the server stores it: writing the resolved value there
+		// made merely visiting another tool in the picker overwrite a pin the user
+		// never edited — pick codex and change your mind, and claude-code's `opus`
+		// came back as `sonnet`. Worse for a tool that pins nothing, where the row
+		// is hidden and there was nothing on screen to show it happening. The
+		// server sends the RAW stored value for exactly this reason, so leaving `f`
+		// alone makes an untouched save a no-op.
 		var selected = f.localAgentModel;
 		if (models.length > 0 && !models.some((m) => m.id === selected)) {
 			var fallback = models.find((m) => m.isDefault) || models[0];
 			selected = fallback.id;
-			f.localAgentModel = selected;
 		}
 		var modelRow =
 			models.length === 0

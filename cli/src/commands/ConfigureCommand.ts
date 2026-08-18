@@ -43,6 +43,27 @@ const PINNED_LOCAL_AGENT_TOOLS: ReadonlyArray<string> = (
 	Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>
 ).filter((id) => localAgentToolModels(id).length > 0);
 
+/**
+ * The accepted model ids GROUPED by the tool that offers them, e.g.
+ * `claude-code: haiku | sonnet | opus | inherit; codex: gpt-5.6-luna | …`.
+ *
+ * Grouped rather than flat because the ids are each CLI's own namespace and
+ * carry no marker saying which: with two pinned tools the flat union reads as
+ * one menu, so nothing tells a person typing `--set localAgentModel=opus` that
+ * it will do nothing while their tool is codex. `inherit` repeats under each
+ * tool deliberately — it is offered by all of them and dropping it from the
+ * groups would make it look unavailable.
+ */
+const LOCAL_AGENT_MODELS_BY_TOOL: string = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>)
+	.filter((id) => localAgentToolModels(id).length > 0)
+	.map(
+		(id) =>
+			`${id}: ${localAgentToolModels(id)
+				.map((m) => m.id)
+				.join(" | ")}`,
+	)
+	.join("; ");
+
 /** Valid values for the `globalInstructions` config key. */
 const VALID_GLOBAL_INSTRUCTIONS: ReadonlyArray<NonNullable<JolliMemoryConfig["globalInstructions"]>> = [
 	"enabled",
@@ -206,7 +227,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		// reject a value `resolveLocalAgentModel` handles fine.
 		const value = raw.trim();
 		if (!ALL_LOCAL_AGENT_MODEL_IDS.includes(value)) {
-			throw new Error(`${key} must be one of: ${ALL_LOCAL_AGENT_MODEL_IDS.join(", ")} (got: ${raw})`);
+			throw new Error(`${key} must be one of — ${LOCAL_AGENT_MODELS_BY_TOOL} (got: ${raw})`);
 		}
 		return value;
 	}
@@ -326,7 +347,7 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 	{
 		key: "localAgentModel",
 		type: "enum",
-		description: `Model the local agent is told to run (${PINNED_LOCAL_AGENT_TOOLS.join(", ")} only): ${ALL_LOCAL_AGENT_MODEL_IDS.join(" | ")} — "inherit" runs whatever the tool is configured with`,
+		description: `Model the local agent is told to run (${PINNED_LOCAL_AGENT_TOOLS.join(", ")} only) — ${LOCAL_AGENT_MODELS_BY_TOOL}. A value the tool in force does not offer falls back to that tool's default; "inherit" runs whatever the tool is configured with`,
 	},
 	{
 		key: "globalInstructions",

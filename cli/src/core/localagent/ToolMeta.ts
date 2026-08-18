@@ -23,28 +23,54 @@ export interface LocalAgentToolMeta {
 	 * Model choices jollimemory pins for this tool, or absent when it does not pin
 	 * one and the tool keeps running whatever the user configured it with.
 	 *
-	 * Present for claude-code ONLY, and that is a decision rather than a gap. Two
-	 * things make it the one tool that can be pinned honestly: its model-name space
-	 * is one jollimemory already knows, and its response envelope names the model it
-	 * actually ran (`modelUsage`), so a pinned model can be VERIFIED instead of
-	 * merely asserted. codex, cursor-agent, opencode and kimi report no model at
-	 * all, so pinning one there would be an unverifiable claim in a namespace this
-	 * project does not own — they keep deferring to the user's own configuration.
+	 * Present for claude-code and codex; cursor-agent, opencode and kimi keep
+	 * deferring to the user's own configuration. That split is a decision rather
+	 * than a gap — cursor's catalogue is 200+ entries of which a free plan can use
+	 * one, and opencode spends the user's own provider credit.
 	 *
-	 * Ids are the tool's own aliases, never a resolved API model id: an alias means
-	 * "latest of that family", so it does not rot when a dated model is retired, and
-	 * it cannot select a long-context (`[1m]`) SKU, which is priced above the base
-	 * model and must only ever be chosen deliberately.
+	 * The two pinned tools differ in a way callers must not average over:
+	 *
+	 * - **claude-code's ids are permanent aliases** (`sonnet` tracks the latest of
+	 *   its family), so they never rot, and they cannot select a long-context
+	 *   (`[1m]`) SKU, which is priced above the base model and must only ever be
+	 *   chosen deliberately. Its envelope also names the model it actually ran
+	 *   (`modelUsage`), so the pin can be VERIFIED rather than merely asserted.
+	 * - **codex's ids are dated slugs** with no alias equivalent, so this list needs
+	 *   a release when codex ships a generation — and codex reports no model, so its
+	 *   recorded value is the one we REQUESTED, not one we observed.
+	 *
+	 * Ids are always the tool's OWN identifiers, never `resolveModelId`'s API model
+	 * id, and never shared across tools: the namespaces are disjoint, which is why
+	 * {@link defaultModel} is per tool.
 	 */
 	readonly models?: ReadonlyArray<{ readonly id: string; readonly label: string }>;
+	/**
+	 * Which of this tool's own {@link models} it runs when the user has expressed no
+	 * preference. Absent exactly when `models` is.
+	 *
+	 * Per tool rather than one global constant because model ids are the CLI's own
+	 * namespace and two pinned tools share none — falling back to another tool's
+	 * default is not a milder answer, it is an id this tool will refuse. Nothing in
+	 * the type system ties this to `models`, so `ToolMeta.test.ts` asserts
+	 * membership for every entry that declares either.
+	 */
+	readonly defaultModel?: string;
 }
 
 /**
- * The model a pinned tool runs when the user has expressed no preference.
+ * The model `claude-code` runs when the user has expressed no preference.
  *
- * The Settings surfaces store it as an ABSENT config value rather than as this
- * string (matching how `model` treats its own default), because they always
- * submit the effective value and would otherwise write it on any unrelated save.
+ * Named for claude-code specifically, NOT as a cross-tool fallback —
+ * {@link localAgentToolDefaultModel} is what answers that question for a given
+ * tool. The distinction became load-bearing with the second pinned tool: this
+ * constant used to be what an unrecognised value fell back to for EVERY tool, so
+ * a stored `sonnet` carried into codex would have emitted `-m sonnet` at a CLI
+ * that has never heard of it.
+ *
+ * The Settings surfaces store the default as an ABSENT config value rather than
+ * as this string (matching how `model` treats its own default), because they
+ * always submit the effective value and would otherwise write it on any unrelated
+ * save.
  */
 export const DEFAULT_LOCAL_AGENT_MODEL = "sonnet";
 
@@ -73,7 +99,8 @@ export const LOCAL_AGENT_TOOLS: Record<LocalAgentToolId, LocalAgentToolMeta> = {
 		// written and will resolve to something else later.
 		//
 		// The default is NOT first, so nothing may infer it from position — see
-		// `data-default` in SettingsHtmlBuilder and `defaultLocalAgentModelFor`.
+		// `data-default` in SettingsHtmlBuilder and {@link localAgentToolDefaultModel}.
+		defaultModel: DEFAULT_LOCAL_AGENT_MODEL,
 		models: [
 			{ id: "haiku", label: "Haiku — fastest" },
 			{ id: DEFAULT_LOCAL_AGENT_MODEL, label: "Sonnet — balanced (default)" },
@@ -87,6 +114,34 @@ export const LOCAL_AGENT_TOOLS: Record<LocalAgentToolId, LocalAgentToolMeta> = {
 		label: "Codex",
 		loginHint: "Run `codex login` to sign in with your ChatGPT plan.",
 		separateDesktopApp: "the ChatGPT app",
+		// Balanced, not the frontier model, for the same reason claude-code defaults
+		// to Sonnet: this is a background, mechanical workload.
+		defaultModel: "gpt-5.6-terra",
+		// Ordered cheapest-to-most-capable with the default in the MIDDLE, matching
+		// the claude-code list above so the two pickers read the same way.
+		//
+		// Unlike claude's `sonnet` / `opus`, these are NOT permanent aliases — codex
+		// has none. Every id here is a dated slug that will eventually retire, so
+		// this list needs a release when codex ships a new generation. That is the
+		// accepted cost of not fetching it: `codex app-server`'s `model/list` is an
+		// undocumented private interface, costs ~2.2 s per call, and answers with a
+		// built-in fallback list — wrong in BOTH directions, with no marker saying
+		// so — whenever the CLI cannot parse the server's response (measured: a
+		// codex a few versions behind listed two models it could not run and none of
+		// the three it could). Entitlement also drifts under a fixed client, so a
+		// fetched list is no more authoritative at call time than this one. What
+		// makes either safe is the refusal classification in CodexBackend, not where
+		// the list came from.
+		//
+		// 5.4 and 5.4-mini are deliberately absent: they retire 2026-08-31, and a
+		// list that ships in a release cannot track that.
+		models: [
+			{ id: "gpt-5.6-luna", label: "GPT-5.6-Luna — fastest" },
+			{ id: "gpt-5.6-terra", label: "GPT-5.6-Terra — balanced (default)" },
+			{ id: "gpt-5.6-sol", label: "GPT-5.6-Sol — most capable" },
+			{ id: "gpt-5.5", label: "GPT-5.5 — previous generation" },
+			{ id: LOCAL_AGENT_MODEL_INHERIT, label: "Use Codex's own setting" },
+		],
 	},
 	"cursor-agent": { label: "Cursor", loginHint: "Run `cursor-agent login` to sign in to Cursor." },
 	opencode: { label: "OpenCode", loginHint: "Run `opencode auth login` to connect a provider." },
@@ -135,6 +190,46 @@ export function localAgentToolModels(id: LocalAgentToolId): ReadonlyArray<{ id: 
 }
 
 /**
+ * The model `id` runs when the user has expressed no preference, or `""` for a
+ * tool that pins none.
+ *
+ * The single authority for "which default", and the reason it is a function
+ * rather than {@link DEFAULT_LOCAL_AGENT_MODEL}: each pinned tool's ids live in
+ * its own CLI's namespace, so there is no value that is a sane default for two of
+ * them at once.
+ *
+ * `""` for an unpinned tool is the same "emit no model flag" signal
+ * {@link resolveLocalAgentModel} returns, so the two agree without a special case.
+ */
+export function localAgentToolDefaultModel(id: LocalAgentToolId): string {
+	return LOCAL_AGENT_TOOLS[id]?.defaultModel ?? "";
+}
+
+/**
+ * The model `id` should use for a stored value, resolved against that tool's OWN
+ * list: the value when the tool offers it, {@link LOCAL_AGENT_MODEL_INHERIT} when
+ * that is what was asked for, and the tool's default otherwise.
+ *
+ * The one place the "which model" question is answered, for the runner via
+ * {@link resolveLocalAgentModel} and for storage via
+ * {@link normalizeStoredLocalAgentModel}.
+ *
+ * There is deliberately no DISPLAY wrapper. Both Settings surfaces carry the raw
+ * stored value and resolve it against the options they already render, marked
+ * with each tool's own default — a server-resolved display value was what made an
+ * untouched save destructive, since the panels submit whatever they were handed.
+ */
+function pickLocalAgentModel(id: LocalAgentToolId, configured: string | undefined): string {
+	const value = configured?.trim() ?? "";
+	if (value === LOCAL_AGENT_MODEL_INHERIT) return LOCAL_AGENT_MODEL_INHERIT;
+	// Membership is checked against THIS tool's own list, never the flat union the
+	// validators accept: the union deliberately lets another tool's id through (the
+	// two settings are written in either order), and this is where that id must not
+	// survive.
+	return localAgentToolModels(id).some((m) => m.id === value) ? value : localAgentToolDefaultModel(id);
+}
+
+/**
  * Every model id any pinned tool offers, de-duplicated — the accept-set for the
  * three surfaces that take a `localAgentModel` from outside (`configure --set`,
  * the dashboard POST, the VS Code panel's save).
@@ -169,28 +264,24 @@ export const ALL_LOCAL_AGENT_MODEL_IDS: ReadonlyArray<string> = [
  * a stale page or a hand-edited file, not a decision worth failing an unrelated
  * save over — and the default is the safe landing either way.
  */
-export function normalizeStoredLocalAgentModel(submitted: string | undefined): string | undefined {
+export function normalizeStoredLocalAgentModel(
+	id: LocalAgentToolId,
+	submitted: string | undefined,
+): string | undefined {
 	const value = submitted?.trim() ?? "";
-	if (value === "" || value === DEFAULT_LOCAL_AGENT_MODEL) return undefined;
+	// "Equal to the default" is now a per-tool question, which is why this takes the
+	// tool. An unpinned tool's default is "", already handled by the first test.
+	if (value === "" || value === localAgentToolDefaultModel(id)) return undefined;
+	// Still the flat union, NOT this tool's list, and the reason is the CLI rather
+	// than the panels: `configure --set localAgentModel=…` and `--set
+	// localAgentTool=…` are two commands in either order, so rejecting a model the
+	// currently-stored tool does not offer would fail a valid half-finished setup.
+	//
+	// Note this does NOT make a cross-tool choice survive a round trip through the
+	// panels: they submit the EFFECTIVE value, which `pickLocalAgentModel` has
+	// already collapsed to the shown tool's default. That is the correct outcome
+	// there — the user saw the picker holding that default when they saved.
 	return ALL_LOCAL_AGENT_MODEL_IDS.includes(value) ? value : undefined;
-}
-
-/**
- * The EFFECTIVE model id to show in a picker for a stored value — the inverse of
- * {@link normalizeStoredLocalAgentModel}, and what both Settings surfaces send to
- * their page.
- *
- * Needed because the default is stored as ABSENT: a picker rendered from the raw
- * stored value would have nothing selected, display its first option anyway, and
- * then submit whatever the form state still held. For an id this build does not
- * know that meant the page displayed "Sonnet (default)" while holding the unknown
- * id, so every later save — including one that only touched an unrelated checkbox
- * — was rejected for a field the user had never edited.
- */
-export function effectiveLocalAgentModel(configured: string | undefined): string {
-	const value = configured?.trim() ?? "";
-	if (value === LOCAL_AGENT_MODEL_INHERIT) return LOCAL_AGENT_MODEL_INHERIT;
-	return normalizeStoredLocalAgentModel(value) ?? DEFAULT_LOCAL_AGENT_MODEL;
 }
 
 /**
@@ -198,9 +289,8 @@ export function effectiveLocalAgentModel(configured: string | undefined): string
  * `""` means "emit no model flag at all".
  *
  * The single authority for what the RUNNER does with the stored value; the
- * surfaces use {@link effectiveLocalAgentModel} /
- * {@link normalizeStoredLocalAgentModel} for the display and storage halves of
- * the same setting.
+ * surfaces use {@link normalizeStoredLocalAgentModel} for the storage half of the
+ * same setting, and resolve the display half themselves.
  *
  * An unrecognised stored value falls back to the default rather than being passed
  * through, and that is the load-bearing case. This value comes from the
@@ -212,13 +302,7 @@ export function effectiveLocalAgentModel(configured: string | undefined): string
  * `?? …` fallbacks above, with a costlier failure mode.
  */
 export function resolveLocalAgentModel(id: LocalAgentToolId, configured: string | undefined): string {
-	const models = localAgentToolModels(id);
-	if (models.length === 0) return "";
-	const value = configured?.trim() ?? "";
-	if (value === LOCAL_AGENT_MODEL_INHERIT) return "";
-	// Membership is checked against THIS tool's own list, not the flat union the
-	// validators accept: with a second pinned tool, the union would let that tool's
-	// id through every validator and then run it here, where this tool does not
-	// offer it. Falling back to the default is what keeps the flag valid.
-	return models.some((m) => m.id === value) ? value : DEFAULT_LOCAL_AGENT_MODEL;
+	if (localAgentToolModels(id).length === 0) return "";
+	const picked = pickLocalAgentModel(id, configured);
+	return picked === LOCAL_AGENT_MODEL_INHERIT ? "" : picked;
 }

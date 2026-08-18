@@ -282,11 +282,13 @@ describe("settings.js local-agent model picker", () => {
 	});
 
 	it("hides the row for a tool with no pinned models", () => {
-		// The four unpinned tools defer to their own configuration, so offering a
-		// model control for them would promise a setting that does nothing.
+		// An unpinned tool defers to its own configuration, so offering a model
+		// control for it would promise a setting that does nothing. The row is
+		// driven by the tool's ABSENCE from the map, never by naming tools here —
+		// which is what let codex move from unpinned to pinned without touching it.
 		const html = summaryHtml({
-			localAgentTool: "codex",
-			localAgentTools: [{ id: "codex", label: "Codex" }],
+			localAgentTool: "opencode",
+			localAgentTools: [{ id: "opencode", label: "OpenCode" }],
 		});
 		expect(html).toContain('id="localAgentTool"');
 		expect(html).not.toContain('id="localAgentModel"');
@@ -395,15 +397,51 @@ describe("settings.js Agent-tool switching", () => {
 		summary.aiProvider = "local-agent";
 		summary.localAgentTools = [
 			{ id: "claude-code", label: "Claude Code" },
-			{ id: "codex", label: "Codex" },
+			{ id: "opencode", label: "OpenCode" },
 		];
 		render(model);
 		rail.get("summary")?.onclick?.();
 		expect(app.innerHTML).toContain('id="localAgentModel"');
 
-		tool.value = "codex";
+		tool.value = "opencode";
 		tool.onchange?.();
 
 		expect(app.innerHTML).not.toContain('id="localAgentModel"');
+	});
+
+	it("swaps in the new tool's own options when both tools pin models", () => {
+		// The case that only exists once a SECOND tool is pinned, and the one a
+		// hide/show test cannot reach: the row STAYS open across the switch, so
+		// nothing about its presence changes while every option inside it must.
+		// Leaving the old tool's options up would offer a model the new tool
+		// answers with a 400.
+		const { app, rail, tool, render } = loadToolSwitchJD();
+		const model = structuredClone(MODEL) as typeof MODEL;
+		const summary = model.settings.summary as Record<string, unknown>;
+		summary.aiProvider = "local-agent";
+		summary.localAgentTools = [
+			{ id: "claude-code", label: "Claude Code" },
+			{ id: "codex", label: "Codex" },
+		];
+		(summary.localAgentModels as Record<string, unknown>).codex = [
+			{ id: "gpt-5.6-luna", label: "GPT-5.6-Luna — fastest" },
+			{ id: "gpt-5.6-terra", label: "GPT-5.6-Terra — balanced (default)", isDefault: true },
+			{ id: "inherit", label: "Use Codex's own setting" },
+		];
+		render(model);
+		rail.get("summary")?.onclick?.();
+		expect(app.innerHTML).toContain('value="haiku"');
+
+		tool.value = "codex";
+		tool.onchange?.();
+
+		expect(app.innerHTML).toContain('id="localAgentModel"');
+		expect(app.innerHTML).toContain('value="gpt-5.6-terra"');
+		expect(app.innerHTML).not.toContain('value="haiku"');
+		// The stored `haiku` cannot survive into codex's list, so the row resolves
+		// to the option MARKED default — not to the first one, which is the
+		// cheapest model.
+		expect(app.innerHTML).toMatch(/value="gpt-5\.6-terra"[^>]*selected/);
+		expect(app.innerHTML).not.toMatch(/value="gpt-5\.6-luna"[^>]*selected/);
 	});
 });

@@ -529,9 +529,13 @@ export interface SettingsSummary {
 	/** Local-agent tools this build knows about, for the picker. */
 	readonly localAgentTools: ReadonlyArray<{ readonly id: LocalAgentToolId; readonly label: string }>;
 	/**
-	 * The EFFECTIVE model id — never `""`. The default is stored as an absent
-	 * config value, and an id this build does not recognise resolves to the
-	 * default too, so the picker always has an option to select.
+	 * The RAW stored model id, `""` when nothing is stored — deliberately NOT
+	 * resolved server-side. The page resolves it for DISPLAY against
+	 * `localAgentModels[tool]` and its `isDefault` marker, and submits it back
+	 * untouched unless the user picks something. Sending a resolved value made the
+	 * round trip destructive: a stored id the shown tool does not offer came back
+	 * as that tool's default and was then written to disk, so merely visiting
+	 * another tool in the picker erased a pin the user never edited.
 	 */
 	readonly localAgentModel: string;
 	/**

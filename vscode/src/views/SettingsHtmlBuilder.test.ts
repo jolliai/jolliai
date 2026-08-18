@@ -7,6 +7,11 @@ vi.mock("./SettingsScriptBuilder.js", () => ({
 	buildSettingsScript: () => "/* settings-script */",
 }));
 
+import {
+	LOCAL_AGENT_TOOLS,
+	localAgentToolDefaultModel,
+	localAgentToolModels,
+} from "../../../cli/src/core/localagent/ToolMeta.js";
 import { buildSettingsHtml } from "./SettingsHtmlBuilder.js";
 
 describe("SettingsHtmlBuilder", () => {
@@ -266,13 +271,23 @@ describe("SettingsHtmlBuilder — local-agent model picker", () => {
 		expect(html).toMatch(/<option value="inherit" data-tool="claude-code">/);
 	});
 
-	it("marks the default option, since the list order no longer identifies it", () => {
-		// The options are ordered to match the Anthropic model picker, which puts
-		// Sonnet in the MIDDLE. The row's fallback reads this attribute — picking
-		// the first visible option instead would land on Haiku and quietly
-		// downgrade the machine on a tool switch.
-		expect(html).toMatch(/<option value="sonnet" data-tool="claude-code" data-default="true">/);
-		expect(html.match(/data-default="true"/g)).toHaveLength(1);
+	it("marks each pinned tool's OWN default, since the list order no longer identifies it", () => {
+		// Every list is ordered by capability with the default in the MIDDLE. The
+		// row's fallback reads this attribute — picking the first visible option
+		// instead would land on the cheapest model and quietly downgrade the machine
+		// on a tool switch. Marked per tool: a single global constant would mark
+		// nothing for every tool but the one it belongs to.
+		const pinned = (Object.keys(LOCAL_AGENT_TOOLS) as Array<keyof typeof LOCAL_AGENT_TOOLS>).filter(
+			(id) => localAgentToolModels(id).length > 0,
+		);
+		expect(pinned.length).toBeGreaterThan(1);
+		for (const id of pinned) {
+			const fallback = localAgentToolDefaultModel(id);
+			expect(html).toContain(`<option value="${fallback}" data-tool="${id}" data-default="true">`);
+		}
+		// Exactly one per pinned tool — a second marked option would make the
+		// fallback depend on document order again.
+		expect(html.match(/data-default="true"/g)).toHaveLength(pinned.length);
 	});
 
 	it("renders the model options in the same order and wording as the Anthropic picker", () => {
@@ -283,16 +298,41 @@ describe("SettingsHtmlBuilder — local-agent model picker", () => {
 		const labels = (block: string) => [...block.matchAll(/>([^<]+)<\/option>/g)].map((m) => m[1].trim());
 		const anthropicLabels = labels(anthropic);
 		expect(anthropicLabels.length).toBe(3);
-		// The local list is the Anthropic list plus the inherit escape hatch, which
-		// has no Anthropic counterpart and keeps its own wording.
-		expect(labels(local).slice(0, 3)).toEqual(anthropicLabels);
-		expect(labels(local).at(-1)).toContain("own setting");
+		// Scoped to claude-code's options before comparing. The local <select> now
+		// carries every pinned tool's options at once, so an unscoped `slice(0, 3)`
+		// held only by registry key order and `at(-1)` was reading CODEX's inherit
+		// label — renaming claude-code's left the case green.
+		const claudeOptions = [...local.matchAll(/<option[^>]*data-tool="claude-code"[^>]*>([^<]+)<\/option>/g)].map(
+			(m) => m[1].trim(),
+		);
+		// The claude-code list is the Anthropic list plus the inherit escape hatch,
+		// which has no Anthropic counterpart and keeps its own wording.
+		expect(claudeOptions.slice(0, 3)).toEqual(anthropicLabels);
+		// Names claude-code, so a rename cannot silently leave this reading codex's
+		// entry. Matched loosely because the apostrophe reaches the document
+		// HTML-escaped, which is correct and not what this case is about.
+		expect(claudeOptions.at(-1)).toContain("Claude Code");
+		expect(claudeOptions.at(-1)).toContain("own setting");
+		expect(claudeOptions).toHaveLength(4);
 	});
 
 	it("contributes no options for a tool with no pinned models", () => {
-		for (const tool of ["codex", "cursor-agent", "opencode", "kimi"]) {
+		for (const tool of ["cursor-agent", "opencode", "kimi"]) {
 			expect(html).not.toContain(`data-tool="${tool}"`);
 		}
+	});
+
+	it("emits a separate option per (tool, model) pair, so a shared id is not collapsed", () => {
+		// The inherit choice is offered by every pinned tool under ONE id, so the
+		// document legitimately carries several options with that value. They must
+		// stay distinct — same value, different data-tool and label — because the
+		// script selects the one belonging to the current tool. Collapsing them to
+		// a single option would leave every tool but the first without an escape
+		// hatch the filter can show.
+		const inherits = html.match(/<option value="inherit" data-tool="[^"]+"/g) ?? [];
+		const tools = inherits.map((o) => /data-tool="([^"]+)"/.exec(o)?.[1]);
+		expect(new Set(tools).size).toBe(inherits.length);
+		expect(inherits.length).toBeGreaterThan(1);
 	});
 
 	it("hides every conditional block with the .hidden class, never the `hidden` attribute", () => {

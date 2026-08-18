@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { ALLOWED_JOLLI_HOSTS } from "../../../cli/src/core/JolliApiUtils.js";
 import {
-	DEFAULT_LOCAL_AGENT_MODEL,
+	localAgentToolDefaultModel,
 	LOCAL_AGENT_TOOLS,
 	localAgentToolModels,
 } from "../../../cli/src/core/localagent/ToolMeta.js";
@@ -34,7 +34,7 @@ interface FakeElement {
 	textContent: string;
 	checked: boolean;
 	disabled: boolean;
-	readonly selectedIndex: number;
+	selectedIndex: number;
 	readonly options: ReadonlyArray<FakeOption>;
 	readonly classList: FakeClassList;
 	/** Mirrors the real `hidden` property the model row is toggled through. */
@@ -76,33 +76,65 @@ interface FakeOption {
 	getAttribute(name: string): string | null;
 }
 
+/** One `<option>` to build, kept POSITIONAL so two options may share a value. */
+interface OptionSpec {
+	readonly value: string;
+	readonly label?: string;
+	readonly attrs?: Record<string, string>;
+}
+
 function createElement(
 	optionValues?: readonly string[],
 	labels?: Record<string, string>,
 	attrs?: Record<string, Record<string, string>>,
 ): FakeElement {
+	return createSelect(
+		(optionValues ?? []).map((v) => ({ value: v, label: labels?.[v], attrs: attrs?.[v] })),
+	);
+}
+
+/**
+ * A `<select>` whose selection is an INDEX, not a value.
+ *
+ * Modelling it by value is what the earlier fake did, and it made a whole class
+ * of bug unrepresentable: every pinned tool offers `inherit`, so the real
+ * document holds several <option value="inherit"> that differ only in data-tool
+ * and label. Assigning `select.value` picks the FIRST match per spec — possibly
+ * one belonging to a hidden tool — while a value-keyed fake reported whatever
+ * string was assigned and agreed with any implementation.
+ */
+function createSelect(specs: readonly OptionSpec[]): FakeElement {
 	const listeners: Record<string, Listener[]> = {};
-	let currentValue = optionValues?.[0] ?? "";
-	const options: FakeOption[] = (optionValues ?? []).map((v) => ({
-		value: v,
-		textContent: labels?.[v] ?? v,
+	let currentValue = specs[0]?.value ?? "";
+	let selectedIdx = specs.length > 0 ? 0 : -1;
+	const options: FakeOption[] = specs.map((spec) => ({
+		value: spec.value,
+		textContent: spec.label ?? spec.value,
 		hidden: false,
 		disabled: false,
-		getAttribute: (name: string) => attrs?.[v]?.[name] ?? null,
+		getAttribute: (name: string) => spec.attrs?.[name] ?? null,
 	}));
 	return {
 		hidden: false,
 		get value() {
-			return currentValue;
+			const picked = selectedIdx >= 0 ? options[selectedIdx] : undefined;
+			return picked ? picked.value : currentValue;
 		},
 		set value(v: string) {
 			currentValue = v;
+			// The spec's rule, and the one the bug turned on: the FIRST option with
+			// this value wins, whether or not it is hidden or disabled.
+			selectedIdx = options.findIndex((o) => o.value === v);
 		},
 		textContent: "",
 		checked: false,
 		disabled: false,
 		get selectedIndex() {
-			return (optionValues ?? []).indexOf(currentValue);
+			return selectedIdx;
+		},
+		set selectedIndex(i: number) {
+			selectedIdx = i;
+			if (options[i]) currentValue = options[i].value;
 		},
 		options,
 		classList: createClassList(),
@@ -115,9 +147,6 @@ function createElement(
 		},
 	};
 }
-
-/** Option id planted under a non-pinned tool, so the filter's negative arm is real. */
-const FOREIGN_TOOL_MODEL = "__foreign-tool-model__";
 
 interface ScriptHandles {
 	readonly aiProviderSelect: FakeElement;
@@ -164,28 +193,21 @@ function runScript(scriptSource: string): ScriptHandles {
 	// The model picker carries EVERY pinned tool's options at once, each tagged
 	// with the tool it belongs to — exactly what SettingsHtmlBuilder emits, since
 	// the document is built once while the tool picker changes client-side.
-	const modelValues: string[] = [];
-	const modelLabels: Record<string, string> = {};
-	const modelAttrs: Record<string, Record<string, string>> = {};
+	//
+	// Built positionally from (tool, model) pairs exactly as SettingsHtmlBuilder
+	// emits them — NOT keyed by model id. Every pinned tool offers `inherit`, so a
+	// map keyed by id would collapse those into one option and hide the duplicate
+	// -value case the script has to handle.
+	const modelSpecs: OptionSpec[] = [];
 	for (const id of toolIds) {
-		for (const m of localAgentToolModels(id as keyof typeof LOCAL_AGENT_TOOLS)) {
-			modelValues.push(m.id);
-			modelLabels[m.id] = m.label;
-			modelAttrs[m.id] = { "data-tool": id };
-			if (m.id === DEFAULT_LOCAL_AGENT_MODEL) modelAttrs[m.id]["data-default"] = "true";
+		const tool = id as keyof typeof LOCAL_AGENT_TOOLS;
+		for (const m of localAgentToolModels(tool)) {
+			const attrs: Record<string, string> = { "data-tool": id };
+			if (m.id === localAgentToolDefaultModel(tool)) attrs["data-default"] = "true";
+			modelSpecs.push({ value: m.id, label: m.label, attrs });
 		}
 	}
-	// One SYNTHETIC option belonging to a tool that pins nothing today. Without it
-	// every option in the list carries data-tool="claude-code", `mine` is always
-	// true, and the filter assertions below reduce to `expect(false).toBe(false)`
-	// — i.e. they assert FakeOption's initial state and would pass with the whole
-	// hide/disable pass deleted. The negative half of the filter is the entire
-	// reason data-tool exists, so it has to be exercised even while only one tool
-	// declares models.
-	modelValues.push(FOREIGN_TOOL_MODEL);
-	modelLabels[FOREIGN_TOOL_MODEL] = "A model belonging to another tool";
-	modelAttrs[FOREIGN_TOOL_MODEL] = { "data-tool": "codex" };
-	elements.set("localAgentModel", createElement(modelValues, modelLabels, modelAttrs));
+	elements.set("localAgentModel", createSelect(modelSpecs));
 	const aiProviderSelect = get("aiProvider");
 	const localAgentToolSelect = get("localAgentTool");
 	const localAgentModelSelect = get("localAgentModel");
@@ -935,16 +957,35 @@ describe("local-agent model picker", () => {
 		expect(hiddenCount).toBeGreaterThan(0);
 	});
 
-	it("hides the row for a tool with no pinned models", () => {
+	it("switches to the new tool's own default, not to the first visible option", () => {
 		const h = runScript(script);
 		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
 		h.selectTool("codex");
 
-		// The synthetic foreign option means "codex" is not vacuously empty here —
-		// the row hides because the script counts VISIBLE options, and a tool with
-		// exactly one option would keep it open.
 		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(false);
-		expect(h.localAgentModelSelect.value).toBe(FOREIGN_TOOL_MODEL);
+		// codex's default, never claude-code's — the fallback used to be one global
+		// constant — and never the first option, which is the cheapest model.
+		expect(h.localAgentModelSelect.value).toBe(localAgentToolDefaultModel("codex"));
+		expect(h.localAgentModelSelect.value).not.toBe(localAgentToolDefaultModel("claude-code"));
+	});
+
+	it("selects the CURRENT tool's `inherit`, not another tool's option of the same value", () => {
+		// Every pinned tool offers `inherit`, so the document holds several options
+		// with that value differing only in data-tool and label. Assigning
+		// select.value picks the first by spec, so the row loaded reading "Use
+		// Claude Code's own setting" while codex was the tool. The submitted value
+		// was right either way, which is why only the selected ELEMENT can show it.
+		const h = runScript(script);
+		loadSettings(h, {
+			aiProvider: "local-agent",
+			localAgentTool: "codex",
+			localAgentModel: "inherit",
+		});
+
+		const picked = h.localAgentModelSelect.options[h.localAgentModelSelect.selectedIndex];
+		expect(picked?.value).toBe("inherit");
+		expect(picked?.getAttribute("data-tool")).toBe("codex");
+		expect(picked?.hidden).toBe(false);
 	});
 
 	it("hides the row for a tool that contributes no options at all", () => {
@@ -956,9 +997,13 @@ describe("local-agent model picker", () => {
 	});
 
 	it("restores the row when switching back to a pinned tool", () => {
+		// Through an UNPINNED tool. Routing through codex made this vacuous the day
+		// codex was pinned: the row is never hidden, so an implementation that only
+		// ever ADDS the hidden class passed.
 		const h = runScript(script);
 		loadSettings(h, { aiProvider: "local-agent", localAgentTool: "claude-code" });
-		h.selectTool("codex");
+		h.selectTool("opencode");
+		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(true);
 		h.selectTool("claude-code");
 
 		expect(h.localAgentModelRow.classList.contains('hidden')).toBe(false);

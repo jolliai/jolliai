@@ -53,7 +53,7 @@ export interface LocalAgentOutcome {
 	 * opencode and kimi emit no model field, so their outcomes leave this unset.
 	 *
 	 * Load-bearing for metadata honesty: a pinned model is a REQUEST, not a receipt,
-	 * and the four unpinned tools are sent no model at all — so without this the
+	 * and the three unpinned tools are sent no model at all — so without this the
 	 * stored `model` would be a jollimemory-side value the run may never have used.
 	 * `LlmClient` prefers this when present and falls back to the pinned value, or
 	 * to the config alias, when absent.
@@ -106,8 +106,9 @@ export interface LocalAgentBackend {
 	 * model we ASKED for is the only non-heuristic way to say which entry answered.
 	 *
 	 * Optional, and most backends ignore it: a method may declare fewer parameters
-	 * than the interface, so the four tools that report no model at all keep their
-	 * one-parameter signature unchanged.
+	 * than the interface, so a backend that never inspects it keeps the
+	 * one-parameter signature unchanged. Three do (cursor-agent, opencode, kimi);
+	 * codex declares it to attribute a refusal to the model it was handed.
 	 */
 	parseResult(stdout: string, requestedModel?: string): LocalAgentOutcome;
 	/**

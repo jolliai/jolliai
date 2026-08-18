@@ -3,10 +3,29 @@ import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { CODEX_SPEC, CodexBackend } from "./CodexBackend.js";
 import * as resolver from "./ExecutableResolver.js";
-import { LocalAgentAuthError, LocalAgentSetupError, LocalAgentTransientError } from "./Types.js";
+import {
+	LocalAgentAuthError,
+	LocalAgentModelRefusedError,
+	LocalAgentSetupError,
+	LocalAgentTransientError,
+} from "./Types.js";
 
 const fixture = readFileSync(join(__dirname, "__fixtures__/codex/success.json"), "utf8");
 const outOfCredits = readFileSync(join(__dirname, "__fixtures__/codex/out-of-credits.json"), "utf8");
+// Real capture of `codex exec -m gpt-9.9-nope --json` (codex-cli 0.137.0). Kept
+// verbatim, noise included: the stream carries an `item.completed` whose
+// `item.type` is "error" ahead of the real failure, which is exactly the event a
+// parser keying on the word "error" would misread as the reason.
+const modelRefused = readFileSync(join(__dirname, "__fixtures__/codex/model-refused.json"), "utf8");
+
+/** A `turn.failed` carrying codex's serialised API envelope, for statuses that cannot be induced on demand. */
+const apiFailure = (status: number, message: string): string =>
+	JSON.stringify({
+		type: "turn.failed",
+		error: {
+			message: JSON.stringify({ type: "error", status, error: { type: "invalid_request_error", message } }),
+		},
+	});
 const b = new CodexBackend();
 
 describe("CodexBackend", () => {
@@ -169,6 +188,129 @@ describe("CodexBackend", () => {
 		// retry into the same exhausted workspace.
 		expect(() => b.parseResult(outOfCredits)).toThrow(LocalAgentTransientError);
 		expect(() => b.parseResult(outOfCredits)).not.toThrow(LocalAgentSetupError);
+	});
+
+	it("classifies a refused model as LocalAgentModelRefusedError so LlmClient can retry un-pinned", () => {
+		// Without this class the refusal lands in LocalAgentTransientError, which
+		// LlmClient's un-pin retry does not match — so pinning a model this codex
+		// cannot run took every summary on the machine down, non-recoverably, and
+		// retried with the same doomed model each time.
+		expect(() => b.parseResult(modelRefused, "gpt-9.9-nope")).toThrow(LocalAgentModelRefusedError);
+		expect(() => b.parseResult(modelRefused, "gpt-9.9-nope")).toThrow(/gpt-9\.9-nope/);
+	});
+
+	it("does NOT call it a refusal when the 400 names a model other than the one we pinned", () => {
+		// The whole point of keying on `requestedModel` rather than on a phrase: a
+		// 400 is not self-evidently about the model, and treating every 400 as one
+		// would silently withdraw a pin over an unrelated bad request.
+		expect(() => b.parseResult(modelRefused, "gpt-5.6-sol")).not.toThrow(LocalAgentModelRefusedError);
+		expect(() => b.parseResult(modelRefused, "gpt-5.6-sol")).toThrow(LocalAgentTransientError);
+	});
+
+	it("does NOT call it a refusal when no model was pinned", () => {
+		// Nothing to un-pin, so the retry the class exists to trigger would re-run a
+		// ~400 KB prompt for no reason.
+		expect(() => b.parseResult(modelRefused)).not.toThrow(LocalAgentModelRefusedError);
+		expect(() => b.parseResult(modelRefused)).toThrow(LocalAgentTransientError);
+	});
+
+	it("keeps codex's own prose failures out of the refusal class even while a model is pinned", () => {
+		// out-of-credits is plain text, not a serialised API envelope, so the parse
+		// that classifies returns null and the prose path still owns it. This is the
+		// structural difference the classifier rests on.
+		expect(() => b.parseResult(outOfCredits, "gpt-5.6-terra")).not.toThrow(LocalAgentModelRefusedError);
+		expect(() => b.parseResult(outOfCredits, "gpt-5.6-terra")).toThrow(LocalAgentTransientError);
+	});
+
+	it("classifies the API envelope's auth and transient statuses by STATUS, not by wording", () => {
+		// Same envelope, same pinned model, three different verdicts decided purely
+		// by the status field — so a rephrasing upstream cannot move a failure
+		// between classes.
+		expect(() => b.parseResult(apiFailure(401, "Missing bearer token"), "gpt-5.5")).toThrow(LocalAgentAuthError);
+		expect(() => b.parseResult(apiFailure(403, "Forbidden"), "gpt-5.5")).toThrow(LocalAgentAuthError);
+		expect(() => b.parseResult(apiFailure(429, "Rate limited"), "gpt-5.5")).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(apiFailure(503, "Overloaded"), "gpt-5.5")).toThrow(LocalAgentTransientError);
+		// A 429 must never be read as a refusal even when it does name the model.
+		expect(() => b.parseResult(apiFailure(429, "The 'gpt-5.5' model is busy"), "gpt-5.5")).not.toThrow(
+			LocalAgentModelRefusedError,
+		);
+	});
+
+	it("treats any 4xx quoting the pinned model as a refusal, but never a 5xx", () => {
+		// The range, not the single measured 400, is what carries the safety net if
+		// codex re-codes the condition — the quoted id is the discriminator.
+		//
+		// Be precise about the 5xx half: it is DOUBLY enforced (the transient branch
+		// returns first, AND the range excludes it), so no single-site mutation can
+		// make that assertion fail — widening the range to `< 600` leaves this
+		// green. It is asserted as a property of the classifier's OUTPUT rather than
+		// as a guard on either site; the branch ORDER is what the 401/429 lines
+		// below pin. Do not read this line as protecting the upper bound.
+		for (const status of [400, 404, 422]) {
+			expect(() => b.parseResult(apiFailure(status, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).toThrow(
+				LocalAgentModelRefusedError,
+			);
+		}
+		expect(() => b.parseResult(apiFailure(500, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).not.toThrow(
+			LocalAgentModelRefusedError,
+		);
+		// 401/403/429 return ahead of the range check, so they stay in their own
+		// class even while naming the model — asserted here rather than only in the
+		// status test above, because that ordering is what makes the range safe.
+		expect(() => b.parseResult(apiFailure(401, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).toThrow(
+			LocalAgentAuthError,
+		);
+		expect(() => b.parseResult(apiFailure(429, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).toThrow(
+			LocalAgentTransientError,
+		);
+	});
+
+	it("falls back to the prose path when the reason only looks like JSON", () => {
+		// A reason that opens with a brace but does not parse. The classifier must
+		// treat it as codex's own text rather than propagate a SyntaxError out of
+		// parseResult, where it would surface as an unhandled crash instead of a
+		// classified failure the queue knows how to report.
+		const stream = JSON.stringify({ type: "turn.failed", error: { message: "{not json at all" } });
+		expect(() => b.parseResult(stream, "gpt-5.5")).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(stream, "gpt-5.5")).not.toThrow(LocalAgentModelRefusedError);
+		// And the same shape naming a login problem still reaches the auth class.
+		const authish = JSON.stringify({ type: "turn.failed", error: { message: "{please log in again" } });
+		expect(() => b.parseResult(authish, "gpt-5.5")).toThrow(LocalAgentAuthError);
+	});
+
+	it("survives an API envelope that carries a status but no message", () => {
+		// The server owns this shape, so the message is not guaranteed. Reading it
+		// must not throw, and with nothing to compare against, a 400 cannot be
+		// attributed to the model.
+		const stream = JSON.stringify({ type: "turn.failed", error: { message: JSON.stringify({ status: 400 }) } });
+		expect(() => b.parseResult(stream, "gpt-5.5")).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(stream, "gpt-5.5")).not.toThrow(LocalAgentModelRefusedError);
+	});
+
+	it("reads a 403 that names the pinned model as a refusal, not as an expired login", () => {
+		// "Authenticated but not entitled to X" is what an entitlement refusal IS,
+		// and calling it auth is worse than unhelpful: it routes the user to
+		// `codex login`, which SessionStartHook re-shows every session until a
+		// generation succeeds, while the un-pin retry that would make one succeed
+		// never fires. Told to re-login forever.
+		expect(() => b.parseResult(apiFailure(403, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).toThrow(
+			LocalAgentModelRefusedError,
+		);
+		// A 403 that does NOT name our model is still an auth problem.
+		expect(() => b.parseResult(apiFailure(403, "Forbidden"), "gpt-5.5")).toThrow(LocalAgentAuthError);
+		// 401 stays auth either way: an unauthenticated request is rejected before
+		// any model is resolved, so re-authenticating is never the wrong advice.
+		expect(() => b.parseResult(apiFailure(401, "The 'gpt-5.5' model is not supported"), "gpt-5.5")).toThrow(
+			LocalAgentAuthError,
+		);
+	});
+
+	it("ignores a JSON reason that carries no HTTP status", () => {
+		// The guard against reading an ordinary message that merely happens to be
+		// JSON as an API envelope.
+		const stream = JSON.stringify({ type: "turn.failed", error: { message: JSON.stringify({ note: "hi" }) } });
+		expect(() => b.parseResult(stream, "gpt-5.5")).toThrow(LocalAgentTransientError);
+		expect(() => b.parseResult(stream, "gpt-5.5")).not.toThrow(LocalAgentModelRefusedError);
 	});
 
 	it("reads turn.failed's nested error.message, which is not the top-level `message` field", () => {

@@ -634,9 +634,11 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	const backend = getBackend(tool);
 	const exe = await backend.discoverExecutable(options.localAgentPath);
 	// The model is pinned PER TOOL, not per action, and only for the tools that
-	// declare one (claude-code today) — `resolveLocalAgentModel` returns "" for
-	// every other tool, and an empty model tells the backend to emit no model flag
-	// at all, so those four keep running whatever they are configured with.
+	// declare one (claude-code and codex today) — `resolveLocalAgentModel` returns
+	// "" for every other tool, and an empty model tells the backend to emit no model
+	// flag at all, so those three keep running whatever they are configured with.
+	// It resolves against the pinned tool's OWN list and default: the two ids
+	// namespaces are disjoint, so one shared config field cannot have one default.
 	//
 	// Why pin at all, when the spend lands on the user's own subscription: leaving
 	// it unpinned does not mean "the user chose" — it means a background,
@@ -648,9 +650,12 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	// machines, for a reason that has nothing to do with this tool. `inherit` keeps
 	// that behaviour available, as an explicit choice rather than the default.
 	//
-	// Why an alias (`sonnet`) rather than `resolveModelId`'s API model id: measured,
-	// the CLI accepts both, but an alias tracks the latest of its family (so it does
-	// not 404 when a dated model retires) and cannot select the `[1m]` SKU.
+	// Why an alias (`sonnet`) rather than `resolveModelId`'s API model id, for
+	// claude-code: measured, the CLI accepts both, but an alias tracks the latest of
+	// its family (so it does not 404 when a dated model retires) and cannot select
+	// the `[1m]` SKU. codex has no alias equivalent — every id it offers is a dated
+	// slug that will eventually retire, which is why its list is maintained by
+	// release and why a refused model must degrade rather than fail hard.
 	//
 	// Still NOT threaded here, deliberately: `jolli configure --set model=…` and
 	// `PlanProgressEvaluator`'s `haiku` both name Anthropic API model ids, which are

@@ -27,7 +27,6 @@ import {
 import { resolveMemoryBankState } from "../../../cli/src/core/KBPathResolver.js";
 import { isLocalAgentUsable, localAgentOverrideFrom } from "../../../cli/src/core/localagent/DetectAgents.js";
 import {
-	effectiveLocalAgentModel,
 	LOCAL_AGENT_TOOLS,
 	normalizeStoredLocalAgentModel,
 } from "../../../cli/src/core/localagent/ToolMeta.js";
@@ -644,16 +643,22 @@ export class SettingsWebviewPanel {
 
 		const maskedApiKey = maskApiKey(config.apiKey);
 		const maskedJolliApiKey = maskApiKey(config.jolliApiKey);
+		// One expression for the tool, shared by the field the webview renders and
+		// by the model resolution below — the effective model is per-tool now, so a
+		// second `?? "claude-code"` here could disagree with the picker it labels.
+		const configLocalAgentTool: LocalAgentToolId = config.localAgentTool ?? "claude-code";
 
 		const payload: SettingsPayload = {
 			apiKey: maskedApiKey,
 			model: config.model ?? "sonnet",
 			maxTokens: config.maxTokens ?? null,
 			aiProvider: this.resolveProvider(config),
-			localAgentTool: config.localAgentTool ?? "claude-code",
-			// The EFFECTIVE value — see effectiveLocalAgentModel for why an unknown
-			// stored id must render as the default rather than as itself.
-			localAgentModel: effectiveLocalAgentModel(config.localAgentModel),
+			localAgentTool: configLocalAgentTool,
+			// The RAW stored value; the webview resolves it for DISPLAY against the
+			// options tagged for the tool in force and hands it back untouched
+			// unless the user picks something. Resolving it here made the round
+			// trip destructive — see the note in SettingsPageQuery.
+			localAgentModel: config.localAgentModel ?? "",
 			jolliApiKey: maskedJolliApiKey,
 			claudeEnabled: config.claudeEnabled !== false,
 			codexEnabled: config.codexEnabled !== false,
@@ -814,16 +819,20 @@ export class SettingsWebviewPanel {
 				? { globalInstructions: "disabled" }
 				: {};
 
+		// Same pairing as the read path: what gets STORED for a model depends on
+		// which tool's default it equals, so both fields must read one value.
+		const savedLocalAgentTool: LocalAgentToolId = settings.localAgentTool ?? "claude-code";
+
 		const update: Partial<JolliMemoryConfig> = {
 			apiKey: resolvedApiKey.length > 0 ? resolvedApiKey : undefined,
 			model: settings.model === "sonnet" ? undefined : settings.model,
 			maxTokens: settings.maxTokens ?? undefined,
 			aiProvider: settings.aiProvider,
-			localAgentTool: settings.localAgentTool ?? "claude-code",
+			localAgentTool: savedLocalAgentTool,
 			// Shared with the dashboard and `configure --set` rather than restated
 			// here: what a submitted model means on disk is a product rule, and the
 			// three surfaces had each answered it differently.
-			localAgentModel: normalizeStoredLocalAgentModel(settings.localAgentModel),
+			localAgentModel: normalizeStoredLocalAgentModel(savedLocalAgentTool, settings.localAgentModel),
 			jolliApiKey:
 				resolvedJolliApiKey.length > 0 ? resolvedJolliApiKey : undefined,
 			// The site the status surfaces report has to follow the key being saved

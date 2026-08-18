@@ -13,7 +13,8 @@
 
 import { Command } from "commander";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { JolliMemoryConfig } from "../Types.js";
+import { ALL_LOCAL_AGENT_MODEL_IDS, localAgentToolModels } from "../core/localagent/ToolMeta.js";
+import type { JolliMemoryConfig, LocalAgentToolId } from "../Types.js";
 
 // ─── Hoist mocks ─────────────────────────────────────────────────────────────
 
@@ -234,10 +235,36 @@ describe("ConfigureCommand — settable keys", () => {
 	});
 
 	it("accepts every localAgentModel id the registry offers", async () => {
-		for (const model of ["sonnet", "haiku", "opus", "inherit"]) {
+		// Derived, not listed. The hard-coded four covered claude-code alone, so the
+		// day a second tool was pinned the case silently tested half the ids while
+		// its name still claimed all of them.
+		expect(ALL_LOCAL_AGENT_MODEL_IDS.length).toBeGreaterThan(4);
+		for (const model of ALL_LOCAL_AGENT_MODEL_IDS) {
 			mockSaveConfig.mockClear();
 			await runConfigure(["--set", `localAgentModel=${model}`]);
 			expect(mockSaveConfig).toHaveBeenCalledWith(expect.objectContaining({ localAgentModel: model }));
+		}
+	});
+
+	it("groups the accepted model ids BY tool when rejecting one", async () => {
+		// The user-visible point of pinning a second tool. The ids are each CLI's
+		// own namespace and carry no marker saying which, so a flat union reads as
+		// one menu and tells nobody that half of it does nothing under the tool they
+		// have selected. A `stringContaining("sonnet")` assertion cannot see the
+		// difference — it is true of both forms.
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const prevExitCode = process.exitCode;
+		await runConfigure(["--set", "localAgentModel=nope"]);
+		process.exitCode = prevExitCode;
+		const message = errorSpy.mock.calls.map((c) => String(c[0])).join(" | ");
+		errorSpy.mockRestore();
+		for (const tool of ["claude-code", "codex"]) {
+			expect(message).toContain(`${tool}: `);
+			// Each tool's own ids follow its name, before the next tool's group.
+			const group = message.slice(message.indexOf(`${tool}: `)).split(";")[0] ?? "";
+			for (const m of localAgentToolModels(tool as LocalAgentToolId)) {
+				expect(group).toContain(m.id);
+			}
 		}
 	});
 
