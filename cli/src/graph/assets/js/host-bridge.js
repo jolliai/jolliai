@@ -167,10 +167,81 @@
     postToHost("jolli-graph-rendered");
   }
 
+  // --- Lazy wiki body request/response -------------------------------------
+  // graph.json no longer inlines topic bodies (schema v5). When the user opens a
+  // full wiki page, the viz asks the host for `_wiki/topic--<slug>.md` and the
+  // host (which holds any auth / disk / network access) posts it back. This
+  // generalises the one-shot requestGraph handshake into a keyed request/response
+  // so multiple topic pages can be in flight at once.
+  //
+  // Two transports, picked at call time:
+  //   - VS Code webview: `acquireVsCodeApi()` (its messages do NOT arrive with
+  //     `event.source === window.parent`, so the response is matched purely by
+  //     requestId, not the `fromHost` gate).
+  //   - framed host (web app / dashboard iframe): `window.parent.postMessage`,
+  //     with the response gated by `fromHost` like the theme/host channel.
+  var WIKI_TIMEOUT_MS = 15000;
+  var vscodeApi = null;
+  try {
+    // May be called exactly once per webview; nothing else in the viz calls it.
+    if (typeof acquireVsCodeApi === "function") vscodeApi = acquireVsCodeApi();
+  } catch (e) {
+    vscodeApi = null; // already acquired elsewhere, or not a VS Code webview
+  }
+  var wikiSeq = 0;
+  var wikiPending = new Map(); // requestId -> { resolve, reject, timer }
+  var wikiListenerBound = false;
+
+  function onWikiMessage(event) {
+    // VS Code: accept by requestId (source is not window.parent). Framed host:
+    // require the `fromHost` gate so a sibling/other-origin frame can't answer.
+    if (!vscodeApi && !fromHost(event)) return;
+    var data = event.data;
+    if (!data || data.type !== "jolli-graph-wiki-body") return;
+    var entry = wikiPending.get(data.requestId);
+    if (!entry) return;
+    wikiPending.delete(data.requestId);
+    clearTimeout(entry.timer);
+    if (typeof data.error === "string" && data.error) {
+      entry.reject(new Error(data.error));
+    } else if (typeof data.markdown === "string") {
+      entry.resolve(data.markdown);
+    } else {
+      entry.reject(new Error("wiki body response carried no markdown"));
+    }
+  }
+
+  function requestWikiBody(slug) {
+    return new Promise(function (resolve, reject) {
+      if (!wikiListenerBound) {
+        window.addEventListener("message", onWikiMessage);
+        wikiListenerBound = true;
+      }
+      var requestId = "wiki-" + ++wikiSeq;
+      var timer = setTimeout(function () {
+        wikiPending.delete(requestId);
+        reject(new Error("host did not provide wiki body within " + WIKI_TIMEOUT_MS / 1000 + "s"));
+      }, WIKI_TIMEOUT_MS);
+      wikiPending.set(requestId, { resolve: resolve, reject: reject, timer: timer });
+      var msg = { type: "jolli-graph-wiki-request", requestId: requestId, slug: slug };
+      if (vscodeApi) {
+        vscodeApi.postMessage(msg);
+      } else if (embedded) {
+        var target = hostOrigin && hostOrigin !== "null" ? hostOrigin : "*";
+        window.parent.postMessage(msg, target);
+      } else {
+        wikiPending.delete(requestId);
+        clearTimeout(timer);
+        reject(new Error("no host to request a wiki body from"));
+      }
+    });
+  }
+
   // rootLabel: breadcrumb root override (repo name), set from the host handshake.
   window.WikiHost = {
     embedded: embedded,
     requestGraph: requestGraph,
+    requestWikiBody: requestWikiBody,
     notifyRendered: notifyRendered,
     applyTheme: applyTheme,
     rootLabel: null,

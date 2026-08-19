@@ -267,6 +267,28 @@ describe("isAllowedPath — .jolli/graph/", () => {
 	});
 });
 
+describe("isAllowedPath — _wiki/ (explicit, additive over the generic .md rule)", () => {
+	const opts = { syncTranscripts: false };
+
+	it("explicitly guarantees the two named wiki shapes are allowed", () => {
+		// The additive branch returns true for these regardless of the generic rule,
+		// so a future tightening of the generic `.md` rule can't drop them.
+		expect(isAllowedPath("myrepo/_wiki/_index.md", opts)).toBe(true);
+		expect(isAllowedPath("myrepo/_wiki/topic--auth.md", opts)).toBe(true);
+		expect(isAllowedPath("myrepo/_wiki/topic--ai-context-relevance-filtering.md", opts)).toBe(true);
+	});
+
+	it("lets other _wiki entries fall through to the generic rules (no hard reject / no regression)", () => {
+		// A non-conforming leaf is NOT hard-rejected — it rides the generic `.md`
+		// rule exactly as before this branch existed, so LegacyMigration keeps
+		// migrating arbitrary content under a folder literally named `_wiki`.
+		expect(isAllowedPath("myrepo/_wiki/topic--Bad_Slug.md", opts)).toBe(true); // generic .md
+		expect(isAllowedPath("myrepo/_wiki/notes.md", opts)).toBe(true); // generic .md
+		// Non-markdown is still rejected by the generic extension check.
+		expect(isAllowedPath("myrepo/_wiki/topic--auth.txt", opts)).toBe(false);
+	});
+});
+
 describe("isAllowedPath — windows-style separators", () => {
 	const opts = { syncTranscripts: true };
 

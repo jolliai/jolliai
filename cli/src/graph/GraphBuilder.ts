@@ -76,8 +76,8 @@ export function topicFingerprint(title: string, summary: string, content: string
  * LLM inputs, so they can change while {@link topicFingerprint} stays put — and
  * the rolled-up `commitCount` is derived from them. When the content diff is a
  * no-op but this changes, GraphBuilder does a NO-LLM reassemble instead of
- * skipping, so the on-disk metadata never goes stale. (`overview` / `fullBody`
- * are derived from `content`, already covered by the content fingerprint.)
+ * skipping, so the on-disk metadata never goes stale. (`overview` is derived
+ * from `content`, already covered by the content fingerprint.)
  */
 export function topicMetaFingerprint(meta: TopicSourceMeta): string {
 	const branches = meta.sourceBranches.join(",");
@@ -208,7 +208,6 @@ export async function buildKnowledgeGraph(
 			sourceBranches: page?.relatedBranches ?? entry.relatedBranches ?? [],
 			sourceCommits: commitRefs(page?.sourceRefs ?? entry.sourceRefs ?? []),
 			overview: firstParagraph(content),
-			fullBody: content,
 		};
 		sources.set(entry.stableSlug, meta);
 		metaFingerprints[entry.stableSlug] = topicMetaFingerprint(meta);

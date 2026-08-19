@@ -43,6 +43,14 @@ export type OwnedPathKind =
 	// viz renders. Regenerable (rebuilt by `jolli compile`), so a torn/stale
 	// copy self-heals; synced so the Space renders the graph without a rebuild.
 	| "graph"
+	// <repoFolder>/_wiki/topic--<slug>.md and <repoFolder>/_wiki/_index.md — the
+	// human-browsable topic pages the knowledge-graph reader fetches on click.
+	// Regenerable (rewritten by `jolli compile`); synced so the Space graph can
+	// serve wiki bodies on demand instead of inlining them into graph.json. Was
+	// only ever staged via the `user-content` fallthrough before; named
+	// explicitly so a future tightening of that fallthrough can't silently stop
+	// syncing the bodies the graph reader depends on.
+	| "wiki"
 	// Per-repo visible markdown (under <repoFolder>/<branch>/...):
 	| "visible-summary" // <repoFolder>/<branch>/<slug>-<hex8>.md
 	| "visible-plan" // <repoFolder>/<branch>/plan--<slug>.md

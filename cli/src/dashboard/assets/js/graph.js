@@ -23,6 +23,10 @@ window.JD = window.JD || {};
 	 * known repos, and it drives nothing but the address bar (no token, no mutation).
 	 */
 
+	// The repo currently shown in the frame (initial pick, then updated on an
+	// in-frame switch). Used to scope the on-demand wiki-body relay below.
+	let currentKb = null;
+
 	function availableRepos(model) {
 		return ((model.graph && model.graph.repos) || []).filter((r) => r.graphAvailable);
 	}
@@ -46,13 +50,14 @@ window.JD = window.JD || {};
 			return;
 		}
 		var kb = initialKb(available);
+		currentKb = kb;
 		var src = "/graph-viewer?kb=" + encodeURIComponent(kb) + "&theme=" + JD.currentTheme();
 		document.getElementById("app").innerHTML =
 			'<section class="graph-page"><iframe class="graph-frame" sandbox="allow-scripts" ' +
 			'title="Knowledge graph" src="' +
 			src +
 			'"></iframe></section>';
-		syncUrlWithFrame(available);
+		wireFrameMessages(available);
 		// wiki/graph freshness + on-demand Rebuild (folder-wide aggregate).
 		if (JD.mountWikiFreshness) JD.mountWikiFreshness();
 	}
@@ -62,20 +67,56 @@ window.JD = window.JD || {};
 	// makes sense. The banner is folder-wide: it reports how far behind ALL Memory
 	// Bank repos are (aggregate), and its `never`/`fresh`/`behind` states cover that.
 
-	// Mirror the frame's in-iframe repo switch into this page's /graph?kb= URL.
-	// Re-registered per render with the current repo list; the previous handler
-	// is removed so repeated renders don't stack listeners.
-	function syncUrlWithFrame(available) {
-		if (JD._graphRepoHandler) window.removeEventListener("message", JD._graphRepoHandler);
-		JD._graphRepoHandler = function (ev) {
+	// Relay messages from the (sandboxed, opaque-origin) graph frame:
+	//   - `jolli-graph-repo`: mirror the in-frame repo switch into this page's
+	//     `/graph?kb=` URL (so refresh / bookmark / share reopens the same repo),
+	//     and track `currentKb` for the wiki relay below.
+	//   - `jolli-graph-wiki-request`: the frame cannot fetch same-origin itself
+	//     (opaque origin), so this same-origin parent fetches the topic's wiki body
+	//     from `/graph-wiki` and posts it back. Body text is NOT inlined into the
+	//     graph (schema v5) — this is the dashboard's on-demand path.
+	// Re-registered per render with the current repo list; the previous handler is
+	// removed so repeated renders don't stack listeners.
+	function wireFrameMessages(available) {
+		if (JD._graphFrameHandler) window.removeEventListener("message", JD._graphFrameHandler);
+		JD._graphFrameHandler = function (ev) {
 			var d = ev && ev.data;
-			if (!d || d.type !== "jolli-graph-repo" || typeof d.kb !== "string") return;
-			if (!available.some((r) => r.kb === d.kb)) return;
-			try {
-				window.history.replaceState(null, "", "/graph?kb=" + encodeURIComponent(d.kb));
-			} catch (e) {}
+			if (!d) return;
+			// Only trust messages from THIS page's own graph iframe. Without this, a
+			// hostile page that window.open()s the dashboard's /graph can postMessage
+			// the relay below and exfiltrate wiki content cross-origin (the relay's
+			// own fetch to /graph-wiki is same-origin, so it bypasses the server's
+			// Origin allowlist — a confused deputy). The sandboxed frame posts via
+			// window.parent.postMessage, so its messages arrive with ev.source ===
+			// the frame's contentWindow; an opener window's do not. Re-query live so
+			// it still matches after an in-frame repo-switch navigation.
+			var frame = document.querySelector(".graph-frame");
+			if (!frame || ev.source !== frame.contentWindow) return;
+			if (d.type === "jolli-graph-repo" && typeof d.kb === "string") {
+				if (!available.some((r) => r.kb === d.kb)) return;
+				currentKb = d.kb;
+				try {
+					window.history.replaceState(null, "", "/graph?kb=" + encodeURIComponent(d.kb));
+				} catch (e) {}
+				return;
+			}
+			if (d.type === "jolli-graph-wiki-request" && typeof d.requestId === "string" && typeof d.slug === "string") {
+				var source = ev.source;
+				if (!source || !currentKb) return;
+				var requestId = d.requestId;
+				var slug = d.slug;
+				fetch("/graph-wiki?kb=" + encodeURIComponent(currentKb) + "&slug=" + encodeURIComponent(slug))
+					.then((res) => (res.ok ? res.text() : Promise.reject(new Error("wiki " + res.status))))
+					.then((markdown) =>
+						source.postMessage({ type: "jolli-graph-wiki-body", requestId: requestId, slug: slug, markdown: markdown }, "*"),
+					)
+					.catch(() =>
+						source.postMessage({ type: "jolli-graph-wiki-body", requestId: requestId, slug: slug, error: "load-failed" }, "*"),
+					);
+				return;
+			}
 		};
-		window.addEventListener("message", JD._graphRepoHandler);
+		window.addEventListener("message", JD._graphFrameHandler);
 	}
 
 	JD.renderGraph = (model) => render(model);

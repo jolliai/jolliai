@@ -45,6 +45,9 @@
  *       │   ├── plan-progress/<slug>.json       ← plan-progress
  *       │   ├── notes/<id>.md                   ← note (markdown)
  *       │   └── graph/graph.json                ← graph (regenerable KB-graph data)
+ *       ├── _wiki/
+ *       │   ├── _index.md                       ← wiki (topic index page)
+ *       │   └── topic--<slug>.md                ← wiki (topic page; fetched on click)
  *       └── <branch>/
  *           ├── <slug>-<hex8>.md                ← visible-summary
  *           ├── plan--<slug>.md                 ← visible-plan
@@ -263,6 +266,21 @@ function classifyStrict(relPath: string): OwnedPathKind | null {
 		const branch = segments[1];
 		const file = segments[2];
 		if (branch === undefined || file === undefined) return null;
+
+		// `<repoFolder>/_wiki/...` — the human-browsable topic pages the knowledge-
+		// graph reader fetches on click: `topic--<slug>.md` (slug is the same
+		// lowercase-hyphen `stableSlug` a summary uses) plus the `_index.md` index.
+		// Named explicitly (rather than left to the `user-content` fallthrough) so a
+		// future tightening of that fallthrough can't silently stop syncing them.
+		if (branch === "_wiki") {
+			if (file === "_index.md") return "wiki";
+			if (file.startsWith("topic--") && file.endsWith(".md")) {
+				const slug = file.slice("topic--".length, -".md".length);
+				return SUMMARY_SLUG_RE.test(slug) ? "wiki" : null;
+			}
+			return null;
+		}
+
 		if (!BRANCH_FOLDER_RE.test(branch)) return null;
 
 		// plan--<slug>.md

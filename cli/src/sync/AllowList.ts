@@ -92,6 +92,9 @@ const SUMMARY_HASH_REGEX = /^[0-9a-f]{7,64}\.json$/;
  */
 const PLAN_OR_NOTE_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}\.md$/;
 const PLAN_PROGRESS_REGEX = /^[A-Za-z0-9][A-Za-z0-9._-]{0,254}\.json$/;
+// `<repoFolder>/_wiki/` leaves: the topic index `_index.md` and per-topic
+// `topic--<slug>.md` pages (slug is the lowercase-hyphen `stableSlug`).
+const WIKI_LEAF_REGEX = /^(?:_index|topic--[a-z0-9]+(?:-[a-z0-9]+)*)\.md$/;
 
 export interface AllowListOpts {
 	readonly syncTranscripts: boolean;
@@ -155,6 +158,20 @@ export function isAllowedPath(relPath: string, opts: AllowListOpts): boolean {
 			return segments[2] === "graph.json";
 		}
 		return false;
+	}
+
+	// `<repoFolder>/_wiki/...` — the human-browsable topic pages the knowledge-
+	// graph reader fetches on click (`topic--<slug>.md`) plus the `_index.md`
+	// index. The two named shapes are allowed EXPLICITLY (additively) so a future
+	// tightening of the generic `.md` rule below can't silently stop the Space
+	// graph reader's bodies from being allowed. Anything else under `_wiki/` falls
+	// through to the generic rules unchanged — additive, never a hard reject, so
+	// arbitrary legacy content under a `_wiki/` folder still migrates as before,
+	// staying symmetric with `classifyVaultPath`'s `user-content` fallthrough.
+	// (Sync staging is gated by `classifyVaultPath`, not this function — its only
+	// runtime caller is LegacyMigration — so the tight `wiki` kind lives there.)
+	if (segments.length === 3 && segments[1] === "_wiki" && WIKI_LEAF_REGEX.test(segments[2] as string)) {
+		return true;
 	}
 
 	// Reject any other dot-prefixed segment (hidden file or hidden directory).

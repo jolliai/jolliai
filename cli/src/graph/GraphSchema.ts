@@ -112,8 +112,13 @@ export function isCanonicalKinds(v: unknown): v is UnitKind[] {
  * written under v3 lacks it; the version mismatch forces a one-time full rebuild
  * that regenerates graph.json in the v4 shape (no migration script — the array
  * is recomputed deterministically every build, never reused from the baseline).
+ * Bumped 4→5 when `fullBody` (the verbatim topic body) was REMOVED from every
+ * `GraphTopic`. The viz no longer inlines wiki bodies into graph.json; it
+ * fetches `_wiki/topic--<slug>.md` on demand (`wikiFile` names it). Dropping an
+ * output field is a breaking shape change ⇒ the version mismatch forces a
+ * one-time full rebuild that regenerates graph.json in the leaner v5 shape.
  */
-export const GRAPH_SCHEMA_VERSION = 4;
+export const GRAPH_SCHEMA_VERSION = 5;
 
 /** Category id for topics not grouped into any real category. Shared by the full
  * distiller (backfill) and the incremental merge so both bucket the same way. */
@@ -209,8 +214,6 @@ export interface TopicSourceMeta {
 	readonly sourceBranches: string[];
 	readonly sourceCommits: SourceCommitRef[];
 	readonly overview: string;
-	/** Verbatim topic page body, rendered in the viz reader drawer. */
-	readonly fullBody: string;
 }
 
 // -- Final merged graph (what the viz consumes) -------------------------------
@@ -225,7 +228,12 @@ export interface GraphTopic extends DistilledTopic {
 	readonly sourceBranches: string[];
 	readonly sourceCommits: SourceCommitRef[];
 	readonly overview: string;
-	readonly fullBody: string;
+	/**
+	 * Basename of the human-browsable topic page under `<kbRoot>/_wiki/`
+	 * (`topic--<slug>.md`). The viz fetches this on demand when the user opens
+	 * the full wiki page — the body is NOT inlined into graph.json (see the
+	 * v5 note on {@link GRAPH_SCHEMA_VERSION}).
+	 */
 	readonly wikiFile: string;
 	unitCount: number;
 	commitCount: number;
@@ -491,7 +499,6 @@ export function assembleGraph(
 			sourceBranches: src ? src.sourceBranches : [],
 			sourceCommits: src ? src.sourceCommits : [],
 			overview: src ? src.overview : "",
-			fullBody: src ? src.fullBody : "",
 			wikiFile: `topic--${t.slug}.md`,
 			unitCount: 0,
 			commitCount: 0,

@@ -135,8 +135,8 @@ describe("buildKnowledgeGraph", () => {
 		// The full-build exit stamps the repo name (breadcrumb root) — basename("/kb") === "kb".
 		expect(graphArg.repoName).toBe("kb");
 		const t1 = graphArg.topics.find((t: { slug: string }) => t.slug === "t1");
-		expect(t1.fullBody).toBe("page body\n\nsecond para");
 		expect(t1.overview).toBe("page body"); // first non-heading paragraph
+		expect(t1.wikiFile).toBe("topic--t1.md"); // body fetched on demand, not inlined
 		expect(t1.sourceBranches).toEqual(["main"]);
 		expect(t1.sourceCommits).toEqual([{ hash: "abcdef12", message: "" }]);
 	});
@@ -269,7 +269,7 @@ describe("buildKnowledgeGraph", () => {
 	// tests cannot silently go green if the separator/algorithm ever changes.
 	const fpOf = topicFingerprint;
 	const metaOf = (sourceBranches: string[], sourceCommits: { hash: string; message: string }[]) =>
-		topicMetaFingerprint({ sourceBranches, sourceCommits, overview: "", fullBody: "" });
+		topicMetaFingerprint({ sourceBranches, sourceCommits, overview: "" });
 
 	/** A field-valid baseline that actually carries a distilled t1 topic + unit, so a
 	 *  no-LLM reassemble (metadata drift) and an empty-on-delete have something to act on. */

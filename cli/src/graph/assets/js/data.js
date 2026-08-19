@@ -5,14 +5,20 @@
 (function () {
   "use strict";
 
-  // The schema version this viewer is built for. MUST stay in lockstep with
-  // GRAPH_SCHEMA_VERSION in cli/src/graph/GraphSchema.ts — same "thin mirror,
-  // keep in sync" contract as the symmetric-edge dedup below. A loaded graph.json
-  // whose schemaVersion is a NUMBER strictly below this was written by an older
-  // build; the viewer still renders it (every new-field read is guarded), but
-  // main.js surfaces a "regenerate for the full experience" notice. A missing or
-  // non-numeric schemaVersion is NOT treated as stale (no false positive on data
-  // that predates the field or is hand-authored).
+  // Oldest schema whose graphs still render FULLY in this viewer. A loaded
+  // graph.json whose schemaVersion is a NUMBER strictly below this was written by
+  // a build old enough to be missing something the viewer needs; main.js then
+  // surfaces a "regenerate for the full experience" notice (the viewer still
+  // renders it — every new-field read is guarded). A missing/non-numeric
+  // schemaVersion is NOT stale (no false positive on pre-field or hand-authored
+  // data).
+  //
+  // Deliberately NOT equal to GRAPH_SCHEMA_VERSION (now 5): the v4→v5 bump only
+  // REMOVED `fullBody`, a field this viewer no longer reads (it fetches
+  // `_wiki/topic--<slug>.md` on demand via `wikiBody` below). A v4 graph still
+  // carries `wikiFile` and every other field, so it renders fully here — flagging
+  // it stale would be a false positive. Advance this only when a NEW version adds
+  // something the viewer actually depends on.
   const SUPPORTED_SCHEMA_VERSION = 4;
 
   // Muted jewel-tone palette for categories — deliberately avoids pure red/blue
@@ -21,6 +27,32 @@
     "#7d99c4", "#a3b577", "#cc977c", "#a995cf", "#c8a06b", "#7eb0b0",
     "#c99898", "#b5c47a", "#bc8e5c", "#9d8cc4", "#8aaab8", "#a0a0a0",
   ];
+
+  // --- Lazy per-topic wiki body -------------------------------------------
+  // graph.json no longer inlines topic bodies (schema v5). The reader fetches
+  // `_wiki/topic--<slug>.md` on demand: from window.__EMBEDDED_WIKI__ in a
+  // self-contained export, else over the host bridge (dashboard / VS Code / web).
+  // The PROMISE is cached per slug so concurrent opens dedupe and a resolved body
+  // is reused; a rejection is evicted so a later open can retry.
+  const _bodyCache = new Map();
+  function wikiBody(slug) {
+    if (_bodyCache.has(slug)) return _bodyCache.get(slug);
+    const p = resolveWikiBody(slug);
+    _bodyCache.set(slug, p);
+    p.catch(() => _bodyCache.delete(slug));
+    return p;
+  }
+  function resolveWikiBody(slug) {
+    // ① Self-contained export: bodies inlined as a { slug -> markdown } map.
+    const inlined = window.__EMBEDDED_WIKI__;
+    if (inlined && typeof inlined[slug] === "string") return Promise.resolve(inlined[slug]);
+    // ② Framed host (dashboard / VS Code / web app): fetch on demand.
+    if (window.WikiHost && typeof window.WikiHost.requestWikiBody === "function") {
+      return window.WikiHost.requestWikiBody(slug);
+    }
+    // ③ No source available (e.g. a standalone file opened with no inlined bodies).
+    return Promise.reject(new Error("no wiki body source"));
+  }
 
   async function load() {
     let graph;
@@ -204,6 +236,8 @@
       coChangeCategoryAgg: [...coChangeCategoryAgg.values()],
       // Relationship types with no direction — drawn as a single line, no arrow.
       symmetricTypes: SYMMETRIC,
+      // Lazy per-topic wiki body loader (fetches `_wiki/topic--<slug>.md`). See above.
+      wikiBody,
     };
     return window.WikiData;
   }

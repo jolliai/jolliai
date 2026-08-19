@@ -1436,6 +1436,37 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
+		// The Graph page's on-demand wiki body: RAW markdown for ONE topic, fetched
+		// when the user opens a full wiki page in the graph. The graph iframe is a
+		// `sandbox="allow-scripts"` opaque-origin frame and cannot fetch same-origin
+		// itself, so the parent `/graph` page relays the request here (see the
+		// `jolli-graph-wiki-request` handler in `graph.js`). Public GET like the
+		// other viewer routes; the viz renders the markdown client-side. The body is
+		// NOT inlined into graph.json (schema v5) — this is what replaces it.
+		if (url.pathname === "/graph-wiki") {
+			const kb = url.searchParams.get("kb");
+			const slug = url.searchParams.get("slug");
+			if (!kb || !slug) {
+				sendText(res, 400, "kb and slug are required");
+				return;
+			}
+			// Slug is the lowercase-hyphen `stableSlug`; the strict shape also blocks
+			// path traversal before the filename is built (readWikiBody re-checks).
+			if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) {
+				sendText(res, 400, "invalid slug");
+				return;
+			}
+			const repo = await resolveKbRepo(configDir, kb);
+			const body = repo ? readWikiBody(repo.kbRoot, `topic--${slug}.md`) : undefined;
+			if (body === undefined) {
+				sendText(res, 404, "wiki page not found");
+				return;
+			}
+			res.writeHead(200, { "Content-Type": "text/markdown; charset=utf-8", "Cache-Control": "no-store" });
+			res.end(body);
+			return;
+		}
+
 		// The Graph page's iframe: the repo's knowledge graph inlined into the
 		// self-contained viz (reusing `GraphExport.buildStandaloneHtml`), served
 		// into a `sandbox="allow-scripts"` iframe. Same public-GET + isolation model.

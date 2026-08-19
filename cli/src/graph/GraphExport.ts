@@ -4,8 +4,13 @@
  * (vendor + app), and the repo's `graph.json` (as `window.__EMBEDDED_GRAPH__`),
  * so the file opens directly from `file://` — no server, no `fetch` (CORS-safe).
  *
- * The full `_wiki` pages need no external files: each topic's markdown is
- * embedded as `fullBody` inside graph.json and rendered in-panel by `panel.js`.
+ * graph.json no longer carries the topic bodies (v5 dropped `fullBody`). To keep
+ * the exported file self-contained and offline (`file://`, no fetch), each
+ * topic's `_wiki/topic--<slug>.md` page is re-inlined here as a
+ * `window.__EMBEDDED_WIKI__` map keyed by topic slug; `panel.js` reads it when
+ * the user opens the full wiki page. The SERVED surfaces (dashboard / VS Code /
+ * web) instead fetch the body on demand over a host bridge and pass no
+ * `embeddedWiki`, so they never carry the bodies inline.
  *
  * Mirrors the VS Code webview's `KnowledgeGraphPanel.renderGraphHtml`, with one
  * shared hazard to respect: replacements are passed as FUNCTIONS, never strings.
@@ -24,6 +29,10 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 /** Vendor + app scripts, in the same order as the viz `index.html` loads them. */
 const VENDOR_FILES = ["panzoom.min.js", "elk.bundled.js", "marked.min.js"] as const;
 const SCRIPT_FILES = [
+	// host-bridge.js first (as in the template) so `window.WikiHost` exists before
+	// data.js runs. It is inert in a standalone export (not framed), but the
+	// dashboard iframe needs its `requestWikiBody` bridge to fetch bodies on click.
+	"host-bridge.js",
 	"data.js",
 	"state.js",
 	"edges.js",
@@ -41,6 +50,12 @@ export interface GraphHtmlParts {
 	readonly vendorJs: ReadonlyArray<string>; // vendor/*.js, in load order
 	readonly appJs: ReadonlyArray<string>; // js/*.js, in load order
 	readonly graphJson: string; // the repo's graph.json (verbatim)
+	/**
+	 * Optional `{ slug → markdown }` map re-inlined as `window.__EMBEDDED_WIKI__`
+	 * so a self-contained offline export renders wiki bodies with no fetch. Omitted
+	 * by the served surfaces (dashboard / VS Code), which fetch bodies on demand.
+	 */
+	readonly embeddedWiki?: Record<string, string>;
 }
 
 /**
@@ -70,10 +85,17 @@ function replaceMarker(html: string, marker: RegExp, replacement: () => string, 
 export function assembleGraphHtml(parts: GraphHtmlParts, bodyClass?: string): string {
 	const safeGraph = escapeForInlineScript(parts.graphJson);
 	const scriptTag = (js: string) => `<script>\n${js}\n</script>`;
+	// Optional inlined wiki bodies (`{ slug → markdown }`) for a self-contained
+	// export; omitted by the served surfaces, which fetch on demand.
+	const wikiScript = parts.embeddedWiki
+		? `<script>window.__EMBEDDED_WIKI__ = ${escapeForInlineScript(JSON.stringify(parts.embeddedWiki))};</script>\n`
+		: "";
 	// Vendor first, then the embedded data (data.js reads it), then app scripts.
+	// Both globals precede the app scripts (host-bridge.js / data.js read them).
 	const scripts =
 		`${parts.vendorJs.map(scriptTag).join("\n")}\n` +
 		`<script>window.__EMBEDDED_GRAPH__ = ${safeGraph};</script>\n` +
+		wikiScript +
 		parts.appJs.map(scriptTag).join("\n");
 
 	// Real `<body>` first (CSS with its comment `<body>` is not inlined yet).
@@ -104,7 +126,12 @@ export function resolveAssetsDir(baseDir: string = HERE): string {
 }
 
 /** Read the viz assets from `assetsDir` and assemble the standalone HTML. */
-export function buildStandaloneHtml(assetsDir: string, graphJson: string, bodyClass?: string): string {
+export function buildStandaloneHtml(
+	assetsDir: string,
+	graphJson: string,
+	bodyClass?: string,
+	embeddedWiki?: Record<string, string>,
+): string {
 	const read = (...p: string[]) => readFileSync(join(assetsDir, ...p), "utf8");
 	return assembleGraphHtml(
 		{
@@ -113,9 +140,43 @@ export function buildStandaloneHtml(assetsDir: string, graphJson: string, bodyCl
 			vendorJs: VENDOR_FILES.map((f) => read("vendor", f)),
 			appJs: SCRIPT_FILES.map((f) => read("js", f)),
 			graphJson,
+			embeddedWiki,
 		},
 		bodyClass,
 	);
+}
+
+/** A topic wiki filename is always `topic--<lowercase-hyphen-slug>.md` (see GraphSchema). */
+const WIKI_FILE_RE = /^topic--[a-z0-9]+(?:-[a-z0-9]+)*\.md$/;
+
+/**
+ * Read each topic's `_wiki/<wikiFile>` page into a `{ slug → markdown }` map for
+ * a self-contained export. Best-effort: a topic whose file is missing/unreadable
+ * is omitted (the viz shows a placeholder). The `wikiFile` is validated to be a
+ * bare `topic--<slug>.md` basename before it is joined to `<kbRoot>/_wiki/`, so a
+ * tampered graph.json can't drive a path traversal.
+ */
+function readWikiBodies(kbRoot: string, graphJson: string): Record<string, string> {
+	const map: Record<string, string> = {};
+	let topics: Array<{ slug?: unknown; wikiFile?: unknown }>;
+	try {
+		const parsed = JSON.parse(graphJson) as { topics?: unknown };
+		topics = Array.isArray(parsed.topics) ? (parsed.topics as Array<{ slug?: unknown; wikiFile?: unknown }>) : [];
+	} catch {
+		return map; // malformed graph.json → export still opens, just without bodies
+	}
+	for (const t of topics) {
+		if (typeof t.slug !== "string" || typeof t.wikiFile !== "string") continue;
+		if (!WIKI_FILE_RE.test(t.wikiFile)) continue; // basename guard (no separators / traversal)
+		const file = join(kbRoot, "_wiki", t.wikiFile);
+		if (!existsSync(file)) continue;
+		try {
+			map[t.slug] = readFileSync(file, "utf8");
+		} catch {
+			// unreadable → omit; the viz placeholder covers it
+		}
+	}
+	return map;
 }
 
 export interface ExportGraphOptions {
@@ -137,7 +198,9 @@ export async function exportGraphHtml(opts: ExportGraphOptions): Promise<string>
 	if (!existsSync(graphPath)) {
 		throw new Error(`No knowledge graph found at ${graphPath}. Run "jolli compile --cwd ${opts.cwd}" first.`);
 	}
-	const html = buildStandaloneHtml(resolveAssetsDir(), readFileSync(graphPath, "utf8"));
+	const graphJson = readFileSync(graphPath, "utf8");
+	const embeddedWiki = readWikiBodies(kbRoot, graphJson);
+	const html = buildStandaloneHtml(resolveAssetsDir(), graphJson, undefined, embeddedWiki);
 
 	const outFile = opts.out.toLowerCase().endsWith(".html")
 		? opts.out

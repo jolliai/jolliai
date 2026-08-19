@@ -109,7 +109,9 @@
 
     // Full wiki page opens in-panel (kind: "wiki"); Back returns to this topic.
     // Sits right under the description, mirroring the "Open category" button.
-    if (t.fullBody) {
+    // Gated on `wikiFile` (every topic has one) — the body is fetched on open,
+    // not inlined into the graph (schema v5), so `fullBody` no longer exists here.
+    if (t.wikiFile) {
       html += `<button type="button" class="wiki-open" data-open-wiki="${esc(slug)}">📖 Open full wiki page</button>`;
     }
 
@@ -143,19 +145,70 @@
     return html;
   }
 
-  // Full markdown wiki page, rendered inside the panel (reading mode widens it).
+  // Full wiki page, rendered inside the panel (reading mode widens it). The body
+  // is NOT inlined into the graph (schema v5) — it is fetched on demand, so this
+  // returns a heading + loading placeholder synchronously and `loadWikiInto`
+  // fills `.wiki-body` once `WikiData.wikiBody(slug)` resolves. Keeping the render
+  // synchronous lets the existing state→render pipeline stay unchanged.
   function renderWiki(slug) {
     const D = window.WikiData;
     const t = D.topicsBySlug.get(slug);
     if (!t) return renderEmpty();
-    const md = (window.marked && window.marked.parse)
-      ? window.marked.parse(t.fullBody || "")
-      : `<pre>${esc(t.fullBody || "")}</pre>`;
     let html = "";
     html += `<h2>${esc(t.shortTitle)}</h2>`;
     html += `<div class="p-meta">${esc(t.title)}</div>`;
-    html += `<div class="wiki-body">${md}</div>`; // marked output is our own wiki HTML
+    html += `<div class="wiki-body" id="wiki-body"><div class="wiki-loading">Loading…</div></div>`;
     return html;
+  }
+
+  // Neutralise the wiki page's relative links: `_wiki` pages link to sibling
+  // topic pages and per-commit files by RELATIVE path, which do not resolve
+  // inside the graph panel. Turn any non-absolute (or in-page anchor) link into
+  // inert text; keep real http(s) links but open them in a new tab.
+  function neutralizeRelativeLinks(htmlString) {
+    const tmp = document.createElement("div");
+    tmp.innerHTML = htmlString; // marked output is our own wiki HTML
+    tmp.querySelectorAll("a[href]").forEach((a) => {
+      const href = a.getAttribute("href") || "";
+      if (/^https?:\/\//i.test(href)) {
+        a.setAttribute("target", "_blank");
+        a.setAttribute("rel", "noopener noreferrer");
+        return;
+      }
+      const span = document.createElement("span");
+      span.className = "wiki-inert-link";
+      span.textContent = a.textContent || "";
+      a.replaceWith(span);
+    });
+    return tmp.innerHTML;
+  }
+
+  // Fetch the wiki body for `slug` and render it into the live `.wiki-body`
+  // container. Guards staleness: the user may navigate away while the fetch is in
+  // flight, so re-check the current selection before patching the DOM.
+  function loadWikiInto(slug) {
+    const D = window.WikiData;
+    if (!D || typeof D.wikiBody !== "function") return;
+    const stillShowing = () => {
+      const s = window.WikiState.get();
+      return !!(s.selected && s.selected.kind === "wiki" && s.selected.id === slug);
+    };
+    D.wikiBody(slug).then(
+      (md) => {
+        if (!stillShowing()) return;
+        const live = document.getElementById("wiki-body");
+        if (!live) return;
+        live.innerHTML =
+          window.marked && window.marked.parse
+            ? neutralizeRelativeLinks(window.marked.parse(md || ""))
+            : `<pre>${esc(md || "")}</pre>`;
+      },
+      () => {
+        if (!stillShowing()) return;
+        const live = document.getElementById("wiki-body");
+        if (live) live.innerHTML = `<div class="wiki-error">${esc("The full wiki page isn’t available right now.")}</div>`;
+      },
+    );
   }
 
   function renderCategoryPair(pairId) {
@@ -227,6 +280,9 @@
     // Opening the full wiki page: jump to the top so reading starts at the
     // beginning, not wherever the previous panel content was scrolled.
     if (panelEl && sel && sel.kind === "wiki") panelEl.scrollTop = 0;
+    // The wiki body is fetched lazily (not inlined). renderWiki emitted a loading
+    // placeholder; fill it once the body resolves (or show an error).
+    if (sel && sel.kind === "wiki") loadWikiInto(sel.id);
 
     const back = document.getElementById("panel-back");
     if (back) back.addEventListener("click", () => S.goBack());

@@ -22,7 +22,39 @@ import * as vscode from "vscode";
 import { escapeForInlineScript } from "../../../cli/src/core/InlineScript.js";
 
 const VENDOR_FILES = ["panzoom.min.js", "elk.bundled.js", "marked.min.js"];
-const SCRIPT_FILES = ["data.js", "state.js", "edges.js", "camera.js", "drag.js", "views.js", "panel.js", "main.js"];
+// host-bridge.js first (as in the template) so `window.WikiHost` exists before
+// data.js runs. In the webview it provides `requestWikiBody`, which fetches a
+// topic's `_wiki/topic--<slug>.md` from the extension host over `acquireVsCodeApi`
+// (the body is NOT inlined into graph.json — schema v5). The requestGraph
+// handshake stays inert here because `window.__EMBEDDED_GRAPH__` short-circuits it.
+const SCRIPT_FILES = [
+	"host-bridge.js",
+	"data.js",
+	"state.js",
+	"edges.js",
+	"camera.js",
+	"drag.js",
+	"views.js",
+	"panel.js",
+	"main.js",
+];
+
+/** A topic wiki slug is the lowercase-hyphen `stableSlug`; the shape also blocks traversal. */
+const WIKI_SLUG_RE = /^[a-z0-9][a-z0-9-]*$/;
+
+/**
+ * Read one topic's wiki page from `<kbParent>/<repoName>/_wiki/topic--<slug>.md`.
+ * The slug shape is validated first, so a malicious `slug` cannot escape `_wiki/`.
+ * Returns undefined when the slug is malformed or the file is missing/unreadable.
+ */
+export function readGraphWikiBody(kbParent: string, repoName: string, slug: string): string | undefined {
+	if (!WIKI_SLUG_RE.test(slug)) return undefined;
+	try {
+		return readFileSync(join(kbParent, repoName, "_wiki", `topic--${slug}.md`), "utf8");
+	} catch {
+		return undefined;
+	}
+}
 
 /** Resolved asset URIs + nonce for one render. */
 export interface GraphHtmlAssets {
@@ -105,20 +137,26 @@ export class KnowledgeGraphPanel {
 	 */
 	private static panels: Map<string, KnowledgeGraphPanel> = new Map();
 	private readonly panel: vscode.WebviewPanel;
+	private readonly repoName: string;
+	/** Memory Bank parent dir; mutable because the folder can be re-targeted between opens. */
+	private kbParent: string;
 	private disposed = false;
 
 	/** Opens (or re-uses) the graph panel for `repoName`, rendering `graphJson`. */
-	static show(extensionUri: vscode.Uri, repoName: string, graphJson: string): void {
+	static show(extensionUri: vscode.Uri, kbParent: string, repoName: string, graphJson: string): void {
 		const existing = KnowledgeGraphPanel.panels.get(repoName);
 		if (existing && !existing.disposed) {
+			existing.kbParent = kbParent; // the Memory Bank folder may have been re-targeted
 			existing.panel.webview.html = buildGraphHtml(existing.panel.webview, extensionUri, graphJson);
 			existing.panel.reveal(vscode.ViewColumn.One);
 			return;
 		}
-		KnowledgeGraphPanel.panels.set(repoName, new KnowledgeGraphPanel(extensionUri, repoName, graphJson));
+		KnowledgeGraphPanel.panels.set(repoName, new KnowledgeGraphPanel(extensionUri, kbParent, repoName, graphJson));
 	}
 
-	private constructor(extensionUri: vscode.Uri, repoName: string, graphJson: string) {
+	private constructor(extensionUri: vscode.Uri, kbParent: string, repoName: string, graphJson: string) {
+		this.kbParent = kbParent;
+		this.repoName = repoName;
 		this.panel = vscode.window.createWebviewPanel(
 			"jollimemory.knowledgeGraph",
 			`Knowledge Graph — ${repoName}`,
@@ -130,10 +168,29 @@ export class KnowledgeGraphPanel {
 			},
 		);
 		this.panel.webview.html = buildGraphHtml(this.panel.webview, extensionUri, graphJson);
+		// The viz fetches a topic's wiki body on demand (schema v5 — not inlined).
+		// host-bridge.js posts a `jolli-graph-wiki-request`; read the file from disk
+		// (only the host can) and post the body back keyed by requestId.
+		const sub = this.panel.webview.onDidReceiveMessage((msg: unknown) => this.onMessage(msg));
 		this.panel.onDidDispose(() => {
 			this.disposed = true;
+			sub.dispose();
 			if (KnowledgeGraphPanel.panels.get(repoName) === this) KnowledgeGraphPanel.panels.delete(repoName);
 		});
+	}
+
+	private onMessage(msg: unknown): void {
+		if (!msg || typeof msg !== "object") return;
+		const m = msg as { type?: unknown; requestId?: unknown; slug?: unknown };
+		if (m.type !== "jolli-graph-wiki-request" || typeof m.requestId !== "string" || typeof m.slug !== "string") {
+			return;
+		}
+		const markdown = readGraphWikiBody(this.kbParent, this.repoName, m.slug);
+		void this.panel.webview.postMessage(
+			markdown === undefined
+				? { type: "jolli-graph-wiki-body", requestId: m.requestId, slug: m.slug, error: "not-found" }
+				: { type: "jolli-graph-wiki-body", requestId: m.requestId, slug: m.slug, markdown },
+		);
 	}
 }
 
@@ -157,7 +214,7 @@ export async function openKnowledgeGraph(
 		return;
 	}
 	try {
-		KnowledgeGraphPanel.show(extensionUri, repoName, readFileSync(graphPath, "utf8"));
+		KnowledgeGraphPanel.show(extensionUri, kbParent, repoName, readFileSync(graphPath, "utf8"));
 	} catch (err) {
 		await vscode.window.showErrorMessage(
 			`Could not open the knowledge graph: ${err instanceof Error ? err.message : String(err)}`,

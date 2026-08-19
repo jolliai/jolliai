@@ -67,6 +67,21 @@ describe("assembleGraphHtml", () => {
 		expect(html.indexOf("__EMBEDDED_GRAPH__")).toBeLessThan(html.indexOf("/* data */"));
 	});
 
+	it("inlines __EMBEDDED_WIKI__ (escaped) after the graph and before the app scripts when embeddedWiki is given", () => {
+		const html = assembleGraphHtml({ ...PARTS, embeddedWiki: { auth: "# Auth\n</script>x" } });
+		expect(html).toContain("window.__EMBEDDED_WIKI__ = ");
+		// The body's </script> is escaped like the graph global.
+		expect(html).toContain("\\u003c/script");
+		expect(html).not.toContain("</script>x");
+		// Both globals precede the app scripts; the wiki map follows the graph.
+		expect(html.indexOf("__EMBEDDED_GRAPH__")).toBeLessThan(html.indexOf("__EMBEDDED_WIKI__"));
+		expect(html.indexOf("__EMBEDDED_WIKI__")).toBeLessThan(html.indexOf("/* data */"));
+	});
+
+	it("omits __EMBEDDED_WIKI__ when no embeddedWiki is given (served surfaces fetch on demand)", () => {
+		expect(assembleGraphHtml(PARTS)).not.toContain("__EMBEDDED_WIKI__");
+	});
+
 	it("preserves $-sequences verbatim (no String.replace $$/$&/$' corruption)", () => {
 		const html = assembleGraphHtml({
 			...PARTS,
@@ -153,6 +168,12 @@ describe("exportGraphHtml", () => {
 		const html = readFileSync(file, "utf8");
 		expect(html).toContain("window.__EMBEDDED_GRAPH__");
 		expect(html).not.toContain("styles/main.css"); // stylesheet inlined (real assets)
+		// host-bridge.js MUST be bundled: it defines WikiHost.requestWikiBody, the
+		// on-demand body source for the dashboard iframe (which shares this builder).
+		// Dropping it from SCRIPT_FILES would silently break "Open full wiki page"
+		// there, so pin its presence and its load-order before data.js.
+		expect(html).toContain("requestWikiBody");
+		expect(html.indexOf("requestWikiBody")).toBeLessThan(html.indexOf("WikiDataLoader"));
 	});
 
 	it("honors an explicit *.html output path", async () => {
@@ -178,5 +199,94 @@ describe("exportGraphHtml", () => {
 		await expect(exportGraphHtml({ cwd: kbRoot, out: tmp("kg-out4-") })).rejects.toThrow(
 			/No knowledge graph found.*jolli compile/s,
 		);
+	});
+
+	it("re-inlines each topic's _wiki page as __EMBEDDED_WIKI__ (skips missing file / non-basename)", async () => {
+		const kbRoot = tmp("kg-wiki-");
+		mkdirSync(join(kbRoot, ".jolli", "graph"), { recursive: true });
+		mkdirSync(join(kbRoot, "_wiki"), { recursive: true });
+		const graphJson = JSON.stringify({
+			stats: { categories: 1 },
+			categories: [],
+			units: [],
+			edges: [],
+			topics: [
+				{ slug: "auth", wikiFile: "topic--auth.md" },
+				{ slug: "gone", wikiFile: "topic--gone.md" }, // no file on disk → omitted
+				{ slug: "evil", wikiFile: "../escape.md" }, // basename guard → skipped
+				{ slug: "nofield" }, // no wikiFile → skipped (non-string guard)
+			],
+		});
+		writeFileSync(join(kbRoot, ".jolli", "graph", "graph.json"), graphJson, "utf8");
+		writeFileSync(join(kbRoot, "_wiki", "topic--auth.md"), "# Auth page body", "utf8");
+		// Plant a file at the traversal TARGET of `../escape.md` (join(kbRoot,"_wiki","../escape.md")
+		// = <kbRoot>/escape.md). This is what makes the basename guard load-bearing: without a file
+		// here, `evil` would be dropped by existsSync alone and the guard would be untested.
+		writeFileSync(join(kbRoot, "escape.md"), "SECRET-TRAVERSAL-CONTENT", "utf8");
+		createStorage.mockResolvedValue({ kbRoot });
+
+		const file = await exportGraphHtml({ cwd: kbRoot, out: tmp("kg-wiki-out-") });
+		const html = readFileSync(file, "utf8");
+		// Extract and parse the embedded wiki map (ASCII bodies → escape is a no-op → valid JSON).
+		const m = html.match(/window\.__EMBEDDED_WIKI__ = (\{.*?\});/s);
+		expect(m).toBeTruthy();
+		expect(JSON.parse((m as RegExpMatchArray)[1])).toEqual({ auth: "# Auth page body" });
+		// The WIKI_FILE_RE basename guard blocked the traversal: escape.md's content
+		// never reached the export. (Deleting the guard would read it into `evil`.)
+		expect(html).not.toContain("SECRET-TRAVERSAL-CONTENT");
+	});
+
+	it("still exports (empty wiki map) when graph.json is malformed JSON", async () => {
+		const kbRoot = tmp("kg-badjson-");
+		mkdirSync(join(kbRoot, ".jolli", "graph"), { recursive: true });
+		writeFileSync(join(kbRoot, ".jolli", "graph", "graph.json"), "{not valid json", "utf8");
+		createStorage.mockResolvedValue({ kbRoot });
+
+		const file = await exportGraphHtml({ cwd: kbRoot, out: tmp("kg-badjson-out-") });
+		const html = readFileSync(file, "utf8");
+		// readWikiBodies swallows the parse error → empty map; the export still opens.
+		const m = html.match(/window\.__EMBEDDED_WIKI__ = (\{.*?\});/s);
+		expect(m).toBeTruthy();
+		expect(JSON.parse((m as RegExpMatchArray)[1])).toEqual({});
+	});
+
+	it("tolerates a graph.json whose `topics` is present but not an array", async () => {
+		const kbRoot = tmp("kg-notopics-");
+		mkdirSync(join(kbRoot, ".jolli", "graph"), { recursive: true });
+		writeFileSync(
+			join(kbRoot, ".jolli", "graph", "graph.json"),
+			JSON.stringify({ stats: {}, topics: "oops" }),
+			"utf8",
+		);
+		createStorage.mockResolvedValue({ kbRoot });
+
+		const file = await exportGraphHtml({ cwd: kbRoot, out: tmp("kg-notopics-out-") });
+		const m = readFileSync(file, "utf8").match(/window\.__EMBEDDED_WIKI__ = (\{.*?\});/s);
+		expect(m).toBeTruthy();
+		expect(JSON.parse((m as RegExpMatchArray)[1])).toEqual({});
+	});
+
+	it("omits a topic whose _wiki entry is present but unreadable (a directory in its place)", async () => {
+		const kbRoot = tmp("kg-unreadable-");
+		mkdirSync(join(kbRoot, ".jolli", "graph"), { recursive: true });
+		// A DIRECTORY where the topic page file is expected: existsSync passes, readFileSync throws.
+		mkdirSync(join(kbRoot, "_wiki", "topic--dir.md"), { recursive: true });
+		writeFileSync(
+			join(kbRoot, ".jolli", "graph", "graph.json"),
+			JSON.stringify({
+				stats: {},
+				categories: [],
+				units: [],
+				edges: [],
+				topics: [{ slug: "dir", wikiFile: "topic--dir.md" }],
+			}),
+			"utf8",
+		);
+		createStorage.mockResolvedValue({ kbRoot });
+
+		const file = await exportGraphHtml({ cwd: kbRoot, out: tmp("kg-unreadable-out-") });
+		const m = readFileSync(file, "utf8").match(/window\.__EMBEDDED_WIKI__ = (\{.*?\});/s);
+		expect(m).toBeTruthy();
+		expect(JSON.parse((m as RegExpMatchArray)[1])).toEqual({});
 	});
 });

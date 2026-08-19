@@ -664,6 +664,30 @@ describe("routes", () => {
 			expect(body).toContain('<option value="repoB">repoB</option>');
 		});
 
+		it("serves a topic's RAW markdown body over /graph-wiki (utf-8, no-store) for the graph reader", async () => {
+			const configDir = writeMemoryBank(dir, [
+				{ dir: "repoA", wiki: { "topic--auth.md": "# Auth\n\nbody text" } },
+			]);
+			const port = await listen(testServer({ configDir }));
+			const res = await get(port, "/graph-wiki?kb=repoA&slug=auth");
+			expect(res.status).toBe(200);
+			expect(res.headers.get("content-type")).toBe("text/markdown; charset=utf-8");
+			expect(res.headers.get("cache-control")).toBe("no-store");
+			// Raw markdown (the viz renders it client-side) — not a framed HTML document.
+			expect(await res.text()).toBe("# Auth\n\nbody text");
+		});
+
+		it("/graph-wiki 400s missing params + a traversal slug, 404s an unknown repo / missing topic", async () => {
+			const configDir = writeMemoryBank(dir, [{ dir: "repoA", wiki: { "topic--auth.md": "# x\n" } }]);
+			const port = await listen(testServer({ configDir }));
+			expect((await get(port, "/graph-wiki?kb=repoA")).status).toBe(400); // missing slug
+			expect((await get(port, "/graph-wiki?slug=auth")).status).toBe(400); // missing kb
+			expect((await get(port, "/graph-wiki?kb=repoA&slug=..")).status).toBe(400); // traversal
+			expect((await get(port, "/graph-wiki?kb=repoA&slug=Bad_Slug")).status).toBe(400); // wrong shape
+			expect((await get(port, "/graph-wiki?kb=nope&slug=auth")).status).toBe(404); // unknown repo
+			expect((await get(port, "/graph-wiki?kb=repoA&slug=missing")).status).toBe(404); // missing topic
+		});
+
 		it("classes the REAL <body> for light theme (not the CSS comment's literal <body>)", async () => {
 			const configDir = writeMemoryBank(dir, [{ dir: "repoA", graph: '{"schemaVersion":4,"nodes":[]}' }]);
 			const port = await listen(testServer({ configDir }));

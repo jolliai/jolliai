@@ -256,7 +256,6 @@ describe("assembleGraph", () => {
 					{ hash: "def67890", message: "" },
 				],
 				overview: "T1 overview",
-				fullBody: "# body 1",
 			},
 		],
 		// t2 deliberately absent → empty source metadata
@@ -270,14 +269,13 @@ describe("assembleGraph", () => {
 
 		const t1 = graph.topics.find((t) => t.slug === "t1");
 		expect(t1?.sourceBranches).toEqual(["main", "feature/x"]);
-		expect(t1?.fullBody).toBe("# body 1");
 		expect(t1?.wikiFile).toBe("topic--t1.md");
 		expect(t1?.unitCount).toBe(2);
 		expect(t1?.commitCount).toBe(2);
 
 		const t2 = graph.topics.find((t) => t.slug === "t2");
 		expect(t2?.sourceBranches).toEqual([]);
-		expect(t2?.fullBody).toBe("");
+		expect(t2?.wikiFile).toBe("topic--t2.md");
 		expect(t2?.unitCount).toBe(1);
 		expect(t2?.commitCount).toBe(0);
 

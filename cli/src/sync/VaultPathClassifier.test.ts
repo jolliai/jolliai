@@ -27,6 +27,8 @@ describe("classifyVaultPath — positive cases", () => {
 		["myrepo/.jolli/plan-progress/my-feature.json", "plan-progress"],
 		["myrepo/.jolli/notes/note-xyz.md", "note"],
 		["myrepo/.jolli/graph/graph.json", "graph"],
+		["myrepo/_wiki/_index.md", "wiki"],
+		["myrepo/_wiki/topic--fix-auth.md", "wiki"],
 		[`myrepo/main/fix-auth-${HASH8}.md`, "visible-summary"],
 		["myrepo/main/plan--my-feature.md", "visible-plan"],
 		["myrepo/main/note--note-xyz.md", "visible-note"],
@@ -153,6 +155,21 @@ describe("classifyVaultPath — negative cases", () => {
 		expect(classifyVaultPath("myrepo/.jolli/graph/other.json")).toBeNull();
 		expect(classifyVaultPath("myrepo/.jolli/graph/graph.txt")).toBeNull();
 		expect(classifyVaultPath("myrepo/.jolli/graph/nested/x.json")).toBeNull();
+	});
+
+	it("classifies `_wiki/_index.md` and `_wiki/topic--<slug>.md` as `wiki`, strict on the leaf shape", () => {
+		// The knowledge-graph reader fetches these on click. They are named
+		// explicitly rather than riding the `user-content` fallthrough, so a
+		// future tightening of that fallthrough can't silently stop syncing them.
+		expect(classifyVaultPath("myrepo/_wiki/_index.md")).toBe("wiki");
+		expect(classifyVaultPath("myrepo/_wiki/topic--auth.md")).toBe("wiki");
+		expect(classifyVaultPath("myrepo/_wiki/topic--ai-context-relevance-filtering.md")).toBe("wiki");
+		// Wrong shapes under _wiki still SYNC (they fall back to the safe-segment
+		// `user-content` fallthrough) — they just don't earn the strict `wiki`
+		// kind. This keeps the canary tight without ever dropping a real file.
+		expect(classifyVaultPath("myrepo/_wiki/readme.md")).toBe("user-content");
+		expect(classifyVaultPath("myrepo/_wiki/topic--Bad_Slug.md")).toBe("user-content");
+		expect(classifyVaultPath("myrepo/_wiki/sub/topic--x.md")).toBe("user-content");
 	});
 
 	it("rejects shadow-status.json (per-device dirty-write recovery state — never synced)", () => {

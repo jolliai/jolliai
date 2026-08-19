@@ -25,7 +25,13 @@ vi.mock("vscode", () => ({
 	ViewColumn: { One: 1 },
 }));
 
-import { buildGraphHtml, KnowledgeGraphPanel, openKnowledgeGraph, renderGraphHtml } from "./KnowledgeGraphPanel.js";
+import {
+	buildGraphHtml,
+	KnowledgeGraphPanel,
+	openKnowledgeGraph,
+	readGraphWikiBody,
+	renderGraphHtml,
+} from "./KnowledgeGraphPanel.js";
 
 const TEMPLATE = `<!doctype html><html><head>
   <meta charset="utf-8" />
@@ -62,19 +68,29 @@ beforeEach(() => {
 	showInformationMessage.mockReset();
 	showErrorMessage.mockReset();
 	disposeCbs = [];
-	createWebviewPanel.mockImplementation((_viewType: string, title: string) => ({
-		webview: {
+	createWebviewPanel.mockImplementation((_viewType: string, title: string) => {
+		// biome-ignore lint/suspicious/noExplicitAny: loose webview mock, cast at call sites
+		const webview: any = {
 			asWebviewUri: (u: { toString: () => string }) => ({ toString: () => `vsc:${u.toString()}` }),
 			cspSource: "vscode-resource:",
 			html: "",
-		},
-		onDidDispose: (cb: () => void) => {
-			disposeCbs.push(cb);
-		},
-		reveal: vi.fn(),
-		title,
-		dispose: vi.fn(),
-	}));
+			postMessage: vi.fn(),
+			// Capture the handler so tests can drive it, and hand back a disposable.
+			onDidReceiveMessage: (cb: (m: unknown) => void) => {
+				webview._onMessage = cb;
+				return { dispose: vi.fn() };
+			},
+		};
+		return {
+			webview,
+			onDidDispose: (cb: () => void) => {
+				disposeCbs.push(cb);
+			},
+			reveal: vi.fn(),
+			title,
+			dispose: vi.fn(),
+		};
+	});
 });
 
 afterEach(() => {
@@ -146,6 +162,11 @@ describe("buildGraphHtml", () => {
 		expect(html).toContain("window.__EMBEDDED_GRAPH__ = {\"a\":1};");
 		expect(html).toContain("/assets/graph/vendor/panzoom.min.js");
 		expect(html).toContain("/assets/graph/styles/main.css");
+		// host-bridge.js MUST be loaded (defines WikiHost.requestWikiBody, the webview's
+		// on-demand body source) and BEFORE data.js. Dropping it from SCRIPT_FILES would
+		// silently break "Open full wiki page" in the webview.
+		expect(html).toContain("/assets/graph/js/host-bridge.js");
+		expect(html.indexOf("/js/host-bridge.js")).toBeLessThan(html.indexOf("/js/data.js"));
 	});
 
 	it("throws a clear error when the shipped template is missing from the build", () => {
@@ -162,37 +183,37 @@ describe("KnowledgeGraphPanel.show", () => {
 	it("opens one tab per repo, reuses a repo's tab on re-show, and recreates after dispose", () => {
 		const extensionUri = makeExtensionDir() as never;
 
-		KnowledgeGraphPanel.show(extensionUri, "repo-a", '{"a":1}');
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "repo-a", '{"a":1}');
 		expect(createWebviewPanel).toHaveBeenCalledTimes(1);
 		const panelA = createWebviewPanel.mock.results[0].value;
 		expect(panelA.title).toBe("Knowledge Graph — repo-a");
 
 		// A different repo gets its own tab — it does NOT overwrite repo-a's.
-		KnowledgeGraphPanel.show(extensionUri, "repo-b", '{"b":2}');
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "repo-b", '{"b":2}');
 		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 		const panelB = createWebviewPanel.mock.results[1].value;
 		expect(panelB.title).toBe("Knowledge Graph — repo-b");
 		expect(panelA.title).toBe("Knowledge Graph — repo-a"); // untouched
 
 		// Re-showing repo-a reveals its existing tab, no new panel.
-		KnowledgeGraphPanel.show(extensionUri, "repo-a", '{"a":11}');
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "repo-a", '{"a":11}');
 		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 		expect(panelA.reveal).toHaveBeenCalled();
 
 		// After repo-a's tab is disposed, the next show for repo-a creates a fresh panel.
 		disposeCbs[0]();
-		KnowledgeGraphPanel.show(extensionUri, "repo-a", '{"a":111}');
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "repo-a", '{"a":111}');
 		expect(createWebviewPanel).toHaveBeenCalledTimes(3);
 	});
 
 	it("ignores a late dispose for an already-recreated repo tab (stale-instance guard)", () => {
 		const extensionUri = makeExtensionDir() as never;
-		KnowledgeGraphPanel.show(extensionUri, "a", "{}"); // panel A1 (disposeCbs[0]), panels[a]=A1
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "a", "{}"); // panel A1 (disposeCbs[0]), panels[a]=A1
 		disposeCbs[0](); // dispose A1 -> panels[a] cleared (panels.get(a) === this TRUE)
-		KnowledgeGraphPanel.show(extensionUri, "a", "{}"); // panel A2 (disposeCbs[1]), panels[a]=A2
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "a", "{}"); // panel A2 (disposeCbs[1]), panels[a]=A2
 		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 		disposeCbs[0](); // A1's dispose fires again -> panels.get(a)(A2) !== A1 -> no-op (FALSE branch)
-		KnowledgeGraphPanel.show(extensionUri, "a", "{}"); // A2 still live -> reused, no 3rd panel
+		KnowledgeGraphPanel.show(extensionUri, "/kb", "a", "{}"); // A2 still live -> reused, no 3rd panel
 		expect(createWebviewPanel).toHaveBeenCalledTimes(2);
 	});
 });
@@ -255,5 +276,95 @@ describe("openKnowledgeGraph", () => {
 		}
 		expect(showErrorMessage).toHaveBeenCalledTimes(1);
 		expect(showErrorMessage.mock.calls[0][0]).toContain("raw-string-failure");
+	});
+});
+
+describe("readGraphWikiBody", () => {
+	it("reads a valid slug's page and rejects missing / malformed / traversal slugs", () => {
+		const kbParent = mkdtempSync(join(tmpdir(), "kg-rb-"));
+		tmpDirs.push(kbParent);
+		mkdirSync(join(kbParent, "repo-a", "_wiki"), { recursive: true });
+		writeFileSync(join(kbParent, "repo-a", "_wiki", "topic--auth.md"), "BODY", "utf8");
+		expect(readGraphWikiBody(kbParent, "repo-a", "auth")).toBe("BODY");
+		expect(readGraphWikiBody(kbParent, "repo-a", "missing")).toBeUndefined();
+		expect(readGraphWikiBody(kbParent, "repo-a", "../secret")).toBeUndefined();
+		expect(readGraphWikiBody(kbParent, "repo-a", "Bad_Slug")).toBeUndefined();
+	});
+});
+
+describe("KnowledgeGraphPanel — wiki body request handler", () => {
+	it("serves _wiki/topic--<slug>.md over postMessage, error-answers a miss, ignores junk", () => {
+		const extensionUri = makeExtensionDir() as never;
+		const kbParent = mkdtempSync(join(tmpdir(), "kg-msg-"));
+		tmpDirs.push(kbParent);
+		mkdirSync(join(kbParent, "repo-a", "_wiki"), { recursive: true });
+		writeFileSync(join(kbParent, "repo-a", "_wiki", "topic--auth.md"), "# Auth\n\nbody", "utf8");
+
+		KnowledgeGraphPanel.show(extensionUri, kbParent, "repo-a", "{}");
+		const panel = createWebviewPanel.mock.results[0].value;
+		const onMessage = panel.webview._onMessage as (m: unknown) => void;
+		const post = panel.webview.postMessage as ReturnType<typeof vi.fn>;
+
+		// A hit → the body is posted back, keyed by the request id.
+		onMessage({ type: "jolli-graph-wiki-request", requestId: "r1", slug: "auth" });
+		expect(post).toHaveBeenLastCalledWith({
+			type: "jolli-graph-wiki-body",
+			requestId: "r1",
+			slug: "auth",
+			markdown: "# Auth\n\nbody",
+		});
+
+		// A missing topic → error, never a body.
+		onMessage({ type: "jolli-graph-wiki-request", requestId: "r2", slug: "missing" });
+		expect(post).toHaveBeenLastCalledWith({
+			type: "jolli-graph-wiki-body",
+			requestId: "r2",
+			slug: "missing",
+			error: "not-found",
+		});
+
+		// A traversal slug is blocked before it reaches disk → error.
+		onMessage({ type: "jolli-graph-wiki-request", requestId: "r3", slug: "../secret" });
+		expect(post).toHaveBeenLastCalledWith({
+			type: "jolli-graph-wiki-body",
+			requestId: "r3",
+			slug: "../secret",
+			error: "not-found",
+		});
+
+		// Unrelated / malformed messages are ignored (no extra posts).
+		const before = post.mock.calls.length;
+		onMessage({ type: "jolli-graph-other" });
+		onMessage({ type: "jolli-graph-wiki-request", requestId: "r4" }); // no slug
+		onMessage(null);
+		expect(post.mock.calls.length).toBe(before);
+	});
+
+	it("re-reads _wiki from the NEW kbParent after the folder is re-targeted on re-show", () => {
+		const extensionUri = makeExtensionDir() as never;
+		const kb1 = mkdtempSync(join(tmpdir(), "kg-kb1-"));
+		const kb2 = mkdtempSync(join(tmpdir(), "kg-kb2-"));
+		tmpDirs.push(kb1, kb2);
+		mkdirSync(join(kb1, "repo-a", "_wiki"), { recursive: true });
+		mkdirSync(join(kb2, "repo-a", "_wiki"), { recursive: true });
+		writeFileSync(join(kb1, "repo-a", "_wiki", "topic--auth.md"), "OLD FOLDER BODY", "utf8");
+		writeFileSync(join(kb2, "repo-a", "_wiki", "topic--auth.md"), "NEW FOLDER BODY", "utf8");
+
+		KnowledgeGraphPanel.show(extensionUri, kb1, "repo-a", "{}");
+		// Re-show the SAME repo after the Memory Bank folder was re-targeted (kb1 → kb2).
+		KnowledgeGraphPanel.show(extensionUri, kb2, "repo-a", "{}");
+		expect(createWebviewPanel).toHaveBeenCalledTimes(1); // same panel reused
+		const panel = createWebviewPanel.mock.results[0].value;
+		const onMessage = panel.webview._onMessage as (m: unknown) => void;
+		const post = panel.webview.postMessage as ReturnType<typeof vi.fn>;
+
+		onMessage({ type: "jolli-graph-wiki-request", requestId: "r1", slug: "auth" });
+		// Must serve from kb2 (the re-targeted folder), not the stale kb1.
+		expect(post).toHaveBeenLastCalledWith({
+			type: "jolli-graph-wiki-body",
+			requestId: "r1",
+			slug: "auth",
+			markdown: "NEW FOLDER BODY",
+		});
 	});
 });
