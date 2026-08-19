@@ -40,6 +40,7 @@ const h = vi.hoisted(() => ({
 	// `--repair-transcripts` per-candidate error-isolation test can make exactly
 	// one candidate fail without touching any other test's real repair behavior.
 	throwHash: "f".repeat(40),
+	findStrandedRoots: vi.fn(),
 }));
 
 vi.mock("../dashboard/SessionSyncRunner.js", () => ({ runSessionSync: h.runSessionSync }));
@@ -119,6 +120,7 @@ vi.mock("../core/TranscriptRepair.js", async (importOriginal) => {
 		),
 	};
 });
+vi.mock("../core/repair/StrandedTrees.js", () => ({ findStrandedRoots: h.findStrandedRoots }));
 vi.mock("../install/DistPathResolver.js", () => ({ traverseDistPaths: h.traverseDistPaths }));
 vi.mock("../install/Installer.js", () => ({ getStatus: h.getStatus, install: h.install }));
 vi.mock("../PluginLoader.js", () => ({ inspectPlugins: h.inspectPlugins }));
@@ -180,6 +182,7 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 		h.getGlobalConfigDir.mockReturnValue("/global");
 		h.traverseDistPaths.mockReturnValue([]);
 		h.inspectPlugins.mockResolvedValue([]);
+		h.findStrandedRoots.mockResolvedValue([]);
 	});
 
 	afterEach(() => {
@@ -398,6 +401,78 @@ describe("DoctorCommand — local-agent tool diagnostic", () => {
 		expect(lines).toContain("Git hooks: reinstalled");
 		expect(lines).not.toContain("--fix would apply:");
 		expect(h.install).toHaveBeenCalled();
+	});
+});
+
+describe("DoctorCommand — Memory tree check", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+		h.resolveProjectDir.mockReturnValue("/repo");
+		h.readManualDisableFlag.mockResolvedValue(false);
+		h.getStatus.mockResolvedValue({ gitHookInstalled: true, claudeHookInstalled: true, geminiHookInstalled: true });
+		h.orphanBranchExists.mockResolvedValue(true);
+		h.resolveSotBackend.mockResolvedValue({ ok: true, state: "uncutover", storage: {} });
+		h.isWorkerLockStale.mockResolvedValue(false);
+		h.loadAllSessions.mockResolvedValue([]);
+		h.countActiveQueueEntries.mockResolvedValue(0);
+		h.loadConfig.mockResolvedValue({});
+		h.resolveLlmCredentialSource.mockReturnValue("anthropic-config");
+		h.getGlobalConfigDir.mockReturnValue("/global");
+		// A healthy, fully-registered install (not `[]`, which independently fails
+		// the unrelated "dist-paths" check) so this describe's exit-code
+		// assertions isolate what the Memory tree check itself contributes.
+		h.traverseDistPaths.mockReturnValue([{ source: "cli", version: "1.0.0", distDir: "/dist", available: true }]);
+		h.inspectPlugins.mockResolvedValue([]);
+		h.findStrandedRoots.mockResolvedValue([]);
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+	});
+
+	it("reports ok with no stranded trees", async () => {
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("Memory tree");
+		expect(lines).toContain("no stranded trees");
+	});
+
+	it("warns with a count and points at `jolli repair-memory` when trees are stranded", async () => {
+		h.findStrandedRoots.mockResolvedValue([{}, {}] as never);
+
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("2 stranded tree(s)");
+		expect(lines).toContain("jolli repair-memory");
+		// warn, not fail: a stranded tree must not flip doctor's overall exit code.
+		expect(process.exitCode).toBeUndefined();
+	});
+
+	it("does not repair stranded trees under --fix — the check carries no fixer", async () => {
+		h.findStrandedRoots.mockResolvedValue([{}, {}] as never);
+
+		const lines = (await runDoctor(["--fix"])).join("\n");
+
+		expect(lines).toContain("2 stranded tree(s)");
+		// `findStrandedRoots` runs exactly once for the report; no second call from
+		// an "Applying fixes..." pass, because this check declares no `fixer`.
+		expect(h.findStrandedRoots).toHaveBeenCalledTimes(1);
+		expect(lines).not.toMatch(/Applying fixes[\s\S]*Memory tree/);
+	});
+
+	it("reports a detection failure as its own warn state, never as 'no stranded trees'", async () => {
+		h.findStrandedRoots.mockRejectedValue(new Error("not a git repo"));
+
+		const lines = (await runDoctor()).join("\n");
+
+		expect(lines).toContain("Memory tree");
+		expect(lines).toContain("could not determine — not a git repo");
+		expect(lines).not.toContain("no stranded trees");
+		// warn, not fail: a detection failure must not flip doctor's overall exit
+		// code either — it is diagnostic, not a fault this build caused.
+		expect(process.exitCode).toBeUndefined();
 	});
 });
 

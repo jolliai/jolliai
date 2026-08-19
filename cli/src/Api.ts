@@ -36,6 +36,7 @@ import { registerPrDescriptionCommand } from "./commands/PrDescriptionCommand.js
 import { registerPushControlCommand } from "./commands/PushControlCommand.js";
 import { registerQueueStatusCommand } from "./commands/QueueStatusCommand.js";
 import { registerRecallCommand } from "./commands/RecallCommand.js";
+import { registerRepairMemoryCommand } from "./commands/RepairMemoryCommand.js";
 import { registerSearchCommand } from "./commands/SearchCommand.js";
 import { registerStatusCommand } from "./commands/StatusCommand.js";
 import { registerSyncCommand } from "./commands/SyncCommand.js";
@@ -179,6 +180,7 @@ const MEMORY_COMMAND_NAMES = new Set([
 	"clean",
 	"doctor",
 	"cutover",
+	"repair-memory",
 	"view",
 	"recall",
 	"search",
@@ -379,6 +381,7 @@ export async function main(args?: ReadonlyArray<string>): Promise<void> {
 	registerUninstallCommand(program);
 	registerStatusCommand(program);
 	registerCutoverCommand(program);
+	registerRepairMemoryCommand(program);
 	registerConfigureCommand(program);
 	registerCleanCommand(program);
 	registerDoctorCommand(program);

@@ -20,6 +20,7 @@ import { getBackend } from "../core/localagent/BackendRegistry.js";
 import { describeCandidate } from "../core/localagent/ExecutableResolver.js";
 import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
+import { findStrandedRoots } from "../core/repair/StrandedTrees.js";
 import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
 import { createStorage } from "../core/StorageFactory.js";
@@ -408,6 +409,38 @@ async function runDoctor(cwd: string, fix: boolean, dryRun = false, forgetDead =
 				? "absent (expected — this repo is cut over to SQLite)"
 				: "not yet created (will be created on first commit)",
 	});
+
+	// 2c. Memory tree — a stranded root (one an amend, rebase or squash left
+	// under a commit hash the branch no longer has) is reported but never
+	// repaired here: `jolli repair-memory` can call the LLM, cost money, take
+	// tens of seconds and fail, and every other `--fix` repair in this command
+	// is instant, free and idempotent. Folding this one in would make running
+	// `doctor --fix` a risky act, so this check carries no `fixer` at all.
+	//
+	// Detection failure must NOT read as "ok" — this check exists to surface a
+	// failure class (a memory tree stranded with nothing reporting it) that was
+	// previously invisible, so silently answering "no stranded trees" when
+	// detection itself failed (non-git cwd, a storage error, ...) reproduces
+	// that exact blind spot inside the tool built to remove it.
+	let strandedCheck: DoctorCheck;
+	try {
+		const stranded = await findStrandedRoots(cwd);
+		strandedCheck =
+			stranded.length === 0
+				? { name: "Memory tree", status: "ok", message: "no stranded trees" }
+				: {
+						name: "Memory tree",
+						status: "warn",
+						message: `${stranded.length} stranded tree(s) — run \`jolli repair-memory\` to reattach`,
+					};
+	} catch (err) {
+		strandedCheck = {
+			name: "Memory tree",
+			status: "warn",
+			message: `could not determine — ${err instanceof Error ? err.message : String(err)}`,
+		};
+	}
+	checks.push(strandedCheck);
 
 	// 3. Worker lock (stuck = exists AND older than LOCK_HEARTBEAT_TIMEOUT_MS; a normal worker
 	// refreshes mtime every minute, so any age > 5 min implies a crashed worker).

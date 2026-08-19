@@ -117,11 +117,11 @@ import {
 	saveCursor,
 	savePlansRegistry,
 } from "../core/SessionTracker.js";
+import { consolidateSquashSources } from "../core/SquashConsolidation.js";
 import { cleanupBranchStaleChildMarkdown } from "../core/StaleChildMarkdownCleanup.js";
 import { createStorage } from "../core/StorageFactory.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import {
-	extractTicketIdFromMessage,
 	generateSquashConsolidation,
 	generateSummary,
 	mechanicalConsolidate,
@@ -2560,14 +2560,12 @@ async function consumeSquashContext(args: {
  *     with squash/fixup in the todo list.
  *
  * Steps:
- *   1. Build SquashConsolidationSource[] via expandSourcesForConsolidation.
- *      This preserves commit-level grouping for nested squash roots (rule 4
- *      supersede evidence relies on per-commit chronology).
- *   2. Extract the outer ticketId from the squash commit message (highest
- *      priority hint per ticketId resolution chain in generateSquashConsolidation).
- *   3. Call generateSquashConsolidation -- returns null on no-content / repeated
- *      LLM failure, in which case mechanicalConsolidate concatenates source
- *      content as a graceful fallback (Hoist invariant always completes).
+ *   1-3. Source expansion, outer-ticketId extraction and the LLM/mechanical
+ *      consolidation call -- delegated to `consolidateSquashSources`
+ *      (SquashConsolidation.ts), shared with `jolli repair-memory`. This
+ *      caller passes the commit-time failure policy: `onFailure: "mechanical"`,
+ *      because losing the memory on a fire-and-forget path is unacceptable
+ *      (Hoist invariant always completes).
  *   4. mergeManyToOne writes the v4 root with consolidated topics+recap and
  *     stripped children.
  *
@@ -2589,83 +2587,26 @@ async function runSquashPipeline(
 	// Best-effort — a clear failure must never break consolidation.
 	await clearAiSelection(cwd).catch((err) => log.warn("clearAiSelection failed: %s", (err as Error).message));
 
-	// Expand each source via expandSourcesForConsolidation: preserves per-commit
-	// grouping for nested squash roots (so the LLM can apply rule 4 evidence).
-	const sources: ReadonlyArray<SquashConsolidationSource> = oldSummaries.flatMap(expandSourcesForConsolidation);
-
-	// Outer ticketId: the squash commit message often carries the explicit ticket
-	// ("PROJ-123: ..."), which beats per-source ticketIds. extractTicketIdFromMessage
-	// returns undefined when none is present, leaving the inner resolution chain
-	// (earliest source -> LLM-extracted) to fill in.
-	const outerTicketId = extractTicketIdFromMessage(commitInfo.message);
-
-	// Source-state inheritance: if any source summary is already in a degraded
-	// state, the squash result is "merged from compromised inputs" — consolidate
-	// only mergers existing topic structures, it does NOT re-derive from raw
-	// diff + transcript like Regenerator does. expandSourcesForConsolidation
-	// drops summaryError from the source contract (only carries topics/recap/
-	// ticketId/commitMessage), so the LLM never sees the failure history; we
-	// have to OR it in at the caller level.
-	const anySourceFailed = oldSummaries.some(isSummaryError);
-
-	let consolidated: ConsolidatedTopics & { status: "llm" | "mechanical" };
-
-	try {
-		const config = await loadConfig();
-		const outcome = await generateSquashConsolidation({
-			squashCommitMessage: commitInfo.message,
-			/* v8 ignore next */
-			...(outerTicketId !== undefined && { ticketId: outerTicketId }),
-			sources,
-			config,
-		});
-		/* v8 ignore start -- mechanical fallback arms: "no-content" and "llm-error" both re-route to mechanicalConsolidate; covered at integration level by Summarizer's own tests. */
-		if (outcome.status === "ok") {
-			consolidated = {
-				topics: outcome.topics,
-				...(outcome.recap !== undefined && { recap: outcome.recap }),
-				...(outcome.ticketId !== undefined && { ticketId: outcome.ticketId }),
-				llm: outcome.llm,
-				status: "llm",
-				...(anySourceFailed && { summaryError: LLM_FAILED }),
-			};
-		} else if (outcome.status === "llm-error") {
-			// Real LLM failure (both attempts threw). Mechanical fallback preserves
-			// source content; mark the root with summaryError so the webview
-			// banner fires.
-			consolidated = {
-				...mechanicalConsolidate(sources, outerTicketId),
-				status: "mechanical",
-				summaryError: LLM_FAILED,
-			};
-		} else {
-			// "no-content": no sources / all-empty sources / LLM self-reported
-			// nothing to merge. Healthy case — mechanical fallback. Marker only
-			// if a source was already degraded (input-contamination inheritance).
-			consolidated = {
-				...mechanicalConsolidate(sources, outerTicketId),
-				status: "mechanical",
-				...(anySourceFailed && { summaryError: LLM_FAILED }),
-			};
-		}
-	} catch (err) {
-		// Defensive: unexpected runtime error outside generateSquashConsolidation
-		// (e.g. loadConfig throws). Treat as llm-error so the user sees a banner.
-		log.warn("Squash consolidation failed (runtime), using mechanical merge: %s", errMsg(err));
-		consolidated = {
-			...mechanicalConsolidate(sources, outerTicketId),
-			status: "mechanical",
-			summaryError: LLM_FAILED,
-		};
-	}
-	/* v8 ignore stop */
+	// Delegates to the shared pipeline (extracted so `jolli repair-memory` can
+	// reuse it with a different failure policy). QueueWorker runs at commit
+	// time, fire-and-forget, with no retry -- losing the memory is
+	// unacceptable, so a failed LLM call degrades to a mechanical merge
+	// rather than throwing. See SquashConsolidation.ts for the full contract,
+	// including the source-state inheritance (anySourceFailed -> summaryError).
+	const consolidated = await consolidateSquashSources(oldSummaries, commitInfo.message, {
+		onFailure: "mechanical",
+		useLlm: true,
+	});
 
 	/* v8 ignore start -- log formatting (recap presence ternary). */
+	// Source counts come back on the result: consolidateSquashSources already
+	// expanded the sources, so re-running expandSourcesForConsolidation here purely
+	// for the log would walk every source tree a second time on the commit path.
 	log.info(
 		"Squash consolidation for %s: sources=%d, topics %d → %d, recap=%s, status=%s",
 		commitInfo.hash.substring(0, 8),
-		sources.length,
-		sources.reduce((n, s) => n + s.topics.length, 0),
+		consolidated.sourceCount,
+		consolidated.sourceTopicCount,
 		consolidated.topics.length,
 		consolidated.recap ? "yes" : "no",
 		consolidated.status,

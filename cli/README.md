@@ -430,6 +430,8 @@ jolli doctor --mark-migration <name>
 
 `--schema-log` also flags any migration whose recorded text disagrees with the build you are running. That is a warning, never a refusal: a newer or older database is still opened and written normally. `--mark-migration` exists for the one state that cannot be repaired by re-running — the log lost a row while the change it describes is already in place, so a normal open would try to apply it again and fail. Deleting the database is never the answer; memories rebuild from git, but session usage and recall history have no second copy.
 
+Doctor also reports **stranded memory trees** — memories left under a commit hash an amend, rebase or squash removed from your branch. `--fix` deliberately does not repair those: that repair can call the AI model, cost money and take tens of seconds, while every other `--fix` action is instant and free. Run [`jolli repair-memory`](#jolli-repair-memory) instead.
+
 Doctor is deliberately narrow — it only flags conditions that *break* Jolli Memory. Stale-but-harmless data (old sessions, orphan files from amend/squash) is handled by `clean`.
 
 ### `jolli clean`
@@ -526,6 +528,46 @@ jolli cutover --probe
 ```
 
 **This is effectively one-way.** Cutover freezes the repo's orphan branch, and `jolli enable` will not unfreeze it — only an explicit manual path in `jolli doctor` can. Run `--status` first; it reports the current repo only, not a list across repos. `--probe` reports any writer that has moved a frozen branch since cutover (an old client, or an IDE that was never restarted).
+
+### `jolli repair-memory`
+
+Reattaches memory trees that an amend, rebase or squash left behind.
+
+When a commit is rewritten, its memory has to move to the new commit hash. If that
+migration did not happen, the old memory stays mounted under a hash your branch no
+longer has: the conversations, skills and topics are all still there, one hash away,
+while the new commit shows either no memory or a thin one with nothing in it. Nothing
+reported this before — `jolli doctor` now warns when it finds one, and this command
+fixes it.
+
+```bash
+# Show what would be repaired, changing nothing
+jolli repair-memory --status
+
+# Repair
+jolli repair-memory
+
+# When the reflog can no longer pair the two hashes, say so yourself
+jolli repair-memory --from <old-hash> --to <new-hash>
+
+# Merge squashed sources without calling the AI model
+jolli repair-memory --no-llm
+```
+
+`--status` lists, per stranded memory: what it would do, the commit it would attach to,
+how many conversations and skills that brings back, and whether it needs an AI call.
+Running without `--status` performs the repair, including the AI consolidation a squash
+needs — `--no-llm` merges those mechanically instead.
+
+Every memory the repair is about to overwrite is copied to
+`.jolli/jollimemory/repair-backups/<timestamp>/` first. Repairing twice is safe: the
+second run finds nothing to do.
+
+Pairing comes from your git reflog, which is per-clone and expires (90 days by default),
+so on a fresh clone or an old rewrite there may be nothing to pair with. That is what
+`--from/--to` is for. Jolli never guesses a target: if the commit you name does not
+exist, or is itself unreachable, the command refuses rather than moving the memory
+somewhere it would be stranded again.
 
 ## Session Context Recall
 

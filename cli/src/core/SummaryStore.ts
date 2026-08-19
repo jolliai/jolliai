@@ -341,121 +341,289 @@ export async function storeSummary(
 	// write (mkdir + lock file), so the storage-level writeFiles gate alone
 	// would still leave a lock artifact behind on a manually-disabled project.
 	if (isManuallyDisabled()) return;
-	await withRequiredOrphanWriteLock(cwd, "storeSummary", async () => {
-		const writeIndex = await loadIndex(cwd, storage);
-		const writeCatalog = await loadCatalog(cwd, storage);
-		// Union the read-side (folder shadow) snapshot into the base so
-		// peer-synced rows survive the dual-write rewrite. See
-		// `unionIndexes` for merge semantics; the matching payload-lift
-		// below uses `folderOnlyHashes` to keep the writeStorage backing
-		// files in sync with the rebuilt index.
-		const hasDistinctReadStorage = readStorage !== undefined && readStorage !== storage;
-		const readIndex = hasDistinctReadStorage ? await loadIndex(cwd, readStorage) : null;
-		const readCatalog = hasDistinctReadStorage ? await loadCatalog(cwd, readStorage) : null;
-		const existingIndex = hasDistinctReadStorage ? unionIndexes(writeIndex, readIndex) : writeIndex;
-		const existingCatalog = hasDistinctReadStorage ? unionCatalogs(writeCatalog, readCatalog) : writeCatalog;
-		const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
-		const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
+	await withRequiredOrphanWriteLock(cwd, "storeSummary", () =>
+		storeSummaryLocked(summary, cwd, force, artifacts, storage, readStorage),
+	);
+}
 
-		// Hashes whose index row was contributed by readStorage but whose
-		// backing `summaries/<hash>.json` payload hasn't reached writeStorage
-		// yet. Without lifting these files into the same write batch, the
-		// orphan branch ends up with index entries that point at payloads
-		// only the folder side actually has — and every orphan-routed
-		// reader (`getSummary`/`readSummaryFile` via the active storage,
-		// `QueueWorker.loadSourceSummaries`, `SummaryExporter`) returns
-		// null on those rows. `DualWriteStorage.readFile` is primary-only,
-		// so even in dual-write mode we cannot lean on the folder for
-		// payload resolution at read time — orphan must be self-complete.
-		const folderOnlyHashes = new Set<string>();
-		if (hasDistinctReadStorage && readIndex) {
-			const writeHashes = new Set(writeIndex?.entries.map((e) => e.commitHash) ?? []);
-			for (const entry of readIndex.entries) {
-				if (!writeHashes.has(entry.commitHash)) folderOnlyHashes.add(entry.commitHash);
-			}
+/**
+ * The body of {@link storeSummary}, minus the lock.
+ *
+ * Named so a second writer (`remountStrandedTree`) can run it under its OWN
+ * lock acquisition. Calling the public `storeSummary` from inside another
+ * locked section would acquire the lock a second time; the lock refuses even
+ * its own PID, so that write polls out its budget and then reports
+ * contention — a log line identical to real contention, while nothing lands.
+ */
+async function storeSummaryLocked(
+	summary: CommitSummary,
+	cwd?: string,
+	force = false,
+	artifacts?: {
+		readonly transcript?: { readonly id: string; readonly data: StoredTranscript };
+		readonly planProgress?: ReadonlyArray<PlanProgressArtifact>;
+	},
+	storage?: StorageProvider,
+	readStorage?: StorageProvider,
+): Promise<void> {
+	const writeIndex = await loadIndex(cwd, storage);
+	const writeCatalog = await loadCatalog(cwd, storage);
+	// Union the read-side (folder shadow) snapshot into the base so
+	// peer-synced rows survive the dual-write rewrite. See
+	// `unionIndexes` for merge semantics; the matching payload-lift
+	// below uses `folderOnlyHashes` to keep the writeStorage backing
+	// files in sync with the rebuilt index.
+	const hasDistinctReadStorage = readStorage !== undefined && readStorage !== storage;
+	const readIndex = hasDistinctReadStorage ? await loadIndex(cwd, readStorage) : null;
+	const readCatalog = hasDistinctReadStorage ? await loadCatalog(cwd, readStorage) : null;
+	const existingIndex = hasDistinctReadStorage ? unionIndexes(writeIndex, readIndex) : writeIndex;
+	const existingCatalog = hasDistinctReadStorage ? unionCatalogs(writeCatalog, readCatalog) : writeCatalog;
+	const existingEntries = existingIndex?.entries ? [...existingIndex.entries] : [];
+	const entryMap = new Map(existingEntries.map((e) => [e.commitHash, e]));
+
+	// Hashes whose index row was contributed by readStorage but whose
+	// backing `summaries/<hash>.json` payload hasn't reached writeStorage
+	// yet. Without lifting these files into the same write batch, the
+	// orphan branch ends up with index entries that point at payloads
+	// only the folder side actually has — and every orphan-routed
+	// reader (`getSummary`/`readSummaryFile` via the active storage,
+	// `QueueWorker.loadSourceSummaries`, `SummaryExporter`) returns
+	// null on those rows. `DualWriteStorage.readFile` is primary-only,
+	// so even in dual-write mode we cannot lean on the folder for
+	// payload resolution at read time — orphan must be self-complete.
+	const folderOnlyHashes = new Set<string>();
+	if (hasDistinctReadStorage && readIndex) {
+		const writeHashes = new Set(writeIndex?.entries.map((e) => e.commitHash) ?? []);
+		for (const entry of readIndex.entries) {
+			if (!writeHashes.has(entry.commitHash)) folderOnlyHashes.add(entry.commitHash);
 		}
+	}
 
-		// Duplicate guard: skip if root already indexed and force=false
-		if (!force && entryMap.has(summary.commitHash)) {
-			log.info(
-				"Summary for commit %s already exists — skipping (use force to overwrite)",
-				summary.commitHash.substring(0, 8),
-			);
-			return;
-		}
+	// Duplicate guard: skip if root already indexed and force=false
+	if (!force && entryMap.has(summary.commitHash)) {
+		log.info(
+			"Summary for commit %s already exists — skipping (use force to overwrite)",
+			summary.commitHash.substring(0, 8),
+		);
+		return;
+	}
 
-		// Flatten the entire tree into index entries and upsert
-		const newEntries = await flattenSummaryTree(summary, null, cwd, entryMap);
-		for (const entry of newEntries) {
-			entryMap.set(entry.commitHash, entry);
-		}
+	// Flatten the entire tree into index entries and upsert
+	const newEntries = await flattenSummaryTree(summary, null, cwd, entryMap);
+	for (const entry of newEntries) {
+		entryMap.set(entry.commitHash, entry);
+	}
 
-		const newIndex: SummaryIndex = {
-			version: 3,
-			entries: [...entryMap.values()],
-			commitAliases: existingIndex?.commitAliases,
-		};
+	const newIndex: SummaryIndex = {
+		version: 3,
+		entries: [...entryMap.values()],
+		commitAliases: existingIndex?.commitAliases,
+	};
 
-		const verb = force ? "Overwrite" : "Add";
-		const files: FileWrite[] = [
-			{ path: `summaries/${summary.commitHash}.json`, content: JSON.stringify(summary, null, "\t") },
-			{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
-			buildCatalogFileWrite(existingCatalog, entryMap, summary),
-		];
+	const verb = force ? "Overwrite" : "Add";
+	const files: FileWrite[] = [
+		{ path: `summaries/${summary.commitHash}.json`, content: JSON.stringify(summary, null, "\t") },
+		{ path: INDEX_FILE, content: JSON.stringify(newIndex, null, "\t") },
+		buildCatalogFileWrite(existingCatalog, entryMap, summary),
+	];
 
-		// Append transcript file if provided. Path is keyed by the v5 transcript
-		// ID, not the commit hash — caller is responsible for matching the ID to
-		// the IDs listed in `summary.transcripts`.
-		if (artifacts?.transcript && artifacts.transcript.data.sessions.length > 0) {
+	// Append transcript file if provided. Path is keyed by the v5 transcript
+	// ID, not the commit hash — caller is responsible for matching the ID to
+	// the IDs listed in `summary.transcripts`.
+	if (artifacts?.transcript && artifacts.transcript.data.sessions.length > 0) {
+		files.push({
+			path: `transcripts/${artifacts.transcript.id}.json`,
+			content: JSON.stringify(artifacts.transcript.data, null, "\t"),
+		});
+	}
+
+	// Append plan progress files if provided
+	if (artifacts?.planProgress) {
+		for (const progress of artifacts.planProgress) {
 			files.push({
-				path: `transcripts/${artifacts.transcript.id}.json`,
-				content: JSON.stringify(artifacts.transcript.data, null, "\t"),
+				path: `plan-progress/${progress.planSlug}.json`,
+				content: JSON.stringify(progress, null, "\t"),
 			});
 		}
+	}
 
-		// Append plan progress files if provided
-		if (artifacts?.planProgress) {
-			for (const progress of artifacts.planProgress) {
-				files.push({
-					path: `plan-progress/${progress.planSlug}.json`,
-					content: JSON.stringify(progress, null, "\t"),
-				});
+	// Backfill the payloads behind every folder-only index row so the
+	// orphan branch ends this commit with index → file integrity.
+	// Missing files (embedded squash children that never had their
+	// own `summaries/<hash>.json`) are silently skipped — leaving
+	// the index row alone is the right behavior there since the
+	// child resolves through its parent root's blob via
+	// `flattenSummaryTree` / `getSummary`'s prefix scan. The headline
+	// summary's own hash is skipped because its payload is already in
+	// the batch above (avoids a duplicate path inside one `writeFiles`).
+	if (folderOnlyHashes.size > 0 && readStorage) {
+		for (const hash of folderOnlyHashes) {
+			if (hash === summary.commitHash) continue;
+			const summaryPath = `summaries/${hash}.json`;
+			const transcriptPath = `transcripts/${hash}.json`;
+			const summaryPayload = await readStorage.readFile(summaryPath);
+			if (summaryPayload !== null) {
+				files.push({ path: summaryPath, content: summaryPayload });
+			}
+			const transcriptPayload = await readStorage.readFile(transcriptPath);
+			if (transcriptPayload !== null) {
+				files.push({ path: transcriptPath, content: transcriptPayload });
 			}
 		}
+	}
 
-		// Backfill the payloads behind every folder-only index row so the
-		// orphan branch ends this commit with index → file integrity.
-		// Missing files (embedded squash children that never had their
-		// own `summaries/<hash>.json`) are silently skipped — leaving
-		// the index row alone is the right behavior there since the
-		// child resolves through its parent root's blob via
-		// `flattenSummaryTree` / `getSummary`'s prefix scan. The headline
-		// summary's own hash is skipped because its payload is already in
-		// the batch above (avoids a duplicate path inside one `writeFiles`).
-		if (folderOnlyHashes.size > 0 && readStorage) {
-			for (const hash of folderOnlyHashes) {
-				if (hash === summary.commitHash) continue;
-				const summaryPath = `summaries/${hash}.json`;
-				const transcriptPath = `transcripts/${hash}.json`;
-				const summaryPayload = await readStorage.readFile(summaryPath);
-				if (summaryPayload !== null) {
-					files.push({ path: summaryPath, content: summaryPayload });
-				}
-				const transcriptPayload = await readStorage.readFile(transcriptPath);
-				if (transcriptPayload !== null) {
-					files.push({ path: transcriptPath, content: transcriptPayload });
-				}
-			}
-		}
+	const store = await resolveStorage(storage, cwd);
+	await store.writeFiles(
+		files,
+		`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
+	);
 
-		const store = await resolveStorage(storage, cwd);
-		await store.writeFiles(
-			files,
-			`${verb} summary for ${summary.commitHash.substring(0, 8)}: ${summary.commitMessage.substring(0, 50)}`,
-		);
+	log.info("Summary stored successfully for commit %s", summary.commitHash.substring(0, 8));
+}
 
-		log.info("Summary stored successfully for commit %s", summary.commitHash.substring(0, 8));
-	});
+/**
+ * The fields a rewrite copies from the old root onto the new one.
+ *
+ * Copy, not move: skills are deliberately NOT stripped off the child
+ * (`stripFunctionalMetadata` has no stripSkills), so root and child hold the
+ * same ref. A later squash's `collectChildSkills` meets each ref from both
+ * ends and `mergeSkillRefs` dedupes by `archivedKey`.
+ *
+ * The skill-usage article id/url are hoisted for the same reason the article's
+ * content is unchanged across a rewrite: the new root carries the SAME refs as
+ * the old one, so the next push must update that article in place rather than
+ * publish a duplicate. Dropping the id would leave the original stranded under
+ * a hash the branch no longer has.
+ *
+ * References get the same Copy-Hoist treatment as plans / notes: without it, a
+ * rewrite would silently drop reference refs from the new root even though the
+ * registry still points at correctly-archived snapshot files.
+ *
+ * ONE definition, two callers (`migrateOneToOne` and `remountStrandedTree`).
+ * A second hand-maintained list is how the next field gets dropped, and the
+ * failure is silent: a memory simply missing its skills, with nothing to say so.
+ *
+ * It answers WHICH fields travel, never how they combine. The copy semantics
+ * here are correct only where the destination has nothing of its own to lose —
+ * true of `migrateOneToOne`'s brand-new root, false of `remountStrandedTree`'s
+ * target, which therefore unions each field against the target's own on top of
+ * this result. Do not fold those unions in here.
+ */
+export function copyHoistFields(oldSummary: CommitSummary): Partial<CommitSummary> {
+	return {
+		...(oldSummary.skills && { skills: oldSummary.skills }),
+		...(oldSummary.jolliSkillsDocId && { jolliSkillsDocId: oldSummary.jolliSkillsDocId }),
+		...(oldSummary.jolliSkillsDocUrl && { jolliSkillsDocUrl: oldSummary.jolliSkillsDocUrl }),
+		...(oldSummary.transcripts && { transcripts: oldSummary.transcripts }),
+		...(oldSummary.plans && { plans: oldSummary.plans }),
+		...(oldSummary.notes && { notes: oldSummary.notes }),
+		...(oldSummary.references && { references: oldSummary.references }),
+	};
+}
+
+/**
+ * Attach a stranded tree under a target that ALREADY has its own memory.
+ *
+ * The counterpart to `migrateOneToOne`, for the case that function cannot
+ * serve: its `topics` come from `resolveEffectiveTopics(oldSummary)`, so it
+ * would overwrite the target's own topics and recap. Here the target's
+ * generated content wins and only the tree and the hoisted refs come across.
+ *
+ * **Every hoisted array is a UNION with the target's own, not a copy over it.**
+ * `copyHoistFields` alone is copy-not-merge, which is safe in `migrateOneToOne`
+ * (its target is a brand-new root with nothing to lose) and is data loss here
+ * by construction: this path exists precisely because the target ALREADY has
+ * its own memory. Under the v5 contract `transcripts` is always present, so a
+ * plain copy always replaced the target's own conversation IDs — and since
+ * `children` is `[strandedRoot]` alone, those IDs then existed nowhere in the
+ * tree, while the command reported the repair as a success. This is the exact
+ * "a memory simply missing its skills, with nothing to say so" failure the
+ * shared `copyHoistFields` was introduced to prevent, one layer along.
+ *
+ * The union rules are `mergeManyToOneLocked`'s, reused rather than restated:
+ * `mergeRefsNewWins` + `snapshotKeyOf` for plans / notes / references (the
+ * target's own refs are the newer side and win a key collision), `mergeSkillRefs`
+ * for skills (accumulates per skill, dedupes by `archivedKey`), a `Set` union
+ * for transcript IDs, and `collectChildSkillsDocMeta`'s newest-wins for the
+ * skill-usage article scalars — whose losing id joins `orphanedDocIds`, or the
+ * target's published article is stranded on the Space with nothing pointing at it.
+ *
+ * `copyHoistFields` stays the single definition of WHICH fields travel; the
+ * unions below only change how each one is combined. Do not move them into the
+ * helper — `migrateOneToOne` must keep copying.
+ *
+ * Uses the same lock wrapper as every other orphan write. The caller must NOT
+ * hold the lock — a nested acquire self-blocks and reports contention while
+ * the write silently never lands.
+ */
+export async function remountStrandedTree(
+	target: CommitSummary,
+	strandedRoot: CommitSummary,
+	cwd?: string,
+	storage?: StorageProvider,
+): Promise<void> {
+	if ((target.children ?? []).length > 0) {
+		throw new Error(`target ${target.commitHash.substring(0, 8)} already has children — refusing to clobber`);
+	}
+	if (isManuallyDisabled()) return;
+
+	// Stranded refs first, target's second: `mergeRefsNewWins` lets the SECOND
+	// argument win a key collision, and the target's memory is the newer one —
+	// its refs point at the orphan-branch snapshots written most recently.
+	const plans = mergeRefsNewWins(strandedRoot.plans, target.plans, snapshotKeyOf.plan);
+	const notes = mergeRefsNewWins(strandedRoot.notes, target.notes, snapshotKeyOf.note);
+	const references = mergeRefsNewWins(strandedRoot.references, target.references, snapshotKeyOf.reference);
+	const transcripts = [...new Set<string>([...(target.transcripts ?? []), ...(strandedRoot.transcripts ?? [])])];
+	const foldedSkills = mergeSkillRefs([...(strandedRoot.skills ?? []), ...(target.skills ?? [])]);
+	// Same drain `mergeManyToOneLocked` owes: the fold banks the ids it discards
+	// on `supersededDocIds`, and they must reach `orphanedDocIds` and be stripped
+	// off the persisted refs so a later merge cannot re-report them.
+	const supersededSkillDocIds = foldedSkills.flatMap((s) => s.supersededDocIds ?? []);
+	const skillsDocMeta = collectChildSkillsDocMeta([target, strandedRoot]);
+	// The stranded root keeps its own pending-cleanup queue (ids/hashes it banked
+	// from its own past merges). Push reads these at the ROOT only, and the v5
+	// normalize step that would otherwise drain a descendant's queue is a no-op,
+	// so anything left on the stranded child leaks forever — the same drain
+	// `mergeManyToOneLocked` performs for its children (`inheritedOrphanIds`).
+	// `collectDescendant*([strandedRoot])` folds the stranded root's own queue plus
+	// every descendant's. Unlike a merge, the stranded root is RESCUED, not
+	// superseded, so its own article is NOT orphaned here.
+	const orphanedDocIds = [
+		...new Set<number>([
+			...(target.orphanedDocIds ?? []),
+			...skillsDocMeta.orphanedDocIds,
+			...supersededSkillDocIds,
+			...collectDescendantOrphanedDocIds([strandedRoot]),
+		]),
+	];
+	const unresolvedOrphanHashes = [
+		...new Set<string>([
+			...(target.unresolvedOrphanHashes ?? []),
+			...collectDescendantUnresolvedOrphanHashes([strandedRoot]),
+		]),
+	];
+
+	const merged: CommitSummary = {
+		...target,
+		// Keeps `copyHoistFields` the one place the FIELD SET is declared, so a
+		// field added there still travels here even before it gets a union rule.
+		...copyHoistFields(strandedRoot),
+		...(transcripts.length > 0 && { transcripts }),
+		...(plans.length > 0 && { plans }),
+		...(notes.length > 0 && { notes }),
+		...(references.length > 0 && { references }),
+		...(foldedSkills.length > 0 && { skills: foldedSkills.map(stripSupersededDocIds) }),
+		...(skillsDocMeta.winner && {
+			jolliSkillsDocId: skillsDocMeta.winner.jolliSkillsDocId,
+			jolliSkillsDocUrl: skillsDocMeta.winner.jolliSkillsDocUrl,
+		}),
+		...(orphanedDocIds.length > 0 && { orphanedDocIds }),
+		...(unresolvedOrphanHashes.length > 0 && { unresolvedOrphanHashes }),
+		children: [strandedRoot],
+	};
+	await withRequiredOrphanWriteLock(cwd, "remountStrandedTree", () =>
+		storeSummaryLocked(merged, cwd, true, undefined, storage),
+	);
 }
 
 /**
@@ -540,33 +708,17 @@ async function migrateOneToOneLocked(
 		...(oldSummary.ticketId && { ticketId: oldSummary.ticketId }),
 		...(oldSummary.jolliDocId && { jolliDocId: oldSummary.jolliDocId }),
 		...(docUrl && { jolliDocUrl: docUrl }),
-		// Skill-usage article — Copy-Hoist beside `skills` below, and for the same
-		// reason the memory article's id is copied: a 1:1 migration carries the SAME
-		// refs onto the new hash, so the article's content is unchanged and the next
-		// push must update it in place. Dropping the id would publish a duplicate and
-		// leave the original stranded under a hash the branch no longer has.
-		...(oldSummary.jolliSkillsDocId && { jolliSkillsDocId: oldSummary.jolliSkillsDocId }),
-		...(oldSummary.jolliSkillsDocUrl && { jolliSkillsDocUrl: oldSummary.jolliSkillsDocUrl }),
 		...(oldSummary.orphanedDocIds && { orphanedDocIds: oldSummary.orphanedDocIds }),
 		...(oldSummary.unresolvedOrphanHashes && { unresolvedOrphanHashes: oldSummary.unresolvedOrphanHashes }),
-		...(oldSummary.plans && { plans: oldSummary.plans }),
-		...(oldSummary.notes && { notes: oldSummary.notes }),
-		// References — same Copy-Hoist treatment as plans / notes. Without this
-		// line, rebase-pick / migrate-1-to-1 paths would silently drop reference
-		// refs from the new root summary even though the registry still pointed
-		// at correctly-archived snapshot files. Root-only Copy, no merge needed.
-		...(oldSummary.references && { references: oldSummary.references }),
+		// Copy-Hoist: skills (+ the skill-usage article id/url), transcripts,
+		// plans, notes and references. See `copyHoistFields` for the full
+		// rationale — this is the ONE definition shared with
+		// `remountStrandedTree`; a second hand-maintained list here is how the
+		// next field silently drops. The `transcripts` this contributes is
+		// overridden below by `inheritedTranscriptIds`, which is filtered
+		// against files that actually exist on disk.
+		...copyHoistFields(oldSummary),
 		...(oldSummary.e2eTestGuide && { e2eTestGuide: oldSummary.e2eTestGuide }),
-		// Skills — same Copy-Hoist as references. Without this line a rebase-picked
-		// commit loses its skill record from the root, so the PR-wide aggregate, the
-		// sidebar skill rows and the PR markdown table all read nothing (the refs
-		// survive only on the wrapped child, which none of those read paths walk).
-		// Unlike references, skills are NOT stripped off the child — stripFunctionalMetadata
-		// has no stripSkills — so root and child end up holding the SAME ref. That is the
-		// established squash shape, not a leak: a later squash's collectChildSkills meets
-		// each ref from both ends and mergeSkillRefs dedupes by `archivedKey` before
-		// accumulating, precisely for this case. Copy, no merge needed.
-		...(oldSummary.skills && { skills: oldSummary.skills }),
 		// summaryError marker — rebase-pick doesn't run the LLM, so a degraded
 		// old summary stays degraded on the new hash. Use isSummaryError() so
 		// legacy summaries (only `llm.stopReason: "error"`, no summaryError
@@ -1829,8 +1981,9 @@ export async function getSummary(
 
 	// Typed fallback (phase H): on the database backend, steps 2, 3 and 4 are
 	// one SELECT each — loading the index here would synthesize a whole
-	// document per miss.
-	const typed = asSqliteStorage(await resolveStorage(storage, cwd));
+	// document per miss. Read-side resolver: these are alias/prefix lookups plus
+	// `readSummaryFile`, all reads, so no write-miss warning belongs here.
+	const typed = asSqliteStorage(await resolveReadStorage(storage, cwd));
 	if (typed) {
 		if (hash.length === FULL_HASH_LENGTH) {
 			const alias = await typed.lookupAlias(hash);
@@ -2339,7 +2492,13 @@ async function readSummaryFile(
 	cwd?: string,
 	storage?: StorageProvider,
 ): Promise<CommitSummary | null> {
-	const store = await resolveStorage(storage, cwd);
+	// Read-side resolution: this function only ever calls `readFile`. A write
+	// flow that loads a summary first still resolves its own storage for the
+	// write itself, so the write-miss warning is not lost by silencing it here —
+	// exactly the argument `loadIndex` already makes. Using the write-side
+	// resolver here fired a spurious "Memory Bank side will miss this write" per
+	// summary read on read-only paths (e.g. `repair-memory --status`).
+	const store = await resolveReadStorage(storage, cwd);
 	const content = await store.readFile(`summaries/${commitHash}.json`);
 	if (!content) return null;
 

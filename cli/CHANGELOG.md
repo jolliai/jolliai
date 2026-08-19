@@ -2,6 +2,10 @@
 
 <!-- Last synced commit: b2e68798 | 2026-08-15 -->
 
+## Unreleased
+
+- **`jolli repair-memory` puts a memory back where it belongs** — when an amend, rebase or squash rewrites a commit and its memory does not move with it, the conversations, skills and topics stay mounted under a commit hash your branch no longer has, while the new commit shows nothing. Nothing used to report that. `jolli doctor` now warns when it finds one, and `jolli repair-memory` reattaches it — `--status` first to see what it would do and what it would bring back, `--from/--to` when your reflog is too old to pair the two hashes, `--no-llm` to merge a squash without an AI call. Every memory it is about to overwrite is backed up first, and running it twice is safe.
+
 ## 0.99.13
 
 - **Breaking: `jolli dashboard` stays in your terminal** — it serves the dashboard until you press **Ctrl+C** instead of leaving a background server behind, so `jolli dashboard --stop` is gone with it. Run it again and it replaces the dashboard already running, so you always get a fresh one at the address you expect. A background server left over from the old version is taken over automatically; an unrelated service on port 1818 is still left alone.
