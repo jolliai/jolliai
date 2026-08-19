@@ -177,6 +177,26 @@ window.JD = window.JD || {};
 		}
 	};
 
+	/* "August 19, 2026 at 10:49 AM" — the memory footer's generation stamp.
+	   Same option set as `formatFullDate` in cli/src/core/SummaryFormat.ts, which
+	   is what the editor panel and the Markdown export print, so one memory reads
+	   the same on every surface. "en-US" is pinned for that reason rather than
+	   left to the viewer's locale: the other two callers pass it explicitly. */
+	JD.fullDateTime = (ms, timeZone) => {
+		try {
+			return new Intl.DateTimeFormat("en-US", {
+				timeZone: timeZone,
+				year: "numeric",
+				month: "long",
+				day: "numeric",
+				hour: "numeric",
+				minute: "2-digit",
+			}).format(ms);
+		} catch (e) {
+			return new Date(ms).toISOString().slice(0, 16).replace("T", " ");
+		}
+	};
+
 	/* Local `YYYY-MM-DD` in the model's zone — the same key the server buckets
 	   days by. "en-CA" is what yields ISO order; DashboardQuery uses the same
 	   locale for exactly that reason, so the two agree on the day boundary. */

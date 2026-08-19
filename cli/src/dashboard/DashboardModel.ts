@@ -880,7 +880,45 @@ export interface MemoryDetail {
 	};
 	/** Jolli's own summarization call — the model that WROTE this memory, distinct from {@link tokens}. */
 	readonly summarizedBy?: { readonly model: string; readonly tokens: number };
+	/**
+	 * Who generated this memory, as `formatProviderLabel` renders it ("Anthropic",
+	 * "Local agent - Cursor", `mixed: …`). The footer's `· via <provider>` segment,
+	 * matching the editor panel's and the Markdown export's.
+	 *
+	 * Separate from {@link summarizedBy} rather than a third field on it, because
+	 * the two are read off different populations: `summarizedBy` is the ROOT's own
+	 * `llm` node, while this walks the whole tree — a squash whose root carries no
+	 * `llm` but whose folded children do has a provider and no `summarizedBy`.
+	 * Absent for summaries written before `llm.source` existed; the footer then
+	 * omits the segment rather than printing "via unknown".
+	 */
+	readonly provider?: string;
+	/**
+	 * When Jolli wrote THIS memory (`summary.generatedAt`), which is what the
+	 * footer stamps. Not {@link DashboardModel.generatedAtMs} beside it — that one
+	 * is when the PAGE's payload was built, so a footer reading it would print the
+	 * current time under every memory ever recorded and change on each refresh
+	 * tick with nothing under it changing.
+	 *
+	 * Falls back to the commit date for a summary whose `generatedAt` is absent or
+	 * unparseable — it is persisted as an empty string on some paths (see
+	 * `getDisplayDate` in core/SummaryFormat.ts). The substitute is this query's
+	 * COALESCEd COMMITTER date, the same value {@link committedAtMs} carries — NOT
+	 * the AUTHOR date `getDisplayDate` picks off `summary.commitDate` (`%aI`, which
+	 * is also what `memories.commit_date_ms` stores raw). A rebased memory must not
+	 * stamp one instant here and another in the tree row beside it, which is what
+	 * the COALESCE in `buildMemoryDetail`'s query exists for.
+	 */
+	readonly generatedAtMs: number;
 	readonly recap?: string;
+	/**
+	 * The conversations this memory was built from. Also what the footer's privacy
+	 * note counts: it briefly carried a separate transcript-FILE count instead,
+	 * which is a unit this page never shows — one memory storing six sessions in
+	 * two files rendered "Conversations · 6" directly above "(2)". A field a
+	 * client cannot reconcile with what it already prints does not belong on this
+	 * type, so there is no second count here to pick the wrong one from.
+	 */
 	readonly conversations: ReadonlyArray<MemoryConversationRow>;
 	/** Plans, notes, references and the skills row — one ordered list, see {@link MemoryContextRow}. */
 	readonly context: ReadonlyArray<MemoryContextRow>;

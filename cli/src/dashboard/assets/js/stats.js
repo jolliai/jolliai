@@ -113,16 +113,15 @@ window.JD = window.JD || {};
 
 		/* Dollar in a circle — Lucide `circle-dollar-sign`. It was an axes-plus-
 		   trend-line glyph, which is the same "it's a chart" statement Tokens'
-		   bar chart already makes one card up; the only thing that distinguishes
+		   bar chart already makes one band up; the only thing that distinguishes
 		   these two widgets is that this one is denominated in money, so that is
 		   what the icon has to say. */
-		/* span6, paired with Tokens rather than a full row of its own. The two ask
-		   one question in two units — the hint on Tokens' head is about the
-		   difference between them — and side by side is where that comparison can
-		   actually be made. What the halved width costs is chart resolution: the
-		   bars are a 660-wide viewBox drawn at `width="100%"`, so they scale rather
-		   than clip, and half a row is still wider than the third of a row Tokens
-		   drew them in before this. */
+		/* span6 rather than a full row of its own. It shared the row with Tokens
+		   until the two swapped bands, and now shares it with Decisions — the
+		   pairing changed, the width did not, because nothing on this card was
+		   using twelve columns. What the halved width costs is chart resolution:
+		   the bars are a 660-wide viewBox drawn at `width="100%"`, so they scale
+		   rather than clip. */
 		var html =
 			'<section class="card span6" aria-label="Spend">' +
 			widgetHead(
@@ -438,7 +437,9 @@ window.JD = window.JD || {};
 	   every 30 s refresh tick, and this needs no such thing. `esc` is what makes
 	   it safe in an attribute — it escapes both quote characters. */
 	/* `aside` is the card's headline figure, right-aligned on the head's own row —
-	   the shape Spend built inline, now shared so Tokens reads the same way.
+	   the shape Spend built inline, now shared so Decisions reads the same way.
+	   Tokens read it that way while it held the span6 seat and gave it back when
+	   the two swapped bands; the users are whoever is at span6, not either card.
 
 	   Two numbers in it are MEASURED, not chosen, and both come from Spend at
 	   `span6`. `flex:1 1 220px` (not 300) is what decides whether the figure sits
@@ -516,23 +517,23 @@ window.JD = window.JD || {};
 		"Decisions your sessions made, accumulating across the range — the knowledge Jolli banked, " +
 		"with the receipts behind it.";
 
-	/* Decisions (span4) — the corpus of decisions itself: kept count, a
+	/* Decisions (span6) — the corpus of decisions itself: kept count, a
 	   cumulative step chart, and the latest one as a single TITLE line.
 	   Distinct from the KPI sub-line (gone with the KPI strip) and from the
 	   feed's per-commit `decision` line — this is the standalone widget those
 	   always implied but never had. Carries no "recalled" figure — see
 	   DecisionsCard's doc comment in DashboardModel.ts.
 
-	   Third seat in the equal-third band, where Tokens used to sit. It was
-	   span12 — alone on its row after the Recall card beside it was removed
-	   (JOLLI-2193) — and the width bought nothing: the step chart draws with
-	   `preserveAspectRatio="none"`, so it fills whatever column it is given.
-	   Joining the band means adopting the band's head, which is why the
-	   description became a hint and the kept count moved below the title the way
-	   Tokens states its own: the old head hung a right-aligned `hdr-stat` off a
-	   two-line title, which needs more than a third of the row to sit on one
-	   line. The window went with it — the topbar range control is where that is
-	   set and stated, the same reason Tokens dropped its own `Last 30 days`. */
+	   Paired with Spend in the half-and-half band, having swapped seats with
+	   Tokens — see the band comment in `renderStats`. Width has never been what
+	   this card needs: the step chart draws with `preserveAspectRatio="none"`,
+	   so it fills whatever column it is given (span12, then span4, now span6).
+	   What the half row buys is the HEAD. At a third of a row a right-aligned
+	   headline does not fit beside the title, which is why the kept count sat
+	   below it in the band; here it rides in `widgetHead`'s aside at 18px, the
+	   same size and slot as Spend's own figure beside it. The window stays off
+	   the card either way — the topbar range control is where that is set and
+	   stated, the same reason Tokens dropped its own `Last 30 days`. */
 	function decisionsCard(model) {
 		var esc = JD.esc;
 		var decisions = model.stats.decisions;
@@ -540,12 +541,15 @@ window.JD = window.JD || {};
 			"--s1",
 			'<path d="M9 18h6M10 22h4M12 2a6 6 0 0 0-4 10.4c.6.5 1 1.3 1 2.1V16h6v-1.5c0-.8.4-1.6 1-2.1A6 6 0 0 0 12 2Z"/>',
 		);
-		var head =
-			'<section class="card span4" aria-label="Decisions">' + widgetHead(icon, "Decisions", null, DECISIONS_HINT);
+		var open = '<section class="card span6" aria-label="Decisions">';
 
 		if (!decisions) {
+			/* Bare head here, for the reason Tokens' empty state keeps one: there is
+			   no count to right-align, and the locked panel below states the whole
+			   situation already. */
 			return (
-				head +
+				open +
+				widgetHead(icon, "Decisions", null, DECISIONS_HINT) +
 				'<div class="locked-panel"><p><b>Decisions need a summarized commit.</b></p>' +
 				"<p class=\"why\">Each decision is mined from a commit's memory — enable Jolli Memory to start " +
 				"recording them.</p>" +
@@ -553,11 +557,20 @@ window.JD = window.JD || {};
 			);
 		}
 
+		/* `N kept`, not a bare `N`: the sub under it names the noun and the window,
+		   so the figure has to carry the verb or it reads as a second total of
+		   whatever the card counted. */
 		var html =
-			head +
-			'<div class="bignum num" style="font-size:22px;font-weight:650;margin-top:2px">' +
-			decisions.keptCount +
-			' kept<div class="sub" style="font-weight:400;margin-top:2px">decisions in this window</div></div>';
+			open +
+			widgetHead(
+				icon,
+				"Decisions",
+				null,
+				DECISIONS_HINT,
+				'<div class="num" style="font-size:18px;font-weight:650">' +
+					decisions.keptCount +
+					' kept</div><div class="sub">decisions<br>in this window</div>',
+			);
 
 		/* Cumulative step chart over `perDay` — an empty window still draws a
 		   flat baseline rather than an empty box. */
@@ -1574,7 +1587,7 @@ window.JD = window.JD || {};
 		};
 	}
 
-	/* Tokens (span6) — input/output/cache, day-bucketed. Reuses
+	/* Tokens (span4) — input/output/cache, day-bucketed. Reuses
 	   `JD.stackedBars` (the same chart Cost & tokens draws) rather than a
 	   one-off SVG, so the two cards read as the same chart language. `cached`
 	   is one combined figure, not a cache-write/cache-read split — the database
@@ -1681,30 +1694,32 @@ window.JD = window.JD || {};
 		   nothing twice. */
 		if (total === 0) {
 			return (
-				'<section class="card span6" aria-label="Tokens">' +
+				'<section class="card span4" aria-label="Tokens">' +
 				widgetHead(icon, "Tokens", null, TOKENS_HINT) +
 				'<div class="empty-note">No token data yet — Claude sessions report tokens; other agents count ' +
 				"sessions only.</div></section>"
 			);
 		}
 
-		/* Right-aligned in the head, matching Spend beside it. `span6` with a
-		   one-word title is exactly the case `widgetHead`'s aside was measured
-		   for. 18px, not the 22px it used at full width, so the two cards' figures
-		   are the same size. */
+		/* Below the title, not right-aligned in the head — this card leads the
+		   equal-third band now, and `widgetHead`'s aside is measured for a
+		   `span6`-or-wider head: a third of a row has no room for icon + title +
+		   figure on one line, which is the same reason Decisions kept its count
+		   below the title while it held this seat. Same shape and 22px size it used
+		   there, so the band has one way of printing a headline figure — inline,
+		   because the `.bignum` class this markup carried across the swap has never
+		   had a rule in main.css and was this card's only user, so it was dropped
+		   rather than given one. The cache share rides on the sub as a second clause
+		   rather than a second line — the aside's `<br>` was what made two lines
+		   read as one right-aligned block, and there is no such block here. */
 		var html =
-			'<section class="card span6" aria-label="Tokens">' +
-			widgetHead(
-				icon,
-				"Tokens",
-				null,
-				TOKENS_HINT,
-				'<div class="num" style="font-size:18px;font-weight:650">' +
-					JD.fmtTokens(total) +
-					'</div><div class="sub">captured tokens<br>' +
-					Math.round((tb.cached / total) * 100) +
-					"% of them cache</div>",
-			);
+			'<section class="card span4" aria-label="Tokens">' +
+			widgetHead(icon, "Tokens", null, TOKENS_HINT) +
+			'<div class="num" style="font-size:22px;font-weight:650;margin-top:2px">' +
+			JD.fmtTokens(total) +
+			'<div class="sub" style="font-weight:400;margin-top:2px">captured tokens · ' +
+			Math.round((tb.cached / total) * 100) +
+			"% of them cache</div></div>";
 
 		var view = JD.tokSplitView || "type";
 		html += tokensViewChips(view);
@@ -1878,20 +1893,29 @@ window.JD = window.JD || {};
 			return;
 		}
 		/* Two bands over the feed. The equal-third band leads with the three
-		   summary widgets — what ran, what was called, what was decided — and the
-		   half-and-half band under it carries the two cost views, which are one
-		   question in two units (see Tokens' hint) and so belong beside each other
-		   rather than stacked a scroll apart.
+		   summary widgets — what ran, what was called, how much of the model it
+		   took — and the half-and-half band under it carries what the work banked
+		   and what it cost.
 
-		   Both are moves off the original jolli-design order, where Tokens held the
-		   third seat and Spend and Decisions each took a full row: Decisions was
-		   span12 only because the Recall card beside it was removed (JOLLI-2193),
-		   and neither it nor Spend draws anything that needs twelve columns. */
+		   Tokens and Decisions swapped seats: token volume is the figure this page
+		   is opened for, so it belongs in the band above the fold, while the
+		   decisions corpus accumulates across the range and reads the same one row
+		   down. What the swap gives up is Tokens sitting BESIDE Spend — they are
+		   one question in two units (see TOKENS_HINT, and the reason a rising
+		   cached share moves them in opposite directions), and that comparison is
+		   now a scroll apart rather than side by side. Each card takes the other's
+		   head along with the seat, because `widgetHead`'s aside only fits a
+		   `span6`-or-wider head.
+
+		   Both bands are moves off the original jolli-design order, where Spend and
+		   Decisions each took a full row: Decisions was span12 only because the
+		   Recall card beside it was removed (JOLLI-2193), and neither it nor Spend
+		   draws anything that needs twelve columns. */
 		var html = skillsCard(model);
 		html += mcpCard(model);
-		html += decisionsCard(model);
-
 		html += tokensCard(model);
+
+		html += decisionsCard(model);
 		html += costCard(model);
 
 		/* The session-activity card (heatmap, hour histogram, records, share card)

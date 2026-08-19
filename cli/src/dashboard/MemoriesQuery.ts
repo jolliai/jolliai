@@ -37,6 +37,7 @@ import { sanitizeNativeIdForPath } from "../core/references/ReferenceStore.js";
 import { firstUserMessageTitleFromEntries } from "../core/SessionTitleResolver.js";
 import { buildSkillsAggregateMarkdown, buildSkillsSummaryLabel } from "../core/SkillsAggregateMarkdown.js";
 import { assembleMemoryTree } from "../core/SqliteStorage.js";
+import { formatProviderLabel } from "../core/SummaryFormat.js";
 import {
 	aggregateConversationTokenBreakdown,
 	aggregateConversationTokens,
@@ -823,6 +824,13 @@ export function buildMemoryDetail(
 				tokens: summary.llm.inputTokens + summary.llm.outputTokens + (summary.llm.cachedTokens ?? 0),
 			}
 		: undefined;
+	// The whole tree, not `summary.llm` beside it — see MemoryDetail.provider.
+	const provider = formatProviderLabel(summary);
+	// This memory's OWN stamp — see MemoryDetail.generatedAtMs for why the page's
+	// is not a substitute. `Date.parse` answers NaN for the empty string this
+	// field is persisted as on some paths, which is what selects the fallback.
+	const parsedGeneratedAt = Date.parse(summary.generatedAt ?? "");
+	const generatedAtMs = Number.isFinite(parsedGeneratedAt) ? parsedGeneratedAt : row.commit_date_ms;
 
 	return {
 		repoIdentity: row.repo_identity,
@@ -849,6 +857,8 @@ export function buildMemoryDetail(
 		...(row.deletions != null ? { deletions: row.deletions } : {}),
 		...(tokens ? { tokens } : {}),
 		...(summarizedBy ? { summarizedBy } : {}),
+		...(provider ? { provider } : {}),
+		generatedAtMs,
 		...(summary.recap ? { recap: summary.recap } : {}),
 		conversations: buildConversations(db, row.repo_id, fullHash, summary),
 		context,

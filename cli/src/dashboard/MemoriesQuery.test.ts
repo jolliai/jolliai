@@ -46,7 +46,14 @@ interface SeedMemoryOptions {
 	readonly conversationTokenBreakdown?: { input: number; output: number; cached: number };
 	readonly estimatedCostUsd?: number;
 	readonly pricesAsOf?: string;
-	readonly llm?: { model: string; inputTokens: number; outputTokens: number; cachedTokens?: number };
+	readonly llm?: {
+		model: string;
+		inputTokens: number;
+		outputTokens: number;
+		cachedTokens?: number;
+		/** `LlmCredentialSource` — what the footer's `· via <provider>` is derived from. */
+		source?: string;
+	};
 	readonly recap?: string;
 	readonly references?: ReadonlyArray<{ source: string; nativeId: string; title: string; url?: string }>;
 	readonly plans?: ReadonlyArray<{ slug: string; title: string; addedAt: string; updatedAt: string }>;
@@ -71,6 +78,8 @@ interface SeedMemoryOptions {
 	}>;
 	/** v5 `summary.transcripts` — the id ORDER the conversation list is built in. */
 	readonly transcripts?: ReadonlyArray<string>;
+	/** `summary.generatedAt` — when Jolli wrote this memory, which the footer stamps. */
+	readonly generatedAt?: string;
 }
 
 /** Seeds one `memories` row (+ its `memory_topics`) with a hand-built summary payload. */
@@ -107,6 +116,7 @@ async function seedMemory(
 				...(opts.e2eTestGuide ? { e2eTestGuide: opts.e2eTestGuide } : {}),
 				...(opts.jolliDocId != null ? { jolliDocId: opts.jolliDocId } : {}),
 				...(opts.transcripts ? { transcripts: opts.transcripts } : {}),
+				...(opts.generatedAt != null ? { generatedAt: opts.generatedAt } : {}),
 				diffStats: { filesChanged: 2, insertions: 10, deletions: 3 },
 			};
 			db.prepare(
@@ -794,6 +804,77 @@ describe("MemoriesQuery", () => {
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
 			expect(detail?.conversations.map((c) => c.sessionId)).toEqual(["s3", "s1", "s2"]);
+		});
+
+		it("carries ONE conversation figure, with no transcript-file count beside it", async () => {
+			// The pane prints `conversations.length` in three places — the section
+			// header, the counts line and the footer's privacy note — so a SECOND
+			// count on the payload is something a renderer can pick the wrong one
+			// from. It briefly carried a transcript-FILE count for the note and did
+			// exactly that: a real memory storing six sessions in two files rendered
+			// "Conversations · 6" directly above "(2)". This fixture is that shape
+			// inverted — one session sliced across three files — and the answer the
+			// page needs is one, either way.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "one session, three slices",
+				messageCount: 2,
+				extraSliceHashes: ["b".repeat(40), "c".repeat(40)],
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations).toHaveLength(1);
+			expect(detail).not.toHaveProperty("transcriptCount");
+		});
+
+		it("carries the memory's OWN generation stamp, falling back to the commit date", async () => {
+			// The footer prints this, so it has to be when Jolli wrote the memory —
+			// the page's own `generatedAtMs` is "now" and would date every memory to
+			// the current minute. `generatedAt` is persisted as an empty string on
+			// some paths, which is the case the fallback exists for.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const stamped = "a".repeat(40);
+			const blank = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", stamped, "feat: x", {
+				generatedAt: "2026-08-14T03:22:00.000Z",
+				commitDateMs: Date.parse("2026-08-14T03:00:00.000Z"),
+			});
+			await seedMemory(dbPath, "repo-1", blank, "feat: y", {
+				generatedAt: "",
+				commitDateMs: Date.parse("2026-07-02T09:15:00.000Z"),
+			});
+
+			const withStamp = await withDashboardDb((db) => buildMemoryDetail(db, ALL, stamped), { dbPath });
+			const withoutStamp = await withDashboardDb((db) => buildMemoryDetail(db, ALL, blank), { dbPath });
+			expect(withStamp?.generatedAtMs).toBe(Date.parse("2026-08-14T03:22:00.000Z"));
+			expect(withoutStamp?.generatedAtMs).toBe(Date.parse("2026-07-02T09:15:00.000Z"));
+		});
+
+		it("attributes the provider off the summary, and omits it when none was recorded", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const attributed = "a".repeat(40);
+			const legacy = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", attributed, "feat: x", {
+				llm: { model: "claude-sonnet-5", inputTokens: 10, outputTokens: 5, source: "anthropic-config" },
+			});
+			// Written before `llm.source` existed. The footer omits the segment
+			// rather than printing "via unknown", so the field has to stay absent
+			// instead of falling back to a default label.
+			await seedMemory(dbPath, "repo-1", legacy, "feat: y", {
+				llm: { model: "claude-sonnet-5", inputTokens: 10, outputTokens: 5 },
+			});
+
+			const withSource = await withDashboardDb((db) => buildMemoryDetail(db, ALL, attributed), { dbPath });
+			const withoutSource = await withDashboardDb((db) => buildMemoryDetail(db, ALL, legacy), { dbPath });
+			expect(withSource?.provider).toBe("Anthropic");
+			expect(withoutSource?.provider).toBeUndefined();
+			// The provider is NOT read off `summarizedBy` — that one is the root's
+			// own `llm` node and is present on both of these.
+			expect(withoutSource?.summarizedBy).toBeDefined();
 		});
 
 		it("prefers the title the ARCHIVE recorded over the live sessions row", async () => {

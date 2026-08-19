@@ -431,9 +431,9 @@ describe("Decisions card footer", () => {
 
 /**
  * Every card built on `widgetHead` — the three in the equal-third band plus
- * Tokens, which kept the head when it moved down to share a row with Spend. The
- * shape is what they have in common (one-line title, explanation in a `title=`
- * hint, no visible sub), not the column count.
+ * Decisions, which kept the head when it moved down to share a row with Spend.
+ * The shape is what they have in common (one-line title, explanation in a
+ * `title=` hint, no visible sub), not the column count.
  */
 const WIDGET_HEAD_CARDS = ["Skills", "MCPs", "Decisions", "Tokens"];
 
@@ -449,15 +449,50 @@ describe("widget card heads", () => {
 	const hintLines = (label: string): string[] =>
 		((/title="([^"]*)"/.exec(headOf(label)) as RegExpExecArray)[1] || "").split("&#10;");
 
-	const headOf = (label: string): string => {
+	/**
+	 * One card's head, sliced at the `card-head` div's OWN close — depth-counted,
+	 * not "the first `</div></div>` after the title".
+	 *
+	 * The naive scan is right only for a head with no aside. A head that carries
+	 * one (the right-aligned figure a `span6` card passes `widgetHead`) nests two
+	 * more divs inside the card-head, so the first `</div></div>` falls INSIDE the
+	 * aside: the slice ended early AND pulled the aside's own `.sub` in with it,
+	 * which is exactly what the cases below assert a head does not have. Nothing
+	 * caught it because the default fixture leaves `decisions` absent and
+	 * `tokenBreakdown` at zero, so both of those cards render their bare-head
+	 * branch — `statsOver` is what reaches the other one.
+	 */
+	const headOf = (label: string, statsOver: Record<string, unknown> = {}): string => {
 		app.innerHTML = "";
-		JD.renderStats(model());
-		const start = app.innerHTML.indexOf(`aria-label="${label}"`);
+		JD.renderStats(model({}, statsOver));
+		const html = app.innerHTML;
+		const start = html.indexOf(`aria-label="${label}"`);
 		expect(start, label).toBeGreaterThan(-1);
-		// To the end of the head's title block — `</div></div>` closes the
-		// title wrapper and, for a hover card, the card-head with it.
-		const h2 = app.innerHTML.indexOf("<h2", start);
-		return app.innerHTML.slice(start, app.innerHTML.indexOf("</div></div>", h2) + "</div></div>".length);
+		const open = html.indexOf('<div class="card-head">', start);
+		expect(open, label).toBeGreaterThan(-1);
+		let depth = 0;
+		const tags = /<div\b|<\/div>/g;
+		tags.lastIndex = open;
+		for (let m = tags.exec(html); m; m = tags.exec(html)) {
+			depth += m[0] === "</div>" ? -1 : 1;
+			if (depth === 0) return html.slice(start, m.index + "</div>".length);
+		}
+		throw new Error(`unbalanced card-head for ${label}`);
+	};
+
+	/**
+	 * The head up to the aside — `<h2>` plus the visible sub under it, if any.
+	 *
+	 * The `.sub` cases below mean "no visible sub UNDER THE TITLE", and an aside
+	 * carries a `.sub` of its own by design (the noun line beside its figure), so
+	 * they have to be scoped here rather than to the whole head. `widgetHead`
+	 * emits `<div class="spacer">` only in the aside branch, immediately after the
+	 * title wrapper closes, which makes it the exact boundary.
+	 */
+	const titleBlockOf = (label: string, statsOver: Record<string, unknown> = {}): string => {
+		const head = headOf(label, statsOver);
+		const aside = head.indexOf('<div class="spacer">');
+		return aside === -1 ? head : head.slice(0, aside);
 	};
 
 	it("puts the Skills explanation in the title's tooltip", () => {
@@ -468,7 +503,7 @@ describe("widget card heads", () => {
 		// subagent is the `Task` builtin and a slash command is never a tool call
 		// — so the copy must not widen to either without the classifier widening.
 		expect(head).not.toContain("command");
-		expect(head).not.toContain('<div class="sub">');
+		expect(titleBlockOf("Skills")).not.toContain('<div class="sub">');
 	});
 
 	it("puts the MCPs explanation in the title's tooltip", () => {
@@ -480,27 +515,29 @@ describe("widget card heads", () => {
 		// needs the registered-server list, which no transcript carries.
 		expect(hintOf("MCPs")).toContain("Only servers that actually made a call");
 		expect(head).not.toContain("errored");
-		expect(head).not.toContain('<div class="sub">');
+		expect(titleBlockOf("MCPs")).not.toContain('<div class="sub">');
 	});
 
 	it("explains what Tokens counts, and no longer restates the window", () => {
 		// `Last 30 days` came off the card: the topbar range control is the one
 		// place the window is set, and it says so there. What the tooltip carries
 		// instead is the thing the bars cannot show — why this card counts tokens
-		// while Spend counts dollars. Tokens has since moved out of the band and
-		// onto the row it shares with Spend, but the head shape came with it.
+		// while Spend counts dollars. Tokens has been out to Spend's row and back
+		// into the band since, and the head shape rode along both times.
 		const head = headOf("Tokens");
 		expect(head).toContain('class="has-hint"');
 		expect(hintOf("Tokens")).toContain("Cache reads bill at 10% of input");
 		expect(hintOf("Tokens")).toContain("this widget counts tokens and Spend counts dollars");
 		expect(head).not.toContain("Last 30 days");
-		expect(head).not.toContain('<div class="sub">');
+		expect(titleBlockOf("Tokens")).not.toContain('<div class="sub">');
 	});
 
 	it("puts the Decisions explanation in the title's tooltip", () => {
 		// Took Tokens' seat in the band, and with it the band's head: what was a
-		// visible sub is now a one-line title carrying its sentence as a hint.
-		// The window went the same way `Last 30 days` did on Tokens.
+		// visible sub is now a one-line title carrying its sentence as a hint. The
+		// window went the same way `Last 30 days` did on Tokens. The two have since
+		// swapped back — Decisions now sits beside Spend — and the head shape is
+		// what survived the round trip, which is why this case still applies.
 		const head = headOf("Decisions");
 		expect(head).toContain('class="has-hint"');
 		expect(hintOf("Decisions")).toContain("Decisions your sessions made, accumulating across the range");
@@ -509,7 +546,53 @@ describe("widget card heads", () => {
 		// the reader's work.
 		expect(hintOf("Decisions")).not.toContain("What Jolli decided to keep");
 		expect(head).not.toContain("Last 30 days");
-		expect(head).not.toContain('<div class="sub">');
+		expect(titleBlockOf("Decisions")).not.toContain('<div class="sub">');
+	});
+
+	/**
+	 * The two POPULATED heads, which nothing above reaches: the default fixture
+	 * leaves `decisions` absent and `tokenBreakdown` at zero, so every case up to
+	 * here renders a locked panel or an empty note and its bare head. The band swap
+	 * moved the aside from one card to the other, and this pair is what holds each
+	 * end of it — without them the swap's whole visible consequence is untested.
+	 */
+	const DECISIONS_DATA = { decisions: { keptCount: 4, repoCount: 1, perDay: [] } };
+	const TOKENS_DATA = { tokenBreakdown: { input: 700, output: 200, cached: 100, perDay: [] } };
+
+	it("hands Decisions' kept count to the head's aside at span6", () => {
+		const head = headOf("Decisions", DECISIONS_DATA);
+		// The spacer is `widgetHead`'s aside branch, and nothing else emits it.
+		expect(head).toContain('<div class="spacer"></div>');
+		expect(head).toContain("4 kept");
+		// 18px, the size Spend's figure uses beside it in the same band — a headline
+		// figure that disagreed with its own row's other card would read as a
+		// different kind of number.
+		expect(head).toContain("font-size:18px");
+		// And it is no longer under the title, which is what the seat change bought.
+		expect(titleBlockOf("Decisions", DECISIONS_DATA)).not.toContain("4 kept");
+		// The slice really is the WHOLE head. An aside nests two more divs, so the
+		// scan this replaced — "to the first `</div></div>`" — stopped inside it and
+		// left every negative assertion over a head weaker than it reads.
+		expect(head.split("<div").length).toBe(head.split("</div>").length);
+	});
+
+	it("keeps Tokens' total under the title, with no aside at span4", () => {
+		// The other end of the swap: a third of a row has no room for icon + title +
+		// figure on one line, so this card gives the aside back.
+		expect(headOf("Tokens", TOKENS_DATA)).not.toContain('<div class="spacer">');
+		app.innerHTML = "";
+		JD.renderStats(model({}, TOKENS_DATA));
+		const from = app.innerHTML.indexOf('aria-label="Tokens"');
+		const card = app.innerHTML.slice(from, app.innerHTML.indexOf("</section>", from));
+		// 22px below the head, the band's own way of printing a headline figure.
+		expect(card).toContain('style="font-size:22px;font-weight:650;margin-top:2px">1.0k');
+		// The cache share rides on that figure's sub as a second clause, not as the
+		// `<br>`-separated second line the aside used.
+		expect(card).toContain("captured tokens · 10% of them cache");
+		expect(card).not.toContain("captured tokens<br>");
+		// `.bignum` has never had a rule in main.css — the styling is inline, and
+		// the class rode along one swap too many before it was dropped.
+		expect(card).not.toContain("bignum");
 	});
 
 	it("hard-wraps every tooltip — a native one does not wrap itself", () => {

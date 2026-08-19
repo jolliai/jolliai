@@ -395,13 +395,14 @@ body {
   }
   @media (min-width: 900px) {
     .span7 { grid-column: span 7; } .span5 { grid-column: span 5; }
-    /* Half-and-half band — Tokens beside Spend: one question in two units
-       (tokens vs dollars, which a rising cached share moves in opposite
-       directions), so the comparison needs them on one row. */
+    /* Half-and-half band — Decisions beside Spend: what the work banked and what
+       it cost. It was Tokens beside Spend (one question in two units — tokens vs
+       dollars, which a rising cached share moves in opposite directions) until
+       Tokens moved up to lead the band below. */
     .span6 { grid-column: span 6; }
-    /* Equal-third band — Skills / MCPs / Decisions, matching jolli-design's own
+    /* Equal-third band — Skills / MCPs / Tokens, matching jolli-design's own
        three-up row: three widgets of the same weight, so none of them leads.
-       Tokens held the third seat until it paired off with Spend above. */
+       Decisions held the third seat until it swapped with Tokens. */
     .span4 { grid-column: span 4; }
   }
   .card h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
@@ -585,16 +586,16 @@ body {
   .jd[data-tier="2"] .t2hide { display: none; }
 
   /* ---------- decisions ----------
-     A span4 card, third seat in the equal-third band. It was span12 (span6 until
-     the Recall card beside it was removed, JOLLI-2193) and gave the width back:
-     the step chart below scales to any column, so nothing on the card was using
-     it. Carries no "recalled" figure of its own — see DecisionsCard's doc
-     comment.
+     A span6 card, sharing the half-and-half band with Spend. Its width has been
+     span12 (span6 until the Recall card beside it was removed, JOLLI-2193), then
+     span4 in the equal-third band, and none of it mattered: the step chart below
+     scales to any column, so nothing on the card was ever using the extra. Carries
+     no "recalled" figure of its own — see DecisionsCard's doc comment.
 
-     The `.hdr-stat` rules that used to head this section went with that move —
-     a right-aligned headline beside a two-line title needs more than a third of
-     the row — and this card was their only user. The count is now a `.bignum`
-     under the title, styled inline exactly like Tokens' own. */
+     The `.hdr-stat` rules that used to head this section are still gone, and the
+     kept count is still not one: at span6 it rides in `widgetHead`'s shared aside
+     instead, styled inline at the same 18px as Spend's figure beside it. That
+     aside is the generalised form of what `.hdr-stat` did for this card alone. */
   .stepchart { margin-top: 10px; }
   .stepchart svg { display: block; width: 100%; height: 60px; }
   .dec-quote {
@@ -993,6 +994,16 @@ body {
   .mem-topics .fchips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
   .mem-topics .fchip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 6px; border-radius: 4px; background: var(--lock-bg); color: var(--muted); font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 11px; }
   .mem-topics .fchip .mem-icon { width: 12px; height: 12px; }
+  /* Detail footer — the privacy note and the product signature that close the
+     reading pane, matching the editor panel's `.transcript-privacy` +
+     `.page-footer` pair. Muted and rule-separated on purpose: it is the one
+     block on the pane that is about the PRODUCT rather than about the memory,
+     so it has to read as an end-of-page note and not as one more section. The
+     top rule is `--grid`, the same weight `.mem-detail-sections` opens with, so
+     the pane is closed by the line it was opened by. */
+  .mem-detail-foot { margin-top: 22px; padding-top: 14px; border-top: 1px solid var(--grid); }
+  .mem-privacy { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.5; }
+  .mem-generated { margin-top: 10px; color: var(--muted); font-size: 11.5px; }
   @media (max-width: 1180px) {
     .wrap:has(.memories-page) { padding: 0 24px 0 0; }
     .memories-page { grid-template-columns: 320px minmax(0, 1fr); gap: 6px; }
