@@ -3884,31 +3884,23 @@ export class SummaryWebviewPanel {
 		// whether a source is *captured going forward*, not whether already-archived
 		// history is shown. Filtering here under-counted disabled-source sessions and
 		// — paired with the save path — was the visible half of a silent data-loss bug.
-		const seen = new Set<string>();
+		//
+		// The counts MUST agree with the Conversations list, which renders exactly
+		// `groupArchivedSessions`' rows. Deriving them from that same rule — rather
+		// than re-implementing the `source:sessionId` merge here — is what keeps the
+		// subtitle from reporting a conversation the list drops: every zero-turn
+		// conversation (usage-only carrier and overlay-emptied shell alike) is hidden
+		// uniformly, on the MERGED slices, so a conversation that is real in another
+		// transcript still counts. `totalEntries` is unchanged by the drop — a
+		// zero-turn conversation contributes no entries either way.
+		const { order, grouped } = groupArchivedSessions(transcriptMap);
 		let totalEntries = 0;
 		const sessionCounts: Record<string, number> = {};
-		for (const [, transcript] of transcriptMap) {
-			for (const session of transcript.sessions) {
-				const source = session.source ?? "claude";
-				const key = `${source}:${session.sessionId}`;
-				totalEntries += session.entries.length;
-				if (seen.has(key)) {
-					continue;
-				}
-				// Skip a usage-only carrier slice WITHOUT marking the key seen: such a
-				// conversation must not be counted (its row is hidden, so a count of 1
-				// against an empty list reads as a bug), but a conversation whose slice in
-				// THIS transcript happens to be a carrier still gets counted when a later
-				// transcript carries its real turns. Same merged-view semantics as
-				// readGroupedArchivedSessions, reached without a second grouping pass, and
-				// the same narrow predicate — a session that merely omits `entries` is
-				// legacy data, not a carrier, and still counts.
-				if ((session.entries ?? []).length === 0 && session.usage !== undefined) {
-					continue;
-				}
-				seen.add(key);
-				sessionCounts[source] = (sessionCounts[source] ?? 0) + 1;
-			}
+		for (const key of order) {
+			const { session, entries } = grouped.get(key) as NonNullable<ReturnType<typeof grouped.get>>;
+			totalEntries += entries.length;
+			const source = session.source ?? "claude";
+			sessionCounts[source] = (sessionCounts[source] ?? 0) + 1;
 		}
 
 		this.panel.webview.postMessage({

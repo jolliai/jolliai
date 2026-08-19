@@ -1085,7 +1085,7 @@ describe("MemoriesQuery", () => {
 			]);
 		});
 
-		it("drops a usage-only carrier session, the way the editor's conversation list does", async () => {
+		it("drops every zero-turn session — usage-only carrier and overlay-emptied shell alike", async () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			const hash = "a".repeat(40);
 			await seedMemory(dbPath, "repo-1", hash, "feat: x");
@@ -1106,7 +1106,8 @@ describe("MemoriesQuery", () => {
 										entries: [],
 										usage: { input: 1, output: 2, cached: 0 },
 									},
-									// Entry-less WITHOUT usage is legacy data and stays visible.
+									// Entry-less WITHOUT usage is an overlay-emptied shell ("Mark All
+									// as Deleted") — a zero-turn `0 msgs` noise row, now hidden too.
 									{ sessionId: "legacy", source: "claude", entries: [] },
 								],
 							}),
@@ -1123,9 +1124,7 @@ describe("MemoriesQuery", () => {
 			);
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
-			expect(detail?.conversations).toEqual([
-				{ source: "claude", title: "(untitled session)", messageCount: 0, sessionId: "legacy" },
-			]);
+			expect(detail?.conversations).toEqual([]);
 		});
 	});
 
@@ -1409,7 +1408,18 @@ describe("MemoriesQuery", () => {
 						id: number;
 					};
 					const blob = deflateSync(
-						Buffer.from(JSON.stringify({ sessions: [{ sessionId: "sess-old", entries: [] }] })),
+						// One real turn so the session survives the zero-turn drop; the
+						// point of the test is the source-less → "claude" key resolution.
+						Buffer.from(
+							JSON.stringify({
+								sessions: [
+									{
+										sessionId: "sess-old",
+										entries: [{ role: "human", content: "hi", timestamp: "2026-08-19T10:00:00Z" }],
+									},
+								],
+							}),
+						),
 					);
 					db.prepare("UPDATE transcripts SET sessions_blob = ? WHERE repo_id = ?").run(blob, repoId);
 				},

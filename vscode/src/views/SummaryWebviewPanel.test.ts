@@ -4646,6 +4646,55 @@ describe("SummaryWebviewPanel", () => {
 				expect(msg.totalEntries).toBe(1);
 			});
 
+			it("excludes an overlay-emptied zero-turn shell (empty entries, no usage) from sessionCounts", async () => {
+				// A "Mark All as Deleted" edit leaves a session with empty entries and NO
+				// usage. `groupArchivedSessions` drops it uniformly alongside usage-only
+				// carriers, so the conversation list renders nothing for it — the stats
+				// subtitle must match, or it reports "1 conversation" over an empty list.
+				mockGetTranscriptHashes.mockResolvedValue(new Set(["abc123"]));
+				const transcriptMap = new Map([
+					[
+						"abc123",
+						{
+							sessions: [
+								// Overlay-emptied shell: no entries, no usage — must be dropped.
+								{ sessionId: "shell", source: "claude" as const, entries: [] },
+								// A real conversation that must still count.
+								{
+									sessionId: "real",
+									source: "claude" as const,
+									entries: [{ role: "human" as const, content: "hi" }],
+								},
+							],
+						},
+					],
+				]);
+				mockReadTranscriptsForCommits.mockResolvedValue(transcriptMap as never);
+
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadTranscriptStats" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find(
+					(c) => (c[0] as { command?: string })?.command === "transcriptStatsLoaded",
+				);
+				const msg = call?.[0] as {
+					totalEntries: number;
+					sessionCounts: Record<string, number>;
+				};
+				// Only the real conversation counts; the shell contributes to neither.
+				expect(msg.sessionCounts).toEqual({ claude: 1 });
+				expect(msg.totalEntries).toBe(1);
+			});
+
 			it("deduplicates sessions and counts codex sessions separately", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(
 					new Set(["abc123", "def456"]),
@@ -13041,7 +13090,7 @@ describe("SummaryWebviewPanel", () => {
 				);
 			});
 
-			it("tolerates source-less / entries-less sessions and merges duplicates", async () => {
+			it("tolerates source-less / entries-less sessions, merges duplicates, then drops the zero-turn result", async () => {
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1", "c2"]));
 				const map = new Map<
 					string,
@@ -13066,20 +13115,17 @@ describe("SummaryWebviewPanel", () => {
 					source: string;
 					messageCount: number;
 				}>;
-				expect(items).toHaveLength(1);
-				expect(items[0]).toMatchObject({
-					sessionId: "su",
-					source: "claude",
-					messageCount: 0,
-				});
+				// The merge still runs (both slices coalesce onto "claude:su"), but the
+				// merged conversation has zero turns, so groupArchivedSessions drops it.
+				expect(items).toHaveLength(0);
 			});
 
-			it("hides a usage-only carrier but keeps a real conversation that shares the transcript", async () => {
+			it("hides every zero-turn session (usage-only carrier and legacy shell), keeps the real conversation", async () => {
 				// The queue worker persists a zero-entry session carrying `usage` when a
 				// conversation spent tokens without producing a readable turn — it exists
-				// only so `detach` has a subtrahend. Listing it would render an empty
-				// conversation row, so the reader drops it. The sibling with real turns,
-				// and an entries-less LEGACY session (no `usage`), both still list.
+				// only so `detach` has a subtrahend. An entries-less LEGACY session (no
+				// `usage`) is an overlay-emptied shell. Both render as empty `0 msgs`
+				// rows, so the reader drops both; only the sibling with real turns lists.
 				mockGetTranscriptHashes.mockResolvedValue(new Set(["c1"]));
 				const map = new Map<
 					string,
@@ -13098,8 +13144,8 @@ describe("SummaryWebviewPanel", () => {
 							sessions: [
 								{ sessionId: "real", entries: [{ role: "human", content: "hi" }] },
 								{ sessionId: "carrier", entries: [], usage: { input: 600, output: 300, cached: 0 } },
-								// Legacy/malformed: omits `entries`, carries no `usage` → NOT a
-								// carrier, still listed with a turn count of 0.
+								// Legacy/malformed: omits `entries`, carries no `usage` → an
+								// overlay-emptied shell, a zero-turn row, now dropped too.
 								{ sessionId: "legacy" },
 							],
 						},
@@ -13115,7 +13161,7 @@ describe("SummaryWebviewPanel", () => {
 					(c) => (c[0] as { command?: string })?.command === "conversationsData",
 				);
 				const items = call?.[0].items as Array<{ sessionId: string; messageCount: number }>;
-				expect(items.map((i) => i.sessionId)).toEqual(["real", "legacy"]);
+				expect(items.map((i) => i.sessionId)).toEqual(["real"]);
 			});
 
 			it("keeps a conversation whose carrier slice is joined by real turns in another transcript", async () => {

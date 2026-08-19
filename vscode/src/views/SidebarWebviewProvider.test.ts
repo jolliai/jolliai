@@ -4456,12 +4456,11 @@ describe("SidebarWebviewProvider", () => {
 	});
 
 	describe("kb:expandMemory → kb:memoryEvidence", () => {
-		it("omits a usage-only carrier from the conversations evidence, keeps entries-less legacy sessions", async () => {
+		it("omits every zero-turn session from the conversations evidence (carrier and legacy shell alike)", async () => {
 			// A carrier (empty `entries` + a recorded `usage`) is stored only so `detach`
-			// has a token subtrahend; an evidence row for it would read as an empty
-			// conversation. A session that merely OMITS `entries` is legacy data, not a
-			// carrier, and must still surface with a turn count of 0 — hence the `usage`
-			// half of the predicate.
+			// has a token subtrahend; a legacy/overlay-emptied session merely OMITS
+			// `entries`. Both are zero-turn and would read as empty `0 msgs` rows, so the
+			// evidence list drops both uniformly — only a session with real turns lists.
 			const view = makeMockView();
 			const fakeSummary = {
 				version: 5,
@@ -4512,10 +4511,7 @@ describe("SidebarWebviewProvider", () => {
 			const sent = await flushUntilMessage(view, "kb:memoryEvidence");
 			const evidenceMsg = sent.find((m) => m.type === "kb:memoryEvidence");
 
-			expect(evidenceMsg.evidence.conversations.map((c: { id: string }) => c.id)).toEqual([
-				"sess-real",
-				"sess-legacy",
-			]);
+			expect(evidenceMsg.evidence.conversations.map((c: { id: string }) => c.id)).toEqual(["sess-real"]);
 		});
 
 		it("shows the title the ARCHIVE recorded, without re-deriving it from the live transcript", async () => {
@@ -4593,7 +4589,14 @@ describe("SidebarWebviewProvider", () => {
 			};
 			const fakeTranscript = {
 				sessions: [
-					{ sessionId: "sess-abc", source: "claude" as const, transcriptPath: "/tmp/claude.jsonl" },
+					{
+						sessionId: "sess-abc",
+						source: "claude" as const,
+						transcriptPath: "/tmp/claude.jsonl",
+						// One real turn so the session is not a zero-turn row the evidence
+						// list now drops — this test is about the plan/note/ref/file projection.
+						entries: [{ role: "human" as const, content: "hi" }],
+					},
 				],
 			};
 			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
@@ -4627,8 +4630,7 @@ describe("SidebarWebviewProvider", () => {
 				id: "sess-abc",
 				source: "claude",
 				transcriptPath: "/tmp/claude.jsonl",
-				// No `entries` on the fake session → archived turn count falls back to 0.
-				messageCount: 0,
+				messageCount: 1,
 			});
 			// context: plan + note + reference
 			expect(evidenceMsg.evidence.context).toHaveLength(3);
@@ -5106,7 +5108,18 @@ describe("SidebarWebviewProvider", () => {
 			};
 			const getSummaryByHash = vi.fn().mockResolvedValue(fakeSummary);
 			const readTranscriptById = vi.fn()
-				.mockResolvedValueOnce({ sessions: [{ sessionId: "s1", source: "claude" as const, transcriptPath: "/tmp/a.jsonl" }] })
+				.mockResolvedValueOnce({
+					sessions: [
+						{
+							sessionId: "s1",
+							source: "claude" as const,
+							transcriptPath: "/tmp/a.jsonl",
+							// A real turn so the surviving transcript's session is not dropped
+							// as a zero-turn row — this test is about the inner-catch skip.
+							entries: [{ role: "human" as const, content: "hi" }],
+						},
+					],
+				})
 				.mockRejectedValueOnce(new Error("read failed"));
 			const provider = new SidebarWebviewProvider({
 				executeCommand: vi.fn(),
@@ -5182,7 +5195,14 @@ describe("SidebarWebviewProvider", () => {
 			};
 			const foreignTranscript = {
 				sessions: [
-					{ sessionId: "foreign-sess-1", source: "claude" as const, transcriptPath: "/other-repo/claude.jsonl" },
+					{
+						sessionId: "foreign-sess-1",
+						source: "claude" as const,
+						transcriptPath: "/other-repo/claude.jsonl",
+						// A real turn so the session is not dropped as a zero-turn row —
+						// this test is about reading conversations from foreign-repo storage.
+						entries: [{ role: "human" as const, content: "hi" }],
+					},
 				],
 			};
 			// getSummaryAnyRepoWithSource returns the summary with sourceRepoName set (foreign repo)

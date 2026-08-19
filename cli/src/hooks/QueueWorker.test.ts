@@ -2824,8 +2824,16 @@ describe("QueueWorker", () => {
 		it("omits title rather than storing a sentinel when no title can be resolved", async () => {
 			// Absence is what lets a reader fall back; a stored "(untitled session)"
 			// would be indistinguishable from a real title and pin the wrong answer.
+			// A carrier (usage>0, no live file, no archived entries) has no resolvable
+			// title and survives the shell drop, so it exercises the omission path.
 			const stored = await __test__.buildStoredTranscript([
-				{ sessionId: "s1", transcriptPath: "/gone/s1.jsonl", source: "claude", entries: [] },
+				{
+					sessionId: "s1",
+					transcriptPath: "/gone/s1.jsonl",
+					source: "claude",
+					entries: [],
+					usage: { input: 10, output: 5, cached: 0 },
+				},
 			]);
 
 			expect(stored.sessions[0]).not.toHaveProperty("title");
@@ -2838,6 +2846,9 @@ describe("QueueWorker", () => {
 					transcriptPath: "/claude/legacy.jsonl",
 					// source intentionally omitted — pre-multi-source data shape
 					entries: [],
+					// usage>0 keeps this carrier alive past the shell drop; the test is
+					// about source preservation on serialize, not the drop.
+					usage: { input: 10, output: 5, cached: 0 },
 				},
 			]);
 
@@ -2873,12 +2884,14 @@ describe("QueueWorker", () => {
 			// A stored zero would read as "this session used nothing", which detach would
 			// treat as a valid no-op subtraction; absent means "cannot attribute" and
 			// leaves the memory's totals alone. Sources with no usage must land on absent.
+			// Entries are present so the all-zero usage does not read as a droppable
+			// shell — the point here is the usage-field gate, not the shell drop.
 			const stored = await __test__.buildStoredTranscript([
 				{
 					sessionId: "s1",
 					transcriptPath: "/gemini/s1.json",
 					source: "gemini",
-					entries: [],
+					entries: [{ role: "human", content: "hi", timestamp: "2026-08-19T10:00:00Z" }],
 					usage: { input: 0, output: 0, cached: 0 },
 					usageByModel: [],
 				},
@@ -2895,6 +2908,10 @@ describe("QueueWorker", () => {
 					transcriptPath: "/claude/s1.jsonl",
 					source: "claude",
 					entries: [],
+					// A carrier (usage>0) — toolUse rides the same usage gate as its
+					// usage in production, so an entry-less toolUse session always has
+					// usage. usage>0 also keeps it past the shell drop.
+					usage: { input: 10, output: 5, cached: 0 },
 					toolUse: [
 						{ name: "Bash", kind: "builtin", calls: 3 },
 						{ name: "jollimemory.recall", kind: "mcp", server: "jollimemory", calls: 1 },
@@ -2915,7 +2932,16 @@ describe("QueueWorker", () => {
 			// `[]` replaces stored rows, absent leaves them alone. Length-gating this
 			// the way `usageByModel` is gated would collapse them.
 			const stored = await __test__.buildStoredTranscript([
-				{ sessionId: "s1", transcriptPath: "/claude/s1.jsonl", source: "claude", entries: [], toolUse: [] },
+				{
+					sessionId: "s1",
+					transcriptPath: "/claude/s1.jsonl",
+					source: "claude",
+					entries: [],
+					// usage>0 keeps this carrier past the shell drop; the assertion is
+					// about the empty-vs-absent toolUse distinction.
+					usage: { input: 10, output: 5, cached: 0 },
+					toolUse: [],
+				},
 			]);
 
 			expect(stored.sessions[0].toolUse).toEqual([]);
@@ -2923,10 +2949,53 @@ describe("QueueWorker", () => {
 
 		it("omits toolUse for a source whose parser cannot report tool calls", async () => {
 			const stored = await __test__.buildStoredTranscript([
-				{ sessionId: "s1", transcriptPath: "/gemini/s1.json", source: "gemini", entries: [] },
+				{
+					sessionId: "s1",
+					transcriptPath: "/gemini/s1.json",
+					source: "gemini",
+					entries: [],
+					// A carrier (usage>0) so it survives the shell drop; the point of the
+					// test — that gemini reports no toolUse — is unchanged.
+					usage: { input: 10, output: 5, cached: 0 },
+				},
 			]);
 
 			expect(stored.sessions[0]).not.toHaveProperty("toolUse");
+		});
+
+		it("drops overlay-emptied shells (no entries and no usage) but keeps real sessions and usage-only carriers", async () => {
+			// Repro for the "Mark All as Deleted" bug: a delete-all overlay empties a
+			// session's entries AFTER it was read with real content, so it reaches here
+			// with entries:[] and no usage — a shell whose only effect is a `0 msgs`
+			// noise row in the CONVERSATIONS list. A legitimate carrier (entries:[] but
+			// usage>0, appended by appendUsageOnlyCarriers) must survive: detach reads
+			// it as a per-session subtrahend. A present-but-all-zero usage counts as no
+			// usage — the same predicate the serialize step uses to gate the field.
+			const stored = await __test__.buildStoredTranscript([
+				{
+					sessionId: "real",
+					transcriptPath: "/claude/real.jsonl",
+					source: "claude",
+					entries: [{ role: "human", content: "hi", timestamp: "2026-08-19T10:00:00Z" }],
+				},
+				{ sessionId: "shell-no-usage", transcriptPath: "/claude/a.jsonl", source: "claude", entries: [] },
+				{
+					sessionId: "shell-zero-usage",
+					transcriptPath: "/claude/b.jsonl",
+					source: "claude",
+					entries: [],
+					usage: { input: 0, output: 0, cached: 0 },
+				},
+				{
+					sessionId: "carrier",
+					transcriptPath: "/claude/carrier.jsonl",
+					source: "claude",
+					entries: [],
+					usage: { input: 10, output: 5, cached: 0 },
+				},
+			]);
+
+			expect(stored.sessions.map((s) => s.sessionId)).toEqual(["real", "carrier"]);
 		});
 	});
 

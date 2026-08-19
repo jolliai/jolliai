@@ -4675,6 +4675,26 @@ function appendUsageOnlyCarriers(
  * the later session's metadata onto the earlier one on serialize.
  */
 async function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTranscript>): Promise<StoredTranscript> {
+	// Drop overlay-emptied shells before anything else. A "Mark All as Deleted"
+	// overlay empties a session's entries AFTER it was read with real content, so
+	// the session slips past readAllTranscripts' read-time `entries.length > 0`
+	// gate and appendUsageOnlyCarriers' `usage > 0` gate, then applyOverlaysToSessions
+	// prunes its entries to `[]` — landing here with neither entries nor usage.
+	// attachPerSessionUsage sees `post < pre` and deliberately withholds usage
+	// (avoiding over-subtraction on detach), so nothing re-fills it. Such a session
+	// contributes nothing to the summary body, the token accounting, or detach — its
+	// only effect would be a `0 msgs` noise row in the CONVERSATIONS list. Filtering
+	// it here restores the "a stored session has entries OR usage" invariant.
+	//
+	// The predicate keeps a legitimate usage-only carrier (empty entries but
+	// usage > 0, appended by appendUsageOnlyCarriers) — detach subtracts its
+	// `StoredSession.usage`. It is the SAME `input+output+cached > 0` test the
+	// serialize step below gates the `usage` field on, so a carrier that survives
+	// here always keeps its usage on disk (and a present-but-all-zero usage is
+	// treated as no usage, exactly as it is there).
+	const kept = sessionTranscripts.filter(
+		(st) => st.entries.length > 0 || (st.usage != null && st.usage.input + st.usage.output + st.usage.cached > 0),
+	);
 	// Titles are resolved HERE rather than attached upstream like `usage` and
 	// `toolUse`, even though that is the established pattern for this array: there
 	// are two call sites (commit and amend) plus the backfill's own writer, and an
@@ -4682,9 +4702,9 @@ async function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTr
 	// well-formed archive. Serializing is the one thing no writer can skip. The
 	// cost is that this stops being a pure function — see `resolveArchivedTitle`
 	// for why commit time is the only moment the answer is available at all.
-	const titles = await Promise.all(sessionTranscripts.map((st) => resolveArchivedTitle(st)));
+	const titles = await Promise.all(kept.map((st) => resolveArchivedTitle(st)));
 	return {
-		sessions: sessionTranscripts.map((st, i) => ({
+		sessions: kept.map((st, i) => ({
 			sessionId: st.sessionId,
 			source: st.source,
 			transcriptPath: st.transcriptPath,

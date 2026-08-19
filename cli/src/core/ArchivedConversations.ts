@@ -105,22 +105,20 @@ export function groupArchivedSessions(
 			return ta - tb;
 		});
 		const entries = sorted.flat();
-		// Hide a usage-only conversation: it exists on disk only so `detach` has a
-		// per-session subtrahend (the queue worker persists a zero-entry carrier for
-		// a conversation that spent tokens without producing a readable turn), so a
-		// row for it would render as an empty conversation.
-		//
-		// The `usage` half of the predicate is load-bearing. "No entries at all" is a
-		// DIFFERENT case: a legacy/malformed stored session can omit `entries`
-		// entirely, and those are real conversations this deliberately still lists
-		// (turn count 0). Only a carrier is identifiable by empty-entries AND a
-		// recorded `usage`.
+		// Hide every zero-turn conversation, uniformly. Two disk shapes produce one:
+		// a usage-only carrier (empty entries + recorded usage) the queue worker
+		// persists so `detach` has a per-session subtrahend, and an overlay-emptied
+		// shell (empty entries + no usage) a "Mark All as Deleted" edit left behind
+		// on memories written before the storage-layer drop (buildStoredTranscript)
+		// existed. Neither has a readable turn, so a row for either would render as
+		// an empty `0 msgs` conversation — noise the user asked us to suppress. This
+		// also cleans up already-generated memories with no data migration.
 		//
 		// Filtered on the MERGED entries, not per slice: a conversation split across
 		// commits can legitimately be entry-less in one transcript and real in
 		// another, and that one must still show. Detach reads `transcript.sessions`
 		// directly and is deliberately NOT filtered — the record stays subtractable.
-		if (entries.length === 0 && g.session.usage !== undefined) continue;
+		if (entries.length === 0) continue;
 		grouped.set(key, { session: g.session, hash: g.hash, entries });
 	}
 	// Keep `order` in sync with `grouped` so callers can zip the two without

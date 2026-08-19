@@ -240,6 +240,15 @@ class SummaryReader(
                     val source = session.notNull("source")?.asString ?: "ai"
                     val entries = session.arrayOrNull("entries")
                     val messageCount = entries?.size() ?: 0
+                    // Drop zero-turn conversations uniformly, mirroring the CLI-owned
+                    // rule in core/ArchivedConversations.ts (`groupArchivedSessions`):
+                    // both a usage-only carrier (empty entries + recorded usage, kept on
+                    // disk so `detach` has a per-session subtrahend) and an overlay-emptied
+                    // shell (empty entries, no usage) archive with no readable turn and
+                    // would otherwise render as a `0 msgs` noise row here. VS Code and the
+                    // dashboard already suppress these; this keeps the JVM host in step
+                    // rather than re-implementing the visibility rule without the filter.
+                    if (messageCount == 0) return@mapNotNull null
                     ConversationBrief(
                         source = source,
                         title = deriveTitle(entries, source),

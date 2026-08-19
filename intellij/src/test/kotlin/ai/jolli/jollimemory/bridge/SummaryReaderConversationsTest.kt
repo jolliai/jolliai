@@ -66,13 +66,33 @@ class SummaryReaderConversationsTest {
             val json = """
                 {"sessions":[
                   {"sessionId":"s1","source":"claude","entries":[{"role":"human","content":"first"}]},
-                  {"sessionId":"s2","source":"cursor","entries":[]}
+                  {"sessionId":"s2","source":"cursor","entries":[{"role":"human","content":"second"}]}
                 ]}
             """.trimIndent()
             val rows = SummaryReader.parseConversations(json)
             rows.map { it.source } shouldBe listOf("claude", "cursor")
-            rows[1].messageCount shouldBe 0
-            rows[1].title shouldBe "Cursor session"
+            rows[1].messageCount shouldBe 1
+            rows[1].title shouldBe "second"
+        }
+
+        /**
+         * Zero-turn sessions are dropped uniformly, matching the CLI-owned
+         * `groupArchivedSessions` rule: a usage-only carrier or an overlay-emptied
+         * shell (both archived with `entries:[]`) has no readable turn, so it must
+         * not surface as a `0 msgs` row on the JVM host any more than it does on
+         * VS Code or the dashboard.
+         */
+        @Test
+        fun `drops zero-turn sessions but keeps their non-empty siblings`() {
+            val json = """
+                {"sessions":[
+                  {"sessionId":"s1","source":"claude","entries":[{"role":"human","content":"first"}]},
+                  {"sessionId":"s2","source":"cursor","entries":[]}
+                ]}
+            """.trimIndent()
+            val rows = SummaryReader.parseConversations(json)
+            rows.size shouldBe 1
+            rows[0].sessionId shouldBe "s1"
         }
 
         /**
@@ -100,7 +120,10 @@ class SummaryReaderConversationsTest {
 
         @Test
         fun `an explicit null source or sessionId falls back instead of dropping the row`() {
-            val json = """{"sessions":[{"sessionId":null,"source":null,"entries":[]}]}"""
+            // A real turn so the zero-turn filter keeps the row — this case is about
+            // null source/sessionId falling back, not about empty-session survival.
+            val json =
+                """{"sessions":[{"sessionId":null,"source":null,"entries":[{"role":"human","content":"hi"}]}]}"""
             val rows = SummaryReader.parseConversations(json)
             rows.size shouldBe 1
             rows[0].source shouldBe "ai"

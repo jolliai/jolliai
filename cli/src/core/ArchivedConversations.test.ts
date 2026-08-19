@@ -109,11 +109,15 @@ describe("groupArchivedSessions", () => {
 		expect(result.grouped.has("claude:s1")).toBe(false);
 	});
 
-	it("keeps a real empty conversation (empty entries, no usage)", () => {
+	it("drops an overlay-emptied shell (empty entries, no usage)", () => {
+		// A "Mark All as Deleted" overlay empties a session's entries after it was
+		// read, leaving a zero-turn shell with no usage. It would render as a
+		// `0 msgs` noise row, so the display rule hides it uniformly alongside the
+		// usage-only carrier above.
 		const empty = session({ sessionId: "s1", source: "claude", entries: [] });
 		const result = groupArchivedSessions([["c1", transcript([empty])]]);
-		expect(result.order).toEqual(["claude:s1"]);
-		expect(result.grouped.get("claude:s1")?.entries).toEqual([]);
+		expect(result.order).toEqual([]);
+		expect(result.grouped.has("claude:s1")).toBe(false);
 	});
 
 	it("shows a conversation entry-less in one commit but real in another, even with usage", () => {
@@ -136,12 +140,13 @@ describe("groupArchivedSessions", () => {
 		expect(result.grouped.get("claude:s1")?.entries.map((e) => e.content)).toEqual(["real"]);
 	});
 
-	it("treats an absent entries field as an empty slice", () => {
+	it("treats an absent entries field as an empty slice and drops it", () => {
 		// Legacy/malformed stored session with `entries` omitted (cast around the
-		// required field to mimic on-disk data the reader tolerates).
+		// required field to mimic on-disk data the reader tolerates). It coalesces to
+		// an empty slice, so it is a zero-turn conversation and hidden like any other.
 		const legacy = { sessionId: "s1", source: "claude" } as unknown as StoredSession;
 		const result = groupArchivedSessions([["c1", transcript([legacy])]]);
-		// No usage recorded, so it stays as a real (empty) conversation.
-		expect(result.grouped.get("claude:s1")?.entries).toEqual([]);
+		expect(result.order).toEqual([]);
+		expect(result.grouped.has("claude:s1")).toBe(false);
 	});
 });

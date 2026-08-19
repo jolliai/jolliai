@@ -94,8 +94,8 @@ describe("loadRegenerateContext", () => {
 		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
 			singleHashMap(baseSummary.commitHash, {
 				sessions: [
-					{ sessionId: "a", source: "claude", entries: [] },
-					{ sessionId: "b", source: "claude", entries: [] },
+					{ sessionId: "a", source: "claude", entries: [{ role: "human", content: "hi" }] },
+					{ sessionId: "b", source: "claude", entries: [{ role: "human", content: "yo" }] },
 				],
 			}),
 		);
@@ -103,24 +103,26 @@ describe("loadRegenerateContext", () => {
 		expect(ctx.sources).toEqual(["Claude"]);
 	});
 
-	it("excludes a usage-only carrier from sessionCount but keeps an entries-less legacy session", async () => {
-		// A carrier is a zero-entry session that carries `usage` — stored only so a
-		// later detach has a token subtrahend, and hidden from every Conversations
-		// surface. Counting it would make the confirm dialog promise a conversation the
-		// user cannot see, and it contributes nothing to the regenerate prompt anyway.
-		// A session that merely omits/empties `entries` WITHOUT `usage` is legacy data
-		// and must keep counting.
+	it("excludes every zero-turn conversation from sessionCount, matching the Conversations list", async () => {
+		// The count must agree with `groupArchivedSessions`, which drops EVERY
+		// zero-turn conversation uniformly — both the usage-only carrier (stored so a
+		// later detach has a token subtrahend) and the overlay-emptied shell (a
+		// "Mark All as Deleted" edit left an entry-less, usage-less session behind).
+		// Counting either would make the confirm dialog promise a conversation the
+		// user cannot see. Only the one session with a readable turn survives.
 		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
 			singleHashMap(baseSummary.commitHash, {
 				sessions: [
 					{ sessionId: "carrier", source: "claude", entries: [], usage: { input: 6, output: 3, cached: 0 } },
-					{ sessionId: "legacy", source: "claude", entries: [] },
+					{ sessionId: "shell", source: "claude", entries: [] },
+					{ sessionId: "real", source: "claude", entries: [{ role: "human", content: "hi" }] },
 				],
 			}),
 		);
 
 		const ctx = await loadRegenerateContext(baseSummary, "/repo");
 		expect(ctx.sessionCount).toBe(1);
+		expect(ctx.entryCount).toBe(1);
 	});
 
 	it("defaults missing session.source to 'claude' for sessionId dedup keys", async () => {
@@ -131,8 +133,8 @@ describe("loadRegenerateContext", () => {
 		vi.mocked(SummaryStore.readTranscriptsForCommits).mockResolvedValue(
 			singleHashMap(baseSummary.commitHash, {
 				sessions: [
-					{ sessionId: "dup", entries: [] },
-					{ sessionId: "dup", entries: [] },
+					{ sessionId: "dup", entries: [{ role: "human", content: "h1" }] },
+					{ sessionId: "dup", entries: [{ role: "assistant", content: "a1" }] },
 				],
 			}),
 		);

@@ -1657,15 +1657,16 @@ export class SidebarWebviewProvider
 					});
 					return { ...base, entries: sorted.flat() };
 				})
-				// Drop usage-only carriers: stored so `detach` has a per-session
-				// subtrahend, but with no readable turn to show — an evidence/branch row
-				// for one would render as an empty conversation. Applied to the MERGED
-				// entries so a conversation that is a carrier in one transcript and real in
-				// another still surfaces. A session that merely OMITS `entries` (legacy /
-				// malformed stored data) is not a carrier and is deliberately kept: those
-				// are real conversations, rendered with a turn count of 0 — hence the
-				// `usage` half of the predicate.
-				.filter((session) => session.entries.length > 0 || session.usage === undefined)
+				// Drop every zero-turn conversation, uniformly — the same rule the
+				// CLI owns in core/ArchivedConversations.ts (`groupArchivedSessions`):
+				// a usage-only carrier (stored so `detach` has a per-session subtrahend)
+				// and an overlay-emptied shell both archive with no readable turn and
+				// would render as an empty `0 msgs` row. Applied to the MERGED entries so
+				// a conversation that is a carrier in one transcript and real in another
+				// still surfaces. This is the sole visibility filter for both callers of
+				// readArchivedSessions (evidence rows and openEvidenceConversation), so
+				// neither re-filters.
+				.filter((session) => session.entries.length > 0)
 		);
 	}
 
@@ -1730,6 +1731,9 @@ export class SidebarWebviewProvider
 			// merged-entries fallback) — identical to the previous behavior, so a
 			// deleted transcript is no worse than before, never a throw. `?? []`
 			// guards a malformed transcript JSON missing `entries`.
+			// readArchivedSessions already drops zero-turn conversations (overlay
+			// shells and usage-only carriers), matching the dashboard's
+			// groupArchivedSessions rule, so this path does not re-filter.
 			const archivedSessions = await this.readArchivedSessions(summary, sourceRepoName, sourceRemoteUrl);
 			const conversations: MemoryEvidenceItem[] = await Promise.all(
 				archivedSessions.map(async (session) => ({

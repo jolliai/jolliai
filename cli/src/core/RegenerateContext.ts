@@ -1,4 +1,5 @@
 import type { CommitSummary, SourceId } from "../Types.js";
+import { groupArchivedSessions } from "./ArchivedConversations.js";
 import type { StorageProvider } from "./StorageProvider.js";
 import { normalizeToV4, readTranscriptsForCommits } from "./SummaryStore.js";
 import { getTranscriptIds } from "./SummaryTree.js";
@@ -58,28 +59,26 @@ export async function loadRegenerateContext(
 	// entries even when the user can see them in the All Conversations card.
 	const transcriptMap = await readTranscriptsForCommits(transcriptIds, cwd, storage);
 
+	// Collapse the transcript files into the SAME conversation rows the user sees
+	// in the All Conversations card by reusing `groupArchivedSessions` — one row
+	// per `source:sessionId`, slices merged across an amend/squash chain, and
+	// every zero-turn conversation dropped uniformly (usage-only carriers AND
+	// overlay-emptied shells alike). Deriving the counts from that shared rule is
+	// what keeps this confirm dialog from promising a conversation the list does
+	// not render; a private re-implementation of the merge is exactly what drifted
+	// before. entryCount/humanTurns are unaffected by the drop — a zero-turn
+	// conversation contributes no entries either way.
+	const { order, grouped } = groupArchivedSessions(transcriptMap);
 	let entryCount = 0;
 	let humanTurns = 0;
-	const seenSessions = new Set<string>();
 	const sourceSet = new Set<string>();
-	for (const stored of transcriptMap.values()) {
-		for (const session of stored.sessions) {
-			entryCount += session.entries.length;
-			for (const entry of session.entries) {
-				if (entry.role === "human") humanTurns++;
-			}
-			// Skip a usage-only carrier: the queue worker stores a zero-entry session
-			// carrying `usage` purely so `detach` has a token subtrahend, and the
-			// Conversations surfaces hide it. Counting it here would make the confirm
-			// dialog promise a conversation the user cannot see (and which contributes
-			// nothing to the regenerate prompt — buildMultiSessionContext emits no block
-			// for an entry-less session). A session that merely omits `entries` is legacy
-			// data, not a carrier, and still counts — hence the `usage` half.
-			if (session.entries.length === 0 && session.usage !== undefined) continue;
-			const sourceKey = session.source ?? "claude";
-			seenSessions.add(`${sourceKey}:${session.sessionId}`);
-			sourceSet.add(transcriptSourceLabel(session.source));
+	for (const key of order) {
+		const { session, entries } = grouped.get(key) as NonNullable<ReturnType<typeof grouped.get>>;
+		entryCount += entries.length;
+		for (const entry of entries) {
+			if (entry.role === "human") humanTurns++;
 		}
+		sourceSet.add(transcriptSourceLabel(session.source));
 	}
 
 	// Bucket references by source in one pass instead of N filter() scans.
@@ -90,7 +89,7 @@ export async function loadRegenerateContext(
 
 	return {
 		entryCount,
-		sessionCount: seenSessions.size,
+		sessionCount: order.length,
 		sources: Array.from(sourceSet),
 		humanTurns,
 		plansCount: normalized.plans?.length ?? 0,
