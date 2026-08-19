@@ -15,7 +15,7 @@ This spec defines how a Claude Code session transcript is read from local newlin
 - The rule that consecutive same-role records (streaming chunks of one response) are coalesced into a single normalized entry.
 - The cursor structure used for incremental resumption.
 - The optional time-cutoff filter that lets a queue-driven caller attribute records to a specific commit boundary.
-- The token-usage figures the read returns alongside the entries, and the fact that a model response spread over several records is counted once per read.
+- The token-usage figures the read returns alongside the entries, the per-response entries returned with them, and the fact that a model response spread over several records is counted once per read.
 - The character-budgeted context-string assembly used to feed an LLM, including a default per-call budget.
 - Behavior on partial / blank / unparseable lines.
 
@@ -24,6 +24,7 @@ This spec defines how a Claude Code session transcript is read from local newlin
 - Discovering which session is active (delivered by a session-tracking layer).
 - Parsing transcripts produced by other AI coding agents (Codex, Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat).
 - The downstream LLM call that consumes the assembled context.
+- What the second consumer of these same lines does with the working directory and the write-tool blocks it reads off them — deriving which worktree roots a session visited or authored into (owned by a neighbouring ownership-ledger topic). This spec records only that the envelope carries that field and that this reader does not use it.
 - Persisting the cursor across runs.
 - Multi-session merging policy beyond noting that the same normalized record shape is reused.
 
@@ -44,8 +45,11 @@ Each non-blank line is a JSON object. Recognized records carry:
 | `message.content`  | string or array | Either a plain text string, or an array of typed blocks `{ type, ... }` of which only `type:"text"` blocks are extracted; their `text` fields are concatenated with newlines. |
 | `timestamp`        | string          | Optional ISO 8601 instant carried through onto the produced entry.                                     |
 | `isCompactSummary` | boolean         | When `true`, the line is a compaction summary and is silently dropped.                                 |
+| `cwd`              | string          | Optional top-level working directory the producer stamped on this record. Not consumed by the reader below; read off the **raw line** by a separate consumer (see Notable Behavior).                                 |
 
 Non-message records (system events, tool invocations, tool results, streaming-status frames, compaction summaries, IDE-event records, and any other shape that lacks a `message` object with a recognized role) are silently dropped.
+
+`cwd` is documented here because it is an envelope field with a consumer, even though nothing in the normalizing read path uses it. That consumer takes it **off the raw line and never through the turn parser** — deliberately, because the producer stamps it on records that are not conversation turns at all, and gating on the parser would discard most of the directories a session ever visited. The field's absence is decisive rather than incidental: a line carrying no working directory contributes **no** evidence to that consumer at all, including the file paths its write-tool blocks name.
 
 ### Normalized entry (output)
 
@@ -63,11 +67,13 @@ Non-message records (system events, tool invocations, tool results, streaming-st
 | `lineNumber`     | int    | The number of lines already consumed on prior reads. Next read starts at this index.        |
 | `updatedAt`      | string | The wall-clock instant the cursor was produced.                                             |
 
-A null/absent cursor means "read from the beginning."
+A null/absent cursor means "read from the beginning." That is the reader's contract and is unchanged — but it no longer describes what the product does end-to-end, because the commit-pipeline caller substitutes a synthetic owner-seeded cursor for a Claude session's first read in a worktree instead of passing none. See **Summary Attribution by Transcript Cutoff** for when that substitution happens and which line it starts from; nothing about this reader is conditional on it.
 
 ### Read result
 
 A read returns the list of normalized entries produced by this call, the new cursor, a count of how many lines were actually consumed during this call, and the token figures for the consumed slice: a scalar total and its three-segment breakdown — **always present**, and both zero for a producer whose records carry no usage counters — plus an optional per-model split, omitted entirely when the producer exposes no per-model capture or when the split would be empty. The segment semantics, the counter mapping, and the cost pricing are owned by **Token Usage Extraction and Cost Estimation**; what belongs here is that the figures are a property of *this read's consumed slice*, not of the file.
+
+The result also carries **per-response usage**: one entry per counted response in the consumed slice, each with its own instant plus that response's model and segment counts. The collection is **present but possibly empty** for any producer whose parser can report usage at all, and **absent** for one that cannot — the two are distinguishable, and only the empty-but-present form means "this slice held no datable responses". Two kinds of counted response are omitted from it while still contributing to the scalar total and the breakdown above: a response whose instant cannot be resolved (a wrong day is worse than a missing one), and a response reporting zero tokens in every segment. So the per-response entries and the totals agree except by exactly what could not be dated or had nothing to report.
 
 ## Behavior
 
@@ -134,6 +140,16 @@ The per-model split (when the producer supports one) is computed over the same
 consumed lines and de-duplicates on the same identities, so it can never
 disagree with the segment breakdown about what was counted.
 
+The per-response entries are built in the same pass, from the same counted
+responses, so no second definition of "a counted response" exists. Each entry
+carries the response's own instant, resolved from the entry's timestamp when it
+has one and otherwise from the raw line. Two filters apply to the entries and
+not to the totals: a response whose instant cannot be resolved is dropped rather
+than dated by guesswork, and a response reporting zero tokens across all three
+segments is not recorded as a response at all — a line with no usage at all
+reports zeros rather than nothing, so without that filter every user turn, tool
+result and meta record would produce an entry.
+
 ### Context-string assembly (character-budget rule)
 
 When the read result is rendered into a single LLM-facing string:
@@ -159,13 +175,15 @@ The reader is stateless beyond the input cursor: each call takes a transcript pa
 
 - **Transcript files are append-only newline-delimited records**; reading always proceeds line-by-line from the cursor position forward.
 - **Compaction summaries are dropped** even though they carry a message envelope, because they synthesize a recap rather than reflect a real turn.
-- **Tool-use blocks are silently discarded** from assistant records; only `text` blocks survive into the normalized entry. The rationale is that the surrounding diff context already captures code-touching effects.
+- **Tool-use blocks are silently discarded *by the normalizing reader*** — only `text` blocks survive into the normalized entry, on the rationale that the surrounding diff context already captures code-touching effects. They are not discarded by the product: a second consumer reads the very same lines for a different purpose, taking the write-tool blocks specifically and deriving worktree ownership from the file paths they name. So "discarded" describes this read path's output, not the information's fate. (See the `cwd` note under Record envelope; the ownership rule itself is owned by a neighbouring topic.)
 - **IDE-injected tags are stripped before noise-prefix filtering**, so a user message that begins with an IDE opened-file tag and is otherwise system-generated still ends up dropped.
 - **Coalescing happens after line-level filtering**, so dropped streaming chunks do not "split" what was logically one assistant turn.
 - **Same-role coalescing keeps the earliest timestamp** of the run, not the latest, so the merged turn aligns with when the model started speaking.
 - **The character budget is a per-call default applied after read**: the read itself does not truncate; truncation belongs to the context-assembly step.
 - **Usage is counted per model response, not per record.** One response is written across several records that each repeat its whole usage object; the read counts the first and skips the rest. (Surprising; see **Token Usage Extraction and Cost Estimation** for why summing per record inflated totals several-fold.)
 - **The de-duplication set does not survive the read.** A response whose records fall on both sides of the time cutoff is counted by both reads. Bounded and accepted, because the cursor stores no response identity (see **Transcript Cursor Resumption**). (Surprising; intentional.)
+- **The per-response entries and the totals are allowed to disagree, in one direction only.** A response the reader cannot date, and a response that reported zero tokens everywhere, count toward the scalar total and the breakdown but produce no per-response entry. The totals therefore stay whole while the dated series stays trustworthy, and the gap between them is exactly what could not be dated or had nothing to report — never the other way round. (Surprising; intentional.)
+- **An absent per-response collection and an empty one mean different things.** Absent means this producer's parser cannot report usage at all; empty means it can and this slice held no datable, non-zero responses. A consumer can tell them apart, which is what lets an empty result be acted on rather than ignored. (Notable.)
 - **The cursor field is named `lineNumber`** but its semantics are "lines already consumed," so it equals the count, not the last-index.
 - **Same-role coalescing is idempotent**: applying it twice produces the same output.
 
@@ -176,4 +194,4 @@ The reader is stateless beyond the input cursor: each call takes a transcript pa
 - **Lossy normalization**: only `text`-bearing user and assistant turns survive; everything else is discarded.
 - **Canonical entry shape** (`{ role: "human"|"assistant", content, timestamp? }`) is the same shape produced by every other transcript-source reader in this product, so downstream consumers do not branch on source.
 - **Cursor-keyed resumption** by `(transcriptPath, lineNumber)` is the same shape used by every other transcript-source reader in this product.
-- **The token figures a read returns** are defined and priced by **Token Usage Extraction and Cost Estimation**, attributed per conversation by **Commit-Pipeline Conversation Token Attribution**, and summed cursorlessly for the review panel's live meter by **Conversation Token Totals for the Review Panel**. This spec owns only the fact that they describe the consumed slice and are de-duplicated within a single read.
+- **The token figures a read returns** are defined and priced by **Token Usage Extraction and Cost Estimation**, attributed per conversation by **Commit-Pipeline Conversation Token Attribution**, and summed cursorlessly for the review panel's live meter by **Conversation Token Totals for the Review Panel**. This spec owns only the fact that they describe the consumed slice and are de-duplicated within a single read. The same division applies to the per-response entries: their segment semantics and pricing belong to those topics, while their presence, their per-response granularity, and the two omissions above belong here.

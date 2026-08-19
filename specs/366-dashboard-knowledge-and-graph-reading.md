@@ -26,7 +26,7 @@ Serving the local dashboard's two folder-backed pages — the browsable topic wi
 - The Memory Bank folder's own layout, its per-repository root resolution, and the discovery that enumerates it.
 - The visualisation's interaction model — its board, search, detail panel and history — which is one self-contained artifact shared with the export and editor surfaces.
 - The route surface these payloads are served over, its access boundary, and the sandbox the documents are framed in.
-- The browser-side rendering of the two pages.
+- The browser-side rendering of the two pages — including one fact worth stating here because a reader of this topic alone would conclude the opposite: **both pages' sidebar rows are hidden by default**, each behind its own machine-global preference, so both ship unreachable from the dashboard's navigation and are reached only by a direct URL, by the wiki page's own per-repository graph link, or after the user switches the row on in the dashboard's Advanced settings. Nothing this topic owns is affected: the two page routes, the two framed document routes and the source-commit jump all answer exactly as described below whether the row is shown or not, and nothing here reads the preference.
 - Everything the machine-level database serves, including the memories the source-commit jump lands on.
 
 ## Data Contracts

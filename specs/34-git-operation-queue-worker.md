@@ -16,6 +16,7 @@ A single-writer background process that drains a per-operation queue in two phas
 - The bounded inner-loop safety cap that prevents a runaway drain.
 - The post-drain topic-KB ingest trigger (enqueue one ingest operation when at least one commit-typed op was processed).
 - The post-drain push-sync trigger (fire-and-forget hand-off of the commit hashes whose summaries were (re)generated this run to the personal-space push engine, so a `git push` that raced ahead of summary generation still syncs once the memory lands).
+- The post-drain session-statistics sync trigger (fire-and-forget, and the one post-drain trigger deliberately **not** gated on whether any work landed this run).
 - The successor-spawn step performed after the locks are released, if new **summary** entries arrived during the drain.
 - The separate ingest phase: that it runs after both entry-level locks release, under its own heartbeated per-worktree ingest lock, and its acquire → record-pending-and-retry-once → run-one-ingest → delete-on-success → release-then-wake sequence.
 - The ingest phase's **outcome report**: what it enumerates about the run it just performed, which runs do not reach it, and why the held-topic list is part of the outcome rather than a footnote.
@@ -23,7 +24,8 @@ A single-writer background process that drains a per-operation queue in two phas
 
 **Out of scope:**
 - The on-disk shape and authoring of an individual queue entry (covered by the queue-entry-format topic 35).
-- The transcript-cutoff mechanism the worker passes into the per-commit handler (covered by the transcript-cutoff topic).
+- The transcript-cutoff mechanism the worker passes into the per-commit handler (covered by the transcript-cutoff topic). The cutoff is no longer the only value the worker hands down that changes what gets read: the entry's executing-session id goes with it, and on the transcript-reading kinds it drives a commit-time ownership backfill performed *before* owners are resolved plus an owner-derived floor on where each candidate transcript is first read from. Both of those, and the machine-global ledger they act on, are covered by the **Claude session-ownership** topic; this spec records only that the field is forwarded and by which handlers.
+- The session-statistics upload the post-drain trigger below starts — its gates, its throttle, its cursors, its row filtering and its wire shape (covered by the session-statistics upload topic). This spec records only that the worker asks for one, unconditionally, and does not wait.
 - The push-pending queue, its dedicated lock, and the claim-based drain engine the post-drain push-sync trigger hands off to (owned by spec 269); this spec only describes the hand-off from the worker's side.
 - The successor-spawn race protocol viewed from the producing hooks' side (covered by the worker-chain-spawn topic).
 - The internals of any individual handler (full conversational pipeline, consolidation pipeline, migration) beyond which one runs for which operation kind. The commit pipeline additionally includes an AI context-relevance filtering sub-stage (which context items — plans, notes, references — are relevant to the change) — owned by spec 258, not re-specified here — and a carve-out that withholds track-only external references from that sub-stage's input, owned by the per-commit summarization and reference specs. The dispatch table itself is unaffected by either. Its per-call wall-clock is likewise spec 258's; the only fact this spec records about it is that it can approach three minutes and is covered by the heartbeat (see below).
@@ -72,8 +74,10 @@ A single directory inside the per-repository state directory under a fixed name.
 
 Each readable queue file produces an in-memory record carrying:
 
-- The parsed operation payload (kind, target hash, optional source hashes, source-of-action marker, optional enqueue-time branch, creation timestamp). The handlers prefer the entry's captured branch over a live branch read when attributing the resulting summary and its associations, falling back to a live read only for legacy entries that lack the field; the per-commit and amend-migration topics own that attribution detail.
+- The parsed operation payload (kind, target hash, optional source hashes, source-of-action marker, optional enqueue-time branch, creation timestamp, optional executing-session id). The handlers prefer the entry's captured branch over a live branch read when attributing the resulting summary and its associations, falling back to a live read only for legacy entries that lack the field; the per-commit and amend-migration topics own that attribution detail.
 - The absolute path of the file on disk, retained so that the entry's file can be deleted after processing.
+
+The executing-session id is forwarded, unchanged, by exactly the handlers that read transcripts: the per-commit conversational pipeline threads it into transcript loading, and so does the amend pipeline (through the metadata bundle it already carries the operation source in). The consolidation and migration handlers never read the field — they have no transcript load to give it to. The worker itself makes no decision from the value; it only passes it down.
 
 ### Per-run cap
 
@@ -89,6 +93,8 @@ Each **summary-producing** operation kind is mapped to exactly one handler, disp
 - Rebase-pick: the one-to-one migration that re-keys an existing summary under a new commit hash.
 - Rebase-squash: the same consolidation pipeline used by squash.
 - Any unknown (but non-ingest) kind: a warning is logged, no handler runs, and the entry is still deleted.
+
+The table splits along a second line that the kinds themselves do not show. Plain commit, cherry-pick, revert and amend all reach a transcript read, so all four participate in session attribution and all four are handed the entry's executing-session id. Squash, rebase-pick and rebase-squash consolidate or re-key summaries that **already exist**: they read no transcript, produce no fresh conversational evidence, and therefore need no attribution — which is why the field is neither forwarded to them nor missed by them.
 
 The **ingest** operation kind is **not** dispatched in the summary drain. Ingest entries are filtered out of the drain and left on the queue for the separate ingest phase that runs after the drain (see "Ingest phase" below). A queue containing only ingest entries therefore drains empty without any summary handler running.
 
@@ -136,11 +142,12 @@ After the drain, if at least one commit-typed op was processed this run, enqueue
 
 After the drain, if the set of hashes whose summary was (re)generated this run is non-empty, hand those hashes to the personal-space push engine (spec 269) as a **fire-and-forget** call scheduled on the next tick, tagged with the **post-queue** source and filtered to exactly those hashes. This exists so a `git push` that fired *before* the pushed commits had memories (the pre-push hook enqueued them into the push-pending queue but the drain worker found no summary yet) gets those memories uploaded as soon as they are generated here. The call is deliberately not awaited: a slow or offline upload must never extend this worker's lock hold or delay the ingest phase, and any failure is swallowed to a debug log — the entries survive in the push-pending queue for the next push / activation retry. The trigger does nothing when no summaries were generated this run.
 
-### Lock release, successor check, then ingest (in order)
+### Lock release, successor check, ingest, then session-statistics sync (in order)
 
 1. **Release both entry-level locks.** Release the per-vault write lock, then the summary-drain lock, clearing their heartbeats, and wake any cross-repo vault waiters. Releasing the summary-drain lock lets a same-repo summary successor run concurrently with the ingest phase below.
 2. **Successor check — summary leftovers only.** Re-list the queue; if any **non-ingest** entry remains (arrived past the per-run cap or during the drain), log how many and start a successor worker as a fresh detached process. Because the summary-drain lock is now released, the successor can immediately win it. Ingest entries are deliberately **not** a successor-spawn trigger — they are handled by the ingest phase and its deferred hand-off, so spawning for them would double-run.
 3. **Ingest phase** (see below).
+4. **Session-statistics sync trigger** (see below), the final step of the worker's main body, with every lock this worker took already released.
 
 ### Ingest phase (separate lock; runs with both entry-level locks released)
 
@@ -152,6 +159,14 @@ Run only if the queue holds at least one ingest entry. This phase holds neither 
 4. **Report the run's outcome.** Once the batch has returned, emit one line describing what it did, carrying: how many batches were processed, how many sources were folded, an enumeration of the **held topics** — each as its slug plus the structured failure code that held it (spec 152 owns the code set) — and the trigger tag the operation was synthesized with. The held list is emitted on every returning run, including the clean one, where it is simply an empty list; there is no branch that suppresses it. Two runs report nothing here: one that was skipped for want of a credential (that skip has its own line and never reaches the pipeline) and one whose batch threw (the throw short-circuits past this step and is reported instead by the phase's own swallow-and-log, which sits ahead of teardown).
 5. **Delete-on-success:** delete the consumed ingest entries only after the ingest run returns without throwing. A throw leaves them queued for the next run — an ingest batch is all-or-nothing against its queue entries.
 6. **Teardown (always):** stop the heartbeat, release the ingest lock, then wake any deferred-ingest waiter (consume the flag and launch a fresh worker). The wake must follow the release so the detached worker can win the now-free lock. An ingest run that throws is logged and swallowed (non-fatal to the worker).
+
+### Post-drain session-statistics sync trigger
+
+After the ingest phase has released its lock — so with none of the locks this worker takes still held — start one session-statistics upload and do not wait for it. Three properties distinguish it from the two triggers above:
+
+- **It is not gated on work.** Neither "a commit-typed op was processed" nor "a summary was (re)generated" is consulted; the trigger fires on every run that reaches this point. That is deliberate rather than an omission: most agent sessions never end in a commit at all, so gating on landed work would mean a machine only ever uploads statistics for the conversations that happened to produce one.
+- **It is fire-and-forget and swallows its own failures.** The call is scheduled and abandoned; a rejection is discarded rather than logged as a worker failure. Nothing about a slow, offline, or refused upload can extend this worker's lifetime or surface as a commit-time error.
+- **It gates and throttles itself.** The worker passes no repository, no filter and no decision — the run decides for itself whether the channel is enabled, whether enough time has passed since the last attempt, and which rows are in scope. This is what makes it safe for the trigger to be unconditional here, and safe for the same run to be triggered from elsewhere on the machine.
 
 ### Storage activation as side effect
 
@@ -221,6 +236,9 @@ Setting the active storage backend during startup is a process-wide side effect:
 
 - **The post-drain push-sync trigger is fire-and-forget and never blocks the worker.** It hands the just-generated commit hashes to the push engine (spec 269) on the next tick, filtered to those hashes, so a `git push` that outran summary generation completes once the memory lands — but it is not awaited, so a slow/offline upload cannot extend the lock hold or delay ingest, and a failure just leaves the entries pending for a later retry. Only summaries generated *this run* are handed off. (Notable.)
 
+- **The post-drain triggers this spec owns do not share a gate, and the odd one out is the unconditional one.** The ingest trigger requires a commit-typed op to have been processed; the push-sync trigger requires at least one summary to have been (re)generated; the session-statistics upload requires nothing at all. The reasoning inverts for the upload because its subject is not this repository's commits but the machine's conversations, most of which never reach a commit — gating it on landed work would restrict a machine-wide upload to exactly the sessions that happened to end in one. It is also placed after the ingest phase rather than before the lock release, so it cannot lengthen any hold even before its fire-and-forget shape is considered. (Surprising; the gate's absence is the decision, not an oversight.)
+- **Those three triggers are not everything the worker does once the drain loop closes.** Further repository- and machine-level steps ride the same tail, some of them after the ingest phase as well, and each is owned by its own topic. So the list above is the set of post-drain triggers *this spec specifies*, not the complete post-drain sequence — reading it as complete is what makes the tail look shorter than it is. (Notable.)
+
 - **Successor spawn re-uses the spawn primitive used by hooks.** The worker has no privileged "in-process re-entry"; it spawns a brand-new detached process, just as a hook would, and unrefs it. (Notable.)
 
 - **Worker can be invoked from arbitrary cwd.** The script reads the working-directory flag and uses that for all repository-rooted operations. The actual `process.cwd()` is irrelevant. (Notable.)
@@ -240,6 +258,8 @@ Setting the active storage backend during startup is a process-wide side effect:
 - The repo-wide manual-disable flag read at startup — its storage, repo-wide anchoring, priority, migration, and the fact that the same gate is carried by every producing hook — is owned by the manual-disable spec. The **in-memory** mirror of that flag, the entry points that carry it, and the zero-write contract it enforces are owned by spec 304; this worker does not participate in that mirror (it is a separate process and reads only the durable flag).
 - The format and lifecycle of an individual queue entry are defined by the **Queue Entry Format** topic.
 - The transcript cutoff that the worker passes into the per-commit handler is defined by the **Summary Attribution by Transcript Cutoff** topic.
+- The machine-global ownership ledger that the forwarded executing-session id is backfilled into and resolved against, and the owner-derived lower bound it seeds on a first transcript read, are defined by the **Claude session-ownership** topic. The field's own presence rules on the entry — and why no rewrite-produced entry ever carries one — are defined by the **Queue Entry Format** topic.
+- The session-statistics upload channel the post-drain trigger starts — its enablement gates, its machine-level attempt throttle, its per-table cursors and its per-repository row filter — is defined by the session-statistics upload topic. The same run is also asked for on a clock by the machine-global resident daemon; both go through that one throttle.
 - The post-drain successor protocol that ensures no entry is ever stranded is defined by the **Worker Chain Spawn** topic.
 - The full conversational pipeline that processes the per-commit kinds is defined by the per-commit summarization topic; its AI context-relevance filtering sub-stage is defined by spec 258.
 - The consolidation pipeline shared by squash and rebase-squash is defined by the squash-consolidation topic.

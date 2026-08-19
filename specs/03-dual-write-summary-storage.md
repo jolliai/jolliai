@@ -105,7 +105,7 @@ Because the mirror's initialization failure is swallowed, a later write batch re
 
 There is no retry, no queue and no background reconciliation. A mirror that has been marked dirty stays dirty until an external process clears the marker or a subsequent successful write batch clears it.
 
-The two writes are **sequential and system-of-record first**, never concurrent: a slow first write delays the mirror write.
+The two writes are **sequential and system-of-record first**, never concurrent: a slow first write delays the mirror write. That ordering is also what makes retrying a refused batch safe — when the system-of-record slot refuses outright, as the ref-backed slot does past a freeze (345), the mirror has not been written yet, so a refused batch leaves no partial write for a retry to duplicate.
 
 ### Delegated visible-layer operations
 
@@ -143,7 +143,7 @@ The composite itself holds no state. Its observable state is the mirror's dirty 
 - **Dirty → in sync** — a subsequent write batch in which both slots succeeded. Nothing else clears it.
 - **Initialization failures on either slot** are observable in the log but do not touch the marker.
 
-The pairing itself changes only when a new composite is constructed: an in-process instance never observes a routing-state change, which is why the ref-backed slot re-checks the freeze from disk on every write batch (345) and why long-lived hosts drop their cached instances on settings-save.
+The pairing itself changes only when a new composite is constructed: an instance never re-pairs itself, which is why the ref-backed slot re-checks the freeze from disk on every write batch (345). The hosts that hold such an instance do now detect a routing-state change out of band — a throttled route probe on their own call paths — and drop or replace the composite on that signal, not only on settings-save.
 
 ## Notable Behavior
 
@@ -171,4 +171,5 @@ The pairing itself changes only when a new composite is constructed: an in-proce
 - The ref-backed slot's plumbing, its two write-time freeze refusals, the storage contract's read semantics, and the optional identity value are defined by **Orphan Branch Summary Storage**.
 - The mirror's three-layer on-disk shape, its manifest and branch-mapping registry, its atomic-write semantics, its dirty-marker persistence, and its wiki rebuild contract are defined by **Folder-Based Summary Storage**.
 - The freeze marker that makes an in-process composite's ref-backed slot start throwing mid-life is defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
+- The throttled route probe by which a long-lived host notices that switch and replaces the composite in place, and the single retry it performs against the refused write, are defined by **Stale Storage Heal After an Unwitnessed Cutover**.
 - The schema of the content carried through both slots is defined by **Summary Tree Structure**.

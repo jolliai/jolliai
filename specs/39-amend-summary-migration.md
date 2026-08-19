@@ -18,8 +18,8 @@ The pipeline that, when a commit is rewritten in place to produce a new commit h
 - Re-association of plans and notes with the new commit hash.
 
 **Out of scope:**
-- The mechanism by which an amend is detected and enqueued (covered by the operation queue topic).
-- The transcript reading and per-session attribution rules (covered by the transcript pipeline topic).
+- The mechanism by which an amend is detected and enqueued (covered by the operation queue topic) — including which producer writes an amend entry, which is what makes the executing-session input below unreachable.
+- The transcript reading and per-session attribution rules (covered by the transcript pipeline topic). One of those rules now reaches this pipeline's inputs from outside it: the machine-global ownership ledger can contribute candidate sessions this checkout never ran, and can floor where such a session's transcript is first read from, so an amend's evidence window may be bounded by an owner edge even though this pipeline's own ownership backfill never runs. The ledger, its edges and that floor are covered by the **Claude session-ownership** topic.
 - The squash and rebase variants (covered by their respective topics).
 - The summary-tree node hoist invariant in detail (covered by the summary-tree topic).
 - When the Amend action is offered to the user vs. hidden (gating by own-commits check, author check, shared-tip check, and fork-point resolution) — that is part of the VS Code AI commit surface, covered by the VS Code AI Commit From Checkbox Selection topic.
@@ -34,6 +34,7 @@ The pipeline receives:
 - **new commit hash** (required): the commit hash produced by the rewrite.
 - **operation source** (optional): which surface initiated the rewrite (a CLI client or an editor plugin); recorded on the new summary so downstream consumers know where the action originated.
 - **enqueue timestamp** (required): used as a transcript time-cutoff for attributing new conversational entries to this rewrite.
+- **executing-session id** (optional): the agent session whose process ran the rewrite, as recorded on the queue entry. It travels in the same metadata bundle as the operation source and is threaded on into transcript loading, where a present value would trigger a commit-time ownership backfill for that session before owners are resolved. **It is never populated in practice** — see "The executing-session input is unreachable on this path" under Notable Behavior — so the arm that consumes it is dead on every real amend, and the parameter documents a capability this pipeline does not have.
 
 ### Delta diff vs full diff
 
@@ -197,6 +198,12 @@ When the consolidation call fails at the transport level, the mechanical-merge f
 
 Across every tier — the prompt-context gathering of active plans/notes/references and the branch label written on the fresh leaf — the branch is the one captured when the rewrite was enqueued, not the branch read live at migration time. Because the migration runs asynchronously under the worker drain, the live branch may have moved (rapid amend/squash/rebase sequences, or a sibling worktree on another branch) by the time the model call completes; reading it live would file the summary and its plan/note/reference associations under the wrong branch. A legacy queue entry with no captured branch is the only case that falls back to the live branch. (Notable; mirrors the worker's tail-cleanup and diff steps, which guard against the same drift.)
 
+### The executing-session input is unreachable on this path
+
+The pipeline accepts an executing-session id and forwards it into transcript loading, but nothing ever supplies one. Two facts close the gap from both ends: amend entries are produced **exclusively** by the post-rewrite hook, which does not stamp the field at all; and the one producer that does read the environment for it — the post-commit hook — returns early the moment its detector reports an amend, before it builds any entry. So every tier of this pipeline loads transcripts with no executing-session id, and the commit-time ownership backfill that a present value would drive never runs for a rewrite. Attribution here is served by the forward ledger alone: the owner edges the end-of-turn session-recording hook wrote on earlier turns, which still contribute candidate sessions and still floor where each is read from.
+
+The reachable consequence follows from *when* the two mechanisms record. A session that edits one checkout's files and then amends in a different checkout inside a single turn commits before the session-recording hook that would have written the authoring edge has run, so at drain time nothing in the ledger names this checkout as an owner, no session is a candidate, and the rewrite gets no conversation attached. What happens next is the ordinary tier dispatch reading an empty evidence window: a trivial delta satisfies Tier A's "no new conversational entries" condition and carries the prior commit's topics and recap forward verbatim, while a larger delta still runs the delta call but with no conversation to interpret it against. Either way the narrative moves less than the work did, with nothing marking the omission. (Surprising; the parameter exists on this path and the arm behind it is dead, so a reader should not infer the capability from the signature.)
+
 ### The prior summary remains independently retrievable
 
 The prior summary's payload file is never deleted by this pipeline. A subsequent lookup by the prior commit hash continues to return the original summary directly, bypassing the new root, because the summary store's read path checks for a direct payload before resolving aliases or descendants.
@@ -209,4 +216,5 @@ The prior summary's payload file is never deleted by this pipeline. A subsequent
 - **Summary index** — the index upsert that paired with the new payload write reclassifies the prior summary entry from root to descendant.
 - **Plan registry** and **note registry** — the independent state files updated by the unconditional re-association step.
 - **Transcript pipeline** — provides the conversational entries within the migration's time window and the persisted transcript artifact.
+- **Claude session-ownership** — the machine-global owner-edge ledger that can contribute candidate sessions this checkout never ran, and the owner-derived floor on a candidate's first read; the commit-time backfill it also offers is the arm this pipeline never reaches.
 - **Cross-process lock** — gates all writes to the summary store during the migration.

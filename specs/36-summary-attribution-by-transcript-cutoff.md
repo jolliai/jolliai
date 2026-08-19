@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-Attribute each transcript entry to exactly one commit by treating the queue entry's creation timestamp as an upper-bound cutoff for transcript reads, so that conversation that happened after a commit was made is reserved for the next commit and never duplicated.
+Attribute each transcript entry to exactly one commit per worktree by treating the queue entry's creation timestamp as an upper-bound cutoff for transcript reads, so that conversation that happened after a commit was made is reserved for the next commit and never duplicated within that worktree.
 
 ## Scope
 
@@ -15,6 +15,7 @@ Attribute each transcript entry to exactly one commit by treating the queue entr
 - The behavior for transcripts whose underlying file no longer exists or has been truncated.
 - Behavior when the cutoff is absent (manual or legacy paths).
 - The one-time-discard exclusion pass that reads then drops conversations and references the user has unchecked, including the composite key shape used to address each excluded row.
+- How the Claude candidate set is assembled from the session registry and the machine-global ownership ledger together, and the owner-derived **lower** bound that bounds such a session's first read in a worktree at its other end.
 
 **Out of scope:**
 - Where the queue entry's creation timestamp is captured (covered by the queue-entry-format topic).
@@ -22,6 +23,7 @@ Attribute each transcript entry to exactly one commit by treating the queue entr
 - The on-disk shape of cursors or the registry that holds them (covered by the cursor-registry topic).
 - The schema of individual transcript entries beyond the timestamp field (covered by transcript-source topics).
 - The on-disk shape, write protocol, and sticky semantics of the exclusion set itself (covered by **Commit Exclusion Selection Store**); this spec only contributes how the exclusion set is observed when deciding what to read.
+- The machine-global ownership ledger consulted for Claude candidates — how a worktree root becomes an owner of a session, how the first-seen line is derived, the ledger's record shape, its lock and its session cap (covered by a neighbouring ownership-ledger topic). This spec contributes only how a drain reads that ledger and what it does with the bound it finds there.
 
 ## Data Contracts
 
@@ -39,6 +41,8 @@ A small record per transcript file recording the last consumed line number, pers
 
 - The number of new lines processed during the read.
 - A "last consumed line index" that records the line position of the last line the reader actually advanced past, which differs from the file's end-of-file when the cutoff stops consumption mid-file.
+
+A third input governs where a read *starts*, and only for a Claude session on its first read in this worktree: a per-transcript **owner lower bound** — the line at which this worktree root first appears in that session, taken from the ownership ledger. It is supplied by the caller as a synthetic cursor for that one read and is never persisted as one; what gets persisted is the ordinary cursor the read produces.
 
 ### Update rule
 
@@ -70,6 +74,22 @@ Both sets are read once per queue-entry drain. They are never written by this to
 4. The helper computes the conversation-exclusion key set (see "Post-read exclusion discard") but does NOT drop any session before reading — every discovered session, checked or unchecked, flows into step 5.
 5. The helper passes the argument unchanged into the per-source transcript reader for every discovered session. The dispatch is a chain of per-source branches — Gemini, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline, Cline CLI, Devin, Cursor CLI and Antigravity each have their own reader — with a **final fall-through** that runs the generic line-streamed reader parameterized by the producer's own line-parser strategy. Claude Code, Codex and Kimi Code CLI all take that fall-through: Claude because it is the historical default (and because an unrecognized producer tag lands there too), the other two because they are line-oriented producers whose parser the generic reader already knows. Each reader honors the cutoff in the same way and advances that session's cursor. After all reads return, excluded conversations are discarded from the aggregated result at a single downstream point (see "Post-read exclusion discard").
 
+### Claude candidate set: session registry plus ownership ledger
+
+The set of Claude sessions a drain reads is no longer the session registry alone. It is the **union** of two sources, de-duplicated on the triple (source, session identifier, transcript locator):
+
+1. The per-project session registry — every session whose stop hook fired against *this* checkout.
+2. The machine-global ownership ledger's entries for **this worktree root** — every session the ledger records as having visited or authored into it, whichever checkout it was launched from. Each such entry contributes the session identifier, the transcript locator, and this root's own first-seen line (see the lower bound below).
+
+The ledger is consulted only when the Claude integration is not explicitly disabled; when it is, the ledger contributes nothing and the registry is the whole Claude candidate set, exactly as before. The union is a merge, not a replacement: the registry remains the cheap path and the fallback for a session the ledger never recorded.
+
+Before that lookup, when the queue entry carries the identifier of the session that **executed** the commit and Claude is not disabled, the worker first synthesises ownership from that session's own transcript — so a session that authored into this worktree from another checkout, and committed in the same turn its stop hook has not yet closed, is an owner by the time the lookup runs. A session that only ran the commit without authoring under this root contributes nothing, and is attributed to nothing.
+
+Two consequences are worth stating plainly:
+
+- The ledger contributes sessions whose stop hook **never fired in this checkout**. That is the entire point: such a session is invisible to the per-project registry, and before the union its conversation was simply never read here.
+- The ledger applies **no staleness prune** of the kind the session registry does. Its membership is bounded only by a cap on how many sessions it retains and by the transcript file still existing when a read is attempted; there is no age threshold that drops an entry.
+
 ### Post-read exclusion discard
 
 The exclusion set does NOT gate transcript reading — every aggregated session is read so that every cursor advances. After the helper has aggregated the active-session list across all enabled sources:
@@ -83,7 +103,7 @@ Reference exclusion is consumed in parallel by the prompt-block assembly and the
 
 ### Per-transcript read with cutoff
 
-1. The reader loads the cursor for the transcript path; if absent, it starts at line zero.
+1. The reader loads the cursor for the transcript path. If absent **and** the source is Claude **and** the ownership ledger holds an edge for this worktree root, the read starts at that edge's first-seen line instead of at line zero. An established cursor always wins over the seed — it is this worktree's own recorded progress, and a seed would rewind it and re-read lines already spent. Line zero remains the answer for every other source, and for a Claude transcript with no owner edge.
 2. It reads the file's content from disk.
 3. It iterates lines beginning at the cursor's line number.
 4. For each new line, it parses the line into a candidate entry. If the candidate has its own timestamp and that timestamp is strictly greater than the cutoff, the loop breaks immediately.
@@ -92,6 +112,15 @@ Reference exclusion is consumed in parallel by the prompt-block assembly and the
    - If the cutoff is set, the cursor's line number is the last consumed line index.
    - If the cutoff is not set, the cursor's line number is the total number of non-empty lines in the file.
 7. The new cursor is returned alongside the produced entries.
+
+### Bounded at both ends (Claude, first read in a worktree)
+
+For a ledger-owned Claude session being read for the first time in this worktree, the read is bounded at **both** ends, and the two bounds are answers to different questions:
+
+- The **lower** bound is the owner's first-seen line. It stops a checkout that joined a conversation late from absorbing the turns that preceded it — turns that belong to whichever checkout was driving the session at the time. Without it, a first read of such a session would start at line zero and sweep the whole earlier conversation into this commit.
+- The **upper** bound is the queue entry's creation instant, applied exactly as described above. The cutoff remains the only upper bound there is.
+
+Neither substitutes for the other: the cutoff cannot tell where a checkout's participation began, and the lower bound cannot tell where a commit's window ends. Every subsequent read of the same transcript in this worktree resumes from the persisted cursor, so the lower bound applies once.
 
 ### Handling of entries without timestamps
 
@@ -103,7 +132,7 @@ The shared transcript-reading helper, immediately after each per-transcript read
 
 ### Cursor advancement on later commits
 
-The next queue entry's processing opens the same transcripts, loads the now-advanced cursors, and reads from those positions onward up to its own (later) cutoff. Each transcript line is therefore exposed to exactly one queue entry's handler, and the boundary between commits is the cutoff timestamp.
+The next queue entry's processing opens the same transcripts, loads the now-advanced cursors, and reads from those positions onward up to its own (later) cutoff. Each transcript line is therefore exposed to exactly one queue entry's handler **per worktree**, and the boundary between commits is the cutoff timestamp. The qualifier is load-bearing: cursors live in the per-repository state directory, so a session that two checkouts both own is read against two independent cursors, and the same transcript line can routinely be read and stored by two different worktrees' — or two different repositories' — commits. Within one worktree the exactly-once claim still holds.
 
 ### Manual / legacy paths
 
@@ -132,6 +161,8 @@ If a transcript path no longer reads cleanly, the per-source reader rejects the 
 
 - **The cutoff is the only mechanism that prevents one Claude Code session's continuing conversation from being attributed to the next commit.** Before the queue, a single-slot pending file was written when the language-model call started; if a second commit arrived while the call was running, the second commit's transcript window included everything the user typed during the first commit's language-model call. The cutoff replaces that window with the precise instant the queue entry was created. (Surprising; intentional, and the explicit motivation called out at the helper's documentation.)
 
+- **"Exactly once" is a per-worktree property, not a per-line one.** Cursors are project-scoped, so a session two checkouts both own is tracked by two independent cursors and one transcript line can legitimately be read and stored by both — and by two different repositories' commits. That is the intended outcome of attributing a session to every root it worked in, not a duplication bug the cutoff was meant to prevent; the cutoff's exactly-once guarantee was always scoped to a single cursor. (Surprising; intentional.)
+
 - **The cutoff is enforced per-line, not per-batch.** The reader iterates lines and breaks the moment the first post-cutoff timestamp is observed. Subsequent lines, even if they would have parsed cleanly, are left for the next read. (Notable.)
 
 - **The cursor advances exactly to the breaking line's position, not past it.** The breaking line is not consumed; the next read with a later cutoff will see it. (Notable.)
@@ -145,6 +176,14 @@ If a transcript path no longer reads cleanly, the per-source reader rejects the 
 - **Identical cutoff value applied to all sources in a single drain.** Every reader in the dispatch receives the same cutoff string — the store-backed ones, the whole-document ones, and the line-streamed fall-through that serves Claude, Codex and Kimi Code CLI. Per-source clock skew or alternate timestamp formats are the readers' problem; the cutoff itself is a single ISO 8601 string. (Notable.)
 
 - **Sessions discovered on demand also use the cutoff.** Every hookless source — Codex, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline and its CLI, Devin, Cursor CLI, Antigravity, and Kimi Code CLI — is not pre-tracked by an agent hook; the worker scans for each of them at drain time, gated by that source's own installed check plus a discovery toggle that defaults to enabled when unset (Cursor's two surfaces share one toggle, as do Copilot's). The cutoff is applied uniformly to those discovered sessions, and their per-transcript cursor state is registered the first time they're read. (Notable.)
+
+- **Claude sessions can now also be contributed at drain time, but by a lookup rather than a scan.** Claude remains hook-backed; what the drain adds for it is a read of the machine-global ownership ledger for this worktree root, which costs one file read and no per-source scanning. The candidates it yields are subject to the same cutoff and the same per-transcript cursor state as every other session. (Notable.)
+
+- **A lower bound and the cutoff answer different questions, and neither covers for the other.** A ledger-owned Claude session's first read in a worktree starts at the line where that worktree first appears in the conversation, so a checkout that joined late does not absorb the turns before it; the cutoff still decides where the window ends. (Notable.)
+
+- **The lower bound does not prevent turns after that owner stopped participating.** The ledger records where a root first appeared and nothing about where it left off, and there is no field that could express one, so a session that moved on to another checkout keeps contributing its later turns to this one up to the cutoff. Only the upper bound stops the read. (Surprising; a real limitation of the record's shape.)
+
+- **An established cursor beats the owner seed, always.** The seed applies solely when this worktree has no cursor for that transcript. Preferring it over a real cursor would rewind past lines this worktree has already read and stored, re-summarising spent conversation. (Notable.)
 
 - **Every source's read failure is isolated, not only the database-backed ones.** A transient lock, schema drift, or deletion of an embedded store between scan and read is caught and logged and the drain continues with the next session — and the same guard wraps the line-streamed fall-through, so a rotated or deleted JSONL transcript skips one session rather than aborting the drain. (Notable; the line-oriented branches were once the unguarded exception.)
 
@@ -162,3 +201,4 @@ If a transcript path no longer reads cleanly, the per-source reader rejects the 
 - The per-source transcript readers — the line-streamed one shared by Claude, Codex and Kimi Code CLI, plus Gemini's document reader, the embedded-store readers (OpenCode, Cursor, Copilot CLI, Devin), the Copilot Chat workspace store, both Cline readers, Cursor CLI's plaintext reader and Antigravity's whole-file reader — each implement the cutoff with the same per-line stop semantics.
 - The persistence of consumed transcript bytes alongside the produced summary is defined by the transcript-persistence topic.
 - The on-disk shape, sticky semantics, and write protocol of the exclusion document — including the `<source>:<sessionId>` conversation key shape and the `<source>:<nativeId>` reference key shape consumed by the pre-read exclusion pass — are defined by **Commit Exclusion Selection Store**.
+- The machine-global ownership ledger that supplies the extra Claude candidates and their first-seen lines — how a worktree root becomes an owner, how that line is derived, the ledger's record shape, its lock, its session cap, and the commit-time synthesis of ownership for the session that executed the commit — is defined by a neighbouring ownership-ledger topic.

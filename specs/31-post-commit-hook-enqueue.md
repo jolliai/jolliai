@@ -40,6 +40,7 @@ Detect the operation kind that produced the just-completed commit, decide whethe
   - an expected-parent-hash field (the tip immediately before the new commit was created); used as a stale-file guard;
   - (additional fields exist but are not consulted here).
 - The optional one-shot graphical-client-source marker file at a well-known path inside the same product-namespace state directory; its mere presence flips the recorded source from `cli` to `plugin` for this entry.
+- The **environment this hook inherited from the version-control process**, read for one value: the identifier of the agent session the commit was executed inside. Exactly one agent host exports such a variable today; under every other host, and under a plain terminal or a graphical client, nothing is found. The value is trimmed and a blank result is treated as absent, so an exported-but-empty variable never becomes an empty session id.
 
 ### Queue entry
 A single JSON document written into the well-known queue subdirectory under the product-namespace state directory, with these fields:
@@ -49,6 +50,8 @@ A single JSON document written into the well-known queue subdirectory under the 
 - `commitSource` (optional): one of `cli` or `plugin`, recording which surface produced the commit.
 - `branch` (optional): the name of the branch the commit landed on, read from the VCS at enqueue time (the literal `HEAD` when the working tree is detached). The field is omitted entirely if that read fails. The consumer prefers this captured value over a live branch read when attributing the eventual summary, because by the time the detached worker drains the entry the user may have checked out a different branch.
 - `createdAt`: an ISO-8601 timestamp captured at enqueue time.
+- `traceId` (optional): the correlation identifier from this hook's own ambient trace scope — adopted from the environment when a product process upstream supplied one, otherwise minted for this invocation. The detached worker adopts it while draining, so this hook's log records, the worker's, and the outbound model and push calls for this commit share one identifier across the process boundary. Omitted when no trace scope is in force.
+- `executingSessionId` (optional): the identifier of the agent session whose process executed this commit, taken from the inherited environment described above. Omitted when the environment named none. The worker uses it to attribute a commit to the session that authored the change even when that session was driving a *different* checkout, which is the one thing no other field on the entry can establish.
 
 ### Queue entry filename
 The entry file's name is `<wall-clock-millis>-<short-hash>.json`, where `<wall-clock-millis>` is the integer number of milliseconds since the epoch at enqueue time and `<short-hash>` is the first eight characters of the just-created commit's hash. The file is written under the well-known queue subdirectory; the subdirectory is created (recursively) if absent. The numeric prefix is what defines processing order; the trailing short hash exists only to prevent collisions when several commits land in the same millisecond.
@@ -81,7 +84,7 @@ The entry file's name is `<wall-clock-millis>-<short-hash>.json`, where `<wall-c
 6. Delete the file regardless of whether it was accepted, valid, stale, or unparseable. Failures during deletion are swallowed.
 
 ### Enqueue
-1. Build the queue entry record per the schema above (`type`, `commitHash`, optional `sourceHashes`, optional `branch` when the branch read succeeded, `commitSource`, `createdAt`).
+1. Build the queue entry record per the schema above (`type`, `commitHash`, optional `sourceHashes`, optional `branch` when the branch read succeeded, `commitSource`, `createdAt`, optional `traceId` when a trace scope is in force, optional `executingSessionId` when the inherited environment named a session).
 2. Ensure the well-known queue subdirectory exists (created recursively if needed).
 3. Compute the entry filename as `<wall-clock-millis>-<short-hash>.json`.
 4. Write the entry as tab-indented JSON in a single synchronous filesystem write.
@@ -115,6 +118,7 @@ When the manual-disable gate returns at step zero, **none** of the above changes
 - **Unparseable squash-pending demotes silently.** If the file exists but cannot be parsed as JSON, the operation is recorded as a plain `commit`, the file is still deleted, and the user-visible commit succeeds without surfacing the error. (Notable.)
 - **Squash-pending is always deleted, even when stale or invalid.** The deletion is unconditional once the file has been opened, so a permanently-invalid file cannot keep mis-classifying future commits. (Surprising; intentional.)
 - **Plugin-source marker is one-shot.** The marker file is deleted by this hook after one consumption, so subsequent commits originating from the command line are correctly recorded as `cli` even right after a graphical-client-driven commit. (Notable; intentional.)
+- **The executing-session id comes from the inherited environment — the hook's only input from a foreign, non-repository source.** Every other field on the entry is derived from the repository (a resolved hash, a branch read, a detector verdict) or from a file the product itself wrote earlier in the commit (the squash pending state, the graphical-client marker), and the one other environment read — the trace id — reads the product's *own* variable, set by a product process upstream. This one reads a variable an agent host exports about itself, which the version-control process passed down to this hook by ordinary inheritance. Consequences: nothing in the repository can be inspected to predict whether the field will be present; a blank exported value is treated as absent rather than stored as an empty id; and because this is the only producer that performs the read, the field can only ever appear on the entry kinds this hook writes. (Surprising; intentional.)
 - **Filename uses millisecond timestamp + short hash.** The filename's leading wall-clock-millis component is what defines drain order in the queue; the trailing short hash is anti-collision only. The worker draining the queue must rely on filename ordering, not file-creation-time, because the latter is not portable across filesystems. (Notable.)
 - **Single tab-indented JSON file per entry.** Each operation gets its own file (rather than a single shared rolling file) precisely because earlier single-slot designs lost summaries during rapid amend/rebase sequences when one hook overwrote another's pending state. (Notable; documented design rationale.)
 - **All failures are non-fatal to the commit.** Hash-resolution errors, write errors, and unparseable inputs are logged and ignored; the hook still exits cleanly so the user's commit completes. The price is that some operations may go un-summarized. (Notable; intentional.)
@@ -127,4 +131,5 @@ When the manual-disable gate returns at step zero, **none** of the above changes
 - The squash pending-state file consumed here is written by **Prepare-Commit-Msg Squash Detection**.
 - Amend and rebase, which this hook deliberately ignores, are handled by **Post-Rewrite Hook Handling**.
 - The queue this hook writes into is drained by the queue-worker (referenced from the queue and worker specs); summary storage details belong to the orphan-branch and summary-tree specs.
+- What the worker does with the `executingSessionId` this hook stamps — the machine-global ownership ledger it is backfilled into and the transcript lower bound it then supplies — is owned by the **Claude session-ownership** topic. Which agent hosts publish a session id at all is owned by that topic too; this hook only reads whatever the inherited environment offers.
 - The interactive capture-progress feedback watch — its gate, milestone stream, timeouts, and dead-worker probe — is defined by the Post-Commit Capture Progress Streaming spec.

@@ -14,6 +14,7 @@ How a repository becomes known to this machine: the durable, machine-global list
 - The write discipline: whole-file rewrite, atomic, under a machine-global best-effort lock, re-read inside the lock.
 - The three mutations — full registration, worktree-list extension, and disable — and exactly which fields each is allowed to touch.
 - The two checkout-list readers and how their answers differ for a repository whose every checkout is gone.
+- The one repository-scoped database table a removal has to delete by hand, because the schema-derived child list cannot reach it.
 - The database identity stamp carried in the same file.
 - The callers that make a repository known, including the hook-side gap fill and its retry rule.
 - The pre-registration folder probe: what it checks, what it reports, what it deliberately does not answer, and the fact that nothing in the browser reaches it.
@@ -136,13 +137,15 @@ The registry **used to be append-only in practice**, and the reason was not a mi
 
 **Removal now exists, and it addresses an entry by IDENTITY** — which is the only addressing that can reach a checkout whose directory is gone. Three callers reach it: the picker row's own control, an unattended prune of *disposable* entries, and the diagnostics command's repair.
 
+**The database side of a removal is only partly derived.** Every table carrying a foreign key to the repository row is deleted from a list the schema derives, so a table added later shows up as a visible edit rather than as rows nobody removed. That guarantee is exactly as wide as the foreign keys: a repository-scoped table with **no** foreign key is invisible to the derivation, and nothing then refuses the parent delete — so it fails *silently* rather than loudly. One such table exists today, the per-day statistics cache (a rebuilt cache that deliberately cascades from nothing), and it is deleted **by hand**; any future one has to be added there the same way. Leaving it behind is not a stale cache but wrong numbers: a cached day is invalidated by source rows being *written* and a delete writes nothing, the settled sentinel is stored once per day rather than per repository, and the all-repositories scope emits no repository filter at all — so a forgotten repository's spend keeps counting there, on days that get no further writes to rebuild them. Those rows are deliberately **excluded from the child-rows-deleted count**, which the transport reads as "was there anything to remove"; a derived row must not be able to answer that on its own.
+
 A disable still does not touch this file, and that separation is deliberate: **a disabled repository is still a repository the machine has**, and the switch lives in each checkout's own profile rather than here.
 
 ### Listing
 
 "Active" repositories are every entry the user has not switched off, decided from each **clone's own** `profile.json` rather than from anything in this file, over the forgiving read.
 
-Three details are load-bearing:
+The load-bearing details:
 
 - **Every clone, not any clone.** An entry is one repository IDENTITY while the switch is per clone, so an entry counts as switched off only when EVERY recorded checkout is — otherwise disabling one checkout would silently stop collecting the other's memories.
 - **The non-migrating reader.** The synchronous reader is used deliberately: its asynchronous counterpart persists what it decides, and asking "should I sweep you?" must not write a profile into someone else's repository.
@@ -150,13 +153,15 @@ Three details are load-bearing:
 
 The importer that consumes this list is handed the **whole** roster instead, not the active subset, because it is also the only writer of the database's own paused column: it skips a switched-off repository's import while still projecting its paused state, and filtering those rows out earlier would leave that column empty forever.
 
+**A further consumer asks the same predicate from outside this file's own surfaces.** The machine-wide session-statistics upload builds its set of *excluded* identities from it — deliberately the same per-clone question, so "which repositories do I import", "which repositories does the database call paused" and "which repositories do I withhold from the wire" cannot be three predicates that disagree. It too asks every recorded checkout, for the same reason: a row is one repository identity while the switch is per clone. None of that changes what this file holds — **the registry still records no disable state**, and that consumer reads the profiles rather than this file for exactly the reason listing does.
+
 ### The database identity stamp
 
 Stamping is a lock-guarded read-modify-write that **no-ops when the stored value already equals the new one**. Reading it goes through the forgiving read and answers `null` on a registry that predates the field.
 
 ### The ways a repository becomes known
 
-Five, plus one caller that re-registers something already known:
+These, plus one caller that re-registers something already known:
 
 1. **The launcher command.** Before doing anything else it registers the current directory, ignoring the failure when the directory is not a repository — outside a repository the dashboard still opens with whatever is already registered. **The guided first-run setup arrives here**, not at the import path below.
 2. **The enable command**, directly, on the directory being enabled.
@@ -247,6 +252,7 @@ These are described here only because they read registry-adjacent state; **no be
 - **The live-checkout reader never returns an empty list**, so "every checkout is gone" and "one checkout, alive" are indistinguishable through it — which is precisely why the second, plain-existence reader exists. Picking the wrong one makes a sweep act on a path that is not there. (Notable.)
 - **Removal exists and is addressed by identity, never by working directory.** That is the whole reason dead entries used to be unreachable rather than merely un-pruned: resolving a target from the working directory cannot name a checkout that is gone.
 - **Two orderings inside a removal are load-bearing.** Database rows are deleted **before** the registry entry: the other way round, a registry write that lands while the row deletion fails leaves a row the page still renders and that no later sweep can ever see, because the registry no longer lists it and nothing will retry. Failing in the correct order costs at most one un-swept pass — the entry is still listed, and the next prune tries again. And **unprojected events must go with the rows**, because a placeholder row is inserted from an event's identity alone, so a single pending or revivable event resurrects the repository on the next drain and deleting the rows without them is a no-op with a delay.
+- **A repository-scoped database table with no foreign key has to be named by hand in a removal.** The derived child-table list is exactly as wide as the foreign keys, and nothing refuses the parent delete for a table outside it, so the omission fails silently. There is one — the per-day statistics cache — and leaving its rows behind is wrong numbers rather than a stale cache, because a delete leaves no write stamp to invalidate a cached day and the all-repositories scope filters by nothing. It is also kept out of the child-rows-deleted count on purpose, so a derived row cannot claim on its own that there was something to remove. (Notable; a new table without a foreign key is how this breaks next.)
 - **The unattended prune only removes a *disposable* entry, and the predicate is deliberately narrow.** Every path the entry claims must lie under a temporary root; unless the identity is a local-only one, every claimed path must additionally look like a fixture path; and **no claimed path may still exist on disk**. The claimed set is de-duplicated first, because the path reader falls back to the single recorded root for an entry with no checkout list and the union would otherwise repeat it. An ordinary repository the user merely deleted is therefore never swept automatically — it is marked in the picker and removed only when the user says so.
 - **A disable is still not recorded here.** It lives in the checkout's own profile, so a paused repository stays listed and keeps counting in the aggregates. (Notable.)
 - **The lock is best-effort: on a 5-second timeout the read-modify-write proceeds unlocked**, trading a lost-update window for never dropping a registration outright. (Notable.)
@@ -256,7 +262,7 @@ These are described here only because they read registry-adjacent state; **no be
 ## Shared Behavior
 
 - Canonical remote normalization — transport folding, port handling, host case-folding, and the no-remote `file:` fallback this module detects — is the Canonical Repo URL and Name Derivation topic; the repository-name derivation from a URL is shared with it.
-- The dashboard database, its repository table, the placeholder-row insert, the bootstrap/recovery import that reads the active list, and the single-entry projection are owned by the dashboard database and import topics.
+- The dashboard database, its repository table, the placeholder-row insert, the bootstrap/recovery import that reads the active list, and the single-entry projection are owned by the dashboard database and import topics. The per-day statistics cache a removal must delete by hand — what a cached day holds and how one is invalidated — is its own neighbouring topic; the machine-wide session-statistics upload that reuses the disabled-set predicate is another.
 - The HTTP routes that expose the probe and drive registration, and the schema-version gate on their projection, are the Local Dashboard HTTP Server topic.
 - The install/uninstall functions that accompany a registration, and the per-checkout user opt-out flag they set and clear, are the hook-installation and repository-profile topics.
 - The commit total and missing-summary count the probe reports are produced by the backfill engine.

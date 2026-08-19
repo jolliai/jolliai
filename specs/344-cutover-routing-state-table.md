@@ -14,6 +14,7 @@ Decide which of four routing states a repository is in from two independent witn
 - What each state yields on the **write** side (storage construction) and, separately, on the **read** side.
 - The retired configuration key: where it is still read, where it is ignored, and what it still decides.
 - The quiet boolean second-witness probe used by the ref-backed write path, and how its failure policy differs from the full routing decision.
+- The shared classifier this module exports for "has the system of record moved off the freezable ref-backed branch": which of the four states it answers true for, and why it is stated once here rather than as a state set each long-lived host restates for itself.
 - The per-process memo of repository identity that the routing decision keeps, and what it does *not* memo.
 - Every consumer that branches on the state rather than on a backend, and what each does in the `blocked` state.
 
@@ -21,6 +22,7 @@ Decide which of four routing states a repository is in from two independent witn
 
 - What the freeze marker *means*, what it freezes, and the locked swap that creates it — covered by **Orphan Branch Cutover Fence and Compare-and-Swap** (345). This spec states only that its presence is one of the two witnesses.
 - The distinction between resolving the *system of record* and resolving *read* storage, and the short-lived route memo one of them keeps — covered by **System-of-Record versus Read Storage Resolution** (346).
+- The scaffolding around the two long-lived hosts' lazy re-probe of this state — the back-off window, the coalescing of a burst of concurrent probes, the one-way latch once a repository is seen switched, and each host's own rebuild step — belongs to the shared heal gate, a neighbouring topic. This spec states only that those hosts probe the state, what the classifier answers them, and what happens on the states it answers false for.
 - The schema, migrations, and general contents of the machine-global memory database; only the one state row this decision reads is described here.
 - How a repository acquires the identity the database row is keyed by.
 - The internals of any backend the state selects (the ref-backed backend, the folder mirror, the database-backed backend, the dual-write composite).
@@ -55,13 +57,14 @@ Because the row is keyed by the **shared** identity, every clone of the same rem
 Three values, kept deliberately distinct — "the row is absent" and "the question could not be asked" are never both encoded as nothing:
 
 - **row** — the state record above.
-- **no-row** — the database opened, the schema was compatible, and either the identity is not a registered repository or the registered repository has no such state entry.
+- **no-row** — the database opened and either the identity is not a registered repository or the registered repository has no such state entry.
 - **unavailable** — carries a reason string. Produced by exactly these conditions, evaluated in this order:
   1. The runtime cannot load the embedded database module without a command-line flag (the floor is Node 22.13).
   2. The database file is absent while its write-ahead sidecars remain — an alarming classification whose reason names the recovery command.
   3. The database file is absent outright (no sidecars either).
-  4. The stored schema version is **greater** than this build's (currently 5) — a newer surface migrated it and this one must not touch it.
-  5. Any thrown error while opening, querying, or parsing.
+  4. Any thrown error while opening, querying, or parsing.
+
+**The stored format number is not one of them, and its absence is the decision.** This read applies no version comparison and no compatibility test at all: a file stamped ahead of this build still answers this question correctly, because the state row is plain text in a key/value table, and answering "cannot ask" instead routed a cut-over repository's writes back onto its frozen ref — the exact loss the protocol exists to prevent.
 
 Conditions 2 and 3 are decided from the presence of the database file and its two sidecar files; every combination in which the database file itself exists proceeds to open it.
 
@@ -104,7 +107,9 @@ The complete table:
 
 The two `uncutover` rows and the `blocked` row are the same database condition read against opposite marker states, and the asymmetry is the whole point: an unreadable database must never stop a repository that was never frozen (one surface upgrading the schema would otherwise halt every healthy repository on the machine), and must never be waved through for one that was.
 
-The answer is computed **per call**. Nothing about it is memoized by this decision except the repository identity (see below), so a long-lived process observes a state change on its next call — but a process holding an already-constructed storage object does not, which is why the ref-backed write path carries its own last-line checks (spec 345).
+The answer is computed **per call**. Nothing about it is memoized by this decision except the repository identity (see below), so a long-lived process observes a state change on its next call.
+
+**A process holding an already-constructed storage object observes it too, on two hosts.** The per-worktree memory-tool daemon and the desktop editor's extension host each probe this state lazily on their own call paths and rebuild that object when the classifier below says the system of record has moved — the daemon by swapping the process-wide storage override, the editor host by dropping its cached storage. The ref-backed write path's own last-line checks (spec 345) remain, and are now the **trigger** for an unthrottled re-probe as well as a refusal: a write that struck the frozen branch is proof a switch landed inside the current back-off window, so the next call re-probes instead of trusting it. The window itself, the coalescing and the latch are the heal gate's.
 
 ### Identity memo
 
@@ -157,6 +162,19 @@ A separate, boolean-valued probe answers only "does a state row exist for this w
 - **It fails open.** Every `unavailable` condition answers `false`, because an unfrozen repository must never be blocked from writing by a missing or broken database — and its caller has already consulted the freeze marker.
 - **It is silent.** It logs nothing on the everyday "no database created yet" path that every pre-database write takes.
 
+### The shared "has the source of truth moved" classifier
+
+This module also exports one boolean *over* the state: has the system of record moved **off** the freezable ref-backed branch — i.e. must a long-lived process holding a pre-switch storage object rebuild it?
+
+| State | Answer |
+| --- | --- |
+| `cutover` | **true** — the switch is committed. |
+| `legacy-fenced` | **true** — frozen but not yet recorded; the ref-backed branch cannot be written and must not be read as current. |
+| `uncutover` | **false** — the ref-backed branch is still authoritative. |
+| `blocked` | **false** — the database is unreachable, and rebuilding there would only turn readable-but-stale reads into a hard throw. |
+
+It lives here, rather than in each host, because it is a **product rule** and not a host detail. Both long-lived hosts above route through this one classifier, so the state set is stated once and a fifth state cannot change one host's behavior without changing the other's. The four-state table itself is unchanged by its existence.
+
 ### Consumers that branch on the state itself
 
 Besides the two storage resolutions, these paths read the state directly:
@@ -166,6 +184,7 @@ Besides the two storage resolutions, these paths read the state directly:
 - **The visible-Markdown heal command** may drop manifest rows whose backing file is gone **only** in the `uncutover` state. Every other state, and any error resolving the state, keeps every manifest row. This is decided from the state and explicitly *not* from `storageMode`, which would have answered "dual-write" for every repository including the frozen ones.
 - **The v1→v3 index migration**, whose writes bypass the ref-backed backend's own gates, refuses unless the state is exactly `uncutover`.
 - **The automatic swap attempt** (spec 345) short-circuits on `cutover` (nothing to do) and on `blocked` (the repository needs recovery, not another attempt).
+- **The two long-lived hosts' heal gate** reads the classifier above rather than the state directly, and on every answer of false — `uncutover`, `blocked`, *and* a probe that failed outright — it leaves the existing, possibly frozen-backed storage exactly where it is and backs off. It logs **nothing** on that path.
 - **The status sub-command** prints one line per state, and sets a failing exit code for `blocked` only.
 
 ## State Transitions
@@ -175,7 +194,7 @@ The state is derived, not stored; it changes when a witness changes.
 - **`uncutover` → `legacy-fenced`** — the swap wrote a freeze marker into this clone's profile while the database still has no row for the identity. One-way: nothing revokes a marker automatically.
 - **`legacy-fenced` → `cutover`** — the swap's transaction recorded the state row.
 - **`uncutover` → `cutover`** — observed by a clone that never received a marker (a second checkout the swap did not enumerate, or a clone created afterwards) the moment the row lands, since the row alone is sufficient.
-- **any state → `blocked`** — a repository carrying a marker (or committed elsewhere) loses its database: the file is deleted, its sidecars are orphaned, the schema is migrated forward by a newer surface, or the runtime falls below the module floor. Reversible by restoring the database or upgrading the surface.
+- **any state → `blocked`** — a repository carrying a marker (or committed elsewhere) loses its database: the file is deleted, its sidecars are orphaned, a read throws, or the runtime falls below the module floor. Reversible by restoring the database or upgrading the runtime.
 - **`uncutover` → `uncutover` with a warning** — the same database conditions on a repository that carries no marker.
 - **`cutover` → `legacy-fenced`** is reachable **without any state changing** when the identity is resolved inconsistently: a caller that hashes a linked worktree's own path rather than the main root produces a different identity than the one registered, finds the marker but no row, and lands in `legacy-fenced` — where the database-backed backend then refuses every write against a frozen ref. (Notable; the reason every identity resolution starts from the main working-tree root.)
 
@@ -188,7 +207,8 @@ The state is derived, not stored; it changes when a witness changes.
 - **The row outranks the marker, and the marker is never revoked.** The end state carries both, and `cutover` is decided without even looking at the marker. (Notable.)
 - **A wiped profile silently un-freezes a clone as far as this decision is concerned.** The profile document lives in per-project gitignored state, and a read failure — including a corrupt or deleted file — presents as "no marker". Such a clone still lands in `cutover` if the database can answer, because the row is keyed by the shared identity; it lands in `uncutover` if the database cannot. (Surprising; the second witness exists precisely to cover the first half of that, and cannot cover the second.)
 - **The full resolution logs on the healthy path only when there is no marker.** The `uncutover`-with-warning arm warns on every call, which for a repository that has simply never created a database is the ordinary state. Downstream resolvers deliberately do not re-log it. (Notable.)
-- **The `blocked` state is a throw on both storage paths, and every other consumer treats it as "defer, do not degrade" — with one exception.** The system-of-record fallback shared by untargeted store operations degrades `blocked` to the ref-backed backend with a warning (spec 346). That is the only place `blocked` does not fail loudly. (Surprising.)
+- **The `blocked` state is a throw on both storage paths, and every other consumer treats it as "defer, do not degrade" — with two exceptions.** The system-of-record fallback shared by untargeted store operations degrades `blocked` to the ref-backed backend with a warning (spec 346). The heal gate is the second and the quieter one: `blocked` (and a failed probe) means "leave the existing, possibly frozen-backed storage in place", and it backs off with **no log line at all** — where the first at least warns. Those are the two places `blocked` does not fail loudly. (Surprising.)
+- **The classifier over the state is a product rule, not a host convenience.** Both long-lived hosts ask this one question rather than each restating the "has the source of truth moved" state set, so a fifth state cannot change one host's behavior without changing the other's. It answers true for `cutover` and `legacy-fenced` only — `uncutover` still has the ref-backed branch as its source of truth, and rebuilding on `blocked` would trade a stale-but-successful read for a throw. (Notable.)
 - **The database is opened on every routing call.** The decision memoizes only the identity, so a caller in a loop pays one database open per call unless it resolves through the memoizing sibling (spec 346). (Notable.)
 - **A source comment asserts that neither frozen state is reachable in production "until the engine starts writing fences".** That is stale at HEAD: an automatic trigger presses the swap from the post-commit queue drain and from the dashboard command, so both frozen states are ordinary production states. (Notable; the comment is wrong, the code is not.)
 
@@ -196,6 +216,7 @@ The state is derived, not stored; it changes when a witness changes.
 
 - The freeze marker's meaning, everything that changes once it is present, the locked compare-and-swap that writes it, and the drift probe that watches for writers that bypassed it are defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
 - The difference between resolving the system of record and resolving read storage, the short-lived route memo, and the degradation that turns `blocked` into ref-backed reads are defined by **System-of-Record versus Read Storage Resolution** (346).
+- The shared heal gate the two long-lived hosts wrap around this decision — its back-off window, its coalescing of concurrent probes, its one-way latch, the racing re-check before a rebuild, and each host's own rebuild step — is a neighbouring topic. This spec owns the classifier it asks and the states that classifier answers false for.
 - The dual-write composite the two folder-bearing routes construct — its read/write fan-out, its dirty-flag protocol, and its shadow-only delegations — is defined by **Dual-Write Summary Storage**.
 - The ref-backed backend's plumbing, and the two last-line refusals its write batch carries, are defined by **Orphan Branch Summary Storage**.
 - The Memory Bank write boundary consulted in every writable state, its refusal vocabulary, and the separately-reported effective state derived from the retired key are defined by **Memory Bank Write Boundary and Effective-State Reporting** (300).

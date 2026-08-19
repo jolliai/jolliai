@@ -2,7 +2,7 @@
 
 ## Topic Statement
 
-A central object the VS Code extension constructs once per workspace that funnels every command, view provider, and webview through one named surface — for changes, commit, amend, push, force-push, squash, summary read/list/search, plan/note read/edit/remove, index snapshot save/restore, install/uninstall, hook-staleness check, and local-folder export — so that no command spawns a subprocess that runs `git` itself and no command imports the storage backend directly; the object lazily creates the storage backend the user's settings ask for, exposes a single reload hook so settings changes invalidate it without a window reload, and routes structural errors (missing summary, malformed key, refused push target) into a small fixed set of bridge-level rejections that webviews can display verbatim.
+A central object the VS Code extension constructs once per workspace that funnels every command, view provider, and webview through one named surface — for changes, commit, amend, push, force-push, squash, summary read/list/search, plan/note read/edit/remove, index snapshot save/restore, install/uninstall, hook-staleness check, and local-folder export — so that no command spawns a subprocess that runs `git` itself and no command imports the storage backend directly; the object lazily creates the storage backend the user's settings ask for, exposes a single reload hook so a settings change — or a cutover another surface committed while the window stayed open — invalidates it without a window reload, and routes structural errors (missing summary, malformed key, refused push target) into a small fixed set of bridge-level rejections that webviews can display verbatim.
 
 ## Scope
 
@@ -21,7 +21,8 @@ A central object the VS Code extension constructs once per workspace that funnel
   - **Plans, notes, references** — list-plans, remove-plan, archive-plan-for-commit, cleanup-visible-plan-artifact, list-notes, save-note, remove-note, cleanup-visible-note-artifact, archive-note-for-commit, list-references, remove-reference, open-reference-in-browser, open-reference-markdown.
   - **Cross-repo helpers** — discover repos under the Memory Bank parent, build a storage handle rooted at a foreign repo's Memory Bank folder, build a storage handle rooted at the current workspace's Memory Bank folder, resolve a memory file at an absolute path to its (repo, slug, source) tuple, detect whether a memory file on disk has diverged from the storage-backed copy.
   - **Memory-bank caching** — the cached "all root index entries" optimization for the Memories panel with its single-purpose invalidation hook, plus a short-lived (few-second TTL) discovery cache for the file-decoration provider's per-URI polling.
-- The lazy storage backends: a write-side handle and a read-side handle, each created on first use of its accessor, each cached for the bridge's lifetime. The `reload-everything` hook clears both handles and every dependent cache on settings save; the narrower `reload-read-only` hook clears just the read handle so a user-initiated refresh can re-probe the folder/orphan fallback without churning the write side.
+- The lazy storage backends: a write-side handle and a read-side handle, each created on first use of its accessor, each cached for the bridge's lifetime. The `reload-everything` hook clears both handles and every dependent cache — fired by a settings save, and now also automatically by the cutover heal, which reaches it from inside either storage accessor and again from a frozen-write retry; the narrower `reload-read-only` hook clears just the read handle so a user-initiated refresh can re-probe the folder/orphan fallback without churning the write side.
+- The cutover heal on the two storage accessors: the throttled route probe each one awaits, the one-way latch that turns it off, the single retry the orphan-branch writers take on the frozen-branch error, and the background alias scan that re-probes without retrying its own write.
 - The squash-with-summary-merge handoff: a squash-pending record is written to the project state directory **before** the new commit is created so the post-commit hook reads it and merges the per-commit summaries instead of running the LLM.
 - The plugin-source marker that every commit / amend / squash writes before invoking git, so the post-commit-hook queue knows the operation came from this surface.
 - The error-normalization contract: backend-specific exceptions and subprocess-spawn errors are caught and re-surfaced through the bridge's own promise rejections / sentinel returns; the rest of the extension never touches storage exceptions or git-subprocess errors directly.
@@ -51,7 +52,7 @@ The bridge holds two private storage-backend handles, each initialized lazily an
 
 | State                  | Trigger                                                                                                |
 | ---------------------- | ------------------------------------------------------------------------------------------------------ |
-| Unset                  | Bridge construction; or after the corresponding storage-reload hook fires.                              |
+| Unset                  | Bridge construction; after the corresponding storage-reload hook fires; or after the cutover heal, which fires the full reload from inside either storage accessor. |
 | In flight              | First call to a method that needs the handle; or first read after invalidation.                        |
 | Resolved (cached)       | Subsequent calls reuse the same handle instance.                                                       |
 
@@ -61,7 +62,7 @@ The bridge does **not** persist either handle across calls into the in-process g
 
 The two reload hooks differ in scope:
 
-- The **full reload** clears the write handle, the read handle, the cached root-entries list, and the short-lived discovery cache. Fired by the settings-save callback when `storageMode` or `localFolder` changes — both handles must be cleared together because leaving the read cache after an orphan ↔ dual-write flip would silently keep reads on the previous mode's storage; the entries cache is cleared because `localFolder` changes the discoverable set of foreign repos.
+- The **full reload** clears the write handle, the read handle, the cached root-entries list, and the short-lived discovery cache. It **also drops the system-of-record route memo** — a separately-owned answer about which backend is authoritative, itself only three seconds old at most — so the next handle build re-resolves that rather than reusing an answer that predates the change. Fired by the settings-save callback when `storageMode` or `localFolder` changes, and by the cutover heal (see "Cutover heal on the storage accessors") — both handles must be cleared together because leaving the read cache after an orphan ↔ dual-write flip would silently keep reads on the previous mode's storage; the entries cache is cleared because `localFolder` changes the discoverable set of foreign repos.
 - The **read-only reload** clears just the read handle. Fired by a user-initiated refresh (e.g. after a peer-sync repopulates the folder). The write-side handle stays hot so the refresh button does not churn the (config-load + factory) path when the user has not changed mode or folder. Without this narrower hook, a dual-write session that fell back to the orphan-branch backend on first read (because the folder shadow's index was still missing) would keep serving that cached instance forever — folder-side rows iCloud or a sibling IDE just dropped in would stay invisible until the next window reload or a settings flip.
 
 The discovery cache that the file-decoration provider's per-URI polling uses has its own short (few-second) TTL plus explicit invalidation by the full reload, so per-URI redraws don't fire a config read + filesystem scan for every visible markdown file on every Explorer scroll.
@@ -185,7 +186,7 @@ Every method that creates a commit (commit, amend-with-message, amend-no-edit, s
 
 ### Error normalization
 
-The bridge funnels three classes of errors:
+The bridge funnels four classes of errors:
 
 | Source                                    | Bridge surface                                                                                          |
 | ----------------------------------------- | ------------------------------------------------------------------------------------------------------- |
@@ -227,6 +228,16 @@ The first method that needs the backend (any summary access, branch history with
 3. Subsequent storage-backend accesses return the cached handle.
 
 When the user saves the settings webview (changing storage mode or folder path), the extension fires the storage-reload hook on the bridge. The next storage-backend access rebuilds.
+
+### Cutover heal on the storage accessors
+
+Both storage accessors — write-side and read-side — now await a probe of the repository's cutover route before they hand back a handle. The problem being solved: a cutover committed by another surface (a command-line run, the dashboard's automatic pass) freezes the orphan branch, and the extension host is the product's longest-lived process, so a window left open across one keeps reading the frozen ref — successfully, and silently missing everything written to the database since — and raises the frozen-branch error on a write. Nothing here noticed, because the full reload was wired only to the settings-save callback.
+
+- **Throttled to five seconds, behind a one-way latch scoped to this bridge instance.** A repository that probes as still orphan-backed is trusted for five seconds before the route is probed again, so a method that awaits both accessors does not probe twice for one operation; once the repository is observed cut over the latch makes every later call a no-op, because a cutover never reverts. Concurrent probes coalesce onto one in flight.
+- **The heal *is* the full reload.** When the route has moved the system of record off the orphan branch, the latch is set and the full reload fires, so the next accessor call rebuilds both handles — and the caches the full reload clears, route memo included — against the current source of truth.
+- **An inconclusive answer changes nothing.** A probe that fails, and a route reporting that the database is unreachable, both back off and leave the cached handles in place; a later call retries. A readable-but-stale handle beats turning a working read into a hard throw.
+- **The orphan-branch writers retry once.** The frozen-branch error is a typed error the caller recognizes without matching message text. On it — and only on it — the write clears the probe back-off, re-probes (now unthrottled, so it latches and reloads), and runs the same operation once more, so the caller never sees the error. Every other thrown value propagates unchanged. The wrapped set is every write that reaches the orphan branch: the summary, plans, notes, references and transcript-batch writes, both archive-for-commit capabilities, and the index migration. Reads are index and file reads, never trigger the lazy catalog writeback, and are not wrapped.
+- **The background tree-hash alias scan is the one exception to that retry.** It is a fire-and-forget background write, so on the frozen-branch error it clears the back-off and re-probes — making later operations rebuild — but deliberately does **not** re-run its own write: a best-effort cross-branch match is not worth failing a panel over. Any other rejection is logged instead. Before this, the scan carried no rejection handler at all, so adding the branch also removed an unhandled promise rejection.
 
 ### File-listing flow
 
@@ -291,6 +302,8 @@ The first time any method that needs storage runs, the bridge invokes the storag
 
 When a settings save changes the storage mode or the folder path, the storage-reload hook clears the cached handle. The next storage-needing call rebuilds it from the freshly-saved settings.
 
+Independently of any settings save, the first storage access after the repository is observed to have cut over fires the same full reload, so the following access rebuilds both handles against the database. That observation is made by the route probe on the accessors, or — when a cutover landed inside the probe's five-second window — by a write that hit the frozen-branch error and re-probed.
+
 When a command runs commit, amend, or squash, the bridge first writes the plugin-source marker for the workspace. If the operation is a squash, the bridge writes the squash-pending record (with the hash list and the fork point) before the soft reset. It then invokes git as appropriate (a plain commit, an amend, or a soft reset followed by a commit), reads the new HEAD, and returns it.
 
 The hook-staleness check fires once on activation. If the project still has legacy hooks in the repo, it runs the enable capability to migrate them. It then derives this extension's source tag, reads its own dist-path entry, and runs the enable capability again whenever the entry is missing or the registered path does not match. Finally it scans all sources and, if any other source has registered a higher version, returns a mismatch hint.
@@ -320,6 +333,9 @@ On deactivation there is no explicit dispose; the bridge is GC'd with the extens
 - **The hook-staleness check swallows errors.** Activation cannot be blocked by a stale-hook check; if anything in the staleness logic throws, activation continues.
 - **The local-folder push falls back to the orphan branch for missing files.** A plan or note whose source file has been deleted (e.g. an archived plan whose live file was removed) is still readable because the orphan branch carries a copy. Snippet notes whose source is inline in the summary are handled in-memory without any read at all.
 - **The cached entries cache invalidates explicitly, not on settings change.** Callers that mutate the orphan branch (push to space, settings save that switches backend) invoke the entries-cache invalidator themselves; the bridge does not infer invalidation from settings or storage events.
+- **The cutover heal sets its one-way latch before the rebuild is known to work, and never clears it.** Setting the latch and dropping the cached handles is one step; the rebuild itself happens later and lazily, in whichever accessor is called next. So if the database becomes unavailable between the probe and that rebuild, every panel read fails for as long as it stays unavailable, with no path back to the stale-but-readable handles the latch has already discarded — where before the heal existed the user kept getting stale-but-rendered data. (Notable.)
+- **The two hosts' heals are equivalent only when they succeed.** The MCP server's variant awaits its rebuild before installing it, so a rebuild that fails there leaves the working storage object in place and a later call retries; this host has already discarded its handles by the time the rebuild is attempted. (Notable.)
+- **A repeatedly failing route probe is entirely silent on this host.** The bridge supplies no probe-failure or apply-failure reporting hook to the shared heal, so nothing is recorded anywhere when the probe keeps failing in the product's longest-lived process — the MCP server host wires up logging for the identical condition. (Notable.)
 
 ## Shared Behavior
 
@@ -334,7 +350,8 @@ On deactivation there is no explicit dispose; the bridge is GC'd with the extens
 - **Reference service** — the bridge re-exports the reference detector, the registry-and-markdown remover, and the open-in-browser / open-markdown helpers.
 - **Repo discoverer and Memory Bank path resolver** — used by the cross-repo helpers to enumerate the foreign repos under the configured Memory Bank parent and resolve the per-repo Memory Bank root.
 - **Folder storage and metadata manager** — instantiated by the cross-repo helpers to construct a storage handle rooted at any one repo's Memory Bank folder.
-- **Read-storage resolver** — picks the right read-side backend (folder when both index and shadow-cleanliness check pass, orphan-branch otherwise) for the current workspace and the read-side handle.
+- **Read-storage resolver** — picks the right read-side backend (folder when both index and shadow-cleanliness check pass, orphan-branch otherwise) for the current workspace and the read-side handle. Its short-lived system-of-record route memo is dropped by the bridge's full reload.
+- **Cutover-route re-check** — the throttle window, the coalescing of concurrent probes, the one-way latch, and the rule deciding which routes have moved the system of record off the orphan branch are shared with the MCP server host and owned by spec 370. The bridge supplies only the two host-specific halves: the "already healed" fact (its own latch) and the apply step (drop the cached handles). The typed frozen-branch error the writers retry on is likewise raised by the shared storage layer, not by the bridge.
 - **Dist-path resolver** — used by the hook-staleness check to read all per-source entries.
 - **Commit-message merge utility** — used by the string-merge squash-message capability for the no-LLM path.
 - **Diff-stats helper** — fallback path when the index entry lacks cached diff stats.

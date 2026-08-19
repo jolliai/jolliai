@@ -37,6 +37,12 @@ The message portion may itself span multiple lines (the dist-paths probe uses an
 - `jolli doctor --cwd <dir>` — operate against `<dir>` instead of the auto-resolved git repository root.
 - `jolli doctor --schema-log` — print the machine-level database's migration log: who ran what, when, and how it went, plus the names whose recorded statement text disagrees with this build's (spec 347). A report, not a repair.
 - `jolli doctor --mark-migration <name>` — record one named migration as applied by other means, carrying this build's own statement text. The one repair that remains for a state the log's name key cannot fix alone; the mechanics, the four reasons it can decline, and why it appends rather than updates are owned by spec 347. **The repair implies the report**, so this form also prints the log — otherwise a user who ran it would reasonably conclude it had done nothing.
+- `jolli doctor --sync-sessions` — upload pending session statistics now. The run is **machine-wide**: it passes no working directory at all, so `--cwd` does not narrow it. It bypasses both the upload throttle and any 24-hour per-backend-scope silence, and deliberately does **not** bypass the session-sync configuration switch (spec 62), a missing Jolli API key, or a runtime that cannot open the machine-level database — those three are reasons a run refuses, not conditions a forced run argues past. One of three outcomes is printed: up to date with nothing new to upload; uploaded N rows in M batches; or not uploaded, naming the reason.
+- `jolli doctor --repair-transcripts` (optionally with `--fix`) — a list-then-act form mirroring `--recover`: bare it reports what it *would* repair, and with `--fix` it applies. It first resolves this repository's active back-end through its own cutover state, so a cut-over repository is repaired against the memory database rather than against the frozen orphan branch. The candidate set is every summary in the repository whose transcript list is empty **and** which carries no repair stamp. Per-candidate errors are reported inline and counted **separately** from repaired and skipped — an error is explicitly not one of the engine's own verdicts, so it is never printed as a repair reason.
+
+**Both new forms short-circuit ahead of the probe report**, in the same way `--recover` and the schema-log forms do. So `--fix` paired with `--repair-transcripts` runs none of the standard fixers: the flag is read purely as "apply the repairs", and nothing else in this command executes on that invocation.
+
+**`--repair-transcripts` does not consult `--dry-run`.** The flag is accepted by the command and simply never reaches this form, so `--repair-transcripts --fix --dry-run` writes exactly as it would without the dry-run flag. The bare form is this form's own report-only mode; the general dry-run flag is not.
 
 ### Probes (in execution order)
 
@@ -137,7 +143,7 @@ Each probe produces exactly one line, with three exceptions: the dist-paths prob
 
 15. **Repo registry** — entries naming a checkout that is no longer on disk. A `warn`, never a `fail`, and that distinction is this command's own contract: this command reports *faults*, and a stale entry breaks nothing — it costs every sweep a pass and puts a dead row in the dashboard's repository picker, which is worth saying and is not worth a non-zero exit on an otherwise healthy machine. The message lists **every** entry, uncapped, because this is a diagnostic the user ran on purpose, the repair is irreversible, and the list is the only thing they have to decide with; it shrinks to nothing after the first repair. A registry that cannot be read at all is its own row.
 
-16. **Parked events** — ingest-log entries that never projected.
+16. **Dashboard events** — ingest-log entries that never projected.
 
 **The roster is not fixed, and the backup row is no longer last.** Rows have been appended after it, so nothing downstream should assume a terminal position; what is stable is that each probe contributes its own row and that the summary line follows all of them.
 
@@ -172,6 +178,9 @@ Exit code `0` therefore means "Jolli Memory is functional", but does not promise
 - **The report never names the one alarming database-file state.** Sidecars present with the database gone is detected elsewhere and is not a probe here; the closest this report comes is a System-of-record failure, and only for a fenced repository. (Notable.)
 - **The Orphan-branch probe cannot fail or warn any more.** It reports one of four informational messages and is always `ok`, because after a cutover the branch's absence is the expected state and warning about it sent users hunting a fault that does not exist. (Notable.)
 - **A plugin line's `ok` verdict says "compatible", not "working".** Version compatibility is all this probe checks; load failures surface separately at load time, so a green plugin line does not promise the plugin's commands will run.
+- **`--sync-sessions` exits zero when it uploaded nothing.** The non-zero exit is reserved for a genuine failure; every skip — no API key, a runtime that cannot open the database, and *the user's own session-sync switch being off* — prints the `✗` mark and still exits `0`. So the exit code alone cannot distinguish "nothing was uploaded because you turned it off" from "everything was already up to date". (Surprising.)
+- **`--fix` means something different under `--repair-transcripts`.** That form short-circuits ahead of the probe report, so the flag applies the transcript repairs and runs none of the standard fixers — no stale lock released, no stuck queue cleared, no missing hooks reinstalled. (Notable.)
+- **`--repair-transcripts --fix --dry-run` still writes.** The repair form never reads the dry-run flag, so the one combination a user would reach for to preview a write has no effect on it. The bare form without `--fix` is the only preview this form has. (Surprising.)
 
 ## Shared Behavior
 
@@ -183,3 +192,4 @@ Exit code `0` therefore means "Jolli Memory is functional", but does not promise
 - The backup health verdict, its folder rules, its seven-day escalation, the repairable flag it sets, and the snapshot pass its fixer invokes are all owned by spec 349. The two configuration keys behind it are validated at save time, not here.
 - The back-end resolution behind the System-of-record probe — including its diagnostic shape, which exists so this command can report the unroutable state instead of throwing — is owned by spec 346, and the routing states it names by spec 344.
 - The recovery mode of this same command (`--recover`), which surveys snapshots and restores one, is owned by spec 60.
+- The session-statistics push channel behind `--sync-sessions` — its throttle, its per-backend-scope silence, its cursors, and which repositories it withholds — and the transcript-repair engine behind `--repair-transcripts`, including every verdict it can refuse a candidate with, each own their own behavior. This command owns only the two invocation forms, the forced run, and how each outcome is reported. The configuration switch that gates the session channel is a settable key owned by spec 62.

@@ -9,13 +9,13 @@ One SQLite database per machine backs every memory and activity surface: this sp
 **In scope:**
 
 - The database file's location and name, the companion files SQLite creates beside it, and the directory and file permission modes a writable open forces.
-- The two ways in — a writable handle and a read-only handle — and everything each applies to the connection: per-connection pragmas, the write-lock wait, and the open-time retry.
+- The ways in — a writable handle and a read-only handle, plus the repair handle that must never migrate — and everything each applies to the connection: per-connection pragmas, the write-lock wait, and the open-time retry.
 - The lifecycle call that creates a missing file *or* brings an existing one's schema forward, and the one condition under which it stays silent.
-- The complete schema as a data contract: every table, primary key, unique constraint, check, foreign key and index, split into its two halves.
+- The complete schema as a data contract: every table, primary key, unique constraint, check, foreign key and index, split into its two halves plus the derived cache declared apart from both.
 - The current schema version, what it is derived from, and the append-only migration ladder — its name-based identity, its execution order, and the transaction discipline each step runs under.
-- The log the ladder writes inside the database, its four outcomes, and the two cases whose rows are inference rather than observation.
-- Drift verification: what is compared, when it runs, the three deliberate silences, and why the answer is a warning and never a refusal.
-- **The deliberate absence of a compatibility gate** — no version floor, no "the file is newer than me" error — the one log line that replaces it, and the reasons a gate was implemented and removed.
+- The log the ladder writes inside the database, its outcomes, and the one case whose rows are inference rather than observation.
+- Drift verification: what is compared, when it runs, the deliberate silences and the one state that is a warning rather than a silence, and why the answer is a warning and never a refusal.
+- **The deliberate absence of a compatibility gate** — no version floor, no "the file is newer than me" error — the one log line that replaces it, the reasons a gate was implemented and removed, and the one derived-data maintainer that nonetheless declines to write while the stamp is ahead.
 - The one repair that remains for a state a name key cannot fix alone.
 - The runtime-floor verdict: what the check actually compares, and everything that degrades through it.
 - The trigger the baseline installs, the entry that drops it again, and what still protects a repository's rows without it.
@@ -48,7 +48,7 @@ Both sidecars are created by the engine itself, under the process umask, wheneve
 
 ### Schema version
 
-The current version is **7**, recorded as the value of key `schema_version` in `schema_meta`. A database with no `schema_meta` table reads as version **0**.
+The current version is **8**, recorded as the value of key `schema_version` in `schema_meta`. A database with no `schema_meta` table reads as version **0**.
 
 The number is a hand-maintained constant that **must equal the number of entries in the ladder** — appending a migration means raising it by one — and a test pins the two together, so two branches that each append one collide loudly in continuous integration rather than silently on disk. It cannot be written as a reference to the ladder's own length, because the ladder is declared after it.
 
@@ -56,7 +56,7 @@ The number is a hand-maintained constant that **must equal the number of entries
 
 ### `schema_meta` keys
 
-`schema_meta` is a whole-database key/value singleton. Four keys are written:
+`schema_meta` is a whole-database key/value singleton. The keys written:
 
 | Key | Written by | Meaning |
 | --- | --- | --- |
@@ -69,7 +69,7 @@ Per-repository control state is deliberately *not* here — it lives in a reposi
 
 ### The activity half
 
-Every table is `STRICT`. This half is a projection of git plus each agent's own storage: losing it costs time, never data.
+Every table is `STRICT`. This half is a projection of git plus each agent's own storage: losing it costs time, never data. One further table is also cheap to lose, but for a different reason, and is declared apart from both halves — see *The derived cache*.
 
 **`schema_meta`** — `(key TEXT PRIMARY KEY, value TEXT)`.
 
@@ -87,19 +87,33 @@ Every table is `STRICT`. This half is a projection of git plus each agent's own 
 - `started_at_ms INTEGER`, `updated_at_ms INTEGER NOT NULL`, `message_count INTEGER`, `duration_ms INTEGER`, `model TEXT`
 - `input_tokens`, `output_tokens`, `cached_tokens` — `INTEGER NOT NULL DEFAULT 0`; `est_cost_usd REAL`
 - `token_coverage TEXT NOT NULL DEFAULT 'sessions-only'`, `prices_as_of TEXT`
+- `written_at_ms INTEGER NOT NULL DEFAULT 0` — the row's write stamp (added at version 8)
 - `UNIQUE (repo_id, source, session_id)`
-- Indices: `ix_sessions_repo_time(repo_id, updated_at_ms)`, `ix_sessions_time(updated_at_ms)`, `ix_sessions_source(source)`
+- Indices: `ix_sessions_repo_time(repo_id, updated_at_ms)`, `ix_sessions_time(updated_at_ms)`, `ix_sessions_source(source)`, `ix_sessions_written(written_at_ms)`, `ix_sessions_keyset(written_at_ms, event_id)`
 
-**`session_model_usage`** — `PRIMARY KEY (session_event_id, model)`; `session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE`; token columns and `est_cost_usd` as above. Index `ix_smu_model(model)`.
+**`session_model_usage`** — `PRIMARY KEY (session_event_id, model)`; `session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE`; token columns and `est_cost_usd` as above; `updated_at_ms INTEGER NOT NULL DEFAULT 0` (the row's write stamp, added at version 8). Indices `ix_smu_model(model)`, `ix_smu_sync(updated_at_ms)`, `ix_smu_keyset(updated_at_ms, session_event_id, model)`.
 
-**`session_tool_use`** — `PRIMARY KEY (session_event_id, tool_name, kind)`; `session_event_id … REFERENCES sessions(event_id) ON DELETE CASCADE`; `server TEXT`; `calls INTEGER NOT NULL DEFAULT 0`; `last_call_at_ms INTEGER` (nullable, added at version 5). Indices `ix_stu_kind(kind)`, `ix_stu_server(server)`. The kind is part of the key because a skill and a builtin can share a name.
+**`session_usage_events`** — one row per counted model response, the per-response detail behind the per-model aggregate above. `STRICT, WITHOUT ROWID`.
+
+- `PRIMARY KEY (session_event_id, dedup_key)`; `session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE`; `dedup_key TEXT NOT NULL`
+- `responded_at_ms INTEGER NOT NULL`
+- `model TEXT NOT NULL` — the empty string when the transcript named none
+- `input_tokens`, `output_tokens`, `cached_tokens` — `INTEGER NOT NULL DEFAULT 0`
+- `est_cost_usd REAL` — nullable
+- `updated_at_ms INTEGER NOT NULL` — the row's write stamp; unlike the stamps added to the tables that already existed, it carries **no default**, so the writer must supply it
+- Indices `ix_sue_at(responded_at_ms)`, `ix_sue_sync(updated_at_ms)`
+
+The commit-summary projection writes no rows here, so a session seeded from a commit summary has an empty per-response set even though its per-model aggregate is populated.
+
+**`session_tool_use`** — `PRIMARY KEY (session_event_id, tool_name, kind)`; `session_event_id … REFERENCES sessions(event_id) ON DELETE CASCADE`; `server TEXT`; `calls INTEGER NOT NULL DEFAULT 0`; `last_call_at_ms INTEGER` (nullable, added at version 5); `updated_at_ms INTEGER NOT NULL DEFAULT 0` (the row's write stamp, added at version 8). Indices `ix_stu_kind(kind)`, `ix_stu_server(server)`, `ix_stu_sync(updated_at_ms)`, `ix_stu_keyset(updated_at_ms, session_event_id, tool_name, kind)`. The kind is part of the key because a skill and a builtin can share a name.
 
 **`commits`**
 
 - `id INTEGER PRIMARY KEY`, `event_id TEXT NOT NULL UNIQUE`, `repo_id INTEGER NOT NULL REFERENCES repos(id)`
 - `hash TEXT NOT NULL`, `branch TEXT`, `message TEXT`, `author_name TEXT`, `author_email TEXT`
 - `committed_at_ms INTEGER NOT NULL`, `files_changed INTEGER`, `insertions INTEGER`, `deletions INTEGER`
-- `UNIQUE (repo_id, hash)`; indices `ix_commits_repo_time(repo_id, committed_at_ms)`, `ix_commits_branch(branch)`
+- `written_at_ms INTEGER NOT NULL DEFAULT 0` — the row's write stamp (added at version 8)
+- `UNIQUE (repo_id, hash)`; indices `ix_commits_repo_time(repo_id, committed_at_ms)`, `ix_commits_branch(branch)`, `ix_commits_written(written_at_ms)`
 
 **`branches`** — `id INTEGER PRIMARY KEY`, `repo_id INTEGER NOT NULL REFERENCES repos(id)`, `name TEXT NOT NULL`, `UNIQUE (repo_id, name)`.
 
@@ -128,13 +142,16 @@ Every table is `STRICT`. This half is a projection of git plus each agent's own 
 - `repo_id INTEGER NOT NULL REFERENCES repos(id)`, `at_ms INTEGER NOT NULL`
 - `surface TEXT NOT NULL`, `session_id TEXT` (null when the call belonged to no agent session)
 - `hit INTEGER NOT NULL`, `commit_count INTEGER NOT NULL DEFAULT 0`, `commits_json TEXT`
-- Index `ix_recall_receipts_repo_at(repo_id, at_ms)`
+- `updated_at_ms INTEGER NOT NULL DEFAULT 0` — a write stamp (added at version 8) that is written on every receipt and read by nothing; see *Notable Behavior*
+- Indices `ix_recall_receipts_repo_at(repo_id, at_ms)`, `ix_recall_receipts_sync(updated_at_ms)`, `ix_recall_receipts_keyset(updated_at_ms, receipt_id)`
 
-There is no aggregate table, no provider-usage table, and no code-graph table; every reader aggregates live over the detail rows above.
+The write stamps added at version 8 are deliberately **not** uniformly named: the session table and the commit table carry `written_at_ms`, while the three child tables — per-model usage, tool use and receipts — carry `updated_at_ms`. Note the session table already carries an `updated_at_ms` of its own, which is the session's activity time and not a write stamp.
+
+There is now one aggregate table, and it is declared apart from this half (see *The derived cache*) because it is a derived cache rather than a maintained total: every row is a whole-day replacement, so it is safe to delete outright and the read path recomputes a missing or stale day live. There is still no provider-usage table and no code-graph table, and readers otherwise aggregate live over the detail rows above.
 
 ### The memory half
 
-Also all `STRICT`. Unlike the activity half this is the only copy of its data.
+Also all `STRICT`. Unlike either of the other two groups this is the only copy of its data.
 
 **`repo_state`** — `PRIMARY KEY (repo_id, key)`, `value TEXT NOT NULL`. A per-repository key/value table, so adding a marker is an insert rather than a schema change.
 
@@ -149,7 +166,7 @@ Also all `STRICT`. Unlike the activity half this is the only copy of its data.
 - `PRIMARY KEY (repo_id, commit_hash)`; `UNIQUE (repo_id, parent_hash, child_pos)`
 - `CHECK ((parent_hash IS NULL) = (child_pos IS NULL))`, `CHECK (child_pos IS NULL OR child_pos >= 0)`, `CHECK (child_pos IS NULL OR child_pos < 2000000)`
 - Self-referencing `FOREIGN KEY (repo_id, parent_hash) REFERENCES memories(repo_id, commit_hash) ON DELETE CASCADE`
-- Indices: `ix_mem_root(repo_id, root_hash)`, `ix_mem_branch(repo_id, branch, commit_date_ms)`, `ix_mem_date(repo_id, commit_date_ms)`, `ix_mem_ticket(repo_id, ticket_id)`
+- Indices: `ix_mem_root(repo_id, root_hash)`, `ix_mem_branch(repo_id, branch, commit_date_ms)`, `ix_mem_date(repo_id, commit_date_ms)`, `ix_mem_ticket(repo_id, ticket_id)`, `ix_mem_written(written_at_ms)` — the last added at version 8 over a column the baseline already carried
 
 Stored generated columns are restricted to `TEXT`: a strict table rejects the whole row when a stored generated value has the wrong type, and a rejected row is a permanently lost memory.
 
@@ -183,7 +200,27 @@ Stored generated columns are restricted to `TEXT`: a strict table rejects the wh
 
 **`topic_processed_sources`** — `PRIMARY KEY (repo_id, source_type, source_id)`, `source_type` checked against the same four values, `repo_id … REFERENCES repos(id)`.
 
-There are no views and — apart from the one on `repos` — no triggers. Constraints a foreign key or check can express are foreign keys and checks; everything else is the write path's job.
+There are no views and, at the current version, no triggers at all: the one the baseline installs on `repos` is dropped again by a later ladder entry. Constraints a foreign key or check can express are foreign keys and checks; everything else is the write path's job.
+
+### The derived cache
+
+A third group, declared apart from both halves because its loss semantics are a third thing: it is neither rescannable from git nor the only copy of anything. Every row is re-derivable from the other two halves **inside this same file**, so deleting it costs page latency and nothing else.
+
+**`stats_daily`** — the per-day rollup cache. `STRICT, WITHOUT ROWID`.
+
+- `PRIMARY KEY (repo_id, tz, day, kind, series_key)` — and **deliberately no foreign key**; the sentinel row below carries a `repo_id` no registry row has
+- `repo_id INTEGER NOT NULL` — a real repository id, or `0` on the sentinel row that records the build
+- `tz TEXT NOT NULL` — an IANA zone name, and part of the key
+- `day TEXT NOT NULL` — `YYYY-MM-DD`
+- `kind TEXT NOT NULL`, `series_key TEXT NOT NULL`
+- `value REAL NOT NULL` — **fractional, not integral**: two of the series axes apportion one response across several members
+- `cost_usd REAL NOT NULL DEFAULT 0`
+- `built_at_ms INTEGER NOT NULL`, `updated_at_ms INTEGER NOT NULL`
+- Index `ix_stats_daily_day(tz, day)`
+
+The `kind` namespace is one entry per series dimension — `model`, `agent`, `project`, `branch`, `ticket`, `category` — plus `tokens`, whose `series_key` is one of `input`, `output`, `cached`, plus the `built` sentinel.
+
+Rows are replaced a **whole day at a time**: settling a day deletes that day's rows and re-inserts them. That is what makes the table safe to delete — a missing or stale day is recomputed live by the read path — and it is why nothing here is a maintained running total.
 
 ### The write-lock wait, by writer role
 
@@ -205,7 +242,7 @@ A detached background writer has nobody waiting on it and should tolerate conten
 
 ### Opening a handle
 
-Two entry points exist, and the split is enforced by the engine rather than by convention: a writable handle and a read-only handle. Both do the following, in order.
+Two entry points serve ordinary work, and the split between them is enforced by the engine rather than by convention: a writable handle and a read-only handle. (A third, for the recovery path, is below.) Both do the following, in order.
 
 1. **Runtime-floor check first.** If the running runtime is below the floor, the open raises the floor error immediately and never touches the file.
 2. Resolve the path (a caller may override it; production paths do not).
@@ -252,8 +289,9 @@ The ladder is append-only. The first entry takes an empty database to version 1;
 | 5 | Add the nullable per-call timestamp column to the tool-use table |
 | 6 | **Create the migration log table and its name index** |
 | 7 | **Drop the delete-refusing trigger the first entry installed** |
+| 8 | The session-statistics sync: write stamps on the session, per-model-usage, tool-use, receipt and commit tables, the new per-response usage table, the per-day rollup cache, thirteen indices, and two backfill passes over the stamps |
 
-The last two are what this topic's own bookkeeping rests on, and the ordering has one awkward consequence stated under *The log* below: on a fresh database the first five entries run before the table that records them exists.
+Entries 6 and 7 are what this topic's own bookkeeping rests on, and the ordering has one awkward consequence stated under *The log* below: on a fresh database the first five entries run before the table that records them exists.
 
 Entry 7 is appended rather than edited out of the first entry, because a shipped entry's bytes are frozen and every existing database has already applied that one. So the baseline still creates the trigger, still carries its original argument for it, and this entry supersedes it.
 
@@ -274,7 +312,7 @@ Bundling the version bump with the step is what makes a crash mid-step safe: the
 
 Every touch of every entry is appended as one row inside the database, carrying: a monotonic sequence number; the array position the entry ran at (**diagnostic only** — nothing decides anything from it, and it is kept because "slot 5" is what a bug report says out loud); the entry's name; an outcome; the identity of the surface that did it, as a client kind and version pair — the thing a user would go and upgrade; the instant; the duration; and **the full text of the statements that ran**.
 
-Four outcomes, none interchangeable:
+Outcomes, none interchangeable:
 
 | Outcome | Meaning |
 | --- | --- |
@@ -285,7 +323,7 @@ Four outcomes, none interchangeable:
 
 **A reading of the log has three answers, and they are not interchangeable either**: rows; no log table at all; or a table that is present and cannot be read. The third is never folded into the second.
 
-**Two kinds of row are inference rather than observation, and the log says which.** A database that predates the log has no rows, so the version stamp is the only evidence of what ran, and the names are taken from *this build's* list at those positions — a guess, and wrong in exactly the case a position key was wrong. Those rows are marked `baseline` rather than `applied` for that reason. A log that is present but **unreadable** gets no seed rows at all: writing inference into a table whose shape this build cannot read is how a half-written log gets manufactured.
+**One kind of row is inference rather than observation, and the log says which.** A database that predates the log has no rows, so the version stamp is the only evidence of what ran, and the names are taken from *this build's* list at those positions — a guess, and wrong in exactly the case a position key was wrong. Those rows are marked `baseline` rather than `applied` for that reason. A log that is present but **unreadable** gets no seed rows at all: writing inference into a table whose shape this build cannot read is how a half-written log gets manufactured.
 
 **The entry that creates the log table cannot record the entries that ran before it.** On a fresh database the earlier entries run before there is anywhere to put their rows, so those rows are held and written by the creating entry — inside its transaction, ahead of its own row, so sequence order still reads as history. They stay `applied`, because this pass did watch them run. If the creating entry then fails, the held rows go with it, and that is recoverable rather than lost: the file is left at a version with no log table, which the next pass reads as a pre-log database and seeds from the stamp. The only cost is that those rows come back as inference — which is the honest description of what is then known.
 
@@ -297,7 +335,7 @@ On **every** writable open — including the ones that migrate nothing, because 
 
 **The answer is always a warning. Nothing here refuses, and turning it back into a refusal is a mistake with a measured cost:** the comparison is byte-exact while the majority of the baseline entry's text is comments, so re-wrapping a single comment would make every existing database refuse writes. A test catches the same disagreement on the author's machine, before it ships, where the fix is free.
 
-Three deliberate silences:
+Two deliberate silences, and a third state that is deliberately not one:
 
 - **No log table at all** → nothing to check. The entry that creates that table is itself in the ladder, so the first run on any existing database reaches this before the table exists.
 - **A name with no `applied` row anywhere** → pass. Databases that predate the log have rows for nothing, so the check cannot reach backwards, only forwards. Seeded `baseline` rows are skipped too — they are a guess by construction, so comparing against them would report drift that was never observed. Note the test is "no `applied` row *anywhere*", not "the newest row is not `applied`": a later `skipped` or `failed` row must not bury an earlier observation.
@@ -306,6 +344,8 @@ Three deliberate silences:
 ### No compatibility gate
 
 **This layer does not decide whether a database may be used.** There is no compatibility floor, no version gate, and no "the file is newer than me" error: a writable open succeeds whatever the file says. Additive columns read back as their defaults and unknown tables are never touched. The single trace is one log line, emitted **once per process**, when the file's format number is ahead of this build — so that "this surface could not see everything" is at least visible afterwards.
+
+**One derived-data maintainer does branch on the stamp, and it refuses nothing.** The daily rollup builder logs one line and declines to *settle* a day when the file's version is greater than this build's — a build blind to a newly stamped source table would otherwise settle a day it can only see part of. Everything else proceeds: the file is opened, read and written normally, and the only consequence is that the cache has no row for that day, which costs a live recomputation on the read path. That is an exception in kind — a derived cache declining to write *itself* — and not a softening of the rule below: nothing here refuses to open, read or write a file stamped ahead of the build, and re-adding an actual version gate remains a mistake.
 
 A gate existed and was removed. Three reasons, in the order they were learned:
 
@@ -369,7 +409,10 @@ For the database file, as seen by a writable open:
 - **Neither entry point refuses a newer schema, and that is now the whole rule rather than an asymmetry.** A reader *or* a writer on an older build opens a database migrated by a newer one and may fail later, per query, on whatever it does not recognise — with one warning per process as the only trace. This replaced a writable-only refusal; the surfaces that must not guess each carry their own comparison rather than relying on this layer, and re-adding a gate in any of them is a regression.
 - **The lifecycle call swallows every read failure except a version answer.** Corruption, a permission error and a sidecars-only residue are all indistinguishable "return silently" outcomes there, chosen precisely because none is a migration's job; the caller's own open is where the user finds out. (Notable.)
 - **A missing version table is read as version 0, and so is a corrupt one.** The version read swallows every error and answers 0, so a damaged file is taken for an empty one and the first baseline statement is what actually fails — which is deliberate, since that statement's error is far better than one this read could produce. (Notable.)
-- **The schema now carries no triggers at all, and the one that used to be the exception is created and then dropped by the same ladder.** The first entry installs a trigger refusing any delete of a repository row, and the last entry drops it — so a database built from scratch passes through a state where it exists. Its original argument is still in the baseline's own text and is now historical.
+- **Entry 8 is seven development steps concatenated under one name, and it runs in one transaction like any other entry.** So its statements — the stamp columns, the new tables, the indices and the backfill passes — all commit or all roll back together, and the first statement to raise aborts the rest of the entry. One consequence is live and harmless: the rollup cache's day index is created twice inside the entry, once inline with the table and once standalone; both are guarded on non-existence, so the second does nothing. (Notable.)
+- **A database that ran an *unreleased* build of entry 8's work re-runs the entry and fails on a duplicate column.** The entry ships under a name no intermediate build logged, so such a file reads it as never applied; its first statement is an unguarded column addition, which raises. The entry rolls back, a `failed` row is recorded, and the error propagates out of every writable open — the repair is the diagnostic command that records the entry as applied by name. This is reachable only where an unreleased build ran: a database that has only ever seen released builds has no name to disagree about. (Notable.)
+- **The receipts table's write stamp and both of its new indices are written on every receipt and read by nothing.** That table is excluded from the sync set and has no stamp-column mapping, so the column advances and the two indices are maintained for a reader that does not exist. (Surprising.)
+- **The schema now carries no triggers at all, and the one that used to be the exception is created and then dropped by the same ladder.** The first entry installs a trigger refusing any delete of a repository row, and entry 7 drops it — so a database built from scratch passes through a state where it exists. Its original argument is still in the baseline's own text and is now historical.
 
   What still protects a repository's rows is not a trigger: every child table references the repository table with the default no-action rule and foreign keys are enabled on **both** the writable and the read-only connection, so deleting a repository that owns any row still fails with a constraint error. The zero-data case — the one the trigger uniquely covered — is now deletable, which is what a removal path addressing a repository by identity needs. Disabling remains an update of a timestamp column and is a different operation from removal. (Notable; the reversal is deliberate.)
 - **Owner-only file modes are re-asserted on every writable open, but the sidecars usually are not covered by them.** The engine creates the sidecars when a write session starts, which is generally after the mode pass has already run, so the enclosing `0700` directory — not the file mode — is the boundary that actually holds. (Notable.)
@@ -377,12 +420,13 @@ For the database file, as seen by a writable open:
 - **The editor host is expected to lose write races, and that is the design.** Its 400 ms wait is short enough that a contended write is dropped rather than freezing the interface; the data is re-derivable and its next periodic tick tries again. (Notable.)
 - **The write-ahead log table keeps the repository identity string rather than the surrogate id**, and its identity column is deliberately not unique — the log's job is to get the raw event onto disk before anything is interpreted, which must not depend on a registry row already existing. (Notable.)
 - **One table in the schema carries no repository column at all** — the commit-to-branch reachability table — and its boundary comes from the branch row instead, at the cost of one extra join. (Notable.)
-- **The two halves have opposite loss semantics and are deliberately declared apart.** The activity half can be rescanned from git and each agent's own storage; the memory half is the only copy there is. Confusing the two is how data gets lost. (Notable.)
+- **The three declared groups have different loss semantics and are deliberately declared apart.** The activity half can be rescanned from git and each agent's own storage; the memory half is the only copy there is; the derived cache is re-derivable from the other two inside this same file, so losing it costs only page latency. Confusing the first two is how data gets lost. (Notable.)
 
 ## Shared Behavior
 
 - The runtime floor here is the same value the shared database-reading helpers for agent session stores enforce, and the same floor the package's declared engine range, the editor extension's declared host range, and the plugin bundles' build targets all encode. A change to one is a change to all of them.
 - The classification of a database failure into contention / corruption / permission / schema-drift is shared with those agent-store readers, and is what decides whether an open is retried here.
 - The database's identity key in `schema_meta`, the snapshot timestamp key and the last-used-folder key are written and read by the snapshot engine (349) and consumed by the deletion detector (348).
+- **A memory write path that deletes, re-grounds or re-aliases a memory row must name the cached rollup days it invalidated.** None of those three touches a column carrying a write stamp, so a scan for staleness cannot notice them and the cache would go on serving a day its rows no longer support — the invalidation has to be stated by the writer. What this topic owns is the cache that cannot see those operations and the stamps that do not move for them; the write protocol itself is owned by 354.
 - The repository registry that the surrogate ids are projected from, and the per-repository control rows in the key/value table, are written by the import and cutover paths (344, 345) and read here only as storage.
 - Which repositories route through this database at all, and which back-end a given read or write resolves to, are owned by 344 and 346.

@@ -23,7 +23,7 @@ A self-contained interactive HTML view that renders a single commit memory (or a
 - When the page's content is first loaded — the readiness conditions the load waits for, the last-resort timeout that now always fires, the three armed recovery paths behind it, and the one-shot repaint nudge afterwards.
 - The first-painted-frame round trip: the host asking the page to report once the display engine has painted, and the brief detach-and-re-attach of the view in its tab that report triggers.
 - The in-place memory swap: what changes when the single memory tab is handed a different memory, and the identity guard that keeps the outgoing memory's asynchronous results off the incoming memory's page.
-- Deferred hydration: which data sets are gathered after the page opens and applied by message rather than by a second load, and how the translatable-plan scan is performed.
+- Deferred hydration: which data is gathered after the page opens and applied by message rather than by a second load, how the translatable-plan scan is performed, and the third datum on that pass — the CLI's repair verdict, which picks the wording of the all-conversations zero-state paragraph.
 - Cache invalidation on persisted edits, so other surfaces reopening the memory see the edit.
 - In-document hover hints, because the embedded browser surfaces no native tooltips.
 - The fallback rendering path when the embedded HTML view cannot be created in this environment.
@@ -33,6 +33,7 @@ A self-contained interactive HTML view that renders a single commit memory (or a
 - The actual cloud push / cloud delete network protocol — owned by the cloud-API spec.
 - The pull-request creation network call — owned by the PR service spec.
 - The generation call that produces an end-to-end test guide, a recap, or a plan translated to English — this host cannot run generation in process and delegates each one over the one-shot generation bridge (spec 292), which owns the request/response contract, provider routing, and prompt assembly.
+- How the repair verdict behind the zero-state wording is derived — the four verdicts, what a real repair reads, the bounds it insists on, and every reason it refuses — owned by the transcript-repair topic. This page owns only the sentence it prints and the round trip that fetches the verdict.
 - The memory reference identifier's format and the copy chip's own behaviour (clipboard payload, confirmation banner, keyboard activation, accessible name, read-only-mode exemption) — owned by spec 301.
 - The IDE-level virtual-file wrapper that lets this view open as an editor tab, and the one-tab-per-project rule that makes a memory swap the normal case rather than a new tab — owned by spec 121. This spec owns only what the swap does *inside* the page.
 - The pull-request status cache that answers this page's PR-state question — its TTLs, its coalescing, and its invalidation API — owned by spec 309. This spec owns only the staleness the page can show as a result.
@@ -51,13 +52,19 @@ The view also receives two pre-computed sets:
 | `transcriptHashSet`  | The set of transcript identifiers this memory actually has stored transcripts for. It is the shared transcript-identifier resolution for the memory — the version-5 transcript-identifier list carried on the memory itself, falling back to walking the tree's children for legacy commit-hash-named transcripts on older data — **intersected** with the set of transcripts genuinely present in storage. So an identifier the memory claims but storage does not hold is not in this set. |
 | `planTranslateSet`   | The set of plan slugs whose body or title contains CJK characters, qualifying them for translation.  |
 
-Neither set is available when the page is first built. Both are gathered afterwards and applied by message — see *Deferred hydration* below.
+…plus one scalar of the same kind:
+
+| Datum | Meaning |
+| ----- | ------- |
+| repair verdict | The CLI's answer to "why does this memory have no captured conversations" — one of `present` / `repaired` / `repairable` / `unrepairable`, or **absent**. It picks the wording of the all-conversations zero-state paragraph and nothing else. Absent is the normal state of the *first* render, and is also what a failed fetch yields; it renders the plainest wording. |
+
+None of the three is available when the page is first built. All are gathered afterwards and applied by message — see *Deferred hydration* below.
 
 ### Page structure
 
 The header and the Pull Request section have both been restructured since an earlier description of this page (which had the header as "the commit message as page title, two header buttons — Copy Markdown, Push to Jolli/Update on Jolli — and a properties table," with the Pull Request section as its own independent top-level section). Top-to-bottom, the page now contains:
 
-1. **All Conversations private-zone block** — present always. **Both** the zero-state paragraph and the populated variant (a "Manage" button, a description line, a stats line, and a privacy reassurance line) are always emitted; whichever does not apply is hidden. This is what lets the deferred hydration reveal the populated variant in place — see *Deferred hydration*.
+1. **All Conversations private-zone block** — present always. **Both** the zero-state paragraph and the populated variant (a "Manage" button, a description line, a stats line, and a privacy reassurance line) are always emitted; whichever does not apply is hidden. This is what lets the deferred hydration reveal the populated variant in place — see *Deferred hydration*. The zero-state paragraph's **text** is server-rendered from the repair verdict when one is already known, and corrected in place by the hydrate otherwise; whether that paragraph *shows* is a separate decision — see *All-Conversations private zone*.
 2. **Header** — the commit message as page title, prefixed by a clickable **memory reference chip** (its identifier format, always-present fallback variant, hover hint, keyboard activation, clipboard payload, and confirmation banner are owned by spec 301; this page owns only the chip's position — leading, on the title line, immediately before the escaped commit message); a compact meta-strip (short hash · branch · relative date); a "Details" toggle that expands/collapses a properties table (the previous always-visible properties table, now collapsed by default); a share-link button; and an export split-menu offering "Copy Markdown" and "Save as Markdown File". The push/update button no longer lives in the header — it moved to the ship bar (below).
 3. **Token/cost banner** — new section directly below the header; see below.
 4. **Ship bar** — new section replacing the old standalone Pull Request section: two cards side by side — a PR card (wrapping the same PR sub-page/state machine the old standalone section had) and a Jolli card (a synced/not-shared status chip plus the relocated push/update button, now labeled "Share in Jolli" when nothing has been pushed yet, "Update on Jolli" once it has).
@@ -65,7 +72,7 @@ The header and the Pull Request section have both been restructured since an ear
 6. **End-to-End Test section** — a placeholder + Generate button when none, otherwise a list of collapsible scenarios with edit/regenerate/delete controls.
 7. **Source Commits section** — only when the tree has more than one source commit; renders a compact row per source.
 8. **Memories section** — header line with title, count, and an "Expand All / Collapse All" button; body is either a flat list of cards (one per topic) or a date-grouped timeline (when the squash spans more than one calendar day).
-9. **Footer** — a "Generated by JolliMemory · {timestamp}" attribution line.
+9. **Footer** — a single "Generated by JolliMemory · {timestamp}" attribution line, with an optional `· via <provider>` clause **inside the same span** (omitted when the tree resolves no provider). The timestamp is read from the clock at render time, not from the memory's own generation stamp, so it moves on every rebuild of the page. This footer carries **no transcript-privacy line and no conversation count** — both of which the VS Code memory panel's footer and the dashboard's memory detail do carry (the former counting transcript files, the latter conversations). Nothing here reads either of those surfaces.
 
 The properties table's row set and order (Commit / Branch / Author / Date / Duration / Changes / Conversations) is unchanged, with one exception: the "Jolli Memory (link + plans)" row that used to appear conditionally in the properties table has moved — its content (the pushed URL and any pushed-plan links) now renders unconditionally inside the ship bar's Jolli card instead of as a conditional properties-table row.
 
@@ -148,7 +155,10 @@ Sent over a custom event channel. The page listens on a single event name and di
 | `transcriptStatsLoaded` / `transcriptsLoading` / `allTranscriptsLoaded` / `transcriptsSaved` / `transcriptsDeleted` | Conversations modal lifecycle. |
 | `transcriptsAvailable` (carries a count) | Deferred hydration: rewrite the private drawer's session-count badge and flip the All-Conversations block between its zero-state and populated variants in place. When the count goes from zero to non-zero the page also issues `loadTranscriptStats`, which the initial render deliberately skipped. |
 | `planTranslateAvailable` (carries a list of plan slugs) | Deferred hydration: un-hide the translate control on each named plan. |
+| `conversationsEmptyText` (carries **the sentence**, not the verdict) | Deferred hydration: rewrite the all-conversations zero-state paragraph's text in place. The payload is the finished wording precisely so the three strings live in **one** place on this host rather than being restated in the page's script, where nothing would notice a drift; the page assigns it as **text**, never as markup. **An absent verdict sends no message at all** — the server-rendered markup already carries the plainest wording, so posting would cost a round trip to change nothing. |
 | `error`                  | Generic error surface.                                       |
+
+**This table is not the page's whole handler set.** The page dispatches on considerably more commands than the twelve rows here, and whole families are absent from it — the recap lifecycle, the reference-card lifecycle, the share-modal state, and the create form's own show event among them. The dispatch inventory itself is not this topic's to own. That gap pre-dates the verdict row above and is recorded here so the table is not read as complete.
 
 ### Theming
 
@@ -231,24 +241,30 @@ The round trip is armed only when the load that completed was a *not-yet-loaded*
 Because there is at most one memory tab (spec 121), the normal way a different memory reaches this page is an in-place swap rather than a new tab. On a swap the host, on the interface thread:
 
 - bumps a **memory-identity generation** counter (below);
-- clears the two deferred sets, so the outgoing memory's transcript and translate affordances cannot leak into the incoming page;
+- clears the two deferred sets **and the repair verdict** — three things, not two. The sets keep the outgoing memory's transcript and translate affordances out of the incoming page; the verdict is cleared for the same reason plus a sharper one, that it is a per-**memory** answer, so reusing the outgoing one would tell the user a repair is possible for a different commit;
 - installs the new memory and, if it changed, the new read-only flag — subscribing to or unsubscribing from memory-change notifications to match;
 - requests a full re-render, which replaces the document in the same browser instance (no native re-attach);
 - marks the page as not-loaded **synchronously**, so anything landing in the same turn — a share-overlay request from the action bar, or a deferred-hydration continuation — parks its intent instead of running script against the document that is about to be replaced. The parked intent is drained by the new page's load completion;
 - clears any pending share-overlay intent and share-modal state left over from the outgoing memory, so a share the user requested on the previous memory does not pop open on the next one;
-- restarts the deferred-set scan and re-asks for the pull-request state, both for the new memory.
+- restarts the deferred pass — both sets and the verdict — and re-asks for the pull-request state, all for the new memory.
 
-**The identity guard.** Roughly twenty memory-scoped asynchronous paths now snapshot that generation counter when they are dispatched and **no-op on mismatch** — the deferred-set scan and both of its halves, the pull-request status lookup, the push-to-cloud chain, topic edit and delete, test-guide generate / edit / delete, recap generate / edit, plan save / remove / translate / associate, the plan-title sync, reference removal, and the memory-state-changed refresh. Without it, single-tab reuse would have introduced a whole class of wrong-attribution errors: the outgoing memory's cold pull-request lookup (seconds) landing its badge on the incoming page, its transcript or translatable-plan chips appearing on the wrong memory, or its just-persisted edit overwriting the incoming memory's in-memory identity. The pull-request "ready" payload does not carry a branch, so the page itself cannot filter it after the fact — the guard has to be host-side.
+**The identity guard.** The memory-scoped asynchronous paths now snapshot that generation counter when they are dispatched and **no-op on mismatch** — the deferred pass and each of its stages, the pull-request status lookup, the push-to-cloud chain, topic edit and delete, test-guide generate / edit / delete, recap generate / edit, plan save / remove / translate / associate, the plan-title sync, reference removal, and the memory-state-changed refresh. Without it, single-tab reuse would have introduced a whole class of wrong-attribution errors: the outgoing memory's cold pull-request lookup (seconds) landing its badge on the incoming page, its transcript or translatable-plan chips appearing on the wrong memory, or its just-persisted edit overwriting the incoming memory's in-memory identity. The pull-request "ready" payload does not carry a branch, so the page itself cannot filter it after the fact — the guard has to be host-side.
 
 The guard protects the *in-memory* identity and the *messages sent to the page*. Persisted writes are deliberately not rolled back: they were writes against the memory the user was actually editing, and re-writing the same content is harmless.
 
+**The verdict's write carries a second generation re-check, after the fetch and before the field is written.** The check at the top of the background block only proves nothing had changed when the call *started*, and this is the slow call on that pass: one memory's cold fetch can still be in flight when the user switches, while the next memory's warm fetch lands first. Dropping the stale hydrate is not enough, because the *field* outlives the message — a later full reload snapshots it, and so does the hold-until-saved drain — so an unguarded write is exactly how "repair may still be possible" ends up on a memory where repair is impossible. It is the same pattern the transcript-set refresh already applied around its own store read.
+
 ### Deferred hydration
 
-Two of the page's inputs — the stored-transcript set and the plan-translate set — drive only cosmetic extras (the conversations drawer's count and controls, and the per-plan translate control). Gathering them is I/O-shaped and was previously done inline on the UI thread during construction, once per tab open. They are now gathered on a background thread **after** the page has been built and its load scheduled, and applied **by message** (the two events above), never by a second content load.
+Two of the page's inputs — the stored-transcript set and the plan-translate set — drive only cosmetic extras (the conversations drawer's count and controls, and the per-plan translate control). Gathering them is I/O-shaped and was previously done inline on the UI thread during construction, once per tab open. They are now gathered on a background thread **after** the page has been built and its load scheduled, and applied **by message** (the events above), never by a second content load.
+
+**A third datum rides the same pass: the repair verdict.** It is fetched over a bridge round trip on that same pool thread, deliberately not on the thread the first paint waits on — the call is a few milliseconds warm but can be several hundred right after IDE start. The rule behind it stays in the CLI: this host asks and displays, and takes the mildest verdict for every failure (an unreadable body, a bridge that is down, a missing runtime) rather than raising, because a memory tab must not fail to open over a wording detail.
 
 That is why the rendered page ships **both** variants of the All-Conversations block with the inapplicable one hidden, and always emits the per-plan translate control (hidden when the plan is not eligible): hydration only has to flip hidden state in place. Two earlier statements — that the "Manage" button is present *only* when transcripts exist, and that the translate control is present *only* when the plan qualifies — describe the old markup and are corrected below.
 
-Nothing is sent at all when both sets come back empty.
+**The hydrate is now always armed once the background pass completes**, because the verdict fetch never answers "absent" — every failure path yields a verdict — so the pass always has something new to deliver. At least the empty-conversations-text message is therefore always posted, including for a memory that *has* conversations, where the sentence it corrects is hidden and the message changes nothing the user can see.
+
+That reverses an earlier early return which sent nothing when both sets came back empty. It is worth stating why: a memory with no transcripts and no translatable plans is exactly the memory whose zero-state wording has to be corrected, so the old condition would have skipped every case this wording exists for.
 
 Two parking rules govern when a hydration is actually delivered:
 
@@ -357,6 +373,16 @@ Always present; layout is identical regardless of whether transcripts exist. Eve
 
 Because the transcript set is not known when the page is built, a tab always opens showing the zero-state and switches to the populated appearance when the hydration lands. The stats request is issued only once the count is known to be non-zero.
 
+**The zero-state paragraph's *text* comes from the repair verdict; whether it *shows* does not.** The text is server-rendered from the verdict whenever one is already known — absent on the first render, so the plainest wording ships and the `conversationsEmptyText` hydrate corrects it in place. Visibility stays decided by the transcript set being empty **and by that alone**, deliberately: `present` is not proof of renderable conversations, because a memory carrying the older commit-hash-named transcript shape reads as `present` unconditionally. So the two questions are answered by two different inputs on purpose.
+
+The three wordings are the same closed set the VS Code memory panel prints, and they live in one place on this host, which is why the hydrate carries the finished sentence rather than the verdict:
+
+| Verdict | Paragraph reads |
+| ------- | --------------- |
+| `repairable` | *Conversation capture is missing but repair may still be possible* |
+| `repaired` | *Conversation capture was repaired from local transcript history* |
+| `present`, `unrepairable`, an unrecognised value, or none fetched | *No conversations were captured for this memory* |
+
 The Manage button opens a modal that calls `loadAllTranscripts`, displays a tabbed view per session, lets the user delete entries inline, and posts the result via `saveAllTranscripts` (Save All) or `deleteAllTranscripts` (Mark All as Deleted).
 
 ### Push button
@@ -386,14 +412,19 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
           first one to see a mounted, visible, non-zero surface wins:
              push the true viewport size, then force a fresh render of the CURRENT memory
           [30 s with the tab still hidden] → give up, stop polling
-  Start gathering the transcript set and the plan-translate set on a background thread
-    (title-qualifying plans need no body read; remaining bodies read ≤8 at a time)
+  Start gathering the transcript set, the plan-translate set and the repair verdict
+    on a background thread
+    (title-qualifying plans need no body read; remaining bodies read ≤8 at a time;
+     the verdict is one bridge round trip, re-checked against the generation
+     AFTER it returns and before the field is written)
 
 [any render requested]
-  Snapshot inputs on the interface thread (memory, both sets copied, bridge script,
-                                          read-only flag, theme colour); bump render counter
+  Snapshot inputs on the interface thread (memory, both sets copied, the repair
+                                          verdict, bridge script, read-only flag,
+                                          theme colour); bump render counter
   Build the document on a background thread
-    (both transcript variants emitted; every plan's translate control emitted, hidden)
+    (both transcript variants emitted; every plan's translate control emitted, hidden;
+     the zero-state paragraph's text taken from the verdict, plainest when absent)
   Hop back to the interface thread
     [a newer render was requested meanwhile] → DROP this one
     [build threw]                            → log and drop; previous document stays
@@ -414,7 +445,7 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 
 [the single memory tab is handed a different memory]
   Bump the memory-identity generation (every outstanding memory-scoped async no-ops)
-  Clear both deferred sets
+  Clear both deferred sets AND the repair verdict (per-memory)
   Install the new memory; if the read-only flag changed, subscribe/unsubscribe
   Request a full re-render (same browser instance, no native re-attach)
   Mark not-loaded synchronously → same-turn share/hydrate intents park instead of firing
@@ -429,11 +460,15 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
   Send checkPrStatus
 
 [background gather returns]
-  [memory switched since dispatch] → discard (identity guard)
-  [both sets empty]        → send nothing
+  [memory switched since dispatch] → discard (identity guard, checked twice on the
+                                     verdict: before the field write and again at
+                                     the hydrate)
   [page not loaded yet]    → park; drain on load-completion
   [unsaved edits pending]  → hold; drain on the next persisted-save acknowledgement
-  [otherwise]              → transcriptsAvailable(count) and/or planTranslateAvailable(slugs)
+  [otherwise]              → transcriptsAvailable(count) and/or planTranslateAvailable(slugs),
+                             and conversationsEmptyText(sentence) whenever a verdict
+                             was fetched — which is always, so the hydrate is always
+                             armed (there is no both-sets-empty early return any more)
                              → flip hidden state in place; if count 0→N, send loadTranscriptStats
 
 [user clicks topic header (not on action)]
@@ -489,11 +524,14 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 - **A viewport-changed notification replaced a second full page load.** The first paint of a freshly built embedded browser does not reliably fill the component, and the old fix was to load the whole page again once the deferred data arrived — which worked, at the cost of a visible 300–400 ms flash. The notification (plus a layout revalidate/repaint) achieves the same repaint with no navigation and no flash. (Notable; the flash is gone, which is why the page now ships both hidden variants instead.)
 - **The viewport notification alone was not enough, so the view is detached and re-attached once per load.** After a load completes the host asks the page to report its first *painted* frame, and on that report briefly removes the embedded view from its tab container and puts it back. That is the only signal that reliably reconciles the embedded view's frame with its container on macOS; without it the top of the tab can stay blank until an external window resize wakes the platform. It costs about a one-frame flash. (Notable; a page-initiated inbound message that the user never triggers.)
 - **That flash happens on every memory swap, not only on first open.** The round trip is armed on a not-yet-loaded → loaded transition, and a memory swap deliberately resets the loaded flag — so the swap's own load completion arms it again. Clicking through five memories in the single reused tab therefore produces five brief flashes. (Surprising; a direct consequence of the single-tab reuse.)
-- **About twenty asynchronous paths carry a memory-identity generation and no-op on mismatch.** Single-tab reuse would otherwise have introduced a whole class of wrong-attribution errors: memory A's cold pull-request lookup landing its badge on memory B's page, A's transcript or translatable-plan chips appearing under B, or A's just-persisted edit overwriting B's in-memory identity. The pull-request "ready" payload carries no branch, so the page cannot filter it after the fact — the guard has to be host-side. Persisted writes are deliberately *not* guarded: they were writes against the memory the user was actually editing. (Notable; the cost of admission for one shared tab.)
+- **The memory-scoped asynchronous paths carry a memory-identity generation and no-op on mismatch.** Single-tab reuse would otherwise have introduced a whole class of wrong-attribution errors: memory A's cold pull-request lookup landing its badge on memory B's page, A's transcript or translatable-plan chips appearing under B, or A's just-persisted edit overwriting B's in-memory identity. The pull-request "ready" payload carries no branch, so the page cannot filter it after the fact — the guard has to be host-side. Persisted writes are deliberately *not* guarded: they were writes against the memory the user was actually editing. (Notable; the cost of admission for one shared tab.)
 - **Every persisted edit invalidates the host's shared memory cache.** Reopening the memory from any other surface therefore shows the edit instead of a pre-edit snapshot — the failure this fixed was editing a topic here and then seeing the old text after reopening from the commits list. The invalidation deliberately does not fire the memory-state notification, which would make every listening panel reload and clobber this page's own in-place patch. Transcript writes are the exception, since they do not rewrite the memory document. (Notable.)
 - **The pull-request state shown here is cached and can lag reality.** A pull request merged, closed, or created outside the IDE is not reflected until the branch answer's short window expires; installing or signing in to the pull-request tool is not reflected until a much longer window expires. This page's own create/update flows clear the branch entry first, so its *own* actions always show immediately. (Notable; the cache's TTLs, coalescing and invalidation are owned by spec 309.)
 - **The translatable-plan scan reads bodies several at a time and skips the read when the title already qualifies.** The resulting set is identical to the old strictly-sequential scan's; only the latency changed, which used to dominate the opening delay for a plan-heavy memory. (Notable; no behavioral difference.)
 - **The page always opens claiming zero transcripts and no translatable plans.** Both sets are gathered after the page opens, so the first frame of every tab shows the conversations zero-state and no translate controls, and they appear a moment later. That is the price of getting two I/O-shaped reads off the UI thread on every tab open. (Surprising; intentional.)
+- **The hydrate is always armed once the background pass completes, and the early return it replaced would have skipped every memory this wording exists for.** The verdict fetch never answers "absent" — every failure yields a verdict — so the pass always carries something, and at least the empty-conversations-text message is always posted, even for a memory that has conversations and therefore keeps that paragraph hidden. The old condition sent nothing when both deferred sets came back empty, which is precisely the shape of a memory with no transcripts: the one whose zero-state sentence needed correcting. (Surprising; a message that changes nothing visible is the price of never missing the case that matters.)
+- **The zero-state paragraph's text and its visibility are decided by two different inputs, on purpose.** The verdict picks the wording; the transcript set being empty — and nothing else — decides whether the paragraph shows. A `present` verdict is not proof of renderable conversations, because a memory on the older commit-hash-named transcript shape reads as `present` unconditionally, so gating visibility on the verdict would hide the zero-state from memories that have nothing to show. (Surprising; intentional.)
+- **The verdict's background write is generation-checked twice.** The check at the top of the pass only proves nothing had changed when the bridge call started, and this is the slow call on that pass — a cold fetch for one memory can land after a warm fetch for the next. Dropping the stale hydrate is not enough: the stored verdict outlives the message and is read again by any later full reload and by the hold-until-saved drain, so the second check (after the call, before the field write) is what keeps one memory's "repair may still be possible" off another memory's page. (Notable; the direction this whole sentence exists to avoid.)
 - **A hydration that arrives while the user is typing is held, not dropped.** It waits for the next persisted-save acknowledgement and is delivered then, so the controls still appear rather than being lost until the next full render. (Notable.)
 - **Hover hints are drawn in the document because the embedded browser has no native tooltips**, and the first hover of an element *moves* its native hint into a private attribute. The consequence is an invariant: page code must never read the native hint attribute at runtime, because after the first hover it no longer exists. A live native hint always wins over the cached copy, which is what keeps hints rewritten at runtime from being pinned to their first-hover text. (Notable; a latent trap for future page code.)
 - **Page-to-host sends are best-effort.** A send failure is swallowed inside the send helper instead of propagating into the interaction handler that called it, so one unencodable payload can no longer abort the rest of a click's work. (Notable.)
@@ -501,6 +539,7 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 - **The operation index outlives the display index.** When topics are sorted by date or major-before-minor, the displayed numbering may differ from the index used for edit/delete; the page must round-trip the operation index through the data attribute, never the position in the rendered list.
 - **Plan dedup picks the most recent.** When the same plan slug appears in multiple child memories of a squashed tree, the copy with the latest `updatedAt` wins; older copies are dropped silently.
 - **The Conversations zone is always visible, but its privacy line is not.** The zone itself — watermark, title, and a zero-state paragraph — renders whether or not transcripts exist, unlike "no plans" or "no E2E test" which collapse to a placeholder inside their section. The privacy reassurance line, however, belongs to the populated variant and is hidden while the transcript count is zero, so the privacy guarantee is advertised only once there is captured data to guarantee it for. (Corrects an earlier claim that the zero-state stub carries the privacy line.)
+- **This page's footer is the attribution line and nothing else.** One span carries "Generated by JolliMemory", a render-time timestamp (the clock, not the memory's own generation stamp, so it moves on every rebuild) and the optional `· via <provider>` clause inside that same span. There is no transcript-privacy line and no conversation count here, both of which the VS Code memory panel's footer and the dashboard's memory detail carry — and those two do not agree with each other either, one counting transcript files and the other conversations. Nothing in any of the three reads another's choice. (Notable.)
 - **The Properties row "Conversations" hides when zero turns.** Other rows always render even with zero/unknown values; this one alone collapses when not applicable.
 - **The push-success link block is added dynamically on first successful push, now inside the ship bar's Jolli card rather than the properties table.** It is not pre-rendered and is constructed by the page's JS on `pushSuccess`, which also flips the card's status chip to "Synced" and drops its "not shared" subtitle. Subsequent full renders persist all three because the underlying memory now carries the cloud URL. (Updated from the prior properties-table-row description — see Page structure.)
 - **The PR section is the only section with three orthogonal failure modes** (multiple commits / unavailable / no-PR-yet) — the page handles all three by replacing the action area's contents with the right informational text or the right action button.
@@ -516,6 +555,7 @@ If the embedded HTML view cannot be instantiated, the host falls back to a read-
 - **Storage** — the source of the input memory and the destination for every persisted edit (topic, plan, e2e guide, transcript). Transcript reads/writes and topic update/delete reach it over the shared summary-store and summary-tree operations rather than through host-local code.
 - **Summary tree structure** — owns the source-node rule this page's Source Commits section and drill-down depend on, including the change that a leaf memory now yields zero source commits.
 - **Share-to-Jolli core** — the `pushToJolli` action delegates to the reusable share core (push plans, fold plan URLs into the summary, push the summary, persist, and run the orphaned-doc cleanup, emit telemetry). The implementation seam moved out of the viewer into that shared core so the branch-level Create-PR view can reuse it verbatim; the viewer's own event lifecycle (`pushStarted`/`pushSuccess`/`pushFailed`) is unchanged even though the button's location and labels have since moved to the ship bar (see Page structure / Push button). Binding-required, re-auth, and plugin-outdated recovery UI stays viewer-side. See the share-to-Jolli spec.
+- **Transcript repair** — owns the four verdicts, the dry run that answers "would a repair succeed", the bounds a real repair insists on, and every reason it refuses. This page reaches it over one bridge action on the deferred-hydration pass and only picks a sentence from the answer; the rule is deliberately not restated in host code, because the same predicate is what the VS Code memory panel calls in process and a second implementation of it could not be checked against the first — nothing on the wire fails when the two disagree, the user simply reads a different sentence in each surface. Owned by the transcript-repair topic.
 - **PR service** — handles `checkPrStatus`, `createPr`, `prepareUpdatePr`, `updatePr`.
 - **Force-push gate** — the divergence check and confirmation dialog invoked by the Create-PR failure path when a push is rejected as non-fast-forward; its own mechanics (safety inspection, gate outcomes, the actual force-push) are owned by that spec (264), not documented here.
 - **Plan service** — owns the available-plans chooser and the associate / unassociate flows.

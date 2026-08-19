@@ -16,7 +16,7 @@ One resident background process per machine per user, owned by no session and sp
 - How the process locates the program to spawn, and why the obvious source for that is a trap.
 - The directory-ownership refusal, and the single connection failure that is allowed to remove a leftover address.
 - The scheduling model: what the interval means, why the scheduler holds no durable state, and the three properties that fall out of that.
-- The work it performs, each item's cadence, and why two cadences two orders of magnitude apart is not an inconsistency.
+- The work it performs — three items, asked every hour, every five minutes and every half minute — why the two furthest apart being two orders of magnitude apart is not an inconsistency, and why the middle one follows a different rule entirely.
 - Its exit reasons, the absence of an idle timeout, and the teardown path that asks it to stand down.
 - The diagnostic row that reports it.
 
@@ -24,6 +24,7 @@ One resident background process per machine per user, owned by no session and sp
 
 - The snapshot mechanism itself — its folder rules, daily gate, retention collectors, verification and restore (owned by the snapshot topic). This topic owns only *that it is asked on a clock*, and how often.
 - The re-scan's own comparison of a conversation against what was already imported, and everything it writes (owned by the import topics).
+- The session-statistics upload channel itself — its state file, its gates, its backend scope keys, its silences, its per-table cursors, its first-run window, its per-repository row filter, its batching and its wire manifest (owned by the upload topic). This topic owns only *that it is asked on a clock*, and how often.
 - The machine-level database's schema, migration ladder and open discipline. This topic consults only the runtime floor that decides whether the database can be used at all.
 - The per-worktree background server that serves editor and agent tool traffic. It is a different process with a different singleton key, a different address family and a different lifecycle; the two run side by side and share only the handshake primitives (see **Shared Behavior**).
 - The per-project editor bridge process, which is a third resident process with a third purpose.
@@ -85,6 +86,12 @@ Commands that must never bring the process up, resolved from the **parsed** comm
 
 Independently of the list, the trigger also declines when the runtime is below the floor at which the database module loads without an experimental flag: a resident process that cannot do the one thing it exists for is worse than no process.
 
+### The name of the command that is spawned
+
+The resident process is a hidden subcommand, and the string naming it is declared **alongside the handshake protocol** rather than alongside the resident process's own implementation. A caller that needs nothing but that string would otherwise pull the networking layer, the snapshot path, the re-scan task and the scheduler in behind every one of its call sites.
+
+The command-line entry keeps its own pinned copy of the same literal, because the check that routes on it runs before the argument parser exists. A source-shape test holds the two spellings together.
+
 ### Where it writes, and what it logs
 
 A detached process inherits its spawner's working directory, and the log location falls back to that directory. Left alone, this process would write its log inside whichever repository happened to trigger it first — a different one across reboots. It therefore anchors its log location to the **home** directory at startup, and is spawned with the home directory as its working directory so that every directory-derived path inside it agrees with that anchor.
@@ -140,9 +147,11 @@ No runtime flags are placed before the program: a flag an older runtime does not
 
 ### The scheduling model
 
-The scheduler holds **no durable state**, and that falls out of a property the work already has rather than from minimalism. The snapshot gates itself on the recorded instant of its last success, which is already persisted and already shared across processes; the re-scan compares each conversation against what was already stored. A scheduler recording its own last-run instant would become a *second owner* of the same fact, with nothing to say which to believe when they disagreed.
+The scheduler holds **no durable state**, and that falls out of a property the work already has rather than from minimalism. The snapshot gates itself on the recorded instant of its last success, which is already persisted and already shared across processes; the re-scan compares each conversation against what was already stored; the upload gates itself on the recorded instant of its last **attempt**. A scheduler recording its own last-run instant would become a *second owner* of the same fact, with nothing to say which to believe when they disagreed.
 
-So an interval is **how often to ask** whether the work is due — not how often it acts. The snapshot is asked hourly and answers "already done today" on twenty-three of every twenty-four asks.
+That third mark is written **on failure as well as on success**, and the asymmetry with the snapshot's — which gates on its last *success* — is deliberate: it is a throttle, not a progress record. Recording only successes would leave every trigger retrying a request that is going to fail in exactly the same way, for as long as the cause lasts. The item's actual progress is recorded separately, in the same file, as per-table cursors that move only on success.
+
+So an interval is **how often to ask** whether the work is due — not how often it acts. The snapshot is asked hourly and answers "already done today" on twenty-three of every twenty-four asks; the upload is asked every five minutes and answers "throttled" on five of every six, and that skip is deliberately the one the run logs nothing for.
 
 Three properties come free from that shape:
 
@@ -152,23 +161,26 @@ Three properties come free from that shape:
 
 Two further rules:
 
-- **An item that raises is reported and its schedule continues.** Snapshot failure already has an independent, result-oriented signal on the diagnostic command, so a second one here would be noise — and stopping the schedule would turn one bad day into a permanently dead timer.
-- **An item never overlaps itself.** The snapshot can outlive a short interval, and two concurrent snapshots would race on the same temporary file. The in-flight marker is per item.
+- **An item that raises is reported and its schedule continues.** Snapshot failure already has an independent, result-oriented signal on the diagnostic command, so a second one here would be noise — and stopping the schedule would turn one bad day into a permanently dead timer. The upload **never raises**, so it never reaches that path at all: a failed upload comes back as a returned result string, which is logged below this process's default file threshold, and what actually makes such a failure visible is the run's own warning lines.
+- **An item never overlaps itself.** The snapshot can outlive a short interval, and two concurrent snapshots would race on the same temporary file. The in-flight marker is per item — **and per process**: it says nothing about a second process running the same work. The upload has two other producers outside this one, so two concurrent uploads are possible, and the only thing between them is the recorded attempt instant, which is itself an unsynchronised read-then-write.
 
 The timers are **released** from holding the process alive; the listening address keeps it alive on its own, which is what lets "address closed, process exits" work. This is the **opposite** of the per-worktree proxy's retry timer, which must be held because there it is the only thing keeping its loop alive.
 
-### The work, and its two cadences
+### The work, and its three cadences
 
 | Work | Asked every | Acts when |
 | --- | --- | --- |
 | The machine-level database snapshot | An hour | A day has passed since the last recorded success |
+| The session-statistics upload | Five minutes | Thirty minutes have passed since the last recorded attempt |
 | A re-scan noticing an agent conversation has grown since it was last imported | Half a minute | A conversation's instant differs from the one already stored |
 
-Every other trigger for either is opportunistic — the dashboard launcher, the post-commit worker, the diagnostic command's repair — which covers the user who commits regularly and abandons the user who does not: exactly the user whose snapshot is oldest and whose afternoon of agent work is least likely to have been recorded.
+Every other trigger is opportunistic, and the sets are **not the same for all three**. For the snapshot and the re-scan they are the dashboard launcher, the post-commit worker and the diagnostic command's repair. For the upload they are the post-commit worker and the diagnostic command's explicit sync flag, and nothing else — **the dashboard launcher does not trigger it at all.** Whichever set applies, it covers the user who commits regularly and abandons the user who does not: exactly the user whose snapshot is oldest, whose afternoon of agent work is least likely to have been recorded, and whose statistics are least likely to have been sent.
 
-**The two cadences differ by two orders of magnitude and that is not an inconsistency.** An hourly question is right for work whose answer changes once a day, and a half-minute one is right for work whose answer changes while the user is typing. What makes the fast one affordable is that a converged ask performs no import work at all — it compares each watched conversation's own instant against the one already stored and stops there, so the steady state costs a scan and nothing else.
+**The outer two cadences differ by two orders of magnitude and that is not an inconsistency.** An hourly question is right for work whose answer changes once a day, and a half-minute one is right for work whose answer changes while the user is typing. What makes the fast one affordable is that a converged ask performs no import work at all — it compares each watched conversation's own instant against the one already stored and stops there, so the steady state costs a scan and nothing else.
 
-**They may overlap, and nothing stops them.** The in-flight marker is per item, so the snapshot can begin while a re-scan waits on disk. That is safe rather than merely unlikely: the snapshot reads the database and writes a separate file, the re-scan's own write is a short transaction at the very end, and the database's write-ahead journal lets those coexist. A cross-item mutex would mean giving the scheduler shared state, which is the one thing it must not have.
+**The middle cadence is set by a different rule, and it is the load-bearing one: a tick must be strictly shorter than any period the task enforces for itself.** The upload's own due-check is an at-or-after comparison against a thirty-minute floor, so a tick *equal* to that period lands every tick exactly on the boundary, and any negative jitter — timer drift, a busy loop, a tick the previous run overlapped — answers "throttled" and pushes the real upload out to sixty minutes. What that presents as is the feature working at half its stated rate, with nothing anywhere reporting a half. Five minutes against a thirty-minute floor is therefore the first cadence in this topic chosen as a **floor** rather than as a match to how fast the answer changes.
+
+**They may overlap, and nothing stops them.** The in-flight marker is per item, so the snapshot can begin while a re-scan waits on disk. That is safe rather than merely unlikely: the snapshot reads the database and writes a separate file, the re-scan's own write is a short transaction at the very end, and the database's write-ahead journal lets those coexist. The upload's case is stronger still — its database access is **read-only**, and it never writes the database at all, only its own state file. A cross-item mutex would mean giving the scheduler shared state, which is the one thing it must not have.
 
 ### No idle timeout
 
@@ -218,7 +230,10 @@ A read-only probe reads the greeting without changing anything, and is given a *
 - **The bare tool-server invocation never reaches the trigger at all**, because it takes an earlier fast path — but two of its sibling invocations do, which is why they are on the exclusion list rather than being assumed unreachable.
 - **The ownership gate is unreachable on the named-pipe platform, and that is a limitation rather than a decision.** That namespace is machine-global, bound with a default access policy, and first-binder-wins, so another local user who can derive the name can squat it. The per-user hash buys *separation*, not protection. (Known limitation.)
 - **The log level of the one process a user cannot watch was silently fixed at the default** until it began reading the configured level. Every debug line it emitted, including its own per-item results, was discarded.
-- **A source comment still describes the work as a single item.** Two are scheduled; the comment predates the second and its argument does not depend on the count.
+- **One cadence is a floor rather than a match.** Every other interval here answers "how fast does the answer change"; the five-minute one answers "what is strictly shorter than the thirty-minute period this work enforces for itself". A tick equal to that period would sit on the boundary every time, and any negative jitter would degrade it to sixty minutes — the feature running at half its stated rate, with nothing reporting a half. (Surprising; the obvious "tick at the period" is the broken choice.)
+- **One item's gate is its last attempt, not its last success**, and the snapshot's is the opposite. The newer mark is a throttle rather than a progress record, so it is stamped even when the attempt failed; recording only successes would have every trigger re-issuing a request that fails the same way. That item's real progress lives beside it as cursors that move only on success.
+- **The most recently added item carries none of the source-shape protection the item before it was deliberately given.** That protection exists because a unit test cannot observe a task that was never registered at all, and it also pins the item's period to a named constant rather than a literal at the registration. Neither is pinned for the newest item. (Known gap.)
+- **Source comments still describe the work as a single item.** Three are scheduled, and there are at least two such comments; both predate the items they undercount, and neither's argument depends on the count.
 
 ## Shared Behavior
 
@@ -226,6 +241,7 @@ A read-only probe reads the greeting without changing anything, and is given a *
 - **The core version this bundle carries**, and the rule that it is the shared release number rather than any surface's own — the same number the highest-version-wins runtime dispatch compares, so this handshake and that dispatcher cannot disagree about which bundle is newest.
 - **The runtime floor** below which the machine-level database module cannot be loaded without an experimental flag, and the two surfaces that can never be given such a flag. Consulted here as a reason to decline entirely.
 - **The snapshot**, its folder rules, its daily gate, its retention floors and its verification. Asked on a clock here; owned elsewhere.
+- **The session-statistics upload** — its state file, its gates, its backend scope keys, its silences, its per-table cursors, its first-run window, its per-repository row filter, its batching and its wire manifest. Asked on a clock here; owned elsewhere.
 - **The conversation re-scan**, its per-conversation comparison and everything it writes.
 - **The parsed-root-command accessor** the exclusion list consults, shared with every other caller that needs to know which command the user actually invoked.
 - **The detached-spawn helper** that hides a child process and discards its output.

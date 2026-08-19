@@ -30,7 +30,7 @@ The single stored record that says where a repository's memory migration — fro
 
 ### Where the record lives
 
-One row in `repo_state` per repository, key **`orphan-import`**, value a JSON object. Three properties of that placement are decisions:
+One row in `repo_state` per repository, key **`orphan-import`**, value a JSON object. Each property of that placement is a decision:
 
 - **The key is reused, not new.** It already exists on disk in every database that has ever imported, where it was a completion receipt written once at the end of a successful run. Renaming it would orphan those rows — every reader would report a fully-migrated repository as never migrated — and a value row has no migration path.
 - **It is a row, not a file.** The cursor is only meaningful if it advances in the *same transaction* as the rows it certifies, which a file cannot do; and the claim being recorded is a claim about the database, so a second witness elsewhere could only ever disagree with it.
@@ -113,6 +113,8 @@ In reconciling mode the position shift runs first, if the phase flag says it has
 ### What the cursor does not cover
 
 Only the memory batch loop and the shift flag. Everything after the loop re-runs in full on every pass, resumed or not: the sweep of transcripts no memory claimed, the commit-alias rows, the document families and their progress rows, the topic pages and processed-source rows, the mode-specific cleanup of the offset region, the re-mount of the tree, and — in reconciling mode — the whole set reconciliation. Idempotence there rests entirely on those writes being keyed on business identity, not on the cursor.
+
+The commit-alias pass carries one obligation beyond its own rows: it also **invalidates the cached rollup days** its aliases touch, and it does that **outside** the chunked transactions the aliases are written in — unlike the live write path, which invalidates inside the single transaction that writes the row. Neither the idempotence of the alias upsert nor the resume story changes: the alias rows are still keyed on business identity, and the precondition that each alias target exists is still asked *of the database* rather than assumed from what this run happens to have written.
 
 Those tail steps also **never stamp a heartbeat**, so a long tail is indistinguishable from a stalled run to a concurrent reader.
 
@@ -212,4 +214,4 @@ Requiring both a live process and a fresh heartbeat would call a healthy long-ru
 - Repository identity resolution and the repository row this record hangs off are defined by the **Dashboard Repo Registry and Probe** topic (cross-ref 355).
 - The freeze marker and recorded switch that make a frozen source possible are defined by the **Orphan Branch Cutover Fence and Compare-and-Swap** topic (cross-ref 345).
 - The process-liveness probe behind the interrupted verdict is defined by the lock-primitive topic.
-- The database file classification and schema version stamp are owned by the store-and-schema topics.
+- The database file classification and schema version stamp are owned by the store-and-schema topics, as is the per-day rollup cache the commit-alias pass invalidates and the rule that a delete, re-ground or re-alias must name the days it invalidated.

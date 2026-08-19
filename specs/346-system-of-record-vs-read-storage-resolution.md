@@ -73,13 +73,13 @@ It therefore keeps a per-process memo keyed by working directory, holding the re
 The time bound is the point, not a detail: permanence is the bug this memo exists to remove. The routing decision's own contract is that the answer is per-call, so a long-lived editor host or bridge server that memoized forever would keep serving the pre-cutover backend after the freeze lands — silently, which is the failure mode being swept up. The window is closed immediately by an explicit drop, available with or without a working directory (no argument clears every entry). Two production callers drop it:
 
 - The cutover protocol, at both of its transitions (just after the marker lands, and just after the swap is recorded).
-- The editor host's storage reload, which drops the memo alongside its own cached write- and read-storage handles. It runs on settings-save, after a first-run Memory Bank migration, and after a folder sweep that actually deleted something. That host is the longest-lived process in the product and never installs a process-global storage override, so every in-process store call resolves through this memo; leaving it hot after a storage reload is the same staleness one layer down.
+- The editor host's storage reload, which drops the memo alongside its own cached write- and read-storage handles. It runs on settings-save, after a first-run Memory Bank migration, after a folder sweep that actually deleted something, and on a cutover heal — fired from either of that host's two storage accessors and from its retry of a write the frozen ref refused. The heal is the one of those four that is not a change this process made itself: it is driven by a lazy route probe, so the reload happens on a transition another surface committed. That host is the longest-lived process in the product and never installs a process-global storage override, so every in-process store call resolves through this memo; leaving it hot after a storage reload is the same staleness one layer down.
 
 ### Resolving read storage
 
 Resolves the routing state (no memo of its own — the caller is responsible for caching), throws on `blocked`, returns the database-backed backend for both frozen states, and otherwise dispatches on the retired configuration key with the Memory Bank write boundary ahead of it. The full `uncutover` dispatch, including the folder-readiness and dirty-marker fallbacks, is defined by 344.
 
-It performs a fresh configuration load — and, on the default dispatch, a fresh folder-index probe and dirty-marker check — on every call. One-shot command-line callers exit after a single read pass and need no cache; the editor bridge memoizes the resolved backend and invalidates it on settings-save and on a user-initiated refresh (so a folder repopulated by an external sync becomes visible without a window reload).
+It performs a fresh configuration load — and, on the default dispatch, a fresh folder-index probe and dirty-marker check — on every call. One-shot command-line callers exit after a single read pass and need no cache; the editor bridge memoizes the resolved backend and invalidates it on settings-save, on a user-initiated refresh (so a folder repopulated by an external sync becomes visible without a window reload), and on the cutover heal, which drops both of its storage caches together.
 
 ### The untargeted store-layer fallback
 
@@ -106,8 +106,8 @@ Neither resolution holds state beyond the route memo. Its transitions are:
 
 - **Cold → warm** — a resolution for a working directory not currently memoized.
 - **Warm → cold, by age** — three seconds after the entry was stored. The next call re-resolves.
-- **Warm → cold, explicitly** — the cutover protocol at each of its two transitions, or the editor bridge's storage reload.
-- **Warm but wrong** — the window between a state change caused by another process and this process's next re-resolution. Bounded by the time-to-live, and closed immediately only for the two explicit droppers, neither of which can observe another process's change.
+- **Warm → cold, explicitly** — the cutover protocol at each of its two transitions, or the editor bridge's storage reload, including a heal-driven reload.
+- **Warm but wrong** — the window between a state change caused by another process and this process's next re-resolution. Bounded by the time-to-live for any process that only re-resolves on age. The editor host also closes it on a change it did not cause: its storage reload is invoked by a lazy route probe, so the memo is dropped on a route transition another surface committed, bounded there by the five-second probe throttle rather than by the three-second time-to-live alone. The cutover protocol's own drops still close only the transitions it performed itself.
 
 ## Notable Behavior
 
@@ -115,15 +115,16 @@ Neither resolution holds state beyond the route memo. Its transitions are:
 - **A resolution that throws and a resolution that reports are both needed for the same question.** A write path must fail loudly when there is no safe backend; a health-check command exists to *report* that state, and one that throws is useless precisely when it is needed. (Notable.)
 - **The one place the unroutable state does not fail loudly is the store layer's untargeted fallback**, which degrades to ref-backed reads with a warning. (Surprising.)
 - **The same fallback warns on the write side and stays silent on the read side.** The asymmetry is deliberate: the identical event is a defect for a write and the documented model for a read, and a warning that fires on healthy behavior is worse than no warning at all. (Notable.)
-- **The memo is deliberately short-lived rather than permanent.** Permanence would make the longest-lived hosts keep writing a frozen ref after the freeze, silently. Three seconds bounds that window; the two explicit drops close it for the transitions this process caused itself. (Notable.)
+- **The memo is deliberately short-lived rather than permanent.** Permanence would make the longest-lived hosts keep writing a frozen ref after the freeze, silently. Three seconds bounds that window; the explicit drops close it sooner — the cutover protocol's for the transitions it performed itself, and the editor host's for a transition it merely noticed, since its reload is now also triggered by a lazy route probe. (Notable.)
 - **The memo caches the routing state, never the backend.** A backend is reconstructed on every call even on a memo hit. (Notable.)
 - **An absent working directory is threaded through unchanged to the ref-backed backend.** Defaulting it at resolution time would freeze the directory that every subsequent version-control call resolves against. (Notable.)
-- **The read resolution has no memo of its own and re-probes the folder on every call.** Caching is each caller's responsibility, and the two hosts that need it invalidate on different signals — settings-save for both, plus a user-initiated refresh for the read side alone. (Notable.)
+- **The read resolution has no memo of its own and re-probes the folder on every call.** Caching is each caller's responsibility, and the two hosts that need it invalidate on different signals — settings-save and the cutover heal for both, plus a user-initiated refresh for the read side alone. (Notable.)
 
 ## Shared Behavior
 
 - The routing state table, its two witnesses, the closed set of conditions that make the database unanswerable, and the full `uncutover` read-side dispatch (including the retired configuration key and the folder-readiness and dirty-marker fallbacks) are defined by **Cutover Routing State Table** (344).
 - The freeze marker, everything its presence changes, and the locked compare-and-swap that drops this memo at both of its transitions are defined by **Orphan Branch Cutover Fence and Compare-and-Swap** (345).
+- The lazy route probe that drives the editor host's heal-triggered reload — its five-second throttle, its one-way latch, and the frozen-write retry that also fires it — is defined by **Stale Storage Heal After an Unwitnessed Cutover**.
 - The Memory Bank write boundary consulted inside the read resolution's folder-bearing branches is defined by **Memory Bank Write Boundary and Effective-State Reporting** (300).
 - The dual-write composite that the untargeted write fallback bypasses is defined by **Dual-Write Summary Storage**.
 - The ref-backed backend's plumbing and its write-time refusals are defined by **Orphan Branch Summary Storage**.
