@@ -55,6 +55,7 @@ describe("scanClaudeSkillLines — Skill tool entry path", () => {
 		expect(uses).toHaveLength(1);
 		expect(uses[0].skill).toBe("superpowers:brainstorming");
 		expect(uses[0].invocations[0].bodyChars).toBeUndefined();
+		expect(uses[0].invocations[0].outcomeObserved).toBe(false);
 	});
 
 	it("rewinds the cursor to before a tool_use whose result has not arrived", () => {
@@ -111,6 +112,7 @@ describe("scanClaudeSkillLines — Skill tool entry path", () => {
 		);
 		const { uses } = scanClaudeSkillLines([TOOL_CALL, failed], 0);
 		expect(uses[0].invocations[0].ok).toBe(false);
+		expect(uses[0].invocations[0].outcomeObserved).toBe(true);
 	});
 
 	it("treats an is_error tool_result block as a failed invocation", () => {

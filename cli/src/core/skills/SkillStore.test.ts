@@ -125,12 +125,20 @@ describe("foldSkillUse", () => {
 		// discarded that second reading entirely, so the fragment's gaps — no bodyChars,
 		// the default ok:true — were frozen on the row forever.
 		const at = "2026-07-30T06:01:00.000Z";
-		const fragment = foldSkillUse(use({ invocations: [inv(at)] }), undefined);
+		const fragment = foldSkillUse(
+			use({ invocations: [inv(at, { entryPath: "tool", outcomeObserved: false })] }),
+			undefined,
+		);
 		expect(fragment.invocations[0].bodyChars).toBeUndefined();
 
-		const completed = foldSkillUse(use({ invocations: [inv(at, { bodyChars: 10280, ok: false })] }), fragment);
+		const completed = foldSkillUse(
+			use({ invocations: [inv(at, { bodyChars: 10280, ok: false, entryPath: "tool", outcomeObserved: true })] }),
+			fragment,
+		);
 		expect(completed.invocations[0].bodyChars).toBe(10280);
 		expect(completed.invocations[0].ok).toBe(false);
+		expect(completed.invocations[0].entryPath).toBe("tool");
+		expect(completed.invocations[0].outcomeObserved).toBe(true);
 		// An upgrade is not a new entry.
 		expect(completed.invocationCount).toBe(1);
 		expect(completed.invocations).toHaveLength(1);
@@ -140,9 +148,10 @@ describe("foldSkillUse", () => {
 		// `ok: true` is what an unresolved entry defaults to, so it must never overwrite
 		// a false that was actually read off a tool_result.
 		const at = "2026-07-30T06:01:00.000Z";
-		const failed = foldSkillUse(use({ invocations: [inv(at, { ok: false })] }), undefined);
-		const reread = foldSkillUse(use({ invocations: [inv(at)] }), failed);
+		const failed = foldSkillUse(use({ invocations: [inv(at, { ok: false, outcomeObserved: true })] }), undefined);
+		const reread = foldSkillUse(use({ invocations: [inv(at, { outcomeObserved: false })] }), failed);
 		expect(reread.invocations[0].ok).toBe(false);
+		expect(reread.invocations[0].outcomeObserved).toBe(true);
 	});
 
 	it("does not lose a field the re-read pass no longer reports", () => {
@@ -368,6 +377,32 @@ describe("renderSkillMarkdown / parseSkillMarkdownFromString", () => {
 		expect(parsed?.invocations).toEqual([{ at: "2026-07-30T06:35:21.000Z", ok: true }]);
 	});
 
+	it("treats an unknown invocation mechanism as absent", () => {
+		// Skill files are user-editable and may outlive the reader that wrote them. An
+		// unfamiliar value must not be cast into the closed entry-path union.
+		const parsed = parseSkillMarkdownFromString(
+			["---", 'source: "claude"', 'skill: "a:b"', "---", "", "- 2026-07-30T06:35:21.000Z · via: future"].join(
+				"\n",
+			),
+		);
+		expect(parsed?.invocations).toEqual([{ at: "2026-07-30T06:35:21.000Z", ok: true }]);
+	});
+
+	it("parses both known invocation mechanisms", () => {
+		const parsed = parseSkillMarkdownFromString(
+			[
+				"---",
+				'source: "claude"',
+				'skill: "a:b"',
+				"---",
+				"",
+				"- 2026-07-30T06:35:21.000Z · via: tool",
+				"- 2026-07-30T06:36:21.000Z · via: command",
+			].join("\n"),
+		);
+		expect(parsed?.invocations.map((invocation) => invocation.entryPath)).toEqual(["tool", "command"]);
+	});
+
 	it("round-trips a fully populated skill file", () => {
 		const content = foldSkillUse(
 			use({
@@ -428,6 +463,20 @@ describe("renderSkillMarkdown / parseSkillMarkdownFromString", () => {
 		const content = foldSkillUse(use({ invocations: [inv("2026-07-30T06:35:21.000Z", { ok: false })] }), undefined);
 		const parsed = parseSkillMarkdownFromString(renderSkillMarkdown(content));
 		expect(parsed?.invocations[0]?.ok).toBe(false);
+	});
+
+	it("round-trips whether each invocation had an observed outcome", () => {
+		const content = foldSkillUse(
+			use({
+				invocations: [
+					inv("2026-07-30T06:35:21.000Z", { entryPath: "tool", outcomeObserved: false }),
+					inv("2026-07-30T06:36:21.000Z", { entryPath: "tool", outcomeObserved: true }),
+				],
+			}),
+			undefined,
+		);
+		const parsed = parseSkillMarkdownFromString(renderSkillMarkdown(content));
+		expect(parsed?.invocations.map((invocation) => invocation.outcomeObserved)).toEqual([true, false]);
 	});
 
 	it("omits an absent plugin rather than writing a null", () => {

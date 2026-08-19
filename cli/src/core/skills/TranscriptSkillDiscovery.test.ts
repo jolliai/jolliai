@@ -180,6 +180,24 @@ describe("scanSkillsFrom", () => {
 		expect((await loadPlansRegistry(tempDir)).skills).toBeUndefined();
 	});
 
+	it("derives a Kimi session id from the directory above agents/main", async () => {
+		// Kimi names every transcript wire.jsonl, so using the basename would collapse
+		// every session onto kimi:wire. The session directory is the stable id source.
+		const sessionDir = join(tempDir, "sessions", "work-key", "kimi-session-1");
+		const transcriptDir = join(sessionDir, "agents", "main");
+		await mkdir(transcriptDir, { recursive: true });
+		const path = join(transcriptDir, "wire.jsonl");
+		const call = JSON.stringify({
+			type: "context.append_loop_event",
+			event: { type: "tool.call", name: "Skill", args: { skill: "hello-capture" } },
+			time: 1_700_000_000_000,
+		});
+		await writeFile(path, `${call}\n`, "utf-8");
+
+		await scanSkillsFrom(path, 0, tempDir, "kimi");
+		expect((await loadPlansRegistry(tempDir)).skills?.["kimi:hello-capture"]).toBeDefined();
+	});
+
 	it("attaches attributed token usage to the persisted row", async () => {
 		const path = await writeTranscript([TOOL_CALL, TOOL_RESULT, TOOL_BODY, USAGE_SPLIT_LINE_1, USAGE_SPLIT_LINE_2]);
 		await scanSkillsFrom(path, 0, tempDir, "claude");

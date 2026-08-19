@@ -152,7 +152,14 @@ function assemble(entries: ReadonlyArray<PendingSkill>): ReadonlyArray<SkillUse>
 			invocations = [];
 			bySkill.set(entry.skill, invocations);
 		}
-		invocations.push({ at: entry.at, ok: entry.ok });
+		invocations.push({
+			at: entry.at,
+			ok: entry.ok,
+			entryPath: "tool",
+			// A call without its paired result is still a run, but its optimistic `ok`
+			// is not an observed outcome.
+			outcomeObserved: entry.sawResult,
+		});
 	}
 
 	const uses: SkillUse[] = [];

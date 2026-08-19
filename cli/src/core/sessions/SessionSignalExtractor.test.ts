@@ -91,6 +91,34 @@ describe("mergeToolCalls", () => {
 		expect(merged[0]).not.toHaveProperty("server");
 	});
 
+	it("adopts usage from whichever side attributed it", () => {
+		// Only the skill extractor attributes tokens, so in practice exactly one side
+		// carries a value — and which side depends on extractor registration order,
+		// which is not something a bucket should depend on.
+		const usage = { input: 1, cached: 4162, output: 797, confidence: "attributed" } as const;
+		const fromSecond = mergeToolCalls([
+			[bucket({ name: "code-review", kind: "skill", calls: 2 })],
+			[bucket({ name: "code-review", kind: "skill", calls: 1, usage })],
+		]);
+		const fromFirst = mergeToolCalls([
+			[bucket({ name: "code-review", kind: "skill", calls: 1, usage })],
+			[bucket({ name: "code-review", kind: "skill", calls: 2 })],
+		]);
+		expect(fromSecond).toEqual([{ name: "code-review", kind: "skill", calls: 2, usage }]);
+		expect(fromFirst).toEqual(fromSecond);
+	});
+
+	it("omits `usage` entirely when neither side attributed anything", () => {
+		// A merged bucket with a zeroed usage would claim the skill was measured and
+		// free. Most skill buckets on a real machine come from sources that attribute
+		// nothing, so this is the common path, not the edge.
+		const merged = mergeToolCalls([
+			[bucket({ name: "jolli-search", kind: "skill" })],
+			[bucket({ name: "jolli-search", kind: "skill", calls: 3 })],
+		]);
+		expect(merged[0]).not.toHaveProperty("usage");
+	});
+
 	it("takes the LATER instant when both sides have one", () => {
 		const merged = mergeToolCalls([
 			[bucket({ name: "Bash", lastCallAtMs: 1_000 })],
@@ -131,5 +159,70 @@ describe("mergeToolCalls", () => {
 			[bucket({ name: `a${NUL}b`, kind: "skill" }), bucket({ name: "a", kind: "skill" })],
 		]);
 		expect(merged).toHaveLength(2);
+	});
+
+	/**
+	 * The per-entry list, and the ORDER these arrive in is the whole point.
+	 *
+	 * `SESSION_SIGNAL_EXTRACTORS` runs the tool extractor first, so its bucket is the
+	 * one the merge starts from — and `parseToolUse` re-attributes a `Skill` call to
+	 * `input.skill`, which means both extractors produce a bucket for any skill entered
+	 * by that tool. Taking the first side's list therefore dropped every per-entry
+	 * record of the one path that can report an outcome. Measured before the fix: 72
+	 * detail rows in a real database and not one marked observed.
+	 */
+	it("keeps the LONGER invocation list, whichever side it arrived on", () => {
+		const entry = (at: string) => ({ at, ok: true, entryPath: "tool" as const });
+		// Tool side first and shorter, mirroring production: it cannot see the
+		// slash-command path, so its list is a subset rather than a second opinion.
+		const merged = mergeToolCalls([
+			[bucket({ name: "review", kind: "skill", calls: 2, invocations: [entry("2026-08-01T10:00:00.000Z")] })],
+			[
+				bucket({
+					name: "review",
+					kind: "skill",
+					calls: 3,
+					invocations: [entry("2026-08-01T10:00:00.000Z"), entry("2026-08-01T11:00:00.000Z")],
+				}),
+			],
+		]);
+		expect(merged[0].invocations).toHaveLength(2);
+	});
+
+	it("keeps a first-side invocation list when the second carries none", () => {
+		const merged = mergeToolCalls([
+			[
+				bucket({
+					name: "review",
+					kind: "skill",
+					calls: 1,
+					invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true }],
+				}),
+			],
+			[bucket({ name: "review", kind: "skill", calls: 1 })],
+		]);
+		expect(merged[0].invocations).toHaveLength(1);
+	});
+
+	it("carries the heuristic mark and the plugin from whichever side resolved one", () => {
+		// Only the skill extractor resolves either, so at most one side has a value —
+		// but the side it lands on is not the one the merge starts from.
+		const merged = mergeToolCalls([
+			[bucket({ name: "jolli-search", kind: "skill" })],
+			[bucket({ name: "jolli-search", kind: "skill", detection: "heuristic", plugin: "jolli" })],
+		]);
+		expect(merged[0]).toMatchObject({ detection: "heuristic", plugin: "jolli" });
+	});
+
+	it("leaves all three absent when neither side has them", () => {
+		// Absent must stay absent: an empty invocation list would read as "it ran zero
+		// times", and a null plugin as "namespace unknown" rather than "no namespace".
+		const merged = mergeToolCalls([
+			[bucket({ name: "Bash" })],
+			[bucket({ name: "Bash", calls: 2, lastCallAtMs: 5 })],
+		]);
+		expect(merged[0]).not.toHaveProperty("invocations");
+		expect(merged[0]).not.toHaveProperty("detection");
+		expect(merged[0]).not.toHaveProperty("plugin");
 	});
 });

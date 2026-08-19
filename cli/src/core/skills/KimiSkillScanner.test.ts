@@ -38,7 +38,7 @@ describe("scanKimiSkillLines", () => {
 			source: "kimi",
 			skill: "hello-capture",
 			entryPaths: ["tool"],
-			invocations: [{ at: iso(1_700_000_000_000), ok: true }],
+			invocations: [{ at: iso(1_700_000_000_000), ok: true, entryPath: "tool", outcomeObserved: true }],
 		});
 		// No heuristic marker — Kimi's skill tool is observed.
 		expect(uses[0]).not.toHaveProperty("detection");
@@ -61,7 +61,9 @@ describe("scanKimiSkillLines", () => {
 		];
 		const { uses } = scanKimiSkillLines(lines, 0);
 		expect(uses).toHaveLength(1);
-		expect(uses[0].invocations).toEqual([{ at: iso(1_700_000_000_000), ok: false }]);
+		expect(uses[0].invocations).toEqual([
+			{ at: iso(1_700_000_000_000), ok: false, entryPath: "tool", outcomeObserved: true },
+		]);
 	});
 
 	it("groups repeat invocations of one skill, newest-first", () => {
@@ -74,8 +76,8 @@ describe("scanKimiSkillLines", () => {
 		const { uses } = scanKimiSkillLines(lines, 0);
 		expect(uses).toHaveLength(1);
 		expect(uses[0].invocations).toEqual([
-			{ at: iso(1_700_000_009_000), ok: true }, // newest first
-			{ at: iso(1_700_000_000_000), ok: true },
+			{ at: iso(1_700_000_009_000), ok: true, entryPath: "tool", outcomeObserved: true }, // newest first
+			{ at: iso(1_700_000_000_000), ok: true, entryPath: "tool", outcomeObserved: true },
 		]);
 	});
 
@@ -138,7 +140,9 @@ describe("scanKimiSkillLines", () => {
 		});
 		const { uses } = scanKimiSkillLines([call], 0);
 		expect(uses).toHaveLength(1);
-		expect(uses[0].invocations).toEqual([{ at: iso(1_700_000_000_000), ok: true }]);
+		expect(uses[0].invocations).toEqual([
+			{ at: iso(1_700_000_000_000), ok: true, entryPath: "tool", outcomeObserved: false },
+		]);
 	});
 
 	it("holds the cursor before an in-flight Skill call (toolCallId, result not yet landed)", () => {
@@ -149,6 +153,7 @@ describe("scanKimiSkillLines", () => {
 		const { uses, lastLine } = scanKimiSkillLines(lines, 0);
 		expect(uses).toHaveLength(1);
 		expect(uses[0].invocations[0].ok).toBe(true);
+		expect(uses[0].invocations[0].outcomeObserved).toBe(false);
 		expect(lastLine).toBe(0); // held before the call (0-based line 0), not advanced to EOF (1)
 	});
 
@@ -219,5 +224,6 @@ describe("scanKimiSkillLines", () => {
 		const { uses } = scanKimiSkillLines(lines, 0);
 		expect(uses).toHaveLength(1);
 		expect(uses[0].invocations[0].ok).toBe(true);
+		expect(uses[0].invocations[0].outcomeObserved).toBe(true);
 	});
 });

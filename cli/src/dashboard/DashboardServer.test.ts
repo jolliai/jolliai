@@ -117,6 +117,7 @@ function writeTestAssets(base: string): string {
 		"charts.js",
 		"shell.js",
 		"stats.js",
+		"skills.js",
 		"standup.js",
 		"graph.js",
 		"memories.js",
@@ -1909,6 +1910,9 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 			totalCount: 2,
 			rows: [{ server: "github", calls: 4 }],
 		});
+		// Window fields are forwarded independently. A non-custom range ignores the
+		// extra bounds in the query layer, but the route must not drop them silently.
+		expect((await get(port, "/api/tool-usage?list=server&range=3m&from=ignored&to=ignored")).status).toBe(200);
 
 		// An unknown list is a 400, never a fallback to the first one: the answer
 		// would be a page of the WRONG list, which the client appends to the one it
@@ -1984,6 +1988,82 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		// Same rule as `offset`: a value this route cannot read is the caller's bug,
 		// and silently answering a different question is what hides it.
 		expect((await get(port, "/api/tool-usage?list=server&limit=abc")).status).toBe(400);
+	});
+
+	it("serves one skill detail and distinguishes a bad name from a missing skill", async () => {
+		const dbPath = join(dir, "skill-detail.db");
+		const configDir = join(dir, "config-skill-detail");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "review-session",
+						updatedAtMs: Date.now() - 3_600_000,
+						tools: [{ name: "code-review", kind: "skill", calls: 2, plugin: "superpowers" }],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const ok = await get(port, "/api/skill-detail?name=%20code-review%20&range=3m&from=ignored&to=ignored");
+		expect(ok.status).toBe(200);
+		expect(await ok.json()).toMatchObject({
+			name: "code-review",
+			sessions: 1,
+			calls: 2,
+			plugin: "superpowers",
+			agents: [{ source: "claude", sessions: 1, calls: 2 }],
+		});
+
+		expect((await get(port, "/api/skill-detail")).status).toBe(400);
+		expect((await get(port, "/api/skill-detail?name=%20%20")).status).toBe(400);
+		expect((await get(port, "/api/skill-detail?name=missing")).status).toBe(404);
+	});
+
+	it("500s dashboard detail reads when the dashboard database is invalid", async () => {
+		const dbPath = join(dir, "broken-tool-reads.db");
+		writeFileSync(dbPath, "this is not a database");
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config-broken-tools") }),
+		);
+
+		expect((await get(port, "/api/tool-usage?list=skill")).status).toBe(500);
+		expect((await get(port, "/api/skill-detail?name=code-review")).status).toBe(500);
+		expect((await get(port, "/api/context?repo=repo-1&kind=plan&key=p1")).status).toBe(500);
+		expect((await get(port, "/api/conversation?repo=repo-1&hash=abc&source=claude&session=s1")).status).toBe(500);
+	});
+
+	it("uses the isolated machine-global database for tool and skill detail when dbPath is omitted", async () => {
+		const home = join(dir, "skill-detail-home");
+		await withIsolatedHome(home, async () => {
+			await withDashboardDb(() => {});
+			const port = await listen(
+				createDashboardServer({
+					port: 0,
+					assetsDir,
+					configDir: join(dir, "config-global-skill-detail"),
+				}),
+			);
+
+			expect((await get(port, "/api/tool-usage?list=skill")).status).toBe(200);
+			expect((await get(port, "/api/skill-detail?name=missing")).status).toBe(404);
+		});
 	});
 
 	// The Context dialog's fetch. A read like every other GET here — no token —

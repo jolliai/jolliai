@@ -124,6 +124,7 @@ import {
 } from "./DashboardModel.js";
 import {
 	buildDashboardModel,
+	buildSkillDetail,
 	buildToolUsagePage,
 	clearWorktreeExistenceCache,
 	type QueryOptions,
@@ -205,6 +206,10 @@ export const DASHBOARD_SCRIPT_FILES = [
 	"charts.js",
 	"shell.js",
 	"stats.js",
+	// Needs format/charts/shell above it for `JD.stackedBars`, `JD.seriesColor` and the
+	// fetch helpers; nothing in stats.js. Ordered here rather than earlier only to keep
+	// the list reading in nav order.
+	"skills.js",
 	"standup.js",
 	"memories.js",
 	"knowledge.js",
@@ -1093,6 +1098,7 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 	"/dashboard": "stats",
 	"/dashboard/standup": "standup",
+	"/skills": "skills",
 	"/memories": "memories",
 	"/knowledge": "knowledge",
 	"/graph": "graph",
@@ -1109,6 +1115,7 @@ const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 	"stats",
 	"standup",
+	"skills",
 	"memories",
 	"knowledge",
 	"graph",
@@ -1653,6 +1660,47 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("tool usage page read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that page of tool usage" });
+			}
+			return;
+		}
+
+		// One skill's breakdown, for the Skills card's detail view. A fetch rather
+		// than a slice of the page model: that model carries ONE PAGE of skills and
+		// none of the per-agent / per-session / per-commit detail, so a skill past
+		// row 8 would have nothing to open.
+		if (url.pathname === "/api/skill-detail") {
+			// Trimmed, because the name rides in a query string and a stray space is a
+			// name that matches nothing — indistinguishable, to the reader, from a skill
+			// with no recorded calls. Empty after trimming is the caller's bug.
+			const name = (url.searchParams.get("name") ?? "").trim();
+			if (name === "") {
+				sendJson(res, 400, { error: "name is required" });
+				return;
+			}
+			const requestedWindow = parseWindow(url);
+			try {
+				const detail = await withReadonlyDashboardDb(
+					(db) =>
+						buildSkillDetail(db, {
+							scope: parseScope(url),
+							name,
+							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
+							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
+							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),
+						}),
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				// 404 for "no call of that skill in this window" — a real answer, and one
+				// the client must not paint as an empty detail view. A skill that ran but
+				// attributed no tokens comes back 200 with `usage` absent instead.
+				if (!detail) {
+					sendJson(res, 404, { error: "no recorded calls for that skill in this window" });
+					return;
+				}
+				sendJson(res, 200, detail);
+			} catch (err) {
+				log.warn("skill detail read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that skill's detail" });
 			}
 			return;
 		}

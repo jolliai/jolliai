@@ -362,11 +362,24 @@ export function foldSkillUse(use: SkillUse, prior: SkillFileContent | undefined)
 function moreCompleteInvocation(prior: SkillInvocation, incoming: SkillInvocation): SkillInvocation {
 	const bodyChars = incoming.bodyChars ?? prior.bodyChars;
 	const args = incoming.args ?? prior.args;
+	const entryPath = incoming.entryPath ?? prior.entryPath;
+	const outcomeObserved =
+		prior.outcomeObserved === true || incoming.outcomeObserved === true
+			? true
+			: (prior.outcomeObserved ?? incoming.outcomeObserved);
+	const ok =
+		incoming.outcomeObserved === true
+			? incoming.ok
+			: prior.outcomeObserved === true
+				? prior.ok
+				: prior.ok && incoming.ok;
 	return {
 		at: prior.at,
 		...(args !== undefined ? { args } : {}),
 		...(bodyChars !== undefined ? { bodyChars } : {}),
-		ok: prior.ok && incoming.ok,
+		ok,
+		...(outcomeObserved !== undefined ? { outcomeObserved } : {}),
+		...(entryPath !== undefined ? { entryPath } : {}),
 	};
 }
 
@@ -406,6 +419,11 @@ function formatInvocation(inv: SkillInvocation): string {
 	// newline, and a JSON string literal has an unambiguous end quote to scan to.
 	if (inv.args !== undefined && inv.args !== "") parts.push(`args: ${JSON.stringify(inv.args)}`);
 	if (inv.bodyChars !== undefined) parts.push(`body: ${inv.bodyChars}`);
+	// Ahead of `failed` so that marker keeps the end of the line, where it is easiest to
+	// spot when scanning a file by eye. Field order carries no meaning to the parser,
+	// which reads by name.
+	if (inv.entryPath !== undefined) parts.push(`via: ${inv.entryPath}`);
+	if (inv.outcomeObserved !== undefined) parts.push(`outcome: ${inv.outcomeObserved ? "observed" : "assumed"}`);
 	if (!inv.ok) parts.push("failed");
 	return `- ${parts.join(FIELD_SEPARATOR)}`;
 }
@@ -505,16 +523,36 @@ function parseInvocationLine(line: string): SkillInvocation | null {
 	}
 
 	let bodyChars: number | undefined;
+	let entryPath: SkillEntryPath | undefined;
+	let outcomeObserved: boolean | undefined;
 	let ok = true;
 	for (const field of tail.split(FIELD_SEPARATOR)) {
 		if (field.startsWith("body: ")) {
 			const n = Number.parseInt(field.slice("body: ".length), 10);
 			if (Number.isFinite(n)) bodyChars = n;
+		} else if (field.startsWith("via: ")) {
+			// Validated against the union rather than cast: this file is user-editable text,
+			// and an unrecognised value must degrade to "unknown mechanism" — which
+			// `skillOutcomeConfidence` then treats as unmeasurable — instead of entering the
+			// type system as a mechanism no scanner produces.
+			const via = field.slice("via: ".length);
+			if (via === "tool" || via === "command") entryPath = via;
+		} else if (field === "outcome: observed") {
+			outcomeObserved = true;
+		} else if (field === "outcome: assumed") {
+			outcomeObserved = false;
 		} else if (field === "failed") {
 			ok = false;
 		}
 	}
-	return { at, ...(args !== undefined ? { args } : {}), ...(bodyChars !== undefined ? { bodyChars } : {}), ok };
+	return {
+		at,
+		...(args !== undefined ? { args } : {}),
+		...(bodyChars !== undefined ? { bodyChars } : {}),
+		...(entryPath !== undefined ? { entryPath } : {}),
+		...(outcomeObserved !== undefined ? { outcomeObserved } : {}),
+		ok,
+	};
 }
 
 function isUsageBySession(value: unknown): value is Readonly<Record<string, SkillUsage>> {

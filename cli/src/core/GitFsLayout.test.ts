@@ -2,7 +2,13 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { type GitFsLayout, readBranchFromFs, readHeadHashFromFs, resolveGitFsLayout } from "./GitFsLayout.js";
+import {
+	type GitFsLayout,
+	readBranchFromFs,
+	readHeadHashFromFs,
+	readRepositoryKey,
+	resolveGitFsLayout,
+} from "./GitFsLayout.js";
 
 const HASH = "0123456789abcdef0123456789abcdef01234567";
 const OTHER_HASH = "89abcdef0123456789abcdef0123456789abcdef";
@@ -243,6 +249,117 @@ describe("resolveGitFsLayout", () => {
 	});
 });
 
+describe("readRepositoryKey", () => {
+	/**
+	 * A main repo plus one linked worktree of it, returning both worktree roots.
+	 *
+	 * Hand-built rather than driven through `git worktree add` so this stays in the
+	 * fast tier; `SessionDirMatch.realgit.test.ts` pins the same claims against real
+	 * git, which is what makes these fixtures evidence rather than a matching guess.
+	 */
+	function seedRepoWithWorktree(): { main: string; worktree: string } {
+		const main = join(root, "main");
+		const mainGitDir = seedPlainRepo(main, "ref: refs/heads/main\n");
+		const linkedGitDir = join(mainGitDir, "worktrees", "wt1");
+		mkdirSync(linkedGitDir, { recursive: true });
+		writeFileSync(join(linkedGitDir, "commondir"), "../..\n");
+		writeFileSync(join(linkedGitDir, "HEAD"), "ref: refs/heads/wt1\n");
+		const worktree = join(root, "wt1");
+		mkdirSync(worktree, { recursive: true });
+		writeFileSync(join(worktree, ".git"), `gitdir: ${linkedGitDir}\n`);
+		return { main, worktree };
+	}
+
+	it("gives every worktree of one repository the same key", () => {
+		const { main, worktree } = seedRepoWithWorktree();
+
+		const key = readRepositoryKey(main);
+		expect(key).not.toBeNull();
+		expect(readRepositoryKey(worktree)).toBe(key);
+	});
+
+	it("gives a subdirectory the same key as its worktree root", () => {
+		const { main, worktree } = seedRepoWithWorktree();
+		const sub = join(worktree, "packages", "foo");
+		mkdirSync(sub, { recursive: true });
+
+		expect(readRepositoryKey(sub)).toBe(readRepositoryKey(main));
+	});
+
+	it("gives two independent repositories different keys", () => {
+		const a = join(root, "a");
+		const b = join(root, "b");
+		seedPlainRepo(a, "ref: refs/heads/main\n");
+		seedPlainRepo(b, "ref: refs/heads/main\n");
+
+		expect(readRepositoryKey(a)).not.toBe(readRepositoryKey(b));
+	});
+
+	it("answers null outside any repository", () => {
+		const loose = join(root, "loose");
+		mkdirSync(loose, { recursive: true });
+
+		expect(readRepositoryKey(loose)).toBeNull();
+	});
+
+	it("answers null for a .git git itself would refuse", () => {
+		mkdirSync(join(root, ".git"), { recursive: true });
+
+		expect(readRepositoryKey(root)).toBeNull();
+	});
+
+	it.each(["", "relative/path", "./also-relative"])("answers null for the non-absolute path %o", (dir) => {
+		// `resolveGitFsLayout` would anchor these to the process cwd and walk up into
+		// whichever repository the test run itself lives in — answering about a
+		// directory nobody named. See the function's docstring.
+		expect(readRepositoryKey(dir)).toBeNull();
+	});
+
+	// POSIX only, because the claim is platform-specific rather than symmetric: a
+	// POSIX-style `/home/flyer/project` IS absolute on Windows (drive-relative), so
+	// there the guard never fires and the null comes from finding no repository —
+	// the same answer for a different reason, which would make the assertion lie.
+	it.skipIf(process.platform === "win32")("answers null for a Windows path on a POSIX host", () => {
+		// The case that made the guard necessary rather than tidy: a session recorded
+		// under WSL or synced from another machine carries `E:\project`, which POSIX
+		// does not read as absolute. Without the guard, `E:\project` and `e:\project`
+		// would BOTH resolve into the running repository and compare EQUAL — one
+		// directory claiming to be another repo's, with nothing to show it.
+		expect(readRepositoryKey("E:\\project")).toBeNull();
+	});
+
+	describe("immunity to the git location variables", () => {
+		// The behaviour that makes this usable from a git hook's detached children —
+		// the QueueWorker and the global daemon both inherit `GIT_DIR`. Honouring it
+		// (as `resolveGitFsLayout` does for its other callers) would answer null on
+		// exactly the paths that do the collecting. See the function's docstring.
+		let saved: string | undefined;
+
+		beforeEach(() => {
+			saved = process.env.GIT_DIR;
+		});
+
+		afterEach(() => {
+			if (saved === undefined) delete process.env.GIT_DIR;
+			else process.env.GIT_DIR = saved;
+		});
+
+		it("still answers when GIT_DIR points at another repository", () => {
+			const { main, worktree } = seedRepoWithWorktree();
+			const decoy = join(root, "decoy");
+			seedPlainRepo(decoy, "ref: refs/heads/main\n");
+			process.env.GIT_DIR = join(decoy, ".git");
+
+			const key = readRepositoryKey(main);
+			expect(key).not.toBeNull();
+			// The decoy named by GIT_DIR is ignored: both directories still resolve to
+			// the repository that CONTAINS them, and the decoy is a third one.
+			expect(readRepositoryKey(worktree)).toBe(key);
+			expect(readRepositoryKey(decoy)).not.toBe(key);
+		});
+	});
+});
+
 describe("readBranchFromFs", () => {
 	function layoutFor(head: string) {
 		seedPlainRepo(root, head);
@@ -302,6 +419,13 @@ describe("readHeadHashFromFs", () => {
 		);
 
 		expect(readHeadHashFromFs(layout)).toBe(HASH);
+	});
+
+	it("returns null when packed-refs exists but does not contain HEAD's branch", () => {
+		const layout = layoutFor("ref: refs/heads/missing\n");
+		writeFileSync(join(layout.gitDir, "packed-refs"), `${HASH} refs/heads/other\n`);
+
+		expect(readHeadHashFromFs(layout)).toBeNull();
 	});
 
 	it("prefers a loose ref over a stale packed one", () => {

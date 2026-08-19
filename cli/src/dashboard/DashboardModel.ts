@@ -20,6 +20,7 @@ import type {
 	LocalAgentToolId,
 	RecallOutcome,
 	SessionUsageEvent,
+	SkillEntryPath,
 	ToolCallCount,
 	ToolCallKind,
 	TranscriptSource,
@@ -401,7 +402,7 @@ export type AdoptionTier = "installed" | "memory" | "space";
  * (`jolli disable` still pauses a repository — the dashboard just no longer
  * offers a control for it).
  */
-export type DashboardView = "stats" | "standup" | "memories" | "knowledge" | "graph" | "settings";
+export type DashboardView = "stats" | "standup" | "skills" | "memories" | "knowledge" | "graph" | "settings";
 
 /** One browsable `_wiki` markdown file (a topic page or the `_index.md`). */
 export interface KnowledgeFile {
@@ -1549,6 +1550,62 @@ export interface ToolUsageAgentTotal extends ToolUsageAgentShare {
 	readonly sessions: number;
 }
 
+/**
+ * One skill's token spend over the window, summed across the sessions that could
+ * be attributed.
+ *
+ * `sessions` is the load-bearing field and the reason this is not just a
+ * {@link SkillUsage}: the sum covers only the rows that carry figures, which on a
+ * real machine is a MINORITY (measured: 12 of 112 skill calls came from a source
+ * that attributes anything). Without it a reader cannot tell a skill that genuinely
+ * cost this much from one where nine sessions in ten went unmeasured — and the
+ * second reading is the common one. Compare it against {@link ToolUsageRow.sessions}
+ * to state the coverage.
+ *
+ * Absent on the row entirely when NO session could be attributed, never a zeroed
+ * object: the same rule the markdown table states by printing an em dash.
+ */
+export interface ToolUsageTokens {
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+	/**
+	 * `estimated` when ANY contributing session was, matching
+	 * `buildSkillsSummaryLabel`: a sum containing one estimate is an estimate, so
+	 * the whole figure carries the weaker claim rather than averaging the two.
+	 */
+	readonly confidence: "attributed" | "estimated";
+	/** Sessions whose figures are in the sum, out of {@link ToolUsageRow.sessions}. */
+	readonly sessions: number;
+}
+
+/**
+ * One local calendar day of skill adoption — the shape `JD.stackedBars` consumes.
+ *
+ * Buckets are LOCAL days, through this file's one time-zone engine, and the whole
+ * window is emitted whether or not a day has rows — the same treatment the token
+ * and spend series get.
+ *
+ * This replaced epoch-week buckets (`at / 604800000`), whose divisor was chosen to
+ * keep the series identical for two readers in different zones. That symmetry cost
+ * more than it bought. The boundary landed on Thursday, so a bar labelled `Aug 6`
+ * covered Aug 6-12 while the heatmap cell labelled `Aug 6` on the same page covered
+ * one local day — two meanings of "day" in one product, and the axis prints a bare
+ * day key either way. It also made the bar WIDTH mislead: `JD.stackedBars` divides
+ * the plot by the number of points, so a fortnight of data drew two bars each 29% of
+ * the chart wide, which reads as a range rather than as a bucket.
+ *
+ * The cost of the switch is stated on {@link ToolUsage.skillDays}: a bucket is
+ * resolved from ONE timestamp per (session, skill), so a session that ran past local
+ * midnight lands wholly in the later day.
+ */
+export interface SkillDayPoint {
+	/** The local calendar day, `YYYY-MM-DD`. */
+	readonly date: string;
+	/** Skill name → sessions that reached for it inside the day. Absent keys are zero. */
+	readonly bySeries: Readonly<Record<string, number>>;
+}
+
 /** One tool, skill or MCP server, aggregated over the window. */
 export interface ToolUsageRow {
 	/** `Bash`, `linear.list_issues`, `code-review`. */
@@ -1559,6 +1616,40 @@ export interface ToolUsageRow {
 	readonly calls: number;
 	/** Which agents made those calls, most calls first — see {@link ToolUsageAgentShare}. */
 	readonly agents: ReadonlyArray<ToolUsageAgentShare>;
+	/**
+	 * Tokens spent under it. Only ever present on `kind: "skill"` rows, and only
+	 * when at least one session could be attributed — see {@link ToolUsageTokens}.
+	 */
+	readonly usage?: ToolUsageTokens;
+	/**
+	 * Providing plugin, on `kind: "skill"` rows alone.
+	 *
+	 * Absent for an unprefixed skill, which is the common case — never "unknown".
+	 * Carried on the list row and not only on {@link SkillDetail} so a reader can
+	 * see which entries came from a plugin without opening each one.
+	 */
+	readonly plugin?: string;
+	/**
+	 * `"heuristic"` when ANY entry behind this row was INFERRED from a file read
+	 * rather than observed; absent otherwise. `kind: "skill"` rows alone.
+	 *
+	 * Any-one-taints, the same rule {@link ToolUsageTokens.confidence} takes for
+	 * `estimated` and `SkillStore.mergeSkillRef` takes across scan windows — a row
+	 * that mixes an observed entry with an inferred one cannot be presented as
+	 * measured. The three had better agree: the same skill is rendered from this
+	 * field here, from `SkillCommitRef.detection` on a committed memory, and from
+	 * `SkillEntry.detection` in the Memory Bank markdown.
+	 *
+	 * ABSENT IS NOT A CLAIM THAT THE ENTRIES WERE OBSERVED. A row's `calls` can
+	 * outlive every entry row behind it — a count merged in from an archived commit,
+	 * or a transcript the agent pruned (see {@link SkillDetail.invocations}) — and
+	 * such a row has nothing left to read a detection off. Absent therefore means
+	 * "no entry on record says inferred", which covers both the genuinely observed
+	 * row and the unreadable one. Spelling that third state out here was considered
+	 * and dropped: the detail view already says "no per-entry record survives" where
+	 * it applies, and a list row has no room to say it a second way.
+	 */
+	readonly detection?: "heuristic";
 }
 
 /** One MCP server, rolled up across all of its tools. */
@@ -1571,6 +1662,224 @@ export interface McpServerRow {
 	readonly tools: number;
 	/** Which agents called it, most calls first — see {@link ToolUsageAgentShare}. */
 	readonly agents: ReadonlyArray<ToolUsageAgentShare>;
+}
+
+/** One agent's share of a single skill, for the detail view's per-agent table. */
+export interface SkillDetailAgent {
+	/** `sessions.source` — the raw `claude` / `codex` tag every other axis shows. */
+	readonly source: string;
+	readonly sessions: number;
+	readonly calls: number;
+	/** Absent for an agent that attributes nothing — see {@link ToolUsageTokens}. */
+	readonly usage?: ToolUsageTokens;
+}
+
+/**
+ * One commit a skill's work reached, with what that commit changed.
+ *
+ * This is the half no other tool can show: not "the skill ran N times" but "this
+ * is what came out of it". The diff figures and categories are the COMMIT's, not
+ * the skill's — a commit usually carries other work too — so a caller must not
+ * present them as the skill's own output.
+ */
+export interface SkillDetailCommit {
+	readonly hash: string;
+	readonly repoName: string;
+	readonly branch?: string;
+	readonly message?: string;
+	readonly committedAtMs: number;
+	readonly filesChanged?: number;
+	readonly insertions?: number;
+	readonly deletions?: number;
+	/** Topic categories of that memory, deduped — `bugfix`, `feature`, … */
+	readonly categories: ReadonlyArray<string>;
+}
+
+/** One session that ran the skill, plus how much of it was this skill's. */
+export interface SkillDetailSession {
+	readonly sessionId: string;
+	readonly source: string;
+	readonly title?: string;
+	readonly startedAtMs?: number;
+	readonly updatedAtMs: number;
+	readonly durationMs?: number;
+	readonly messageCount?: number;
+	readonly model?: string;
+	/** Calls of THIS skill in this session. */
+	readonly calls: number;
+	/**
+	 * The WHOLE session's spend, which is not this skill's — a session normally
+	 * runs several skills and plenty of unattributed work besides. Carried as the
+	 * denominator a reader needs to judge {@link usage} against, and a surface
+	 * showing it must say which of the two it is printing.
+	 *
+	 * Absent when the source reports no session usage either (today: every agent
+	 * except Claude, whose parser is the only one implementing `parseUsageTokens`).
+	 */
+	readonly sessionTokens?: number;
+	/** This skill's own spend inside this session. Absent when unattributable. */
+	readonly usage?: ToolUsageTokens;
+}
+
+/**
+ * Run outcomes over this skill's recorded entries, SPLIT by whether the result was
+ * actually read.
+ *
+ * Three of the six entry mechanisms have no result record at all, so their `ok` was
+ * defaulted rather than observed (see `skillOutcomeConfidence`): nothing said the run
+ * failed, which is not the same as something saying it succeeded. The two classes are
+ * therefore counted separately and must stay separate:
+ *
+ *   - {@link measured} / {@link failed} — entries whose `ok` came from a result
+ *     record. `measured` is the only honest denominator for a failure rate; averaging
+ *     over every entry would price an unknowable run as a success.
+ *   - {@link assumed} — entries that definitely RAN but whose result the transcript
+ *     never stated. Reported as its own number, in words that say what is missing.
+ *
+ * Either count may be 0 on its own. The object is absent only when the skill has no
+ * entry row at all — a count merged in from an archived commit, or a transcript the
+ * agent has since pruned — which is the same distinction {@link SkillDetail.invocations}
+ * draws, and it is the surface's cue to say "no per-entry record", never "it never ran".
+ *
+ * It used to be absent whenever `measured` was 0, so on the common machine — where
+ * nearly every Claude skill is entered by slash command — the whole section vanished
+ * and the reader was told nothing about runs that were fully on record. Surfacing
+ * them as "ran, outcome not recorded" says exactly as much as the record supports,
+ * and no more.
+ */
+export interface SkillDetailOutcomes {
+	/** Entries whose `ok` came from a result record. 0 when no mechanism could report one. */
+	readonly measured: number;
+	/** Failures among {@link measured} alone — never among {@link assumed}. */
+	readonly failed: number;
+	/**
+	 * Entries whose `ok` was defaulted, so the run is known to have happened and its
+	 * result is not knowable. Never added to {@link measured}.
+	 */
+	readonly assumed: number;
+}
+
+/**
+ * One recorded entry into the skill, for the outcome strip and its tooltips.
+ *
+ * Ordered oldest-first by the query, which is what makes "it started failing on
+ * Tuesday" readable left to right.
+ */
+export interface SkillDetailInvocation {
+	readonly atMs: number;
+	readonly ok: boolean;
+	/**
+	 * Whether {@link ok} was read from the transcript or defaulted.
+	 *
+	 * Carried so a surface can decide what it is entitled to SAY: a defaulted outcome
+	 * has no failure to report, so the dashboard draws it as an ordinary tick (the run
+	 * happened, and skipping it reported less than the record holds) and qualifies it
+	 * in words — per-tick hover text, plus the {@link SkillDetailOutcomes.assumed}
+	 * sentence under the strip. What the flag must keep preventing is the other
+	 * reading: {@link ok} being `true` here is the absence of a failure report, so such
+	 * an entry may be counted beside a measured one but never averaged in with it.
+	 */
+	readonly outcomeKnown: boolean;
+	readonly args?: string;
+	readonly bodyChars?: number;
+}
+
+/**
+ * Everything the skill detail view shows — the answer to `/api/skill-detail`.
+ *
+ * Scoped to the same window and repo selection as the card it was opened from, so
+ * the totals here agree with the row that was clicked. That is also why it is a
+ * fetch rather than a slice of the page model: the model carries ONE PAGE of
+ * skills and none of this per-skill breakdown.
+ */
+export interface SkillDetail {
+	readonly name: string;
+	/** Distinct sessions that ran it, over the window. */
+	readonly sessions: number;
+	readonly calls: number;
+	readonly lastCallAtMs?: number;
+	/** Summed over every attributable session — see {@link ToolUsageTokens.sessions}. */
+	readonly usage?: ToolUsageTokens;
+	readonly agents: ReadonlyArray<SkillDetailAgent>;
+	/**
+	 * Commits this skill's usage was archived onto, newest first.
+	 *
+	 * Routinely EMPTY, and that is the normal state rather than a failure: measured
+	 * on one machine, 27 of 111 skill rows linked to a commit at all — the rest is
+	 * work still in the tree. A surface must render the empty case as "not committed
+	 * yet", never as "no data".
+	 */
+	readonly commits: ReadonlyArray<SkillDetailCommit>;
+	readonly linkedSessions: ReadonlyArray<SkillDetailSession>;
+	/** Category mix across {@link commits}, most commits first. */
+	readonly categories: ReadonlyArray<{ readonly category: string; readonly commits: number }>;
+	/** Providing plugin, absent for an unprefixed skill (the common case). */
+	readonly plugin?: string;
+	/**
+	 * Repositories the skill ran in, by name, alphabetically.
+	 *
+	 * From the SESSIONS rather than from {@link commits}: most skill usage is never
+	 * archived onto a commit (measured: 27 of 111 rows), so deriving this from the
+	 * commit list would report "ran in nothing" for the majority.
+	 */
+	readonly repos: ReadonlyArray<string>;
+	/**
+	 * First entry in the window, from the per-entry record rather than the session's
+	 * clock. Absent when no entry row survives — see {@link invocations}.
+	 */
+	readonly firstCallAtMs?: number;
+	/**
+	 * Mechanisms this skill was entered by, deduped. `tool` is the agent choosing to
+	 * invoke it, `command` is a person asking for it by name; both together is normal.
+	 *
+	 * Empty when no entry row carries one, which is not the same as "entered by
+	 * neither" — a stored history predating the field reads as empty.
+	 */
+	readonly entryPaths: ReadonlyArray<SkillEntryPath>;
+	/**
+	 * `"heuristic"` when any entry in the window was inferred from a file read rather
+	 * than observed — see {@link ToolUsageRow.detection}, which carries the identical
+	 * field for the list row so a reader sees the same mark before and after opening.
+	 *
+	 * Sits beside {@link entryPaths} and {@link outcomes} because all three are
+	 * qualifiers read off the per-entry table, and all three go quiet together when
+	 * no entry row survives.
+	 */
+	readonly detection?: "heuristic";
+	/** Absent only when no entry row survives — see {@link SkillDetailOutcomes}. */
+	readonly outcomes?: SkillDetailOutcomes;
+	/**
+	 * The entry rows themselves, oldest first.
+	 *
+	 * Routinely EMPTY while {@link calls} is not, and that is a normal state rather
+	 * than a gap: a count merged in from an already-archived commit has no per-entry
+	 * record, and an agent that pruned its own transcript can never have one again.
+	 * A surface must render the empty case as "no per-entry record", never as "it
+	 * never ran".
+	 */
+	readonly invocations: ReadonlyArray<SkillDetailInvocation>;
+	/**
+	 * One point per session that ran the skill, oldest first — the grain both of the
+	 * detail view's time charts read at.
+	 *
+	 * Separate from {@link linkedSessions}, which is capped for a table a reader
+	 * scrolls: a chart drawn from 20 of 51 sessions is a chart of the wrong shape, so
+	 * this carries the whole window at two numbers per point.
+	 *
+	 * `tokens` is absent where the source attributed none — the charts skip those
+	 * points rather than plotting them at zero.
+	 */
+	readonly sessionSeries: ReadonlyArray<{ readonly atMs: number; readonly tokens?: number }>;
+	/**
+	 * Characters this skill injects on a full entry — the LARGEST body recorded, not
+	 * an average.
+	 *
+	 * A repeat entry within one conversation injects an "already loaded above" stub
+	 * instead of the body (measured: 3,619 characters then 69 for the same skill), so
+	 * an average answers "what did entries cost on average here" while the question
+	 * this figure is read for is "what does this skill cost to load".
+	 */
+	readonly bodyChars?: number;
 }
 
 /**
@@ -1720,6 +2029,35 @@ export interface ToolUsage {
 	readonly skillsTotal: number;
 	/** Every skill run in the window, including rows past the first page. */
 	readonly skillCallsTotal: number;
+	/**
+	 * Day-by-day adoption for the Skills page's stacked band, oldest first.
+	 *
+	 * ONE POINT PER LOCAL DAY IN THE WINDOW, including days with no skill use. The
+	 * chart lays bars out by index, so a dropped day would silently compress the axis
+	 * and make a week-long gap look like a busy stretch. No cap is needed on top of
+	 * that: the window itself is bounded (a custom range is clamped to `MAX_CUSTOM_DAYS`),
+	 * which is what the retired week-bucket cap existed to do.
+	 *
+	 * Covers EVERY skill in the window, not only {@link skills}' first page — the band
+	 * is a whole-window view and a chart drawn from one page would change shape as the
+	 * list below it grew.
+	 *
+	 * **The unit is a skill-session, and it does not sum to sessions.** A session that
+	 * reached for three skills counts once in each of their series, so a bar's total is
+	 * skill-sessions rather than distinct sessions. Adoption is the honest question here
+	 * because usage is recorded per session; a per-RUN daily count does not exist to
+	 * draw, since only the capped entry list carries run timestamps.
+	 *
+	 * **A session is filed under ONE day — the day of its last recorded call for that
+	 * skill.** `session_tool_use` keeps a single timestamp per (session, skill), so a
+	 * session that ran past local midnight contributes entirely to the later day rather
+	 * than to both. Measured on a real database: 5 of 68 (session, skill) pairs spanned
+	 * more than one local day. `skill_invocations` does carry per-call timestamps and
+	 * would resolve those exactly, but it is deliberately NOT the source — it had detail
+	 * for 68 pairs against the aggregate's 116, so 41% of the rows the list below shows
+	 * would be missing from the chart above it.
+	 */
+	readonly skillDays: ReadonlyArray<SkillDayPoint>;
 	/**
 	 * MCP servers, busiest first — ranked by {@link McpServerRow.calls}, with
 	 * sessions as the tiebreak.

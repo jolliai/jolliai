@@ -5,6 +5,9 @@
 	var VIEWS = {
 		stats: { render: (model) => window.JD.renderStats(model), grid: true },
 		standup: { render: (model) => window.JD.renderStandup(model), grid: false },
+		/* Page mode, not the card grid: the list is one full-height column, the same
+		   shape the browser pages below use. */
+		skills: { render: (model) => window.JD.renderSkills(model), grid: false },
 		memories: { render: (model) => window.JD.renderMemories(model), grid: false },
 		knowledge: { render: (model) => window.JD.renderKnowledge(model), grid: false },
 		graph: { render: (model) => window.JD.renderGraph(model), grid: false },

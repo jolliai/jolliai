@@ -211,6 +211,19 @@ export interface ToolCallCount {
 	readonly kind: ToolCallKind;
 	/** MCP server the tool belongs to. Present only when `kind` is `"mcp"`. */
 	readonly server?: string;
+	/**
+	 * Plugin that provides the skill. Present only when `kind` is `"skill"`.
+	 *
+	 * A separate field from {@link server} rather than a reuse of it, even though both
+	 * name "where the tool came from": they are indexed and queried differently (the
+	 * MCP card rolls up by `server`), so a plugin label stored there would join those
+	 * roll-ups as a phantom server.
+	 *
+	 * Absent means the skill has no namespace, which is the common case — not that its
+	 * namespace is unknown. A name two plugins both claim is also absent rather than
+	 * attributed to whichever was seen first; see `observeSkillEntry`.
+	 */
+	readonly plugin?: string;
 	readonly calls: number;
 	/**
 	 * When the LAST call in this bucket was made, from the transcript line that
@@ -236,6 +249,52 @@ export interface ToolCallCount {
 	 * rather than treat absence as "never called".
 	 */
 	readonly lastCallAtMs?: number;
+	/**
+	 * Tokens spent under this bucket, when the source can attribute them.
+	 *
+	 * Only ever set on `kind: "skill"` buckets: a skill owns a bounded stretch of
+	 * the conversation that attribution can delimit, while a builtin or MCP call is
+	 * one step inside a turn whose spend belongs to the turn, not to the tool. So an
+	 * absent value here is the normal case, not a gap to be filled later.
+	 *
+	 * Absent, NEVER a zeroed {@link SkillUsage}: the sources divide into ones that
+	 * attribute (Claude), ones that estimate (OpenCode) and ones that report nothing
+	 * at all (Codex, Kimi, Cursor), and a stored zero would claim the third group's
+	 * skills were free. `confidence` carries which of the first two produced a value.
+	 */
+	readonly usage?: SkillUsage;
+	/**
+	 * The individual entries behind {@link calls}, for the per-invocation record.
+	 *
+	 * Only ever set on `kind: "skill"` buckets, for the same reason {@link usage} is:
+	 * a skill entry is an event with its own timestamp, outcome and injected body,
+	 * while a builtin or MCP call is one step inside a turn that carries none of
+	 * those separately.
+	 *
+	 * `calls` is NOT derivable from this array's length and must stay independent.
+	 * Two reasons, both real: a Codex CLI bucket deliberately reports one invocation
+	 * per session no matter how many paged reads produced it (see
+	 * `scanCodexSkillLines`), and a bucket recovered from an already-archived commit
+	 * carries a count with no invocations at all.
+	 *
+	 * Absent means "this bucket has no per-invocation record", which is the normal
+	 * state for a count merged in from a `SkillCommitRef` — never "it ran zero times".
+	 */
+	readonly invocations?: ReadonlyArray<SkillInvocation>;
+	/**
+	 * Whether the invocations in this bucket were OBSERVED or inferred.
+	 *
+	 * Skill-level rather than per-invocation, matching {@link SkillUse.detection},
+	 * and copying it down to each invocation is lossless: one scan pass emits a
+	 * single nature per skill (`scanCodexSkillLines` drops its inferred entry
+	 * outright when an observed one claimed the same name), so a bucket never mixes
+	 * the two.
+	 *
+	 * Absent means observed. Present means the entry was inferred from a shell read
+	 * of a `SKILL.md`, which cannot distinguish an agent using a skill from a human
+	 * reading it and cannot count entries — see `CodexSkillScanner`.
+	 */
+	readonly detection?: "heuristic";
 }
 
 /**
@@ -1317,6 +1376,35 @@ export interface SkillInvocation {
 	readonly bodyChars?: number;
 	/** False for a failed invocation (the `is_error` tool results). */
 	readonly ok: boolean;
+	/**
+	 * Whether this invocation's result was actually present in the scanned window.
+	 *
+	 * `false` is the important value: Claude and Kimi both emit a real invocation
+	 * before its paired result arrives, with an optimistic `ok: true`. Optional for
+	 * histories written before this evidence existed; readers then fall back to the
+	 * source/entry-path capability table.
+	 */
+	readonly outcomeObserved?: boolean;
+	/**
+	 * Which mechanism entered the skill on THIS invocation.
+	 *
+	 * Distinct from {@link SkillUse.entryPaths}, which is the SET of mechanisms a
+	 * skill has ever been entered by and therefore cannot answer for one
+	 * invocation: a skill reached both ways carries `["command","tool"]`, and
+	 * nothing in that array says which of its invocations was which.
+	 *
+	 * Load-bearing for {@link ok}, not decoration. Whether a source can report an
+	 * outcome at all depends on the mechanism, not only on the host — Claude's
+	 * `Skill` tool has a `tool_result` to read a failure from while its slash
+	 * command has no result record at all, so both arrive as a hard-coded
+	 * `ok: true`. `skillOutcomeConfidence` needs this field to tell the two apart.
+	 *
+	 * Optional because a stored history predates it: `parseInvocationLine` reads
+	 * fields by name, so an older `skills/<source>/<skill>.md` deserializes with
+	 * this absent. Readers must treat absence as "unknown mechanism", never as a
+	 * default one.
+	 */
+	readonly entryPath?: SkillEntryPath;
 }
 
 /**

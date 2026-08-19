@@ -40,52 +40,12 @@
  */
 
 import { errMsg } from "../../Logger.js";
-import type { SkillUse, ToolCallCount, TranscriptSource } from "../../Types.js";
+import type { TranscriptSource } from "../../Types.js";
+import { attributeSkillUsage } from "../skills/SkillAttribution.js";
+import { skillUseToToolCall } from "../skills/SkillToolCall.js";
 import { getSkillScanner } from "../skills/SkillTranscriptScanner.js";
+import { readSubagentLineGroups } from "../skills/TranscriptSkillDiscovery.js";
 import type { SessionSignalExtractor, SessionSignalInput, SessionSignals } from "./SessionSignalExtractor.js";
-
-/**
- * Folds one scanned skill into a tool bucket.
- *
- * `calls` is the invocation count the scanner measured, and `lastCallAtMs` comes
- * from the invocation list — NOT from the session's own clock. A session's
- * `updatedAt` moves every time the conversation is touched afterwards, so using it
- * would date a skill run from three weeks ago as today's and quietly shift it into
- * whatever window the dashboard is showing.
- *
- * Taken as the MAXIMUM over the list rather than as `invocations[0]`. Claude, Kimi
- * and OpenCode all sort newest-first, so for them the two are the same number —
- * this only stops the value depending on an ordering convention that lives in three
- * separate scanners and is not enforced anywhere.
- *
- * **The heuristic Codex path is a documented floor, not a last-call instant.**
- * `scanCodexSkillLines` records one invocation per skill at the FIRST `SKILL.md`
- * read it saw, deliberately: 49% of real (session, skill) pairs are several paged
- * reads of one use, so counting each read would claim a skill was entered ten times
- * when it was entered once. That leaves no last-use instant in the data to recover,
- * so a Codex bucket dates from when the skill entered the picture. Reporting the
- * first read is a lower bound on a real use; the alternative — no timestamp — would
- * drop the skill out of every windowed view instead of placing it early in one.
- *
- * Invocations with an unparseable instant contribute no timestamp rather than a
- * zero: absence means "no timestamp recorded", which readers fall back on, while
- * a zero is a real instant in 1970 and would sort as the oldest call ever made.
- */
-function toToolCall(use: SkillUse): ToolCallCount {
-	let lastCallAtMs = Number.NaN;
-	for (const invocation of use.invocations) {
-		const at = Date.parse(invocation.at);
-		if (Number.isFinite(at) && (!Number.isFinite(lastCallAtMs) || at > lastCallAtMs)) lastCallAtMs = at;
-	}
-	return {
-		// The skill's own name, matching what the `Skill` tool path reports, so the two
-		// halves of one skill's usage fold together instead of appearing as two rows.
-		name: use.skill,
-		kind: "skill",
-		calls: use.invocations.length,
-		...(Number.isFinite(lastCallAtMs) ? { lastCallAtMs } : {}),
-	};
-}
 
 export const skillExtractor: SessionSignalExtractor = {
 	id: "skills",
@@ -105,7 +65,22 @@ export const skillExtractor: SessionSignalExtractor = {
 			// so advancing one from here would permanently strand the lines between the
 			// old mark and the new one for the StopHook that was going to read them.
 			const result = scanner.scan(lines, 0);
-			return result.uses.length > 0 ? { tools: result.uses.map(toToolCall) } : {};
+			if (result.uses.length === 0) return {};
+
+			// Attribution reads the subagent files too, matching `scanSkillsFrom` exactly.
+			// It is the same function over the same input on purpose: the dashboard's
+			// per-skill figures and the ones the IDE panel reads out of `plans.json` have
+			// to be one measurement, not two implementations that agree until they don't.
+			//
+			// A subagent's `attributionSkill` is inherited from its parent and never
+			// updated, so a subagent's spend is invisible to attribution run over the
+			// session file alone — which is why the groups are read here rather than left
+			// to the caller's `content.lines()`.
+			//
+			// Read only once a skill was actually found: a session with no skills owes no
+			// `readdir`, and most sessions have none.
+			const usageBySkill = attributeSkillUsage(lines, await readSubagentLineGroups(input.transcriptPath));
+			return { tools: result.uses.map((use) => skillUseToToolCall(use, usageBySkill.get(use.skill))) };
 		} catch (err) {
 			throw new Error(`skill extraction failed for ${input.source}/${input.sessionId}: ${errMsg(err)}`);
 		}

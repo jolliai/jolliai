@@ -788,8 +788,22 @@ window.JD = window.JD || {};
 			   that gives (the name, which truncates). A bare string was falsy here and
 			   so emitted no slot at all; this keeps that. */
 			var kind = kindOf ? kindOf(row) : null;
+			/* Only the Skills list opens a detail view, so only its rows carry the
+			   affordance. The MCP lists would need their own endpoint and their own
+			   answer to "what is a server's detail", and a row that looks clickable
+			   and does nothing is worse than a row that does not. */
+			var clickable =
+				list === "skill"
+					? ' class="rl-click" tabindex="0" role="button" data-skill="' +
+						JD.esc(row.name) +
+						'" title="Open detail for ' +
+						JD.esc(row.name) +
+						'"'
+					: "";
 			html +=
-				'<li><div class="rl-top">' +
+				"<li" +
+				clickable +
+				'><div class="rl-top">' +
 				// Emitted for every row of a list that HAS a lead, including rows whose
 				// own lead comes back empty. The span is a fixed-width column (see
 				// .rl-lead), so skipping it on a row with no agents would put that row's
@@ -957,9 +971,15 @@ window.JD = window.JD || {};
 	   classifies as a builtin, and a slash command is a prompt expansion that
 	   never becomes a tool call at all. Widening this sentence means widening
 	   that classifier first. */
+	/* The dagger is explained HERE rather than on the row, because this card has no
+	   room for a footnote and the rows are already at their narrowest — the Skills page
+	   the rows link into prints the full sentence under the figures it qualifies. The
+	   mark itself still has to appear on the row: a skill shown clean here and daggered
+	   one click later reads as two different measurements of the same thing. */
 	var SKILLS_HINT =
 		"Skill invocations, counted from the tool calls in your local transcripts. A skill invoked inside a " +
-		"subagent counts once, against the session that spawned it.";
+		"subagent counts once, against the session that spawned it. A † marks a skill whose use was inferred " +
+		"from a command that read its file rather than observed, so its run count is per session.";
 
 	function skillsCard(model) {
 		var usage = model.stats.toolUsage;
@@ -1003,7 +1023,12 @@ window.JD = window.JD || {};
 			"--s2",
 			(r) => r.calls,
 			agentBadges,
-			(r) => "/" + r.name,
+			/* The dagger rides IN the label rather than in a slot of its own. Both slots
+			   are taken here — the lead carries `agentBadges`, and the kind is null on
+			   purpose (see `rankedList`) — and the label is plain text escaped downstream,
+			   which a bare `†` survives. It also lands in the row's `title`, so the mark
+			   is reachable on hover even before the card head explains it. */
+			(r) => "/" + r.name + (r.detection === "heuristic" ? " †" : ""),
 			null,
 			"run",
 			"skill",
@@ -1993,6 +2018,35 @@ window.JD = window.JD || {};
 		revealToolRows(stats.toolUsage);
 		document.querySelectorAll("[data-toolmore]").forEach((button) => {
 			button.onclick = () => loadMoreToolRows(model, button.getAttribute("data-toolmore"));
+		});
+
+		/* The Skills rows LINK INTO the Skills page, which has a reading pane of its
+		   own. They used to open a modal over this card — a second renderer of the same
+		   figures, and one that could not be shared or reloaded. `?skill=` is that
+		   page's own selection state, so this navigation and a click over there land on
+		   the identical view.
+
+		   Re-bound on every repaint like the button above, because a repaint replaces
+		   the whole of `#app` and takes the old rows' handlers with it.
+
+		   Keyboard as well as pointer: the row carries `role="button"` and a tabindex,
+		   so leaving it click-only would put a focusable control on the page that the
+		   keyboard cannot activate. */
+		document.querySelectorAll("[data-skill]").forEach((row) => {
+			var open = () => {
+				/* Through `JD.viewPath`, never a literal "/skills": that table is the one
+				   place a view's URL is spelled, so the nav row and this link cannot end up
+				   disagreeing about where the page lives. */
+				var query = JD.withParams(JD.query(model, {}), { skill: row.getAttribute("data-skill") });
+				window.location.href = JD.viewPath("skills") + query;
+			};
+			row.onclick = open;
+			row.onkeydown = (event) => {
+				if (event.key === "Enter" || event.key === " ") {
+					event.preventDefault();
+					open();
+				}
+			};
 		});
 	};
 

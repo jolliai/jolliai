@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 vi.mock("../skills/SkillTranscriptScanner.js", () => ({ getSkillScanner: vi.fn() }));
 
 import type { SkillInvocation, SkillUse, TranscriptSource } from "../../Types.js";
+import { USAGE_SPLIT_LINE_1 } from "../skills/__fixtures__/claudeTranscript.js";
 import { getSkillScanner } from "../skills/SkillTranscriptScanner.js";
 import type { SessionSignalInput } from "./SessionSignalExtractor.js";
 import { skillExtractor } from "./SkillExtractor.js";
@@ -99,8 +100,43 @@ describe("skillExtractor.extract", () => {
 		const signals = await skillExtractor.extract(input(async () => ["{}"]));
 
 		expect(signals.tools).toEqual([
-			{ name: "code-review", kind: "skill", calls: 1, lastCallAtMs: Date.parse("2026-08-01T10:00:00.000Z") },
+			{
+				name: "code-review",
+				kind: "skill",
+				calls: 1,
+				lastCallAtMs: Date.parse("2026-08-01T10:00:00.000Z"),
+				// Forwarded, not reduced to the count: the dashboard writes one row per entry.
+				invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true }],
+			},
 		]);
+	});
+
+	it("carries the attributed token spend onto the bucket", async () => {
+		// The very figures `SkillAttribution.test.ts` pins for this fixture, reached
+		// through the extractor — which is the point: the dashboard's per-skill numbers
+		// and the ones the IDE panel reads out of `plans.json` are one measurement run
+		// twice, not two implementations that agree until they don't.
+		vi.mocked(getSkillScanner).mockReturnValue(
+			scannerFor([use("superpowers:brainstorming", [{ at: "2026-07-12T11:08:35.523Z", ok: true }])]),
+		);
+
+		const signals = await skillExtractor.extract(input(async () => [USAGE_SPLIT_LINE_1]));
+
+		expect(signals.tools?.[0]?.usage).toEqual({ input: 1, cached: 4162, output: 797, confidence: "attributed" });
+	});
+
+	it("leaves usage ABSENT — never zeroed — when nothing could be attributed", async () => {
+		// Codex, Kimi and Cursor attribute nothing at all, and on a real machine they
+		// are the majority of skill calls. A zeroed bucket would price their skills at
+		// free rather than reporting them unmeasured, which is the distinction the whole
+		// column exists to keep.
+		vi.mocked(getSkillScanner).mockReturnValue(
+			scannerFor([use("code-review", [{ at: "2026-08-01T10:00:00.000Z", ok: true }])]),
+		);
+
+		const signals = await skillExtractor.extract(input(async () => ["{}"]));
+
+		expect(signals.tools?.[0]).not.toHaveProperty("usage");
 	});
 
 	it("counts calls as the number of invocations", async () => {

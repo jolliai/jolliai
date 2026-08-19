@@ -499,10 +499,9 @@ describe("widget card heads", () => {
 		const head = headOf("Skills");
 		expect(head).toContain('class="has-hint"');
 		expect(hintOf("Skills")).toContain("Skill invocations, counted from the tool calls");
-		// Scope claim, pinned: only `Skill` tool calls become skill rows — a
-		// subagent is the `Task` builtin and a slash command is never a tool call
-		// — so the copy must not widen to either without the classifier widening.
-		expect(head).not.toContain("command");
+		// Codex's heuristic path is a command that read the skill file. It is named
+		// explicitly so the tooltip does not present that inference as an observed run.
+		expect(hintOf("Skills")).toContain("inferred from a command that");
 		expect(titleBlockOf("Skills")).not.toContain('<div class="sub">');
 	});
 

@@ -125,6 +125,7 @@ import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js
 import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
+import type { SkillUsage } from "../Types.js";
 import {
 	collectCommitEvents,
 	collectRepoGraph,
@@ -300,7 +301,7 @@ describe("dbBackfillRepo — bootstrap", () => {
 			// full transcript read produced the stored session rows, and it is the only
 			// thing that makes the per-session skip safe to trust. See
 			// `SESSION_READ_GENERATION`.
-			{ source: "sessions-read-generation", cursor: "5" },
+			{ source: "sessions-read-generation", cursor: "8" },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
@@ -1115,7 +1116,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ source: string; cursor: string }>(
 			"SELECT source, cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "5" }]);
+		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "8" }]);
 		// And the second sweep is the one that gets a predicate.
 		await dbBackfillRepo({ repo, dbPath });
 		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeDefined();
@@ -1150,7 +1151,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ cursor: string }>(
 			"SELECT cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ cursor: "5" }]);
+		expect(cursors).toEqual([{ cursor: "8" }]);
 	});
 });
 
@@ -2249,21 +2250,380 @@ describe("dbBackfillRepo — sessions sweep", () => {
 		expect(row).toEqual([{ server: "jollimemory-remote" }]);
 	});
 
-	it("still projects a session whose tool lost its recorded instant", async () => {
-		// The MAX around `last_call_at_ms` cannot save the stored instant here: the
-		// projection DELETEs the tool rows before inserting, so there is no
-		// conflicting row for it to consult and the re-read's absent time lands as
-		// NULL. That erasure is a real write, which is exactly why this comparison
-		// may not treat "no instant" as equal to a stored one.
-		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
+	it("does not re-enqueue sparse tool evidence that the writer would preserve", async () => {
+		// A truncated transcript can lose attribution and see only an earlier call.
+		// StatsWriter carries the tokens forward and takes the later timestamp, so the
+		// unchanged filter must compare against that merged result or this session is
+		// re-projected forever while its stored row never moves.
+		const lastCallAtMs = 1_700_000_040_000;
+		const attributed = {
+			name: "code-review",
+			kind: "skill" as const,
+			calls: 1,
+			lastCallAtMs,
+			usage: { input: 1, output: 2, cached: 3, confidence: "attributed" as const },
+		};
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: [attributed] }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		const { usage: _lost, ...withoutUsage } = attributed;
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...sessionEvent, tools: [{ ...withoutUsage, lastCallAtMs: lastCallAtMs - 1_000 }] },
+		]);
 		await dbBackfillRepo({ repo, dbPath });
 
-		const [bash, recall] = toolSession.tools ?? [];
-		const { lastCallAtMs: _gone, ...timeless } = bash;
-		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...toolSession, tools: [timeless, recall] }]);
+		expect(await loggedSessions("s1")).toBe(1);
+		expect(
+			await query(
+				`SELECT last_call_at_ms, input_tokens, output_tokens, cached_tokens, usage_confidence
+				   FROM session_tool_use WHERE tool_name = 'code-review'`,
+			),
+		).toEqual([
+			{
+				last_call_at_ms: lastCallAtMs,
+				input_tokens: 1,
+				output_tokens: 2,
+				cached_tokens: 3,
+				usage_confidence: "attributed",
+			},
+		]);
+	});
+
+	it("projects each independently changed skill-usage field", async () => {
+		const skill = {
+			name: "code-review",
+			kind: "skill" as const,
+			calls: 1,
+			usage: { input: 1, output: 2, cached: 3, confidence: "attributed" as const },
+		};
+		const eventWithUsage = (usage: SkillUsage): SessionUpsertedEvent => ({
+			...sessionEvent,
+			tools: [{ ...skill, usage }],
+		});
+
+		const revisions = [
+			skill.usage,
+			{ ...skill.usage, input: 9 },
+			{ ...skill.usage, input: 9, output: 8 },
+			{ ...skill.usage, input: 9, output: 8, cached: 7 },
+			{ input: 9, output: 8, cached: 7, confidence: "estimated" as const },
+		];
+		for (const usage of revisions) {
+			vi.mocked(collectSessionEvents).mockResolvedValue([eventWithUsage(usage)]);
+			await dbBackfillRepo({ repo, dbPath });
+		}
+
+		expect(await loggedSessions("s1")).toBe(revisions.length);
+		expect(
+			await query<{
+				input_tokens: number;
+				output_tokens: number;
+				cached_tokens: number;
+				usage_confidence: string;
+			}>(
+				`SELECT input_tokens, output_tokens, cached_tokens, usage_confidence
+				   FROM session_tool_use WHERE kind = 'skill'`,
+			),
+		).toEqual([{ input_tokens: 9, output_tokens: 8, cached_tokens: 7, usage_confidence: "estimated" }]);
+	});
+
+	/**
+	 * The per-entry table is a THIRD child table this comparison has to mirror, and
+	 * omitting it left `skill_invocations` permanently empty when it shipped: the
+	 * generation bump re-read every transcript and this function threw the result away
+	 * because the call counts had not moved. Same trap as the token columns on
+	 * `StoredToolRow`, one table further along.
+	 */
+	const skillSession: SessionUpsertedEvent = {
+		...sessionEvent,
+		tools: [
+			{
+				name: "code-review",
+				kind: "skill",
+				calls: 1,
+				invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" }],
+			},
+		],
+	};
+
+	it("does not re-enqueue a session whose skill entries are unchanged", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose only change is a NEW skill entry", async () => {
+		// The call count moves with it here, but the point is the row that has to land:
+		// a second entry at its own instant, which only the per-entry comparison can ask
+		// about.
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...skillSession,
+				tools: [
+					{
+						...skill,
+						calls: 2,
+						invocations: [
+							{ at: "2026-08-01T11:00:00.000Z", ok: true, entryPath: "tool" },
+							{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" },
+						],
+					},
+				],
+			},
+		]);
 		await dbBackfillRepo({ repo, dbPath });
 
 		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM skill_invocations")).toEqual([{ n: 2 }]);
+	});
+
+	it("still projects a new skill entry when the aggregate call count is unchanged", async () => {
+		// A generation bump can discover invocation detail that the older reader never
+		// emitted. The aggregate row is already byte-identical in that case, so only
+		// the missing detail row can make the re-read observable.
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...skillSession, tools: [{ ...skill, invocations: undefined }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		// The reverse read is intentionally one-sided: detail learned on the second
+		// pass survives when a compacted transcript no longer emits it, and the third
+		// pass settles instead of re-projecting forever.
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...skillSession, tools: [{ ...skill, invocations: undefined }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM skill_invocations")).toEqual([{ n: 1 }]);
+	});
+
+	it("still projects a session whose entry OUTCOME moved, with every other figure equal", async () => {
+		// The case the count cannot see: a window that closed mid-invocation stored an
+		// optimistic `ok: true`, and the re-read that learned it failed carries the same
+		// name, the same count and the same instant. Reporting it unchanged would freeze
+		// that optimism in the database forever.
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...skillSession,
+				tools: [
+					{
+						...skill,
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: false,
+								entryPath: "tool",
+								outcomeObserved: true,
+							},
+						],
+					},
+				],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ ok: number }>("SELECT ok FROM skill_invocations")).toEqual([{ ok: 0 }]);
+	});
+
+	it("still projects a session whose optimistic outcome became observed", async () => {
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...skillSession,
+				tools: [
+					{
+						...skill,
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: true,
+								entryPath: "tool",
+								outcomeObserved: false,
+							},
+						],
+					},
+				],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...skillSession,
+				tools: [
+					{
+						...skill,
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: true,
+								entryPath: "tool",
+								outcomeObserved: true,
+							},
+						],
+					},
+				],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ ok_confidence: string }>("SELECT ok_confidence FROM skill_invocations")).toEqual([
+			{ ok_confidence: "observed" },
+		]);
+	});
+
+	it("projects each independently changed skill-entry field", async () => {
+		const at = "2026-08-01T10:00:00.000Z";
+		const eventWithEntry = (
+			invocation: {
+				at: string;
+				ok: boolean;
+				entryPath?: "tool" | "command";
+				outcomeObserved?: boolean;
+				args?: string;
+				bodyChars?: number;
+			},
+			detection?: "heuristic",
+		): SessionUpsertedEvent => ({
+			...sessionEvent,
+			tools: [
+				{
+					name: "code-review",
+					kind: "skill",
+					calls: 1,
+					...(detection ? { detection } : {}),
+					invocations: [invocation],
+				},
+			],
+		});
+
+		const revisions: SessionUpsertedEvent[] = [
+			eventWithEntry({ at, ok: true, entryPath: "tool", args: "--base main", bodyChars: 100 }),
+			// Identical, and deliberately still carrying args/body: exercises the
+			// COALESCE-aware equality path before the following mutations.
+			eventWithEntry({ at, ok: true, entryPath: "tool", args: "--base main", bodyChars: 100 }),
+			// The path changes, but weaker confidence cannot erase the observed result.
+			eventWithEntry({ at, ok: true, entryPath: "command", args: "--base main", bodyChars: 100 }),
+			// Unknown still changes entry_path independently.
+			eventWithEntry({ at, ok: true, args: "--base main", bodyChars: 100 }),
+			eventWithEntry({ at, ok: true, args: "--base main", bodyChars: 100 }, "heuristic"),
+			eventWithEntry({ at, ok: true, args: "--base release", bodyChars: 100 }, "heuristic"),
+			eventWithEntry({ at, ok: true, args: "--base release", bodyChars: 200 }, "heuristic"),
+		];
+		for (const event of revisions) {
+			vi.mocked(collectSessionEvents).mockResolvedValue([event]);
+			await dbBackfillRepo({ repo, dbPath });
+		}
+
+		// Seven reads, but the byte-identical second one is the only no-op.
+		expect(await loggedSessions("s1")).toBe(revisions.length - 1);
+		expect(
+			await query<{
+				ok_confidence: string;
+				detection: string;
+				entry_path: string | null;
+				args: string;
+				body_chars: number;
+			}>("SELECT ok_confidence, detection, entry_path, args, body_chars FROM skill_invocations"),
+		).toEqual([
+			{
+				ok_confidence: "observed",
+				detection: "heuristic",
+				entry_path: null,
+				args: "--base release",
+				body_chars: 200,
+			},
+		]);
+	});
+
+	it("ignores an unparseable skill-entry instant just like the writer", async () => {
+		const event: SessionUpsertedEvent = {
+			...sessionEvent,
+			tools: [
+				{
+					name: "code-review",
+					kind: "skill",
+					calls: 1,
+					invocations: [{ at: "not-a-date", ok: true, entryPath: "tool" }],
+				},
+			],
+		};
+		vi.mocked(collectSessionEvents).mockResolvedValue([event]);
+		await dbBackfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM skill_invocations")).toEqual([{ n: 0 }]);
+	});
+
+	it("still projects a session whose skill gained a plugin label", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...skillSession, tools: [{ ...skill, plugin: "superpowers" }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ plugin: string }>("SELECT plugin FROM session_tool_use WHERE kind = 'skill'")).toEqual([
+			{ plugin: "superpowers" },
+		]);
+	});
+
+	it("does not re-enqueue over a stored entry the newer read no longer mentions", async () => {
+		// One-sided on purpose: the detail table is add-or-update with no DELETE, so a
+		// row the event dropped is not a difference this projection would resolve.
+		// Comparing sizes would re-project the session on every pass, forever, without
+		// ever removing the row.
+		const [skill] = skillSession.tools ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{
+				...skillSession,
+				tools: [
+					{
+						...skill,
+						calls: 2,
+						invocations: [
+							{ at: "2026-08-01T11:00:00.000Z", ok: true, entryPath: "tool" },
+							{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" },
+						],
+					},
+				],
+			},
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		// A compacted conversation: the older entry is gone from the transcript, and the
+		// count follows it down. `calls` moving is what makes this project once; the
+		// assertion that matters is that it settles instead of re-projecting forever.
+		vi.mocked(collectSessionEvents).mockResolvedValue([skillSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM skill_invocations")).toEqual([{ n: 2 }]);
 	});
 });
 

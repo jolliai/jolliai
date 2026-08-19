@@ -42,7 +42,7 @@ function requiredDist(plugin: string): string[] {
 	return block.split(/\s+/u).filter((entry) => entry.length > 0 && !entry.startsWith("#"));
 }
 
-const PLUGINS = ["claude-plugin", "codex-plugin"] as const;
+const PLUGINS = ["claude-plugin", "codex-plugin", "cursor-plugin"] as const;
 
 describe.each(PLUGINS)("%s publish inventory tracks the dashboard page", (plugin) => {
 	it("lists exactly DASHBOARD_SCRIPT_FILES, in the same order", () => {
@@ -79,7 +79,8 @@ describe.each(PLUGINS)("%s publish inventory tracks the dashboard page", (plugin
 // bootstrap + McpLauncher). Asserted directly so a fix applied to one lib and not
 // the other is a failure here rather than a plugin that publishes fine while its
 // sibling refuses.
-it("both plugin libs require the same dashboard assets", () => {
+it("all plugin libs require the same dashboard assets", () => {
 	const dashboardOnly = (plugin: string) => requiredDist(plugin).filter((e) => e.startsWith("dashboard-assets/"));
 	expect(dashboardOnly("codex-plugin")).toEqual(dashboardOnly("claude-plugin"));
+	expect(dashboardOnly("cursor-plugin")).toEqual(dashboardOnly("claude-plugin"));
 });

@@ -40,6 +40,7 @@ import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import type { SessionSourceDefinition } from "../core/sessions/SessionSourceDefinition.js";
 import { DAEMON_RESCAN_SOURCES, SESSION_SOURCES } from "../core/sessions/SessionSources.js";
+import { skillOutcomeConfidence } from "../core/skills/SkillOutcomeConfidence.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
 import type { ToolCallCount, TranscriptSource } from "../Types.js";
 import {
@@ -185,8 +186,42 @@ const CURSOR_SOT = "sot-import";
  * resolves the identity from the remote — so they carry a read receipt and would be
  * skipped by `isAlreadyCurrent` forever, having never once been reached by a sweep.
  * One un-skipped pass is what lets the widened scope see them.
+ *
+ * `6` — a full read now attributes TOKENS to each skill bucket, not just calls
+ * (`skillExtractor` runs `attributeSkillUsage` over the session plus its subagent
+ * files, and `session_tool_use` gained the four columns to hold the result). This is
+ * exactly the "a token field" case the paragraph above names: every session already
+ * stored carries call counts with NULL tokens, and its instant cannot move on its own
+ * once the conversation has stopped — so without this bump the columns would fill only
+ * for conversations that happen to speak again, and every historical skill would read
+ * as unattributable forever. Measured before the bump: a full recovery pass over a real
+ * database left 0 of 113 skill rows with tokens, because every session was skipped as
+ * already-current.
+ *
+ * `7` — a full read now records each skill entry INDIVIDUALLY into `skill_invocations`
+ * (its outcome, entry mechanism, arguments and injected body size), alongside the
+ * per-session aggregate that was already there. Structurally the same case as `6` one
+ * step further: every session already stored carries a call COUNT with no rows behind
+ * it, and a conversation that has stopped never moves its own instant again — so
+ * without this bump the detail table would fill only for sessions that happen to speak
+ * again, and every historical skill would have no per-entry record forever.
+ *
+ * Note this heals the DASHBOARD path only. The 30-second daemon re-scan tests this
+ * cursor for PRESENCE rather than equality (see `dbRescanSessions` phase 1), so a bump
+ * does not make it re-read history — deliberately, since an equality test there turned
+ * every bump into a machine-wide off switch for that pass. Historical detail therefore
+ * arrives on the next `jolli dashboard` run, not on the next tick.
+ *
+ * `8` — the per-entry rows of the one path that can report an OUTCOME now survive the
+ * merge. `mergeToolCalls` folds the tool extractor's bucket and the skill extractor's
+ * into one, and it did not carry `invocations` across: `parseToolUse` re-attributes a
+ * `Skill` call to `input.skill`, so both produce a bucket for such a skill, and the
+ * tool side — which runs first and has no per-entry list — won. Measured before the
+ * fix: 72 detail rows on a real database and NOT ONE with `ok_confidence = 'observed'`,
+ * because every observed entry arrives by the `Skill` tool. A generation-7 database has
+ * those sessions logged as current, so only a bump re-reads them.
  */
-const SESSION_READ_GENERATION = "5";
+const SESSION_READ_GENERATION = "8";
 
 /**
  * Content fingerprint of the summary index — the summaries cursor value.
@@ -988,20 +1023,54 @@ interface StoredModelRow {
 	readonly cost: number | null;
 }
 
-/** A `session_tool_use` row, in the shape {@link sameToolSet} compares. */
+/**
+ * A `session_tool_use` row, in the shape {@link sameToolSet} compares.
+ *
+ * The token fields are here because a re-read that differs ONLY in them is a real
+ * write — and one that this comparison silently threw away. Measured: after skill
+ * token attribution landed, a full recovery pass over a real database left 0 of 113
+ * skill rows with tokens, because every session's call counts were unchanged and the
+ * event was reported identical. A column the writer persists but this shape omits is
+ * a column that can never be back-filled.
+ */
 interface StoredToolRow {
 	readonly server: string | null;
 	readonly calls: number;
 	readonly lastCallAtMs: number | null;
+	readonly inputTokens: number | null;
+	readonly outputTokens: number | null;
+	readonly cachedTokens: number | null;
+	readonly usageConfidence: string | null;
+	readonly plugin: string | null;
 }
 
 /**
- * One session as it is currently stored: its own row plus ALL THREE child tables.
+ * A `skill_invocations` row, in the shape {@link sameSkillInvocations} compares.
+ *
+ * Here for exactly the reason the token fields are on {@link StoredToolRow}: this is
+ * a third child table the projection writes, so a re-read that differs only in it is
+ * a real write — and one this comparison would otherwise report as identical.
+ * Measured when the table shipped: a full pass over a real database left 0 rows in
+ * it, because every session's call counts were unchanged and the event was called
+ * identical. Same failure, one table further along.
+ */
+interface StoredInvocationRow {
+	readonly ok: number;
+	readonly okConfidence: string;
+	readonly detection: string | null;
+	readonly entryPath: string | null;
+	readonly args: string | null;
+	readonly bodyChars: number | null;
+}
+
+/**
+ * One session as it is currently stored: its own row plus ALL FOUR child tables.
  *
  * The child maps are keyed the way their table is keyed — `session_model_usage`
- * by `model`, `session_tool_use` by `(tool_name, kind)` — so a comparison that
- * walks them cannot accidentally merge two rows the schema keeps apart (a skill
- * and a builtin may share a name; see that table's DDL).
+ * by `model`, `session_tool_use` by `(tool_name, kind)`, `skill_invocations` by
+ * `(skill_name, at_ms)` — so a comparison that walks them cannot accidentally merge
+ * two rows the schema keeps apart (a skill and a builtin may share a name; see that
+ * table's DDL).
  *
  * `buckets` is a bare set because `session_activity` has no payload beyond its own
  * key: a `(session, bucket)` pair either exists or does not.
@@ -1011,11 +1080,17 @@ interface StoredSession {
 	readonly models: ReadonlyMap<string, StoredModelRow>;
 	readonly tools: ReadonlyMap<string, StoredToolRow>;
 	readonly buckets: ReadonlySet<number>;
+	readonly invocations: ReadonlyMap<string, StoredInvocationRow>;
 }
 
 /** `(tool_name, kind)` — the `session_tool_use` primary key, minus the session. */
 function toolKey(name: string, kind: string): string {
 	return `${name}\0${kind}`;
+}
+
+/** `(skill_name, at_ms)` — the `skill_invocations` primary key, minus the session. */
+function invocationKey(skill: string, atMs: number): string {
+	return `${skill}\0${atMs}`;
 }
 
 /** The session rows this repo already has, in the shape {@link unchangedSessionEvent} compares against. */
@@ -1032,7 +1107,7 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 	const sessions = new Map<string, StoredSession>(
 		rows.map((r) => [
 			`${r.source}\0${r.session_id}`,
-			{ row: r, models: new Map(), tools: new Map(), buckets: new Set<number>() },
+			{ row: r, models: new Map(), tools: new Map(), buckets: new Set<number>(), invocations: new Map() },
 		]),
 	);
 
@@ -1068,7 +1143,8 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 
 	const toolRows = db
 		.prepare(
-			`SELECT s.source, s.session_id, t.tool_name, t.kind, t.server, t.calls, t.last_call_at_ms
+			`SELECT s.source, s.session_id, t.tool_name, t.kind, t.server, t.calls, t.last_call_at_ms,
+			        t.input_tokens, t.output_tokens, t.cached_tokens, t.usage_confidence, t.plugin
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			   JOIN repos r    ON r.id = s.repo_id
@@ -1082,6 +1158,11 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 		server: string | null;
 		calls: number;
 		last_call_at_ms: number | null;
+		plugin: string | null;
+		input_tokens: number | null;
+		output_tokens: number | null;
+		cached_tokens: number | null;
+		usage_confidence: string | null;
 	}>;
 	for (const r of toolRows) {
 		const target = sessions.get(`${r.source}\0${r.session_id}`);
@@ -1089,6 +1170,44 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 			server: r.server,
 			calls: r.calls,
 			lastCallAtMs: r.last_call_at_ms,
+			inputTokens: r.input_tokens,
+			outputTokens: r.output_tokens,
+			cachedTokens: r.cached_tokens,
+			usageConfidence: r.usage_confidence,
+			plugin: r.plugin,
+		});
+	}
+
+	const invocationRows = db
+		.prepare(
+			`SELECT s.source, s.session_id, i.skill_name, i.at_ms, i.ok, i.ok_confidence,
+			        i.detection, i.entry_path, i.args, i.body_chars
+			   FROM skill_invocations i
+			   JOIN sessions s ON s.event_id = i.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{
+		source: string;
+		session_id: string;
+		skill_name: string;
+		at_ms: number;
+		ok: number;
+		ok_confidence: string;
+		detection: string | null;
+		entry_path: string | null;
+		args: string | null;
+		body_chars: number | null;
+	}>;
+	for (const r of invocationRows) {
+		const target = sessions.get(`${r.source}\0${r.session_id}`);
+		(target?.invocations as Map<string, StoredInvocationRow>)?.set(invocationKey(r.skill_name, r.at_ms), {
+			ok: r.ok,
+			okConfidence: r.ok_confidence,
+			detection: r.detection,
+			entryPath: r.entry_path,
+			args: r.args,
+			bodyChars: r.body_chars,
 		});
 	}
 
@@ -1193,18 +1312,16 @@ function sameModelSplit(models: ReadonlyArray<StatsModelUsage>, stored: Readonly
  *     they merge, with `calls` taking the later entry's value, `last_call_at_ms`
  *     taking the MAX, and `server` keeping the FIRST entry's value because the
  *     conflict clause does not update it.
- *  2. `last_call_at_ms` is written through `NULLIF(MAX(...), 0)`, so an entry
- *     with no instant does not necessarily store NULL.
+ *  2. The writer snapshots the old rows before replacing the set. It keeps the
+ *     greatest `last_call_at_ms`, and carries token attribution and plugin through
+ *     a sparse re-read that cannot recover them.
  *  3. `server` is nullable on both sides, and `undefined` on the event becomes
  *     NULL in the row.
  *
- * Only the FIRST of those needs an answer here, and the answer is to refuse
- * rather than to restate it: a repeated key is reported CHANGED, so the event
- * projects and the merge stays where it is written. Facts 2 and 3 then stop
- * being reachable subtleties — the projection deletes before inserting, so with
- * no repeat inside the event there is no conflicting row for the MAX to consult
- * and each entry stores its own value, NULL included. That is what makes plain
- * equality exact for every list this branch actually compares.
+ * The first is handled by refusing to fold here: a repeated key is reported
+ * CHANGED, so the event projects and the merge stays where it is written. The
+ * second requires asymmetric comparisons below: missing or older evidence is
+ * already equal when the writer would preserve the stored value.
  *
  * Counting entries against stored rows does NOT subsume that refusal, though it
  * looks like it should: a repeat collapses, so `[Bash, Bash]` is two entries and
@@ -1220,7 +1337,68 @@ function sameToolSet(tools: ReadonlyArray<ToolCallCount>, stored: ReadonlyMap<st
 		if (!row) return false;
 		if (row.calls !== tool.calls) return false;
 		if (row.server !== (tool.server ?? null)) return false;
-		if (row.lastCallAtMs !== (tool.lastCallAtMs ?? null)) return false;
+		if (tool.lastCallAtMs !== undefined && (row.lastCallAtMs === null || tool.lastCallAtMs > row.lastCallAtMs))
+			return false;
+		// Tokens too — see StoredToolRow for what omitting them cost. A stored NULL
+		// against a freshly attributed figure is exactly the case a generation bump
+		// exists to re-read, and reporting it unchanged here would discard the re-read
+		// after paying for it. An absent figure is no difference, though: the writer
+		// preserves the stored attribution instead of replacing it with NULL.
+		const usage = tool.usage;
+		if (usage?.input !== undefined && row.inputTokens !== usage.input) return false;
+		if (usage?.output !== undefined && row.outputTokens !== usage.output) return false;
+		if (usage?.cached !== undefined && row.cachedTokens !== usage.cached) return false;
+		if (usage?.confidence !== undefined && row.usageConfidence !== usage.confidence) return false;
+		// `plugin` is COALESCE'd by the writer, so only a PRESENT value can move the
+		// stored one — the same rule `SESSION_COALESCED_COLUMNS` applies to the session
+		// row. Comparing an absent one against a stored label would report a change the
+		// projection cannot make and re-project the session on every pass forever.
+		if (tool.plugin !== undefined && row.plugin !== tool.plugin) return false;
+	}
+	return true;
+}
+
+/**
+ * True when every entry row this event would write is already stored as it would
+ * write it.
+ *
+ * ONE-SIDED on purpose, unlike {@link sameToolSet}: `skill_invocations` is written
+ * add-or-update with no preceding DELETE (see its DDL), so a stored row the event no
+ * longer mentions — a conversation the agent compacted — is not a difference this
+ * projection would resolve. Comparing sizes would report it as changed on every pass
+ * and re-project that session forever without ever removing the row.
+ *
+ * Which fields are compared mirrors the writer's conflict clause rather than the
+ * table's columns: `ok` / `ok_confidence` / `detection` / `entry_path` are overwritten,
+ * so a difference in any of them is a real write, while `args` and `body_chars` are
+ * COALESCE'd and therefore only movable by a present value.
+ */
+function sameSkillInvocations(
+	tools: ReadonlyArray<ToolCallCount>,
+	source: string,
+	stored: ReadonlyMap<string, StoredInvocationRow>,
+): boolean {
+	for (const tool of tools) {
+		if (tool.kind !== "skill") continue;
+		for (const invocation of tool.invocations ?? []) {
+			const atMs = Date.parse(invocation.at);
+			// Skipped by the writer too — an unparseable instant cannot key a row.
+			if (!Number.isFinite(atMs)) continue;
+			const row = stored.get(invocationKey(tool.name, atMs));
+			if (!row) return false;
+			const incomingConfidence = skillOutcomeConfidence(source, invocation.entryPath, invocation.outcomeObserved);
+			// The writer keeps an observed result when a later scan only has an
+			// unresolved fragment. Mirror that one-way merge here or backfill would
+			// re-enqueue the same no-op on every pass.
+			if (row.okConfidence !== "observed" || incomingConfidence === "observed") {
+				if (row.ok !== (invocation.ok ? 1 : 0)) return false;
+				if (row.okConfidence !== incomingConfidence) return false;
+			}
+			if (row.detection !== (tool.detection ?? null)) return false;
+			if (row.entryPath !== (invocation.entryPath ?? null)) return false;
+			if (invocation.args !== undefined && row.args !== invocation.args) return false;
+			if (invocation.bodyChars !== undefined && row.bodyChars !== invocation.bodyChars) return false;
+		}
 	}
 	return true;
 }
@@ -1309,6 +1487,11 @@ function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSessio
 	// agent but Claude — reaches that return, so gating this behind it would mean their
 	// presence never reached the table.
 	if (event.activityBuckets?.some((bucket) => !stored.buckets.has(bucket))) return false;
+	// The fourth child table, under the same replace-when-observed guard. Omitting it
+	// left the table permanently empty when it shipped — the projection re-read every
+	// transcript and this function threw the result away, which is the same trap the
+	// token fields on `StoredToolRow` document.
+	if (event.tools !== undefined && !sameSkillInvocations(event.tools, event.source, stored.invocations)) return false;
 
 	const sum = (read: (m: StatsModelUsage) => number): number => models.reduce((total, m) => total + read(m), 0);
 	// `COALESCE`d, so only a non-null derived value can move it — but compared

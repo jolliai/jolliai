@@ -40,6 +40,9 @@ import {
 	SESSION_ACTIVITY_DDL,
 	SESSION_USAGE_EVENTS_DDL,
 	SKILL_CONTEXT_KIND_DDL,
+	SKILL_INVOCATIONS_DDL,
+	SKILL_PLUGIN_DDL,
+	SKILL_TOKEN_USAGE_DDL,
 	STATS_DAILY_DAY_INDEX_DDL,
 	STATS_DAILY_DDL,
 	SYNC_KEYSET_INDEX_DDL,
@@ -126,7 +129,7 @@ const log = createLogger("DashboardDb");
  * user's database (other processes may hold the file open, and the memory half
  * is the only copy there is).
  */
-export const DASHBOARD_SCHEMA_VERSION = 9;
+export const DASHBOARD_SCHEMA_VERSION = 12;
 
 /**
  * NOTE ON COMPATIBILITY, because its absence here is a decision.
@@ -420,6 +423,9 @@ BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); E
 			SYNC_STAMP_NULL_BACKFILL_DDL,
 	},
 	{ name: "SESSION_ACTIVITY_DDL", ddl: SESSION_ACTIVITY_DDL },
+	{ name: "SKILL_TOKEN_USAGE_DDL", ddl: SKILL_TOKEN_USAGE_DDL },
+	{ name: "SKILL_INVOCATIONS_DDL", ddl: SKILL_INVOCATIONS_DDL },
+	{ name: "SKILL_PLUGIN_DDL", ddl: SKILL_PLUGIN_DDL },
 ];
 
 /** Reads the stored schema version, treating a fresh DB as 0. */

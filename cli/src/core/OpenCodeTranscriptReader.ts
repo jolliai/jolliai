@@ -19,6 +19,9 @@
 import { createLogger } from "../Logger.js";
 import type { ToolCallCount, TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
 import { withSqliteDb } from "./SqliteHelpers.js";
+import { mergeToolCalls } from "./sessions/SessionSignalExtractor.js";
+import { type OpenCodeRow, scanOpenCodeSkillRows } from "./skills/OpenCodeSkillScanner.js";
+import { skillUseToToolCall } from "./skills/SkillToolCall.js";
 import { builtinTool, skillTool, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
@@ -56,68 +59,91 @@ export async function readOpenCodeTranscript(
 	const tally = new ToolUseTally();
 
 	try {
-		const { rawEntries, totalMessages, lastConsumedIndex } = await withSqliteDb(dbPath, (db) => {
-			// Query messages with their parts via JOIN
-			const rows = db
-				.prepare(
-					`SELECT m.id as msg_id, m.data as msg_data, m.time_created,
-					        p.data as part_data
+		const { rawEntries, totalMessages, lastConsumedIndex, partRows, messageRows } = await withSqliteDb(
+			dbPath,
+			(db) => {
+				// Query messages with their parts via JOIN
+				const rows = db
+					.prepare(
+						`SELECT m.id as msg_id, m.data as msg_data, m.time_created,
+					        p.id as part_id, p.time_created as part_time_created, p.data as part_data
 					 FROM message m
 					 LEFT JOIN part p ON p.message_id = m.id
 					 WHERE m.session_id = :sessionId
 					 ORDER BY m.time_created ASC, p.time_created ASC`,
-				)
-				.all({ sessionId }) as ReadonlyArray<{
-				msg_id: string;
-				msg_data: string;
-				time_created: number;
-				part_data: string | null;
-			}>;
+					)
+					.all({ sessionId }) as ReadonlyArray<{
+					msg_id: string;
+					msg_data: string;
+					time_created: number;
+					part_id: string | null;
+					part_time_created: number | null;
+					part_data: string | null;
+				}>;
 
-			// Group rows by message ID
-			const messageMap = new Map<string, { msgData: string; timeCreated: number; parts: string[] }>();
-			const messageOrder: string[] = [];
+				// Group rows by message ID
+				const messageMap = new Map<
+					string,
+					{ id: string; msgData: string; timeCreated: number; parts: OpenCodeRow[] }
+				>();
+				const messageOrder: string[] = [];
 
-			for (const row of rows) {
-				if (!messageMap.has(row.msg_id)) {
-					messageMap.set(row.msg_id, { msgData: row.msg_data, timeCreated: row.time_created, parts: [] });
-					messageOrder.push(row.msg_id);
+				for (const row of rows) {
+					if (!messageMap.has(row.msg_id)) {
+						messageMap.set(row.msg_id, {
+							id: row.msg_id,
+							msgData: row.msg_data,
+							timeCreated: row.time_created,
+							parts: [],
+						});
+						messageOrder.push(row.msg_id);
+					}
+
+					if (row.part_id !== null && row.part_time_created !== null && row.part_data !== null) {
+						messageMap.get(row.msg_id)?.parts.push({
+							id: row.part_id,
+							timeCreated: row.part_time_created,
+							data: row.part_data,
+						});
+					}
 				}
 
-				if (row.part_data) {
-					messageMap.get(row.msg_id)?.parts.push(row.part_data);
+				// Skip already-processed messages (cursor-based incremental read)
+				const newMessageIds = messageOrder.slice(startIndex);
+				const rawEntries: TranscriptEntry[] = [];
+				const partRows: OpenCodeRow[] = [];
+				const messageRows: OpenCodeRow[] = [];
+				let lastConsumedIndex = startIndex;
+
+				for (let i = 0; i < newMessageIds.length; i++) {
+					const msg = messageMap.get(newMessageIds[i]) as {
+						id: string;
+						msgData: string;
+						timeCreated: number;
+						parts: OpenCodeRow[];
+					};
+
+					// If a time cutoff is specified, stop consuming when we hit messages after it
+					if (cutoffTime && msg.timeCreated > cutoffTime) {
+						break;
+					}
+
+					const partData = msg.parts.map((part) => part.data);
+					const entry = parseOpenCodeMessage(msg.msgData, partData, msg.timeCreated);
+					if (entry) {
+						rawEntries.push(entry);
+					}
+					// Independent of `entry`: an assistant message whose only parts are
+					// tool calls yields no text entry but is real agent activity.
+					tallyOpenCodeToolParts(tally, partData);
+					partRows.push(...msg.parts);
+					messageRows.push({ id: msg.id, timeCreated: msg.timeCreated, data: msg.msgData });
+					lastConsumedIndex = startIndex + i + 1;
 				}
-			}
 
-			// Skip already-processed messages (cursor-based incremental read)
-			const newMessageIds = messageOrder.slice(startIndex);
-			const rawEntries: TranscriptEntry[] = [];
-			let lastConsumedIndex = startIndex;
-
-			for (let i = 0; i < newMessageIds.length; i++) {
-				const msg = messageMap.get(newMessageIds[i]) as {
-					msgData: string;
-					timeCreated: number;
-					parts: string[];
-				};
-
-				// If a time cutoff is specified, stop consuming when we hit messages after it
-				if (cutoffTime && msg.timeCreated > cutoffTime) {
-					break;
-				}
-
-				const entry = parseOpenCodeMessage(msg.msgData, msg.parts, msg.timeCreated);
-				if (entry) {
-					rawEntries.push(entry);
-				}
-				// Independent of `entry`: an assistant message whose only parts are
-				// tool calls yields no text entry but is real agent activity.
-				tallyOpenCodeToolParts(tally, msg.parts);
-				lastConsumedIndex = startIndex + i + 1;
-			}
-
-			return { rawEntries, totalMessages: messageOrder.length, lastConsumedIndex };
-		});
+				return { rawEntries, totalMessages: messageOrder.length, lastConsumedIndex, partRows, messageRows };
+			},
+		);
 
 		const entries = mergeConsecutiveEntries(rawEntries);
 
@@ -139,9 +165,18 @@ export async function readOpenCodeTranscript(
 			newCursor.lineNumber,
 		);
 
+		// The ordinary tally supplies every builtin plus the aggregate skill count.
+		// The row scanner enriches those same skill buckets with per-entry outcomes,
+		// body size and interval-attributed spend. `mergeToolCalls` takes the maximum
+		// count, so the two views of one set are never added together.
+		const skillTools = scanOpenCodeSkillRows(partRows, messageRows).uses.map((use) =>
+			skillUseToToolCall(use, use.usage),
+		);
+		const toolUse = mergeToolCalls([tally.values(), skillTools]);
+
 		// Always present, even when empty — see TOOL_RECORDING_SOURCES for why an
 		// empty array and an absent field mean opposite things.
-		return { entries, newCursor, totalLinesRead, toolUse: tally.values() };
+		return { entries, newCursor, totalLinesRead, toolUse };
 	} catch (error: unknown) {
 		throwTranscriptReadError(log, `Cannot read OpenCode session: ${sessionId}`, error);
 	}

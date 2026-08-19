@@ -125,13 +125,8 @@ export async function scanSkillsFrom(
 	const { uses, lastLine } = scanner.scan(lines, fromLine);
 	const all = [...uses];
 
-	const subagentGroups: string[][] = [];
-	for (const subagentPath of await subagentTranscripts(transcriptPath)) {
-		const subagentLines = await readLines(subagentPath);
-		if (subagentLines === undefined) continue;
-		subagentGroups.push(subagentLines);
-		all.push(...scanner.scan(subagentLines, 0).uses);
-	}
+	const subagentGroups = await readSubagentLineGroups(transcriptPath);
+	for (const subagentLines of subagentGroups) all.push(...scanner.scan(subagentLines, 0).uses);
 
 	// Attribution reads from line 0 regardless of the scan cursor: a skill's spend is
 	// a property of the whole session, not of the slice discovered in this pass. Its
@@ -179,6 +174,29 @@ export async function scanSkillsFrom(
 function sessionStemFor(source: SkillSource, transcriptPath: string): string {
 	if (source === "kimi") return basename(dirname(dirname(dirname(transcriptPath))));
 	return basename(transcriptPath).replace(/\.jsonl$/, "");
+}
+
+/**
+ * Every subagent transcript's lines for one session file, unreadable files skipped.
+ *
+ * Exported because attribution needs the SAME groups the scan above walks, and a
+ * second caller deriving them another way is how the two would drift: a subagent's
+ * `attributionSkill` is inherited from its parent and never updated (see the module
+ * header), so a caller that attributes over the session file alone silently loses
+ * whatever a subagent spent. The dashboard's `skillExtractor` is that second caller.
+ *
+ * Returns `[]` for a session with no subagents, which is the common case — distinct
+ * from a file that could not be read, which is dropped from the groups rather than
+ * represented, since attribution over a partial group is still correct for the lines
+ * it did get.
+ */
+export async function readSubagentLineGroups(transcriptPath: string): Promise<string[][]> {
+	const groups: string[][] = [];
+	for (const subagentPath of await subagentTranscripts(transcriptPath)) {
+		const subagentLines = await readLines(subagentPath);
+		if (subagentLines !== undefined) groups.push(subagentLines);
+	}
+	return groups;
 }
 
 /** Read a transcript's lines, or undefined when it cannot be read. */

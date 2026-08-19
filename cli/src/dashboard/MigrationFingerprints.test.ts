@@ -55,6 +55,9 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// the first release.
 	["SESSION_STATS_SYNC_DDL", "e0c166639049"],
 	["SESSION_ACTIVITY_DDL", "67be18551dae"],
+	["SKILL_TOKEN_USAGE_DDL", "7956cb682d2e"],
+	["SKILL_INVOCATIONS_DDL", "c81c934c4192"],
+	["SKILL_PLUGIN_DDL", "f34c01168b54"],
 ];
 
 describe("migration fingerprints", () => {

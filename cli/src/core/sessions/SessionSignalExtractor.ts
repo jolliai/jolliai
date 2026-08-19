@@ -164,6 +164,28 @@ export function mergeToolCalls(groups: ReadonlyArray<ReadonlyArray<ToolCallCount
 				continue;
 			}
 			const lastCallAtMs = Math.max(seen.lastCallAtMs ?? 0, call.lastCallAtMs ?? 0);
+			const usage = seen.usage ?? call.usage;
+			/**
+			 * The LONGER list wins, which is not the `usage` rule and deliberately so.
+			 *
+			 * Only the skill extractor produces invocations today, but it is also the only
+			 * one that can see the slash-command path — there is no `SlashCommand` tool for a
+			 * tool-call reader to find. So a tool-side list would be a SUBSET of this one
+			 * rather than a second opinion, and `seen ?? call` would silently prefer it:
+			 * `SESSION_SIGNAL_EXTRACTORS` runs the tool extractor FIRST, so `seen` is its
+			 * bucket for every skill entered by the `Skill` tool.
+			 *
+			 * That is not hypothetical — it shipped. `parseToolUse` re-attributes a `Skill`
+			 * call to `input.skill`, so both extractors produce a bucket for such a skill, the
+			 * spread below took the tool side's, and every entry of the one path that CAN
+			 * report an outcome lost its per-entry record on the way to the database.
+			 */
+			const invocations =
+				(call.invocations?.length ?? 0) > (seen.invocations?.length ?? 0) ? call.invocations : seen.invocations;
+			/* Same "either side carries it" rule as `usage`: only the skill extractor
+			   resolves a namespace or marks an inference, so at most one side has a value. */
+			const detection = seen.detection ?? call.detection;
+			const plugin = seen.plugin ?? call.plugin;
 			merged.set(key, {
 				...seen,
 				// `server` rides along from whichever side has it: only MCP buckets carry
@@ -171,6 +193,16 @@ export function mergeToolCalls(groups: ReadonlyArray<ReadonlyArray<ToolCallCount
 				...((seen.server ?? call.server) ? { server: seen.server ?? call.server } : {}),
 				calls: Math.max(seen.calls, call.calls),
 				...(lastCallAtMs > 0 ? { lastCallAtMs } : {}),
+				// Same rule as `server`, and for the same reason rather than by analogy:
+				// only the skill extractor attributes tokens, so at most one side carries
+				// a value. Were both to carry one they would be the same attribution over
+				// the same records — these are two VIEWS of one set, per the note on
+				// `calls` — so taking either is taking the one answer, never picking a
+				// winner between two measurements.
+				...(usage !== undefined ? { usage } : {}),
+				...(invocations !== undefined ? { invocations } : {}),
+				...(detection !== undefined ? { detection } : {}),
+				...(plugin !== undefined ? { plugin } : {}),
 			});
 		}
 	}

@@ -126,7 +126,11 @@ describe("scanOpenCodeSkillRows", () => {
 		// dropping it, and an absent output means no body size rather than a zero one.
 		const sparse = '{"type":"tool","tool":"skill","state":{"status":"completed","metadata":{"name":"jolli"}}}';
 		const { uses } = scanOpenCodeSkillRows([part(sparse, 1785216878468)], []);
-		expect(uses[0].invocations[0]).toEqual({ at: new Date(1785216878468).toISOString(), ok: true });
+		expect(uses[0].invocations[0]).toEqual({
+			at: new Date(1785216878468).toISOString(),
+			ok: true,
+			entryPath: "tool",
+		});
 	});
 
 	it("orders invocations newest-first however the rows arrive", () => {

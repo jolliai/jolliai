@@ -39,7 +39,13 @@ describe("sessionDirBelongsToRepo", () => {
 		expect(sessionDirBelongsToRepo("/nonexistent/repo/sub/dir", "/nonexistent/repo")).toBe(true);
 	});
 
-	describe("nested git repo / submodule exclusion (real filesystem)", () => {
+	// Every `.git` in this block is hand-built and git itself would refuse all of
+	// them (no HEAD, or a pointer to a directory that does not exist), so
+	// `readRepositoryKey` declines and these cases exercise the path-shaped
+	// FALLBACK. That is deliberate — the fallback is what an unreadable repository
+	// gets, and it must keep behaving as it always did. The primary path, where git
+	// answers, is pinned in `SessionDirMatch.realgit.test.ts`.
+	describe("nested git repo / submodule exclusion (unreadable-.git fallback)", () => {
 		let root: string;
 
 		beforeEach(async () => {
@@ -79,22 +85,32 @@ describe("sessionDirBelongsToRepo", () => {
 			expect(sessionDirBelongsToRepo(sub, root)).toBe(true);
 		});
 
-		// A linked worktree (`git worktree add .worktrees/foo`) has a `.git` FILE at
-		// its root. Excluding its sessions from a PARENT/sibling worktree's scan is
-		// intentional, not a gap (P2): the worktree is its own working context on its
-		// own branch and captures its sessions via its OWN post-commit (next test).
-		it("excludes a linked-worktree session from a parent worktree's scan (.git file at worktree root)", async () => {
+		// The next two cases pin the FALLBACK, not the product rule.
+		//
+		// Every fixture in this describe block builds a `.git` that git itself would
+		// reject — an empty directory, or a pointer file naming a directory that does
+		// not exist — so `readRepositoryKey` declines for both sides and
+		// `sessionDirBelongsToRepo` runs its path-shaped fallback. That is worth
+		// pinning (an unreadable repository must behave as it always did), but it is
+		// NOT what a real linked worktree does: see `SessionDirMatch.realgit.test.ts`,
+		// where a genuine `git worktree add` is attributed to its repository.
+		//
+		// The previous version of these two cases claimed the exclusion was deliberate,
+		// because such a worktree would "capture its sessions via its OWN post-commit"
+		// with its own root as `repoRoot`. That premise was false: `registerRepo`
+		// resolves every cwd through `getProjectRootDir`, so a linked worktree's path is
+		// never recorded and never becomes a `repoRoot`.
+		it("falls back to excluding an unreadable nested worktree from a parent's scan", async () => {
 			await mkdir(join(root, ".git"), { recursive: true });
 			const worktree = join(root, ".worktrees", "foo");
 			const worktreeSub = join(worktree, "packages", "bar");
 			await mkdir(worktreeSub, { recursive: true });
-			// The linked worktree's root carries a `.git` FILE pointing into the main repo.
+			// A `.git` FILE whose target does not exist — the layout reader declines.
 			await writeFile(join(worktree, ".git"), "gitdir: ../../.git/worktrees/foo\n");
-			// Scanned against the PARENT repo root: the intervening `.git` file excludes it.
 			expect(sessionDirBelongsToRepo(worktreeSub, root)).toBe(false);
 		});
 
-		it("keeps that same linked-worktree session when scanned against the worktree's own root", async () => {
+		it("falls back to keeping that session when scanned against the worktree's own root", async () => {
 			const worktree = join(root, ".worktrees", "foo");
 			const worktreeSub = join(worktree, "packages", "bar");
 			await mkdir(worktreeSub, { recursive: true });

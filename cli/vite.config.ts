@@ -167,6 +167,7 @@ const SLOW_TEST_FILES = [
 	"src/core/repair/GitReachability.realgit.test.ts",
 	"src/core/repair/ReflogPairing.realgit.test.ts",
 	"src/core/RepoProfile.test.ts",
+	"src/core/SessionDirMatch.realgit.test.ts",
 	"src/core/SpaceBindingCache.test.ts",
 	"src/daemon/DaemonServer.test.ts",
 	// The dashboard/cutover six. Added later than the rest and easy to miss why

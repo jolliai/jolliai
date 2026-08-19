@@ -3188,6 +3188,167 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("mergeToolCallSlice", () => {
+		const invocation = (at: string, ok = true) => ({
+			at,
+			ok,
+			entryPath: "tool" as const,
+			outcomeObserved: true,
+		});
+
+		it("adds every enrichment from disjoint slices and keeps conservative confidence", () => {
+			const claims = new Set<string>();
+			const first = __test__.mergeToolCallSlice(
+				undefined,
+				{
+					name: "review",
+					kind: "skill",
+					calls: 1,
+					lastCallAtMs: 1_000,
+					usage: { input: 1, output: 2, cached: 3, confidence: "attributed" },
+					invocations: [invocation("2026-08-01T10:00:00.000Z")],
+					plugin: "team-a",
+				},
+				claims,
+			);
+			const merged = __test__.mergeToolCallSlice(
+				first,
+				{
+					name: "review",
+					kind: "skill",
+					calls: 2,
+					lastCallAtMs: 2_000,
+					usage: { input: 10, output: 20, cached: 30, confidence: "estimated" },
+					invocations: [invocation("2026-08-01T11:00:00.000Z", false)],
+					detection: "heuristic",
+					plugin: "team-a",
+				},
+				claims,
+			);
+
+			expect(merged).toEqual({
+				name: "review",
+				kind: "skill",
+				calls: 3,
+				lastCallAtMs: 2_000,
+				usage: { input: 11, output: 22, cached: 33, confidence: "estimated" },
+				invocations: [invocation("2026-08-01T11:00:00.000Z", false), invocation("2026-08-01T10:00:00.000Z")],
+				detection: "heuristic",
+				plugin: "team-a",
+			});
+		});
+
+		it("keeps enrichment when a later slice only carries a count", () => {
+			const claims = new Set<string>();
+			const first = __test__.mergeToolCallSlice(
+				undefined,
+				{
+					name: "review",
+					kind: "skill",
+					calls: 1,
+					lastCallAtMs: 1_000,
+					usage: { input: 1, output: 2, cached: 3, confidence: "attributed" },
+					invocations: [invocation("2026-08-01T10:00:00.000Z")],
+					detection: "heuristic",
+					plugin: "team-a",
+				},
+				claims,
+			);
+			const merged = __test__.mergeToolCallSlice(first, { name: "review", kind: "skill", calls: 2 }, claims);
+
+			expect(merged).toMatchObject({
+				calls: 3,
+				lastCallAtMs: 1_000,
+				usage: { input: 1, output: 2, cached: 3, confidence: "attributed" },
+				invocations: [invocation("2026-08-01T10:00:00.000Z")],
+				detection: "heuristic",
+				plugin: "team-a",
+			});
+		});
+
+		it("keeps a plugin conflict omitted when a later slice repeats the first claimant", () => {
+			const claims = new Set<string>();
+			let merged = __test__.mergeToolCallSlice(
+				undefined,
+				{ name: "review", kind: "skill", calls: 1, plugin: "team-a" },
+				claims,
+			);
+			merged = __test__.mergeToolCallSlice(
+				merged,
+				{ name: "review", kind: "skill", calls: 1, plugin: "team-b" },
+				claims,
+			);
+			expect(merged).not.toHaveProperty("plugin");
+
+			merged = __test__.mergeToolCallSlice(
+				merged,
+				{ name: "review", kind: "skill", calls: 1, plugin: "team-a" },
+				claims,
+			);
+			expect(merged.calls).toBe(3);
+			expect(merged).not.toHaveProperty("plugin");
+		});
+	});
+
+	describe("readAllTranscripts — repeated conversation slices", () => {
+		it("persists all skill details from every slice in the shared bucket", async () => {
+			const firstAt = "2026-08-01T10:00:00.000Z";
+			const secondAt = "2026-08-01T11:00:00.000Z";
+			vi.mocked(readTranscript).mockImplementation(async (transcriptPath: string) => {
+				const second = transcriptPath.endsWith("slice-b.jsonl");
+				return {
+					entries: [{ role: "human" as const, content: second ? "second" : "first", timestamp: secondAt }],
+					newCursor: { transcriptPath, lineNumber: 1, updatedAt: secondAt },
+					totalLinesRead: 1,
+					toolUse: [
+						{
+							name: "review",
+							kind: "skill" as const,
+							calls: second ? 2 : 1,
+							lastCallAtMs: second ? 2_000 : 1_000,
+							usage: second
+								? { input: 10, output: 20, cached: 30, confidence: "attributed" as const }
+								: { input: 1, output: 2, cached: 3, confidence: "attributed" as const },
+							invocations: [
+								{
+									at: second ? secondAt : firstAt,
+									ok: !second,
+									outcomeObserved: true,
+									entryPath: "tool" as const,
+								},
+							],
+							...(second ? { detection: "heuristic" as const, plugin: "team-a" } : {}),
+						},
+					],
+				};
+			});
+
+			const result = await __test__.readAllTranscripts(
+				[
+					{ sessionId: "same", transcriptPath: "/tmp/slice-a.jsonl", source: "claude" },
+					{ sessionId: "same", transcriptPath: "/tmp/slice-b.jsonl", source: "claude" },
+				],
+				"/repo",
+			);
+			const tool = result.perSessionTokens.get("claude:same")?.byTool?.get("skill:review");
+
+			expect(tool).toEqual({
+				name: "review",
+				kind: "skill",
+				calls: 3,
+				lastCallAtMs: 2_000,
+				usage: { input: 11, output: 22, cached: 33, confidence: "attributed" },
+				invocations: [
+					{ at: secondAt, ok: false, outcomeObserved: true, entryPath: "tool" },
+					{ at: firstAt, ok: true, outcomeObserved: true, entryPath: "tool" },
+				],
+				detection: "heuristic",
+				plugin: "team-a",
+			});
+			expect(result.sessionTranscripts).toHaveLength(2);
+		});
+	});
+
 	describe("attachPerSessionUsage", () => {
 		const bucket = (input: number, output: number, cached: number) => ({
 			tokens: input + output + cached,

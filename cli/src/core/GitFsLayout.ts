@@ -45,6 +45,7 @@
 
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
+import { normalizePathForCompare } from "./PathUtils.js";
 
 /** Resolved absolute paths for one worktree. */
 export interface GitFsLayout {
@@ -67,6 +68,14 @@ const GIT_LOCATION_ENV_VARS = ["GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"] as 
 function gitLocationIsOverridden(env: NodeJS.ProcessEnv): boolean {
 	return GIT_LOCATION_ENV_VARS.some((name) => (env[name] ?? "") !== "");
 }
+
+/**
+ * An env carrying none of the location vars, for the one question that must be
+ * answered about `cwd` itself rather than about whatever git was pointed at. Used
+ * by {@link readRepositoryKey}; see its docstring for why that is correct there
+ * and nowhere else so far.
+ */
+const LOCATION_FREE_ENV: NodeJS.ProcessEnv = {};
 
 function readTextOrNull(path: string): string | null {
 	try {
@@ -215,6 +224,68 @@ export function resolveGitFsLayout(startDir: string, options: GitFsLayoutOptions
 		if (parent === dir) return null;
 		dir = parent;
 	}
+}
+
+/**
+ * A key identifying the REPOSITORY `dir` belongs to, or null when that cannot be
+ * read off the filesystem.
+ *
+ * The key is the shared git directory, which every worktree of one repository
+ * reports identically — so two directories belong to the same repository exactly
+ * when their keys are equal. That is the question a path comparison can only
+ * approximate, and it approximates it wrong in both directions: a linked worktree
+ * normally lives OUTSIDE the main worktree (so containment says no when the answer
+ * is yes), while a nested clone or submodule lives INSIDE it (so containment says
+ * yes when the answer is no).
+ *
+ * `realpath: true` is load-bearing, and it is the OPPOSITE of what
+ * {@link file://./RepoProfile.ts} passes. That module anchors `profile.json` and
+ * needs a path that never moves, so resolving symlinks there would relocate a
+ * user's opt-out. This function only ever compares two keys, so leaving symlinks
+ * unresolved is what would break it: on macOS `/tmp` and `/private/tmp` are one
+ * directory, and two spellings of one repository would compare as different —
+ * silently, since "different repositories" is also a valid answer.
+ *
+ * Null means "ask something else", NEVER "different repositories". The layout
+ * reader declines for a `.git` git itself would refuse and for a directory that
+ * no longer exists — so every caller keeps its own fallback. See the module
+ * docstring.
+ *
+ * ## Why this passes an EMPTY env, which the module otherwise refuses to do
+ *
+ * `resolveGitFsLayout` declines outright when `GIT_DIR` / `GIT_WORK_TREE` /
+ * `GIT_COMMON_DIR` are set, because its contract is to agree with the `git`
+ * command it replaces — and those vars make `git` answer for the repository they
+ * name instead of the one containing `cwd`. That contract is right for its other
+ * callers and WRONG for this question. Here the whole point is which repository
+ * CONTAINS `dir`, so the ambient vars are noise to be ignored, not honoured:
+ * `GitOps.resolveContainingRepoCommonDir` reaches the same conclusion from the
+ * subprocess side and deletes them before spawning, for the measured reason that
+ * a sibling repo otherwise resolves to the current repo's `.git`.
+ *
+ * Skipping the guard is what makes this work where it matters most. git exports
+ * those vars to every hook, and a detached child inherits them — so the
+ * QueueWorker and the global daemon both run with `GIT_DIR` set. Honouring the
+ * guard there would return null on exactly those paths and leave every caller on
+ * its fallback, i.e. fix nothing in the processes that do the collecting.
+ *
+ * A side effect worth having: the answer no longer depends on `process.env` at
+ * all, so it is the same in a hook, in a terminal and under test.
+ */
+export function readRepositoryKey(dir: string): string | null {
+	// A path THIS platform does not read as absolute is refused outright, and that is
+	// not defensive tidiness: `resolveGitFsLayout` starts with `resolve(dir)`, which
+	// anchors a relative-looking path to the process cwd and then walks UP from
+	// there — so it would answer confidently about whichever repository the current
+	// process happens to be running in, for a directory that was never named. The
+	// real input for this is a foreign-platform absolute path: `E:\project` recorded
+	// by a session under WSL or synced from another machine is not absolute on POSIX,
+	// and two such paths differing only in drive-letter case would both resolve into
+	// the running repository and compare EQUAL. Null hands them to the caller's
+	// fallback, where a plain path comparison gets them right.
+	if (!dir || !isAbsolute(dir)) return null;
+	const commonDir = resolveGitFsLayout(dir, { realpath: true, env: LOCATION_FREE_ENV })?.commonDir;
+	return commonDir ? normalizePathForCompare(commonDir) : null;
 }
 
 /**

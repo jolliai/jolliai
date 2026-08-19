@@ -22,7 +22,7 @@ import { collectDisplayTopics } from "../core/SummaryTree.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
 import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
-import type { CommitSummary } from "../Types.js";
+import type { CommitSummary, SkillEntryPath } from "../Types.js";
 import { ACTIVITY_BUCKET_MS } from "./ActivityBuckets.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import type {
@@ -49,6 +49,8 @@ import type {
 	RepoOption,
 	SeriesDimension,
 	SettingsPageModel,
+	SkillDayPoint,
+	SkillDetail,
 	StandupCommit,
 	StandupInsight,
 	StandupModel,
@@ -61,6 +63,7 @@ import type {
 	ToolUsageList,
 	ToolUsagePage,
 	ToolUsageRow,
+	ToolUsageTokens,
 } from "./DashboardModel.js";
 import {
 	commitCategoryLabels,
@@ -988,7 +991,7 @@ function buildStats(
 		range: window.range,
 		rangeFrom: window.from,
 		rangeTo: window.to,
-		toolUsage: buildToolUsage(db, scope, window),
+		toolUsage: buildToolUsage(db, scope, window, timeZone),
 		...(concurrency !== undefined ? { concurrency } : {}),
 		...(pricesAsOf ? { pricesAsOf } : {}),
 		...(memoriesCreated !== undefined ? { memoriesCreated } : {}),
@@ -1702,6 +1705,39 @@ function toolNameRowsPage(
 	limit: number,
 ): ToolUsageRow[] {
 	const kind = TOOL_LIST_KIND[list];
+	// Whether ANY entry behind a row was inferred from a file read — the list-row half
+	// of `ToolUsageRow.detection`, in the shape `any_estimated` below already uses.
+	//
+	// A CORRELATED SUBQUERY, never a join to `skill_invocations`. That table holds one
+	// row per invocation while this one holds one per (session, skill), so joining it
+	// fans every SUM out by the number of entries behind each row. Measured against a
+	// real database by running both forms side by side: `align-command-behavior` came
+	// back as 7 calls instead of 5, `clear-worktree` and `frontend-design` as 5 instead
+	// of 3. The three token sums inflate the same way.
+	//
+	// WHAT MAKES IT HIDE is that only half the row moves. `sessions` is a
+	// COUNT(DISTINCT), so it is immune and stays correct — the row reads as a plausible
+	// "3 sessions, 5 runs" rather than as anything obviously broken, and nothing errors.
+	// It also will not reproduce on every machine: Codex CLI writes one entry per session
+	// by design, so a Codex-dominated database has 1:1 rows and shows no inflation at all
+	// (both forms agreed on `jolli-search` and `jolli-recall` there). The pairs above had
+	// two entries each, which is the ordinary case for a host with a real skill tool.
+	//
+	// GATED ON `list`, and the gate is load-bearing rather than an optimisation:
+	// `skill_invocations` has no `kind` column (it only ever holds skills), so for the
+	// MCP list an `exec` tool that happens to share a name with an `exec` skill would
+	// match and be marked inferred. The two lists are separated by `t.kind`, which the
+	// subquery cannot see. `plugin` above gets away with no such guard because nothing
+	// WRITES it for an MCP row; an EXISTS has no equivalent protection.
+	const inferredExpr =
+		list === "skill"
+			? `MAX(CASE WHEN EXISTS (
+			                SELECT 1 FROM skill_invocations i
+			                 WHERE i.session_event_id = t.session_event_id
+			                   AND i.skill_name = t.tool_name
+			                   AND i.detection = 'heuristic'
+			              ) THEN 1 ELSE 0 END)`
+			: "0";
 	const rows = db
 		.prepare(
 			// Grouped by name alone: the kind is already pinned by the WHERE, so this
@@ -1710,7 +1746,27 @@ function toolNameRowsPage(
 			// its per-source counts (a session has exactly one source).
 			`SELECT ${TOOL_LIST_KEY[list]} AS tool_name,
 			        COUNT(DISTINCT t.session_event_id) AS session_count,
-			        COALESCE(SUM(t.calls), 0) AS call_count
+			        COALESCE(SUM(t.calls), 0) AS call_count,
+			        SUM(t.input_tokens) AS input_tokens,
+			        SUM(t.output_tokens) AS output_tokens,
+			        SUM(t.cached_tokens) AS cached_tokens,
+			        -- The coverage denominator's numerator: how many of this row's
+			        -- sessions carry figures at all. Counted rather than derived from a
+			        -- NULL sum, because SUM() over a mix of NULLs and numbers answers
+			        -- with the numbers and says nothing about how many were missing.
+			        COUNT(DISTINCT CASE WHEN t.input_tokens IS NOT NULL
+			                            THEN t.session_event_id END) AS usage_sessions,
+			        -- One estimated contributor makes the whole sum an estimate, the
+			        -- same rule buildSkillsSummaryLabel applies. MAX over a 0/1 CASE
+			        -- rather than MAX(usage_confidence): the string form happens to work
+			        -- by dictionary order ('estimated' > 'attributed') and would break
+			        -- silently the day a third confidence is added.
+			        MAX(CASE WHEN t.usage_confidence = 'estimated' THEN 1 ELSE 0 END) AS any_estimated,
+			        -- A bare name can be claimed by different plugins across sessions. Show
+			        -- the namespace only when the group has exactly one named claimant;
+			        -- NULL rows say nothing and therefore do not conflict with that claimant.
+			        CASE WHEN COUNT(DISTINCT t.plugin) = 1 THEN MAX(t.plugin) END AS plugin,
+			        ${inferredExpr} AS any_inferred
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE ${where.sql} AND t.kind = ?
@@ -1722,6 +1778,13 @@ function toolNameRowsPage(
 		tool_name: string;
 		session_count: number;
 		call_count: number;
+		input_tokens: number | null;
+		output_tokens: number | null;
+		cached_tokens: number | null;
+		usage_sessions: number;
+		any_estimated: number;
+		plugin: string | null;
+		any_inferred: number;
 	}>;
 	const agents = toolRowAgents(
 		db,
@@ -1729,13 +1792,53 @@ function toolNameRowsPage(
 		list,
 		rows.map((row) => row.tool_name),
 	);
-	return rows.map((row) => ({
-		name: row.tool_name,
-		kind: list === "skill" ? ("skill" as const) : ("mcp" as const),
-		sessions: row.session_count,
-		calls: row.call_count,
-		agents: agents.get(row.tool_name) ?? [],
-	}));
+	return rows.map((row) => {
+		const usage = toolRowUsage(row);
+		return {
+			name: row.tool_name,
+			kind: list === "skill" ? ("skill" as const) : ("mcp" as const),
+			sessions: row.session_count,
+			calls: row.call_count,
+			agents: agents.get(row.tool_name) ?? [],
+			...(usage !== undefined ? { usage } : {}),
+			...(row.plugin !== null ? { plugin: row.plugin } : {}),
+			// Omitted rather than set to a second value: absent already means "no entry
+			// says inferred", which is where a row with no entry rows at all has to fall.
+			// See `ToolUsageRow.detection` on why that is not a claim of observation.
+			...(row.any_inferred === 1 ? { detection: "heuristic" as const } : {}),
+		};
+	});
+}
+
+/**
+ * One row's token sum, or undefined when nothing in it could be attributed.
+ *
+ * Gated on `usage_sessions`, never on the sums being non-null: a skill whose only
+ * attributed session genuinely spent nothing is a measurement of zero and must
+ * survive as one, while a skill nobody could measure has to stay absent. Those two
+ * are the same three numbers and only the count tells them apart.
+ *
+ * MCP and builtin rows fall out here on their own — nothing writes their token
+ * columns — so this needs no test on `kind`.
+ */
+function toolRowUsage(row: {
+	input_tokens: number | null;
+	output_tokens: number | null;
+	cached_tokens: number | null;
+	usage_sessions: number;
+	any_estimated: number;
+}): ToolUsageTokens | undefined {
+	if (row.usage_sessions === 0) return undefined;
+	return {
+		// The columns move together, so a null here means the sum ran over rows that
+		// all had one — impossible once usage_sessions is positive. Defaulted rather
+		// than asserted: a stray legacy row must not crash a page render.
+		input: row.input_tokens ?? 0,
+		output: row.output_tokens ?? 0,
+		cached: row.cached_tokens ?? 0,
+		confidence: row.any_estimated === 1 ? "estimated" : "attributed",
+		sessions: row.usage_sessions,
+	};
 }
 
 /**
@@ -1923,6 +2026,489 @@ export function buildToolUsagePage(db: DashboardDbHandle, opts: ToolUsagePageOpt
 }
 
 /**
+ * Rows per list in a skill's detail view.
+ *
+ * One number for both the session list and the commit list, because they answer
+ * the same question at two granularities and a reader comparing them should not
+ * have to hold two caps in mind. 20 rather than the card's 8: this view is opened
+ * deliberately, so it can be longer than a summary card that has to share a band
+ * with two others.
+ */
+const SKILL_DETAIL_ROW_LIMIT = 20;
+
+/**
+ * Entry rows returned for the outcome strip.
+ *
+ * Higher than {@link SKILL_DETAIL_ROW_LIMIT} because the two are read at different
+ * densities: a tick is a few pixels wide while a table row is a line, so 50 ticks
+ * occupy less space than 20 rows. The failure counts beside the strip are computed
+ * over the WHOLE window rather than over these rows, so this bound decides how far
+ * back the strip reads and nothing about the figures.
+ */
+const SKILL_INVOCATION_ROWS_LIMIT = 50;
+
+/**
+ * Session points returned for the detail view's time charts.
+ *
+ * Two numbers per point, so this can be far higher than the table's cap without
+ * mattering to the payload — and it has to be, because a chart drawn from 20 of a
+ * skill's 51 sessions has the wrong shape rather than a shorter one. The bound
+ * exists only so an unbounded custom range cannot return an unbounded array.
+ */
+const SKILL_SESSION_SERIES_LIMIT = 400;
+
+/**
+ * Folds `(skill, session, call time)` rows into the stacked-bar series, one point
+ * per LOCAL day of the window.
+ *
+ * The window is walked rather than the data: every day between its bounds is emitted,
+ * whether or not a skill ran. The chart lays bars out by index, so a dropped day would
+ * silently compress the axis and make a week-long gap look like a busy stretch. Walking
+ * the window is also what bounds the result — `resolveWindow` already clamps a custom
+ * range to {@link MAX_CUSTOM_DAYS}, so the retired week-bucket cap has no work left.
+ *
+ * Bucketing happens HERE and not in SQL, per this file's time-zone rule: SQLite's
+ * `localtime` answers with the process's zone and cannot agree with the boundaries the
+ * heatmap and the token series draw. A day key from `localDayKey` is the same key those
+ * use, so `Aug 6` means one thing across the whole page.
+ *
+ * Sessions are counted through a Set rather than by counting rows. `session_tool_use`
+ * is keyed `(session, tool, kind)`, so one row per (session, skill) is what the table
+ * guarantees today and counting rows would agree — but the figure this feeds is defined
+ * as "sessions that reached for the skill", and spelling that as a de-duplication keeps
+ * it right if a row ever splits.
+ *
+ * `addLocalDays` steps the cursor, never a fixed 86_400_000: a 23- or 25-hour DST day
+ * would otherwise skip or repeat a bucket.
+ */
+function buildSkillDays(
+	rows: ReadonlyArray<{ tool_name: string; session_event_id: string; at_ms: number }>,
+	window: ResolvedWindow,
+	timeZone: string,
+): SkillDayPoint[] {
+	const byDay = new Map<string, Map<string, Set<string>>>();
+	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
+		byDay.set(localDayKey(dayStart, timeZone), new Map());
+	}
+	for (const row of rows) {
+		// A row whose call time falls outside the window is dropped rather than
+		// clamped into an edge bucket. The SQL filters by the same bounds, so this
+		// only fires on the boundary rounding between an epoch-ms filter and a local
+		// day key — and attributing such a row to a day it did not happen on would be
+		// worse than omitting it.
+		const bucket = byDay.get(localDayKey(row.at_ms, timeZone));
+		if (!bucket) continue;
+		const sessions = bucket.get(row.tool_name) ?? new Set<string>();
+		sessions.add(row.session_event_id);
+		bucket.set(row.tool_name, sessions);
+	}
+	return [...byDay.entries()].map(([date, skills]) => ({
+		date,
+		bySeries: Object.fromEntries([...skills.entries()].map(([skill, sessions]) => [skill, sessions.size])),
+	}));
+}
+
+/** The four token columns plus the coverage counters, shared by both roll-ups. */
+const SKILL_USAGE_COLUMNS = `SUM(t.input_tokens) AS input_tokens,
+	        SUM(t.output_tokens) AS output_tokens,
+	        SUM(t.cached_tokens) AS cached_tokens,
+	        COUNT(DISTINCT CASE WHEN t.input_tokens IS NOT NULL THEN t.session_event_id END) AS usage_sessions,
+	        MAX(CASE WHEN t.usage_confidence = 'estimated' THEN 1 ELSE 0 END) AS any_estimated`;
+
+/** What one `/api/skill-detail` request names: a skill, and the window to read it over. */
+export interface SkillDetailOptions {
+	readonly scope: DashboardScope;
+	/** `session_tool_use.tool_name` — the exact row the card was showing. */
+	readonly name: string;
+	readonly range?: DashboardRange;
+	readonly customFrom?: string;
+	readonly customTo?: string;
+	readonly timeZone?: string;
+	readonly nowMs?: number;
+}
+
+/**
+ * One skill's whole story over the window — per agent, per session, per commit.
+ *
+ * Five queries rather than one join: the commit chain fans out (a session links to
+ * several transcript files, and a memory tree carries one row per amended commit),
+ * so folding it into the token roll-up would multiply the sums by the fan-out. They
+ * are separated for correctness, not for tidiness.
+ *
+ * Returns undefined when the window holds no call of that skill at all, which the
+ * route turns into a 404 — distinct from a skill that ran but attributed nothing,
+ * which is a real answer with `usage` absent.
+ */
+export function buildSkillDetail(db: DashboardDbHandle, opts: SkillDetailOptions): SkillDetail | undefined {
+	const timeZone = opts.timeZone ?? machineTimeZone();
+	const window = resolveWindow(opts.range, opts.customFrom, opts.customTo, opts.nowMs ?? Date.now(), timeZone);
+	const where = toolUsageWhere(db, opts.scope, window);
+	const scoped = [...where.params, opts.name];
+
+	const total = db
+		.prepare(
+			`SELECT COUNT(DISTINCT t.session_event_id) AS session_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count,
+			        MAX(${TOOL_CALL_TIME_SQL}) AS last_call_at_ms,
+			        -- Conflicts can span scan windows even though one scan suppresses a
+			        -- contested namespace. Never label the combined bare-name bucket as one
+			        -- plugin when more than one named claimant survives behind it.
+			        CASE WHEN COUNT(DISTINCT t.plugin) = 1 THEN MAX(t.plugin) END AS plugin,
+			        ${SKILL_USAGE_COLUMNS}
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ?`,
+		)
+		.get(...scoped) as
+		| {
+				session_count: number;
+				call_count: number;
+				last_call_at_ms: number | null;
+				plugin: string | null;
+				input_tokens: number | null;
+				output_tokens: number | null;
+				cached_tokens: number | null;
+				usage_sessions: number;
+				any_estimated: number;
+		  }
+		| undefined;
+	// An aggregate always returns a row, so `session_count` is what says "not here"
+	// — never the row's absence.
+	if (!total || total.session_count === 0) return undefined;
+
+	const agentRows = db
+		.prepare(
+			`SELECT s.source,
+			        COUNT(DISTINCT t.session_event_id) AS session_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count,
+			        ${SKILL_USAGE_COLUMNS}
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ?
+			  GROUP BY s.source
+			  ORDER BY call_count DESC, s.source ASC`,
+		)
+		.all(...scoped) as ReadonlyArray<{
+		source: string;
+		session_count: number;
+		call_count: number;
+		input_tokens: number | null;
+		output_tokens: number | null;
+		cached_tokens: number | null;
+		usage_sessions: number;
+		any_estimated: number;
+	}>;
+
+	const sessionRows = db
+		.prepare(
+			`SELECT s.session_id, s.source, s.title, s.started_at_ms, s.updated_at_ms,
+			        s.duration_ms, s.message_count, s.model, s.token_coverage,
+			        s.input_tokens + s.output_tokens + s.cached_tokens AS session_tokens,
+			        t.calls, t.input_tokens, t.output_tokens, t.cached_tokens, t.usage_confidence
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ?
+			  ORDER BY ${TOOL_CALL_TIME_SQL} DESC
+			  LIMIT ?`,
+		)
+		.all(...scoped, SKILL_DETAIL_ROW_LIMIT) as ReadonlyArray<{
+		session_id: string;
+		source: string;
+		title: string | null;
+		started_at_ms: number | null;
+		updated_at_ms: number;
+		duration_ms: number | null;
+		message_count: number | null;
+		model: string | null;
+		token_coverage: string;
+		session_tokens: number;
+		calls: number;
+		input_tokens: number | null;
+		output_tokens: number | null;
+		cached_tokens: number | null;
+		usage_confidence: string | null;
+	}>;
+
+	const repoRows = db
+		.prepare(
+			`SELECT DISTINCT r.repo_name
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ?
+			  ORDER BY r.repo_name`,
+		)
+		.all(...scoped) as ReadonlyArray<{ repo_name: string }>;
+
+	// The two time charts' own grain, uncapped where `sessionRows` is capped — a chart
+	// drawn from 20 of 51 sessions has the wrong SHAPE, not just fewer points. Two
+	// columns, so the whole window costs less than the table above it.
+	const seriesRows = db
+		.prepare(
+			`SELECT at_ms, input_tokens, output_tokens, cached_tokens
+			   FROM (
+			        SELECT ${TOOL_CALL_TIME_SQL} AS at_ms,
+			               t.input_tokens, t.output_tokens, t.cached_tokens,
+			               t.session_event_id
+			          FROM session_tool_use t
+			          JOIN sessions s ON s.event_id = t.session_event_id
+			         WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ?
+			         ORDER BY at_ms DESC, t.session_event_id DESC
+			         LIMIT ?
+			   ) recent
+			  ORDER BY at_ms ASC, session_event_id ASC`,
+		)
+		.all(...scoped, SKILL_SESSION_SERIES_LIMIT) as ReadonlyArray<{
+		at_ms: number;
+		input_tokens: number | null;
+		output_tokens: number | null;
+		cached_tokens: number | null;
+	}>;
+
+	// DISTINCT is load-bearing twice over: one session legitimately links to several
+	// transcript FILES, and `parent_hash IS NULL` keeps an amend/rebase tree to its
+	// root — measured, one skill's ref appeared on 15 nodes of one 15-deep tree, so
+	// without the root filter a commit list would repeat it once per node.
+	const commitRows = db
+		.prepare(
+			`SELECT DISTINCT m.commit_hash, r.repo_name, m.branch, m.commit_message,
+			        COALESCE(cm.committed_at_ms, m.commit_date_ms) AS committed_at_ms,
+			        m.files_changed, m.insertions, m.deletions
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			   JOIN transcript_sessions ts
+			     ON ts.repo_id = s.repo_id AND ts.session_id = s.session_id AND ts.source = s.source
+			   JOIN memory_transcripts mt ON mt.repo_id = ts.repo_id AND mt.transcript_id = ts.transcript_id
+			   JOIN memories m ON m.repo_id = mt.repo_id AND m.commit_hash = mt.commit_hash
+			   JOIN repos r ON r.id = m.repo_id
+			   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
+			  WHERE ${where.sql} AND t.kind = 'skill' AND t.tool_name = ? AND m.parent_hash IS NULL
+			  ORDER BY committed_at_ms DESC
+			  LIMIT ?`,
+		)
+		.all(...scoped, SKILL_DETAIL_ROW_LIMIT) as ReadonlyArray<{
+		commit_hash: string;
+		repo_name: string;
+		branch: string | null;
+		commit_message: string | null;
+		committed_at_ms: number;
+		files_changed: number | null;
+		insertions: number | null;
+		deletions: number | null;
+	}>;
+
+	// Fetched per hash rather than joined into the query above: `memory_topics` has a
+	// row per topic, so joining it would return one commit row per topic and the
+	// LIMIT would silently cover fewer commits than it says.
+	const categoriesByHash = new Map<string, string[]>();
+	if (commitRows.length > 0) {
+		const holes = commitRows.map(() => "?").join(",");
+		const topicRows = db
+			.prepare(
+				`SELECT DISTINCT commit_hash, category FROM memory_topics
+				  WHERE commit_hash IN (${holes}) AND category IS NOT NULL`,
+			)
+			.all(...commitRows.map((row) => row.commit_hash)) as ReadonlyArray<{
+			commit_hash: string;
+			category: string;
+		}>;
+		for (const row of topicRows) {
+			const bucket = categoriesByHash.get(row.commit_hash);
+			if (bucket) bucket.push(row.category);
+			else categoriesByHash.set(row.commit_hash, [row.category]);
+		}
+	}
+
+	const commits = commitRows.map((row) => ({
+		hash: row.commit_hash,
+		repoName: row.repo_name,
+		...(row.branch !== null ? { branch: row.branch } : {}),
+		...(row.commit_message !== null ? { message: row.commit_message } : {}),
+		committedAtMs: row.committed_at_ms,
+		...(row.files_changed !== null ? { filesChanged: row.files_changed } : {}),
+		...(row.insertions !== null ? { insertions: row.insertions } : {}),
+		...(row.deletions !== null ? { deletions: row.deletions } : {}),
+		categories: (categoriesByHash.get(row.commit_hash) ?? []).sort(),
+	}));
+
+	const categoryCounts = new Map<string, number>();
+	for (const commit of commits) {
+		// Deduped per commit by the DISTINCT above, so a commit with three `bugfix`
+		// topics counts once — this axis is "how many commits", not "how many topics".
+		for (const category of commit.categories) categoryCounts.set(category, (categoryCounts.get(category) ?? 0) + 1);
+	}
+
+	// The per-entry table, reached THROUGH the aggregate rather than joined only to
+	// `sessions`. Two reasons, and the first is not optional: `where.sql` windows on
+	// `TOOL_CALL_TIME_SQL`, which reads `t.last_call_at_ms`, so the aggregate has to be
+	// in scope for the shared filter to compile at all. It also confines this pass to
+	// exactly the rows the card was showing. The join cannot duplicate an entry — the
+	// aggregate holds one row per (session, skill) by primary key.
+	const invocationSource = `FROM skill_invocations i
+		   JOIN session_tool_use t
+		     ON t.session_event_id = i.session_event_id AND t.tool_name = i.skill_name AND t.kind = 'skill'
+		   JOIN sessions s ON s.event_id = i.session_event_id
+		  WHERE ${where.sql} AND i.skill_name = ?`;
+
+	const entryTotals = db
+		.prepare(
+			`SELECT COUNT(*) AS entry_count,
+			        MIN(i.at_ms) AS first_at_ms,
+			        -- The largest body, never an average — a repeat entry injects a stub. See
+			        -- SkillDetail.bodyChars.
+			        MAX(i.body_chars) AS body_chars,
+			        -- Counted over the ENTRIES WHOSE OUTCOME WAS READ, which is the whole point:
+			        -- a defaulted ok is not evidence of success, so including it would report a
+			        -- 0% failure rate for three of the six entry mechanisms.
+			        SUM(CASE WHEN i.ok_confidence = 'observed' THEN 1 ELSE 0 END) AS measured,
+			        SUM(CASE WHEN i.ok_confidence = 'observed' AND i.ok = 0 THEN 1 ELSE 0 END) AS failed,
+			        -- The complement, carried rather than dropped: those runs DID happen, and a
+			        -- surface handed only the measured count has to choose between hiding them
+			        -- and implying they succeeded. Spelled as "not observed" because the column
+			        -- is free-form TEXT — anything that is not the one verified value is
+			        -- unknowable, which is the direction a stray value must fall.
+			        SUM(CASE WHEN i.ok_confidence <> 'observed' THEN 1 ELSE 0 END) AS assumed,
+			        -- Entries inferred from a file read rather than observed. A plain SUM is
+			        -- safe here where the list query needs an EXISTS: this statement's FROM
+			        -- LEADS with the per-entry table, so there is nothing to fan out.
+			        -- Compared to the one verified value rather than tested for NOT NULL —
+			        -- the column is free-form TEXT, and an unrecognised value is not evidence
+			        -- of inference, so a stray one must fall on the quiet side.
+			        SUM(CASE WHEN i.detection = 'heuristic' THEN 1 ELSE 0 END) AS inferred,
+			        -- Comma-joined; NULLs are dropped by GROUP_CONCAT, so a history with no
+			        -- recorded mechanism comes back NULL rather than as an empty member.
+			        GROUP_CONCAT(DISTINCT i.entry_path) AS entry_paths
+			   ${invocationSource}`,
+		)
+		.get(...scoped) as
+		| {
+				entry_count: number;
+				first_at_ms: number | null;
+				body_chars: number | null;
+				measured: number;
+				failed: number;
+				assumed: number;
+				inferred: number;
+				entry_paths: string | null;
+		  }
+		| undefined;
+
+	// Newest-first in SQL so the LIMIT keeps the RECENT entries, then reversed for the
+	// caller: "it started failing on Tuesday" reads left to right. The counts above are
+	// unaffected by this cap and stay exact over the whole window.
+	const invocationRows = db
+		.prepare(
+			`SELECT i.at_ms, i.ok, i.ok_confidence, i.args, i.body_chars
+			   ${invocationSource}
+			  ORDER BY i.at_ms DESC
+			  LIMIT ?`,
+		)
+		.all(...scoped, SKILL_INVOCATION_ROWS_LIMIT) as ReadonlyArray<{
+		at_ms: number;
+		ok: number;
+		ok_confidence: string;
+		args: string | null;
+		body_chars: number | null;
+	}>;
+
+	// Validated against the union rather than cast: the column is free-form TEXT, and a
+	// value no scanner produces must be dropped rather than enter the model as a
+	// mechanism the renderer will not recognise.
+	const entryPaths = (entryTotals?.entry_paths ?? "")
+		.split(",")
+		.filter((path): path is SkillEntryPath => path === "tool" || path === "command");
+
+	// Absent only when there is NO entry row — not merely when none was measurable. The
+	// two are different answers: "no per-entry record survives" (an archived commit's
+	// merged count, a pruned transcript) versus "it ran N times and the mechanism records
+	// no result". Gating on `measured` collapsed the second into the first and hid every
+	// slash-command entry, which is nearly all of them on a Claude machine. The counts
+	// are handed over separately so the renderer cannot add them: `failed / measured`
+	// stays the only rate, and `assumed` is reported in words. See `SkillDetailOutcomes`.
+	const outcomes =
+		entryTotals !== undefined && entryTotals.entry_count > 0
+			? { measured: entryTotals.measured, failed: entryTotals.failed, assumed: entryTotals.assumed }
+			: undefined;
+	const usage = toolRowUsage(total);
+
+	return {
+		name: opts.name,
+		sessions: total.session_count,
+		calls: total.call_count,
+		...(total.last_call_at_ms !== null ? { lastCallAtMs: total.last_call_at_ms } : {}),
+		...(usage !== undefined ? { usage } : {}),
+		agents: agentRows.map((row) => {
+			const usage = toolRowUsage(row);
+			return {
+				source: row.source,
+				sessions: row.session_count,
+				calls: row.call_count,
+				...(usage !== undefined ? { usage } : {}),
+			};
+		}),
+		commits,
+		linkedSessions: sessionRows.map((row) => ({
+			sessionId: row.session_id,
+			source: row.source,
+			...(row.title !== null ? { title: row.title } : {}),
+			...(row.started_at_ms !== null ? { startedAtMs: row.started_at_ms } : {}),
+			updatedAtMs: row.updated_at_ms,
+			...(row.duration_ms !== null ? { durationMs: row.duration_ms } : {}),
+			...(row.message_count !== null ? { messageCount: row.message_count } : {}),
+			...(row.model !== null ? { model: row.model } : {}),
+			calls: row.calls,
+			// `sessions-only` means the parser read the session but could not read its
+			// tokens, so the three columns are structural zeros rather than a measured
+			// nothing. Omitted in that case for the same reason a skill's usage is.
+			...(row.token_coverage !== "sessions-only" && row.session_tokens > 0
+				? { sessionTokens: row.session_tokens }
+				: {}),
+			...(row.input_tokens !== null
+				? {
+						usage: {
+							input: row.input_tokens,
+							output: row.output_tokens ?? 0,
+							cached: row.cached_tokens ?? 0,
+							confidence:
+								row.usage_confidence === "estimated" ? ("estimated" as const) : ("attributed" as const),
+							// One session, so the coverage denominator is 1 by construction.
+							sessions: 1,
+						},
+					}
+				: {}),
+		})),
+		categories: [...categoryCounts]
+			.map(([category, count]) => ({ category, commits: count }))
+			.sort((a, b) => b.commits - a.commits || a.category.localeCompare(b.category)),
+		...(total.plugin !== null ? { plugin: total.plugin } : {}),
+		repos: repoRows.map((row) => row.repo_name),
+		...(entryTotals?.first_at_ms != null ? { firstCallAtMs: entryTotals.first_at_ms } : {}),
+		entryPaths,
+		// Any-one-taints, matching the list row and `SkillStore.mergeSkillRef`. Absent
+		// where nothing says inferred, which is also where a skill with no surviving
+		// entry row lands — the pane says "no per-entry record" there in its own words.
+		...((entryTotals?.inferred ?? 0) > 0 ? { detection: "heuristic" as const } : {}),
+		...(outcomes !== undefined ? { outcomes } : {}),
+		invocations: [...invocationRows].reverse().map((row) => ({
+			atMs: row.at_ms,
+			ok: row.ok !== 0,
+			outcomeKnown: row.ok_confidence === "observed",
+			...(row.args !== null ? { args: row.args } : {}),
+			...(row.body_chars !== null ? { bodyChars: row.body_chars } : {}),
+		})),
+		...(entryTotals?.body_chars != null ? { bodyChars: entryTotals.body_chars } : {}),
+		sessionSeries: seriesRows.map((row) => ({
+			atMs: row.at_ms,
+			// Absent, not zero, where the source attributed nothing — the cost chart skips
+			// the point rather than drawing a session that spent nothing.
+			...(row.input_tokens !== null
+				? { tokens: row.input_tokens + (row.output_tokens ?? 0) + (row.cached_tokens ?? 0) }
+				: {}),
+		})),
+	};
+}
+
+/**
  * Skills, MCP servers and the tool mix over the window, each row carrying the
  * agents that produced it — the FIRST page of each of the three lists, plus the
  * totals they page against.
@@ -1941,7 +2527,12 @@ export function buildToolUsagePage(db: DashboardDbHandle, opts: ToolUsagePageOpt
  * they answer "who ran this", where the count IS the point. See
  * {@link TOOL_LIST_ORDER}.
  */
-function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: ResolvedWindow): ToolUsage {
+function buildToolUsage(
+	db: DashboardDbHandle,
+	scope: DashboardScope,
+	window: ResolvedWindow,
+	timeZone: string,
+): ToolUsage {
 	const where = toolUsageWhere(db, scope, window);
 	const skillTotals = toolListTotals(db, where, "skill");
 	const serverTotals = toolListTotals(db, where, "server");
@@ -1978,6 +2569,21 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 				.filter((row) => row.kind === kind)
 				.map((row) => ({ source: row.source, sessions: row.session_count, calls: row.call_count })),
 		);
+
+	// Adoption per skill per local day, over EVERY skill in the window rather than the
+	// first page — see `ToolUsage.skillDays`. Unaggregated on purpose: the bucket is a
+	// LOCAL calendar day, which only `buildSkillDays` can compute (see this file's
+	// header on why SQLite's `localtime` is never used), so grouping here would have to
+	// group by a boundary the rest of the page does not share. The call-time expression
+	// is the one the rankings use, so a row's bar and its rank agree about when it ran.
+	const dayRows = db
+		.prepare(
+			`SELECT t.tool_name, t.session_event_id, ${TOOL_CALL_TIME_SQL} AS at_ms
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql} AND t.kind = 'skill'`,
+		)
+		.all(...where.params) as ReadonlyArray<{ tool_name: string; session_event_id: string; at_ms: number }>;
 
 	// Coverage from the FULL session population, never from the join above — and
 	// windowed by the SESSION's own time OR by any call it made, which is the
@@ -2035,6 +2641,7 @@ function buildToolUsage(db: DashboardDbHandle, scope: DashboardScope, window: Re
 		skills,
 		skillsTotal: skillTotals.totalCount,
 		skillCallsTotal: skillTotals.callsTotal,
+		skillDays: buildSkillDays(dayRows, window, timeZone),
 		mcpTools,
 		mcpToolsTotal: mcpToolTotals.totalCount,
 		recallCalls,
@@ -2306,7 +2913,19 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	// wasted queries, and the page only ever reads its own.
 	const payload = (): Pick<DashboardModel, "stats" | "standup" | "memories" | "knowledge" | "graph" | "settings"> => {
 		switch (options.view) {
+			// Skills reads `stats.toolUsage` and nothing else, so it shares this payload
+			// rather than declaring one of its own — which is also what lets its list and
+			// the Stats card's Skills card agree by construction instead of by two queries
+			// that have to be kept in step.
+			//
+			// It does pay for the whole of `buildStats` (the feed, the activity series, the
+			// token dimensions) to read one field of it. Accepted for now: the alternative
+			// is splitting `buildStats` along a seam that does not exist yet, and a reader
+			// arriving from the dashboard has just paid the same cost anyway. The seam to
+			// cut, if this page grows heavy, is a `toolUsage`-only payload — not a second
+			// query over `session_tool_use`.
 			case "stats":
+			case "skills":
 				return {
 					stats: buildStats(
 						db,

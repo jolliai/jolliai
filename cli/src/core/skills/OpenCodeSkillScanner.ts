@@ -150,7 +150,10 @@ export function scanOpenCodeSkillRows(
 			invocation: {
 				at: new Date(at).toISOString(),
 				...(output !== undefined ? { bodyChars: output.length } : {}),
+				// A reading, not a default: `state.status` distinguishes `completed` from
+				// `error`, which is why the `tool` stamp below resolves to observed.
 				ok: status === "completed",
+				entryPath: "tool",
 			},
 		});
 	}

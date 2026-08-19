@@ -344,7 +344,12 @@ export function scanCodexSkillLines(lines: ReadonlyArray<string>, fromLine: numb
 			// Kimi and OpenCode all produce. `toToolCall` takes the MAX rather than the head,
 			// so nothing depends on the order — but an ordering the type declares should not
 			// be left to whatever `Set` iteration happened to give.
-			invocations: [...entry.ats].sort((a, b) => (a < b ? 1 : a > b ? -1 : 0)).map((at) => ({ at, ok: true })),
+			// `ok: true` is a DEFAULT, not a reading: an injected block is a definite entry
+			// but has no result record, so failure is unknowable on this path too. The
+			// `entryPath` stamp is what lets `skillOutcomeConfidence` say so downstream.
+			invocations: [...entry.ats]
+				.sort((a, b) => (a < b ? 1 : a > b ? -1 : 0))
+				.map((at) => ({ at, ok: true, entryPath: "command" as const })),
 			// No `detection` marker — the block is a definite entry, not an inference. Note
 			// the store's cross-window rule is "sticky once heuristic", so this does not
 			// un-label a name a shell read already marked; see this file's header.
@@ -369,7 +374,7 @@ export function scanCodexSkillLines(lines: ReadonlyArray<string>, fromLine: numb
 			// there is no namespace to recover. No usage: see the header. No bodyChars: a
 			// paged read tells us nothing about what reached the model.
 			entryPaths: ["tool"],
-			invocations: [{ at, ok: true }],
+			invocations: [{ at, ok: true, entryPath: "tool" }],
 			detection: "heuristic",
 		});
 	}

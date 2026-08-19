@@ -339,6 +339,12 @@ function assemble(
 			...(entry.args !== undefined ? { args: entry.args } : {}),
 			...(entry.bodyChars !== undefined ? { bodyChars: entry.bodyChars } : {}),
 			ok: entry.ok,
+			outcomeObserved: entry.sawResult,
+			// Stamped per invocation, not left to the bucket's `entryPaths` set: a skill
+			// reached both ways carries both paths there, so only this field can say which
+			// mechanism produced THIS entry — and that is what decides whether its `ok` was
+			// read from a `tool_result` or defaulted (see `skillOutcomeConfidence`).
+			entryPath: "tool",
 		});
 	}
 
@@ -347,7 +353,10 @@ function assemble(
 			at: entry.at,
 			...(entry.args !== undefined ? { args: entry.args } : {}),
 			bodyChars: entry.bodyChars,
+			// Hard-coded, and the reason is what `entryPath` below exists to record: this
+			// path has no result record at all, so failure is not knowable here.
 			ok: true,
+			entryPath: "command",
 		});
 	}
 

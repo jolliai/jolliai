@@ -4202,6 +4202,98 @@ export interface SessionTokenBucket {
 }
 
 /**
+ * Adds one DISJOINT transcript slice's view of a tool to its conversation total.
+ *
+ * This is deliberately not {@link mergeToolCalls}. That helper combines two
+ * extractors looking at the SAME records and therefore takes the larger count;
+ * the queue worker combines cursor-separated slices, so their calls, usage and
+ * invocation rows are separate contributions and must be added/concatenated.
+ *
+ * `pluginClaims` outlives the returned bucket. An omitted `plugin` has two
+ * meanings (no named claimant, or conflicting claimants), so the bucket alone
+ * cannot remember a conflict: after A + B omitted the field, a later A would
+ * otherwise look uncontested and restore a label already proven ambiguous.
+ */
+function mergeToolCallSlice(
+	prev: ToolCallCount | undefined,
+	incoming: ToolCallCount,
+	pluginClaims: Set<string>,
+): ToolCallCount {
+	if (prev?.plugin !== undefined) pluginClaims.add(prev.plugin);
+	if (incoming.plugin !== undefined) pluginClaims.add(incoming.plugin);
+	const plugin = pluginClaims.size === 1 ? pluginClaims.values().next().value : undefined;
+
+	if (prev === undefined) {
+		const { plugin: _incomingPlugin, ...rest } = incoming;
+		return { ...rest, ...(plugin !== undefined ? { plugin } : {}) };
+	}
+
+	const usage =
+		prev.usage === undefined || incoming.usage === undefined
+			? (prev.usage ?? incoming.usage)
+			: {
+					input: prev.usage.input + incoming.usage.input,
+					output: prev.usage.output + incoming.usage.output,
+					cached: prev.usage.cached + incoming.usage.cached,
+					confidence:
+						prev.usage.confidence === "attributed" && incoming.usage.confidence === "attributed"
+							? ("attributed" as const)
+							: ("estimated" as const),
+				};
+	const invocations =
+		prev.invocations === undefined || incoming.invocations === undefined
+			? (prev.invocations ?? incoming.invocations)
+			: [...prev.invocations, ...incoming.invocations].sort((a, b) => {
+					if (a.at === b.at) return 0;
+					return a.at < b.at ? 1 : -1;
+				});
+	const lastCallAtMs =
+		prev.lastCallAtMs === undefined
+			? incoming.lastCallAtMs
+			: incoming.lastCallAtMs === undefined
+				? prev.lastCallAtMs
+				: Math.max(prev.lastCallAtMs, incoming.lastCallAtMs);
+	const server = prev.server ?? incoming.server;
+	const detection = prev.detection ?? incoming.detection;
+
+	// Managed fields are stripped from both spreads before being re-added below.
+	// Besides preventing an absent merged value from leaking out of `prev`, this
+	// lets a future, unrelated ToolCallCount field follow the newest slice without
+	// silently repeating the exact missed-caller bug this helper closes.
+	const {
+		server: _prevServer,
+		plugin: _prevPlugin,
+		calls: _prevCalls,
+		lastCallAtMs: _prevLastCallAtMs,
+		usage: _prevUsage,
+		invocations: _prevInvocations,
+		detection: _prevDetection,
+		...prevRest
+	} = prev;
+	const {
+		server: _incomingServer,
+		plugin: _incomingPlugin,
+		calls: _incomingCalls,
+		lastCallAtMs: _incomingLastCallAtMs,
+		usage: _incomingUsage,
+		invocations: _incomingInvocations,
+		detection: _incomingDetection,
+		...incomingRest
+	} = incoming;
+	return {
+		...prevRest,
+		...incomingRest,
+		...(server !== undefined ? { server } : {}),
+		calls: prev.calls + incoming.calls,
+		...(lastCallAtMs !== undefined ? { lastCallAtMs } : {}),
+		...(usage !== undefined ? { usage } : {}),
+		...(invocations !== undefined ? { invocations } : {}),
+		...(detection !== undefined ? { detection } : {}),
+		...(plugin !== undefined ? { plugin } : {}),
+	};
+}
+
+/**
  * Attaches each surviving conversation's own token attribution to its
  * `SessionTranscript` so `buildStoredTranscript` can persist it alongside the
  * entries. Without this the per-session split dies with the local
@@ -4373,6 +4465,10 @@ async function readAllTranscripts(
 	// populated even when a slice yields zero merged entries (a usage-only slice),
 	// so the subtraction stays exact.
 	const perSessionTokens = new Map<string, SessionTokenBucket>();
+	// A bare `ToolCallCount.plugin` cannot distinguish "no claimant" from "two
+	// claimants conflicted". Keep every named claim beside the conversation while
+	// its slices are folded, so a conflict remains sticky for the whole pass.
+	const pluginClaimsByConversation = new Map<string, Map<string, Set<string>>>();
 	// Session identity per conversationKey, so a conversation that produced tokens
 	// but no merged entries can still be given a persistence carrier after the loop
 	// (see the usage-only reconciliation below). `perSessionTokens` is keyed by
@@ -4621,11 +4717,15 @@ async function readAllTranscripts(
 		// would look like a source that cannot report tools at all.
 		if (result.toolUse) {
 			const byTool = bucket.byTool ?? new Map<string, ToolCallCount>();
+			const pluginClaims = pluginClaimsByConversation.get(convKey) ?? new Map<string, Set<string>>();
 			for (const t of result.toolUse) {
 				const key = `${t.kind}:${t.name}`;
 				const prev = byTool.get(key);
-				byTool.set(key, prev ? { ...prev, calls: prev.calls + t.calls } : { ...t });
+				const claims = pluginClaims.get(key) ?? new Set<string>();
+				byTool.set(key, mergeToolCallSlice(prev, t, claims));
+				pluginClaims.set(key, claims);
 			}
+			pluginClaimsByConversation.set(convKey, pluginClaims);
 			bucket.byTool = byTool;
 		}
 		perSessionTokens.set(convKey, bucket);
@@ -4797,7 +4897,9 @@ export const __test__ = {
 	handleSquashFromQueue,
 	handleRebaseSquashFromQueue,
 	loadSessionTranscripts,
+	readAllTranscripts,
 	commitConsumedTranscripts,
+	mergeToolCallSlice,
 	attachPerSessionUsage,
 	appendUsageOnlyCarriers,
 	buildStoredTranscript,

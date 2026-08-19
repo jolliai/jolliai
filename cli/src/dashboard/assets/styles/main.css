@@ -338,6 +338,11 @@ body {
   .sb-brand { display: flex; align-items: baseline; gap: 7px; padding: 2px 10px 10px; }
   .sb-brand b { font-size: 16px; letter-spacing: -.01em; }
   .sb-brand span { font-size: 11px; color: var(--muted); }
+  /* The mark carries its own size on the element (20x18) and its own brand hexes
+     inline — see index.html for why it is not themed. The only thing it needs
+     from here is `flex: none`, so a longer word beside it squeezes the text
+     rather than distorting a logo. */
+  .sb-brand .sb-mark { flex: none; }
   .sb-label { font-size: 11px; color: var(--muted); text-transform: uppercase; letter-spacing: .06em; padding: 12px 10px 6px; }
   .sb-label small { font-size: 11px; text-transform: none; letter-spacing: 0; }
   .sb-list { display: grid; gap: 2px; }
@@ -368,20 +373,18 @@ body {
     padding-top: 10px; border-top: 1px solid var(--border); background: var(--surface);
   }
 
-  /* ---------- nav: Dashboard's two children ----------
-     Dashboard (two children) and Memories in the scrolling list, Settings in the
-     pinned bottom slot. Children render indented under a group label rather than
-     behind an expand/collapse toggle — that interaction is a later polish pass
-     over the same markup, not a routing concern.
+  /* ---------- nav: one flat list ----------
+     Every menu row is a peer of every other, at one indent, each with its own
+     mark — see NAV_MIDDLE in shell.js for why the "Dashboard" group label and its
+     two indented children went away. The rules that drew them (`.sb-group-label`,
+     `.sb-group-chevron`, `.sb-item.child`) went with the markup; nothing here
+     styles a nesting level, and re-adding one starts with that comment.
 
      The `[aria-disabled]` rules below are unreachable at HEAD: rows used to
      disable themselves until a repository was enabled, mirroring the server's
      redirect to the Repositories page. Both that page and the gate are gone (see
      NAV_MIDDLE in shell.js), so nothing sets the attribute. Kept because the
      treatment is the obvious one for any row that gains a disabled state. */
-  .sb-group-label { display: flex; align-items: center; gap: 8px; color: var(--ink-2); padding: 8px 10px 2px; font-size: 13px; }
-  .sb-group-label .sb-group-chevron { width: 14px; height: 14px; margin-left: auto; color: var(--accent); }
-  .sb-item.child { padding-left: 34px; font-size: 12.5px; }
   .sb-item[aria-disabled="true"] { color: var(--muted); opacity: .55; cursor: not-allowed; }
   .sb-item[aria-disabled="true"]:hover { background: transparent; color: var(--muted); }
 
@@ -1365,6 +1368,17 @@ body {
   .conv-note { font-size: 12px; color: var(--muted); margin: 8px 0 0; }
   .sheet .row { display: flex; gap: 10px; margin-top: 10px; align-items: center; }
 
+  /* A ranked row that opens the Skills page for its own skill. Only the Skills list
+     gets this class — see `rankedList` — so the pointer never promises a destination
+     that does not exist.
+
+     The skill-detail SHEET that used to live here is gone: the Skills page has a
+     reading pane of its own, and a modal over the card was a second renderer of the
+     same figures. The card's rows now link into that page instead. */
+  .rl-click { cursor: pointer; border-radius: 6px; }
+  .rl-click:hover { background: var(--page); }
+  .rl-click:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
   /* ---------- popover ---------- */
   .pop {
     position: absolute; z-index: 40; width: 264px; background: var(--surface);
@@ -1799,3 +1813,279 @@ body {
 }
 .jd .wiki-freshness .wiki-dismiss:hover { opacity: 1; }
 .jd .wiki-freshness .wiki-dismiss:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+
+/* ══ Skills page ══════════════════════════════════════════════════════════════
+   A chart band across the top, then a chooser column and a reading pane — the
+   same grammar Memories uses, so the two pages are navigated the same way.
+   `.mem-*` above is the reference for every chrome value here.
+
+   THE WRAP'S 1200px CAP STAYS HERE, which is where this page parts from
+   `.memories-page`. Releasing it is what a full-bleed browser needs, and this page
+   is not one: the band's chart is capped at 760px and the list column is a fixed
+   344px, so every pixel the release adds lands in the reading pane alone — 802px
+   of pane in the mockup against 982px full-bleed at a 1600px viewport, which is
+   wider than the 560px the pane's own figures and caveat are capped at.
+
+   THE PAGE IS WHAT SCROLLS, with ONE earned exception — and this is the height rule
+   the rest of the section is written against. Every box here is as tall as what it
+   holds and the page grows past the fold like every other view; the single exception
+   is the chooser's rows, which take a MEASURED cap the moment the reader presses Show
+   more (`listOpenTag` in skills.js owns that, and `.sk-list.sk-scroll` below styles
+   it). So the first screenful has exactly one scrollbar, the window's, and a second
+   appears only as the visible result of a click asking for more rows than the column
+   opened with.
+
+   It used to be three viewport-height boxes summing to exactly 100vh: a declared
+   `--sk-band-h`, a `--sk-col-h` deriving the rest from `100vh`, and a scroll region
+   inside each column, present from the first paint. That bought a fixed frame and
+   charged the reader three scroll regions to find — measured at 1440x900, the wheel
+   over the rows moved the WINDOW 3px while the list itself stayed put, the pane
+   carried a second bar of its own, and anything at the end of either box (the paging
+   control, the coverage foot, the pane's basis line) was reachable only by
+   discovering which box it lived in. The `100vh` arithmetic went with it, and so did
+   `.main`'s dropped bottom padding — that override existed only to stop the exact
+   sum spilling 20px past the fold. What came back is the ONE region that earns a
+   window: the rows, once there are more of them than the reader asked to see. */
+.jd .grid:has(.skills-page) { display: block; }
+
+.jd .skills-page {
+	display: grid; grid-template-columns: 344px minmax(0, 1fr); gap: 6px;
+	/* `start`, not the default stretch: the two columns hold unrelated amounts of
+	   content, so stretching makes the shorter card as tall as the taller one and
+	   leaves its own foot floating in the middle of an empty card. */
+	align-items: start;
+}
+
+/* Same chrome as the chooser column, spanning both. */
+.jd .sk-band {
+	grid-column: 1 / -1; min-width: 0; overflow: hidden;
+	border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+	box-shadow: 0 2px 5px rgba(20, 30, 50, .05); padding: 14px 20px 10px;
+	display: flex; flex-direction: column;
+}
+.jd .sk-bandrow { display: flex; gap: 28px; align-items: flex-start; min-height: 0; }
+/* Capped and left-aligned rather than stretched: `JD.stackedBars` is an SVG with a
+   fixed 660-wide viewBox and `width: 100%`, so at full page width it scales to
+   roughly 400px tall. The cap keeps it chart-sized and the slack carries the key. */
+.jd .sk-band .chart-box { flex: 1; max-width: 760px; min-width: 0; }
+/* The key, stacked in that spare width. INSIDE THIS BAND THE RAMP MEANS SKILL,
+   while everywhere else on the dashboard it means agent — which is why the key sits
+   against the chart rather than at the page edge. A colour may not be read across
+   this boundary. */
+.jd .sk-key { display: flex; flex-direction: column; align-items: flex-start; gap: 7px; margin-top: 8px; flex: none; }
+.jd .sk-legend {
+	display: inline-flex; align-items: center; gap: 6px; background: none; border: 0;
+	padding: 2px 6px; margin: -2px -6px; border-radius: 6px; font: inherit; font-size: 11.5px;
+	color: var(--ink-2); cursor: pointer;
+}
+.jd .sk-legend i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.jd .sk-legend b { color: var(--ink); font-weight: 600; }
+.jd .sk-legend:hover { background: var(--lock-bg); }
+.jd .sk-legend:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* The pressed key row wears the same accent edge the selected list row does, so
+   "selected" is ONE visual fact wherever it appears on the page. */
+.jd .sk-legend[aria-pressed="true"] { box-shadow: inset 2px 0 0 var(--accent); background: var(--lock-bg); }
+/* Recessed, not recoloured: a dimmed series must stay recognisably itself. */
+.jd .sk-dim { opacity: .38; }
+
+/* The chooser column: `.mem-navigator`'s chrome at the height of its own content.
+   Head, rows, paging row and coverage foot stack, so the card is as tall as the four
+   of them — the rows are the only one that can be capped, and the card follows that
+   cap rather than setting it. `overflow: hidden` is here for the rounded corners. */
+.jd .sk-nav {
+	min-width: 0; overflow: hidden;
+	border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+	box-shadow: 0 2px 5px rgba(20, 30, 50, .05); display: flex; flex-direction: column;
+}
+/* The counts belong to the LIST, so they sit at the top of the list's column rather
+   than in a page-wide band — this surface has twice declined top-of-page aggregates. */
+.jd .sk-nav-head {
+	flex: none; padding: 14px 20px 12px; font-size: 12px; color: var(--muted);
+	border-bottom: 1px solid var(--grid);
+}
+.jd .sk-nav-head b { color: var(--ink); font-weight: 600; }
+/* Every row — with no height and no scrollbar of its own until the reader pages past
+   the column's first screenful. `sk-scroll` and the inline `max-height` are written by
+   `listOpenTag` in skills.js, which records why the cap is measured rather than
+   declared and why the first page may not scroll.
+ *
+ * THE THIN BAR IS NOT DECORATION, and it is copied off `.ranklist.rl-scroll` so the
+ * page's two scrollers read alike. macOS overlay bars are absent until a scroll is
+ * already under way, so a capped region carrying only the platform's own bar is a
+ * window with a hard bottom edge and nothing saying fifteen more rows sit below it —
+ * and the reader has to know this region scrolls before the footnote at its end is
+ * reachable at all. It hangs off `.sk-scroll` rather than off `.sk-list` because the
+ * uncapped state has nothing to mark. */
+.jd .sk-list { min-width: 0; padding: 8px 14px; }
+.jd .sk-list.sk-scroll {
+	overflow-y: auto;
+	scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 42%, transparent) transparent;
+}
+.jd .sk-list.sk-scroll::-webkit-scrollbar { width: 10px; }
+.jd .sk-list.sk-scroll::-webkit-scrollbar-track { background: transparent; }
+.jd .sk-list.sk-scroll::-webkit-scrollbar-thumb {
+	background: color-mix(in srgb, var(--muted) 38%, transparent); border-radius: 999px;
+	border: 3px solid transparent; background-clip: padding-box;
+}
+.jd .sk-list.sk-scroll:hover::-webkit-scrollbar-thumb {
+	background: color-mix(in srgb, var(--muted) 55%, transparent); background-clip: padding-box;
+}
+/* The paging row's own band, between the rows and the coverage foot — `flex: none` is
+   what holds it OUT of the rows' region, which is exactly where it may not be: from the
+   first Show more onwards that region is capped, so a control living inside it would be
+   reachable only by scrolling the very list it grows (see `navPagingHtml`). The head and
+   the coverage foot are out for the same reason; the region keeps only the rows and their
+   footnote. `.more-row`'s `margin-top` is dropped because this rule's own border and
+   padding already separate it from the last row. */
+.jd .sk-paging { flex: none; padding: 9px 20px; border-top: 1px solid var(--grid); }
+.jd .sk-paging .more-row { margin-top: 0; }
+/* `.w-foot` / `.w-measure` are reused verbatim; this only pins the row into the flex
+   column and restores the side padding a card context would have supplied. */
+.jd .sk-nav .w-foot { flex: none; margin: 0; padding: 11px 20px 14px; }
+
+/* A COLUMNAR ROW, NOT A RANKED BAR. The list is a chooser and an index now that the
+   pane carries the charts, so a bar restating the runs column would be noise. One
+   grid template shared with the header below, so the columns cannot drift apart. */
+.jd .sk-cols,
+.jd .sk-row { display: grid; grid-template-columns: minmax(0, 1fr) 44px 76px; gap: 10px; align-items: baseline; }
+.jd .sk-cols {
+	padding: 4px 8px 6px; font-size: 10.5px; letter-spacing: .04em;
+	text-transform: uppercase; color: var(--muted);
+}
+.jd .sk-cols span:not(:first-child) { text-align: right; }
+.jd .sk-row {
+	width: 100%; text-align: left; background: none; border: 0; margin: 0;
+	padding: 7px 8px; border-radius: 8px; cursor: pointer; color: inherit; font: inherit;
+}
+.jd .sk-row:hover { background: var(--lock-bg); }
+/* SELECTION IS --accent AND MAY NOT BE AN --s* COLOUR. On this page the categorical
+   ramp means WHICH SKILL in the band and which agent in the pane, so a selected row
+   in `--s2` would read as one more series. `--accent` sits outside the ramp and is
+   already what the nav uses for `aria-current`. */
+.jd .sk-row[aria-current="true"] { background: var(--lock-bg); box-shadow: inset 2px 0 0 var(--accent); }
+.jd .sk-row:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.jd .sk-row .num { text-align: right; font-variant-numeric: tabular-nums; }
+/* `min-width: 0` is what lets the name truncate: a grid item's automatic minimum is
+   its content, so without it a long id widens the column and pushes the numbers off. */
+.jd .sk-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.jd .sk-tok { font-size: 11.5px; color: var(--ink-2); }
+
+/* The reading pane, mirroring `.mem-detail` MINUS its scroll: recessed on `--page`
+   against the chooser's `--surface` so the two columns read as chooser and reader,
+   and as tall as the sections it holds so the page is what scrolls them. */
+.jd .sk-pane {
+	min-width: 0;
+	border: 1px solid var(--border); border-radius: 10px; padding: 20px 24px 28px; background: var(--page);
+}
+/* Sections flow into as many columns as the pane's width affords. `auto-fit` against
+   a 300px floor rather than a fixed count, so one markup serves every width; the
+   identity row, the figures and the basis line span all columns because they are
+   about the whole skill rather than one reading of it. */
+.jd .sk-panebody { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 0 32px; align-items: start; }
+.jd .sk-panebody > .sk-title,
+.jd .sk-panebody > .sk-figs,
+.jd .sk-panebody > .sk-caveat,
+.jd .sk-panebody > .sk-basis { grid-column: 1 / -1; }
+.jd .sk-panebody > .sk-figs { max-width: 560px; }
+.jd .sk-pane-empty { color: var(--ink-2); font-size: 12.5px; }
+.jd .sk-title { font-size: 14px; font-weight: 600; color: var(--ink); word-break: break-all; }
+.jd .sk-kind { display: inline-block; margin-left: 6px; font-size: 11px; color: var(--ink-2); font-weight: 400; }
+
+/* Two across, because four figures on one row at this width wrapped their labels. */
+.jd .sk-figs { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 12px; margin-top: 12px; }
+.jd .sk-fig b { display: block; font-size: 17px; font-weight: 600; color: var(--ink); line-height: 1.2; }
+.jd .sk-fig span { display: block; font-size: 11px; color: var(--ink-2); margin-top: 2px; }
+
+.jd .sk-sec { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border); }
+.jd .sk-sec h4 {
+	margin: 0 0 8px; font-size: 11px; font-weight: 600; letter-spacing: .04em;
+	text-transform: uppercase; color: var(--ink-2);
+}
+.jd .sk-line { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-top: 6px; }
+.jd .sk-line i { width: 9px; height: 9px; border-radius: 3px; flex: none; }
+.jd .sk-line b { font-weight: 600; color: var(--ink); }
+.jd .sk-line span { margin-left: auto; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+
+/* The fact grid: two columns of the same label/value line the sections use, so short
+   facts pack instead of stacking one per row. */
+.jd .sk-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
+.jd .sk-facts .sk-line { min-width: 0; }
+.jd .sk-facts .sk-line span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* The pane's two bar charts. Bars rather than `JD.spark`: a polyline interpolates
+   BETWEEN points and every series here is discrete, so bars claim exactly what the
+   record holds. A zero day renders as a stub on `--heat-track`, so absence reads as
+   measured absence rather than a gap.
+
+   AN SVG WITH A FIXED HEIGHT, and the `preserveAspectRatio="none"` in `JD.dayBars`
+   is what that height is for: these charts now span the whole window, so their bar
+   count is the window's day count. The flex row of `<i>` divs this replaced could
+   not hold that — its `min-width: 3px` and 3px gap needed 537px for a 90-day range
+   and 2193px for a 366-day one, so the bars overflowed the pane and the right-hand
+   days were off screen while the axis label still claimed them. Width is free to
+   stretch; only the height is pinned, so no text is inside the SVG to be stretched
+   with it (the endpoint labels are the `.sk-axis` row below).
+
+   BOTH charts read in `--accent` and neither may take an `--s*` colour: the ramp
+   means agent two sections below, so a cadence chart in codex's orange would read as
+   "codex's sessions". Same reasoning as the selected row's edge. */
+.jd .sk-daybars { display: block; width: 100%; height: 46px; margin-top: 2px; opacity: .85; }
+.jd .sk-axis { display: flex; justify-content: space-between; margin-top: 4px; font-size: 10.5px; color: var(--muted); }
+
+/* Outcome ticks — one per recorded run, oldest left. TWO states, matching the mockup:
+   failure is the one that takes a colour of its own, so a bad run is findable without
+   counting, and every other tick stays quiet green. A run whose result the agent never
+   wrote down draws as that same quiet green and is named in words underneath instead —
+   a grey third state was tried and read as "empty" rather than "unmeasured", which is
+   the wrong signal on a skill whose entry mechanism never writes a result at all. */
+.jd .sk-ticks { display: flex; flex-wrap: wrap; gap: 3px; margin: 4px 0 8px; }
+.jd .sk-ticks i { width: 13px; height: 13px; border-radius: 3px; background: var(--good); opacity: .55; }
+.jd .sk-ticks i.bad { background: var(--crit); opacity: 1; }
+
+/* Explanatory prose inside a section — NOT the invocation row, which truncates on
+   purpose. An argument string is not worth three lines of a reading pane, but a
+   sentence explaining what a figure means is exactly the thing that must not lose
+   its ending. */
+.jd .sk-note { margin-top: 6px; font-size: 11px; line-height: 1.5; color: var(--ink-2); }
+/* Small print naming where the figures came from, in the voice the cards use. */
+.jd .sk-basis {
+	display: block; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--border);
+	font-size: 11px; line-height: 1.5; color: var(--ink-2);
+}
+/* A chip rather than more grey text: the plugin is the one identity fact on the row
+   that is not a measurement. */
+.jd .sk-plugin {
+	display: inline-block; padding: 1px 6px; border-radius: 999px;
+	border: 1px solid var(--border); font-size: 10.5px; color: var(--ink-2);
+}
+/* The inferred dagger — deliberately NOT a chip like `.sk-plugin` beside it, and NOT a
+   colour. A chip reads as another identity fact and a warning colour reads as a fault,
+   where this is neither: the entry is real and its provenance is weaker than observed.
+   `help` is the cursor for exactly that, and it is what makes the `title` discoverable
+   in the column, where there is no room for the sentence the pane prints in full. */
+.jd .sk-inferred { color: var(--muted); font-weight: 400; cursor: help; }
+/* The pane's qualifier on the four figures directly above it. Same size and colour as
+   `.sk-note` — it is prose about a measurement, not an alert — but its own class,
+   because it must span every column of `.sk-panebody` and `.sk-note` sits inside one. */
+.jd .sk-caveat {
+	margin-top: 10px; max-width: 560px;
+	font-size: 11px; line-height: 1.5; color: var(--ink-2);
+}
+
+/* No wrap-padding overrides at either breakpoint: the wrap keeps its own 24px and
+   its cap is already inert below 1200px, so there is nothing left to reclaim. */
+@media (max-width: 1180px) {
+	.jd .skills-page { grid-template-columns: 320px minmax(0, 1fr); }
+}
+@media (max-width: 899px) {
+	/* The columns stack — and the rows' cap comes off with them. A scroll region nested
+	   in a scrolling page is awkward under a mouse and worse under a thumb, and at this
+	   width there is no second column beside it for a short list to be keeping room for.
+	   `!important` is not a preference here: the cap is an inline style (a measured pixel
+	   value, which no stylesheet constant can stand in for), and nothing else outranks
+	   one. The rest of what this block used to release now describes the desktop layout
+	   too, so it is gone from both. */
+	.jd .skills-page { grid-template-columns: minmax(0, 1fr); }
+	.jd .sk-list.sk-scroll { max-height: none !important; overflow: visible; }
+}

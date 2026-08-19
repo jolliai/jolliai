@@ -115,6 +115,7 @@ window.JD = window.JD || {};
 	var DASHBOARDS = [
 		{ view: "stats", label: "My Dashboard", sub: "individual · local" },
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
+		{ view: "skills", label: "Skills", sub: "usage · per-skill" },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
 		{ view: "knowledge", label: "Knowledge", sub: "wiki · per-repo" },
 		{ view: "graph", label: "Graph", sub: "knowledge graph · per-repo" },
@@ -128,6 +129,7 @@ window.JD = window.JD || {};
 	var VIEW_PATH = {
 		stats: "/dashboard",
 		standup: "/dashboard/standup",
+		skills: "/skills",
 		memories: "/memories",
 		knowledge: "/knowledge",
 		graph: "/graph",
@@ -135,9 +137,18 @@ window.JD = window.JD || {};
 	};
 	JD.viewPath = (view) => VIEW_PATH[view] || "/" + view;
 
-	/* The nav list. Dashboard's two children render flat under a group label
-	   rather than behind an expand/collapse toggle — that interaction is a later
-	   polish pass, not a routing concern.
+	/* The nav list. EVERY ROW IS A PEER — there is no group label and no indent
+	   step. My Dashboard and Daily Standup used to render as children under a
+	   "Dashboard" label, and on a five-row menu that cost three things and bought
+	   nothing: the label was not a destination yet carried a chevron that read as
+	   expand/collapse (nothing collapsed — both rows were written out flat on
+	   every paint); it spent a row and an indent grouping two of five items under
+	   a word neither label was missing; and it cost the two most-visited pages
+	   their marks, because a child row drew no icon at all — so My Dashboard, the
+	   home of this surface and the fallback for every unroutable view, was the one
+	   destination in the menu with no glyph while the label above it wore the grid
+	   mark that belonged to it. Adding a nested group back means re-answering all
+	   three.
 
 	   NO ROW IS GATED BY REPO COUNT any more (the two optional rows below are a
 	   different question — they are hidden by preference, and their routes stay
@@ -163,13 +174,12 @@ window.JD = window.JD || {};
 	   new page needs its server route, view token and model payload too — a nav
 	   row on its own is not enough. */
 	var NAV_MIDDLE = [
-		{
-			label: "Dashboard",
-			kids: [
-				{ view: "stats", path: "/dashboard", label: "My Dashboard" },
-				{ view: "standup", path: "/dashboard/standup", label: "Daily Standup" },
-			],
-		},
+		{ view: "stats", path: "/dashboard", label: "My Dashboard" },
+		{ view: "standup", path: "/dashboard/standup", label: "Daily Standup" },
+		/* Its own destination rather than a section of My Dashboard: that page's
+		   Skills card is a summary of the same data, and this page answers a
+		   different question (one skill's whole history) at a different grain. */
+		{ view: "skills", path: "/skills", label: "Skills" },
 		{ view: "memories", path: "/memories", label: "Memories" },
 		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
 		   from the enabled dashboard repos — they carry their own empty state. */
@@ -193,24 +203,39 @@ window.JD = window.JD || {};
 	var NAV_ICONS = {
 		dashboard:
 			'<rect width="7" height="9" x="3" y="3" rx="1"/><rect width="7" height="5" x="14" y="3" rx="1"/><rect width="7" height="9" x="14" y="12" rx="1"/><rect width="7" height="5" x="3" y="16" rx="1"/>',
+		/* Lucide `calendar-days`. A calendar rather than a board or a checklist
+		   because the DAY is what separates Daily Standup from My Dashboard, and the
+		   page says so itself — one dated board of Yesterday and Today, where My
+		   Dashboard is a window the reader picks. A board glyph would name the
+		   layout, which is the part a reader can already see. */
+		calendar:
+			'<path d="M8 2v4"/><path d="M16 2v4"/><rect width="18" height="18" x="3" y="4" rx="2"/><path d="M3 10h18"/><path d="M8 14h.01"/><path d="M12 14h.01"/><path d="M16 14h.01"/><path d="M8 18h.01"/><path d="M12 18h.01"/><path d="M16 18h.01"/>',
+		/* Lucide `puzzle` — a skill is a part that slots into a run. THE SAME MARK
+		   THE SKILLS CARD DRAWS (stats.js `skillsCard`, whose own comment records why
+		   it stopped being a star): a nav row for the same subject has to carry the
+		   same mark, or the card and the page read as two different features. It
+		   replaced a `zap` bolt, which said nothing about skills at all. */
+		puzzle:
+			'<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/>',
 		database:
 			'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
-		chevron: '<path d="m6 9 6 6 6-6"/>',
 		book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
 		network:
 			'<rect x="9" y="2" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="16" y="16" width="6" height="6" rx="1"/><path d="M12 8v4"/><path d="M5 16v-2h14v2"/>',
 		settings:
 			'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 	};
-	var navIcon = (name, extraClass) =>
-		'<span class="sb-icon' +
-		(extraClass ? " " + extraClass : "") +
-		'"><svg viewBox="0 0 24 24" aria-hidden="true">' +
-		NAV_ICONS[name] +
-		"</svg></span>";
+	var navIcon = (name) =>
+		'<span class="sb-icon"><svg viewBox="0 0 24 24" aria-hidden="true">' + NAV_ICONS[name] + "</svg></span>";
+	/* EVERY row in the menu resolves a mark here — the pinned Settings row
+	   included. A view missing from this map renders a row with an empty
+	   `.sb-icon` box, which reads as a broken glyph rather than as no glyph, so
+	   adding a page means adding its mark in the same change. */
 	var navIconFor = (view) =>
 		({
 			stats: "dashboard",
+			standup: "calendar",
+			skills: "puzzle",
 			memories: "database",
 			knowledge: "book",
 			graph: "network",
@@ -252,7 +277,7 @@ window.JD = window.JD || {};
 	   removed. Kept as a table rather than collapsed to `true` so a future view
 	   that ignores the scope hides the control instead of lying about it; the
 	   picker hides rather than disables, same as the range control on standup. */
-	var SCOPED_VIEWS = { stats: true, standup: true, memories: true };
+	var SCOPED_VIEWS = { stats: true, standup: true, skills: true, memories: true };
 
 	/* Button label for a selection: the repo's name at one, a count past that.
 	   Names past one would either truncate or push the range control off the row,
@@ -634,36 +659,20 @@ window.JD = window.JD || {};
 		   switched on in Settings → Advanced — a preference, not a gate, so their
 		   routes stay open either way. */
 		var navRow = (item, active) =>
-			'<button type="button" class="sb-item' +
-			(item.child ? " child" : "") +
-			'" data-nav-path="' +
+			'<button type="button" class="sb-item" data-nav-path="' +
 			item.path +
 			'" data-nav-view="' +
 			(item.view || "") +
 			'"' +
 			(active ? ' aria-current="page"' : "") +
-			'>' +
-			(item.child ? "" : navIcon(navIconFor(item.view))) +
+			">" +
+			navIcon(navIconFor(item.view)) +
 			'<span class="name">' +
 			esc(item.label) +
 			"</span></button>";
 		var nav = "";
 		NAV_MIDDLE.forEach((item) => {
 			if (!navRowVisible(item, model)) return;
-			if (item.kids) {
-				nav +=
-				'<div class="sb-group-label">' +
-				navIcon("dashboard") +
-				'<span>' +
-				esc(item.label) +
-				"</span>" +
-				navIcon("chevron", "sb-group-chevron") +
-				"</div>";
-				item.kids.forEach((kid) => {
-					nav += navRow({ ...kid, child: true }, model.view === kid.view);
-				});
-				return;
-			}
 			nav += navRow(item, model.view === item.view);
 		});
 		document.getElementById("sbNav").innerHTML = nav;
@@ -1228,11 +1237,19 @@ window.JD = window.JD || {};
 			return data;
 		});
 
+	/* `status` rides the error, matching `postJson` above. Without it a caller cannot
+	   tell the server ANSWERING badly (a 404 from a build that predates the route)
+	   from the server not being there at all — `fetch` rejects with a bare TypeError
+	   whose message is "Failed to fetch", and those two need opposite advice. */
 	JD.getJson = (path) =>
 		fetch(path, { headers: { "X-Jolli-Dashboard-Token": window.__JOLLI_DASHBOARD_TOKEN__ || "" } }).then(
 			async (res) => {
 				var data = await res.json().catch(() => ({}));
-				if (!res.ok) throw new Error(data.error || "request failed (" + res.status + ")");
+				if (!res.ok) {
+					var err = new Error(data.error || "request failed (" + res.status + ")");
+					err.status = res.status;
+					throw err;
+				}
 				return data;
 			},
 		);

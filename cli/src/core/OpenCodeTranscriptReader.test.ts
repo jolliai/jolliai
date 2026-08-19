@@ -21,6 +21,7 @@ async function createTestDb(
 	messages: ReadonlyArray<{
 		id: string;
 		role: string;
+		data?: Record<string, unknown>;
 		parts: ReadonlyArray<{ type: string; text?: string; [key: string]: unknown }>;
 		time_created: number;
 	}>,
@@ -65,7 +66,7 @@ async function createTestDb(
 	);
 
 	for (const m of messages) {
-		const msgData = JSON.stringify({ role: m.role });
+		const msgData = JSON.stringify({ role: m.role, ...m.data });
 		insertMessage.run(m.id, sessionId, m.time_created, m.time_created, msgData);
 
 		for (let i = 0; i < m.parts.length; i++) {
@@ -464,7 +465,12 @@ describe("OpenCodeTranscriptReader toolUse", () => {
 			{
 				id: "m2",
 				role: "assistant",
-				parts: [{ type: "tool", tool: "bash", callID: "c3" }],
+				parts: [
+					{ type: "tool", tool: "bash", callID: "c3" },
+					// Older rows can omit callID. They still represent a call; only
+					// de-duplication is unavailable for that row.
+					{ type: "tool", tool: "write" },
+				],
 				time_created: now + 1,
 			},
 		]);
@@ -474,6 +480,7 @@ describe("OpenCodeTranscriptReader toolUse", () => {
 		expect(result.toolUse).toEqual([
 			{ name: "bash", kind: "builtin", calls: 2 },
 			{ name: "read", kind: "builtin", calls: 1 },
+			{ name: "write", kind: "builtin", calls: 1 },
 		]);
 	});
 
@@ -497,7 +504,62 @@ describe("OpenCodeTranscriptReader toolUse", () => {
 
 		const result = await readOpenCodeTranscript(transcriptPath);
 
-		expect(result.toolUse).toEqual([{ name: "brainstorming", kind: "skill", calls: 1 }]);
+		expect(result.toolUse).toEqual([
+			{
+				name: "brainstorming",
+				kind: "skill",
+				calls: 1,
+				lastCallAtMs: now,
+				invocations: [{ at: new Date(now).toISOString(), ok: true, entryPath: "tool" }],
+			},
+		]);
+	});
+
+	it("forwards OpenCode outcome, body size and interval-attributed usage", async () => {
+		const now = Date.now();
+		const output = '<skill_content name="brainstorming">body</skill_content>';
+		const transcriptPath = await createTestDb(tempDir, "sess-t2-detail", [
+			{
+				id: "m1",
+				role: "assistant",
+				parts: [
+					{
+						type: "tool",
+						tool: "skill",
+						callID: "c1",
+						state: {
+							status: "error",
+							metadata: { name: "brainstorming" },
+							time: { start: now + 2 },
+							output,
+						},
+					},
+				],
+				time_created: now,
+			},
+			{
+				id: "m2",
+				role: "assistant",
+				data: { tokens: { input: 7, output: 11, reasoning: 3, cache: { write: 5, read: 999 } } },
+				parts: [],
+				time_created: now + 10,
+			},
+		]);
+
+		const result = await readOpenCodeTranscript(transcriptPath);
+
+		expect(result.toolUse).toEqual([
+			{
+				name: "brainstorming",
+				kind: "skill",
+				calls: 1,
+				lastCallAtMs: now + 2,
+				usage: { input: 7, output: 14, cached: 5, confidence: "estimated" },
+				invocations: [
+					{ at: new Date(now + 2).toISOString(), bodyChars: output.length, ok: false, entryPath: "tool" },
+				],
+			},
+		]);
 	});
 
 	it("falls back to the requested skill name when metadata carries none", async () => {

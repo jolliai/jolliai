@@ -15,6 +15,10 @@ window.JD = window.JD || {};
 		var month = MONTHS[Number(parts[1]) - 1];
 		return month && parts[2] ? month + " " + Number(parts[2]) : String(key);
 	};
+	/* Exported because the Skills pane's own charts label the SAME day keys, and a
+	   second copy of this would drift exactly on the `new Date(key)` trap the comment
+	   above exists to warn about. One spelling of a day, page-wide. */
+	JD.dayLabel = dayLabel;
 
 	/* The series palette holds FIVE colours and `JD.seriesColor` cycles them, so a
 	   sixth series is drawn in the first one's colour and the stack stops being
@@ -248,6 +252,76 @@ window.JD = window.JD || {};
 			svg += axis(left, "start", series[0].date);
 			if (series.length > 1) svg += axis(W - 8, "end", series[series.length - 1].date);
 		}
+		return svg + "</svg>";
+	};
+
+	/**
+	 * One value per LOCAL DAY of the window, as the Skills pane's small charts.
+	 *
+	 * SVG, not the flex row of `<i>` divs this replaced, and the reason is the axis
+	 * rather than the markup. These charts now span the whole window, so their bar
+	 * count is the window's day count — and a flex row cannot survive that: at
+	 * `min-width: 3px` with a 3px gap, 90 days needs 537px and a 366-day custom range
+	 * needs 2193px, so the row overflowed its own pane and the right-hand days were
+	 * simply not on screen while the axis label underneath still claimed them. A
+	 * viewBox scales instead, which is exactly how `JD.stackedBars` above already
+	 * survives 366 days in the band.
+	 *
+	 * `preserveAspectRatio="none"` with a CSS-fixed height: the bars stretch
+	 * horizontally to whatever width the pane has and the chart keeps its 46px, so
+	 * bar-to-gap ratio is constant at every range. Nothing here draws text — the two
+	 * endpoint labels stay HTML in `.sk-axis`, because text under a `none` aspect
+	 * ratio is text that has been stretched.
+	 *
+	 * A ZERO DAY IS A 6-UNIT STUB on `--heat-track`, never a skipped bar: a fortnight's
+	 * gap has to read as measured absence. That is the same rule the flex version
+	 * carried and the same rule the band follows by walking the window rather than the
+	 * data.
+	 *
+	 * The flex version's 2px top corners are gone rather than ported: under a `none`
+	 * aspect ratio an `rx` is scaled on one axis only, so a rounded corner becomes a
+	 * visibly lopsided one — and at a range's real bar width (~18px at 30 days, under
+	 * 5px at 90) there was nothing there to see anyway.
+	 */
+	JD.dayBars = (days, values, opts) => {
+		var options = opts || {};
+		/* `fmt` owns the WHOLE value, unit included, rather than taking a unit suffix
+		   beside it: a suffix cannot inflect, so one bar in `" sessions"` read `1
+		   sessions`. Same division of labour `JD.stackedBars` draws for its axis. */
+		var format = options.fmt || JD.fmtTokens;
+		/* One viewBox unit per day, so `slot` is 1 and the bar/gap split is the band's
+		   0.58 — the two charts thin out together as the range grows. */
+		var barW = 0.58;
+		var max = 0;
+		values.forEach((value) => {
+			if (value > max) max = value;
+		});
+		var svg =
+			'<svg class="sk-daybars" viewBox="0 0 ' +
+			Math.max(1, days.length) +
+			' 100" preserveAspectRatio="none" role="img" aria-label="' +
+			JD.esc(options.label || "Daily values") +
+			'">';
+		days.forEach((day, index) => {
+			var value = typeof values[index] === "number" ? values[index] : 0;
+			/* Floors at 20 so a lone call on a busy skill's chart is still a visible bar
+			   rather than a hairline indistinguishable from the empty stub. */
+			var h = value > 0 ? Math.max(20, max > 0 ? (value / max) * 100 : 100) : 6;
+			svg +=
+				'<rect x="' +
+				(index + (1 - barW) / 2).toFixed(3) +
+				'" y="' +
+				(100 - h).toFixed(2) +
+				'" width="' +
+				barW +
+				'" height="' +
+				h.toFixed(2) +
+				'" fill="' +
+				(value > 0 ? "var(--accent)" : "var(--heat-track)") +
+				'"><title>' +
+				JD.esc(dayLabel(day) + " · " + format(value)) +
+				"</title></rect>";
+		});
 		return svg + "</svg>";
 	};
 

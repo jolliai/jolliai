@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { LogLevel } from "../Types.js";
+import type { LogLevel, TranscriptSource } from "../Types.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import type {
@@ -884,6 +884,327 @@ describe("session_activity projection", () => {
 			},
 			{ dbPath },
 		);
+	});
+});
+
+describe("skill_invocations projection", () => {
+	/**
+	 * Buckets are typed loosely and cast through `unknown` on purpose: two cases below
+	 * build shapes no scanner produces — a builtin bucket carrying invocations, and an
+	 * entry whose instant is unparseable — because those are exactly the inputs the
+	 * writer's guards exist for, and a `ToolCallCount` literal cannot express them.
+	 */
+	const sessionEvent = (tools: ReadonlyArray<Record<string, unknown>>, source: TranscriptSource = "claude") =>
+		({
+			event: {
+				type: "session.upserted" as const,
+				repoIdentity: "repo-1",
+				source,
+				sessionId: "s1",
+				updatedAtMs: 1_700_000_000_000,
+				tools,
+			},
+			producerKind: "cli" as const,
+		}) as unknown as StatsEventEnvelope;
+
+	const invocations = async () =>
+		query<Record<string, unknown>>(
+			`SELECT skill_name, at_ms, ok, ok_confidence, detection, entry_path, args, body_chars
+			   FROM skill_invocations ORDER BY at_ms`,
+		);
+
+	const skillBucket = (over: Record<string, unknown> = {}) => ({
+		name: "code-review",
+		kind: "skill",
+		calls: 1,
+		invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" }],
+		...over,
+	});
+
+	it("writes one row per entry, with the outcome marked as READ for a mechanism that reports one", async () => {
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		expect(await invocations()).toEqual([
+			{
+				skill_name: "code-review",
+				at_ms: Date.parse("2026-08-01T10:00:00.000Z"),
+				ok: 1,
+				ok_confidence: "observed",
+				detection: null,
+				entry_path: "tool",
+				args: null,
+				body_chars: null,
+			},
+		]);
+	});
+
+	it("marks the outcome as DEFAULTED for a mechanism with no result record", async () => {
+		// A slash command carries a hard-coded `ok: true` because failure is not knowable
+		// there. The row keeps that assertion and says it was not read — which is what
+		// stops the failure count treating it as a measured success.
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({ invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "command" }] }),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([{ ok: 1, ok_confidence: "assumed", entry_path: "command" }]);
+	});
+
+	it("marks an unresolved result-capable invocation as DEFAULTED", async () => {
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: true,
+								entryPath: "tool",
+								outcomeObserved: false,
+							},
+						],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([{ ok: 1, ok_confidence: "assumed", entry_path: "tool" }]);
+	});
+
+	it("copies the skill-level heuristic mark onto every one of its entries", async () => {
+		await applyStatsEvents(
+			[
+				sessionEvent(
+					[
+						skillBucket({
+							detection: "heuristic",
+							invocations: [
+								{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" },
+								{ at: "2026-08-01T11:00:00.000Z", ok: true, entryPath: "tool" },
+							],
+						}),
+					],
+					"codex",
+				),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([
+			{ detection: "heuristic", ok_confidence: "assumed" },
+			{ detection: "heuristic", ok_confidence: "assumed" },
+		]);
+	});
+
+	it("keeps args and the injected body size", async () => {
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: true,
+								entryPath: "tool",
+								args: "--changed",
+								bodyChars: 3619,
+							},
+						],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([{ args: "--changed", body_chars: 3619 }]);
+	});
+
+	it("converges on the same row when the same entry is read again", async () => {
+		// The producing scan is whole-conversation, so every pass re-reads every entry it
+		// already saw. Keyed on the instant they land back on their own row.
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		expect(await invocations()).toHaveLength(1);
+	});
+
+	it("corrects an optimistic outcome on the next read", async () => {
+		// A window that closed mid-invocation reports `ok: true`; the re-read that sees the
+		// result must be able to overwrite it, not be coalesced away.
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: true,
+								entryPath: "tool",
+								outcomeObserved: false,
+							},
+						],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [
+							{
+								at: "2026-08-01T10:00:00.000Z",
+								ok: false,
+								entryPath: "tool",
+								outcomeObserved: true,
+							},
+						],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([{ ok: 0, ok_confidence: "observed" }]);
+	});
+
+	it("does not let a later unresolved read downgrade an observed outcome", async () => {
+		const at = "2026-08-01T10:00:00.000Z";
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [{ at, ok: false, entryPath: "tool", outcomeObserved: true }],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [{ at, ok: true, entryPath: "tool", outcomeObserved: false }],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toMatchObject([{ ok: 0, ok_confidence: "observed" }]);
+	});
+
+	it("keeps a stored body size when a later read reports none", async () => {
+		// COALESCE'd, unlike the outcome: both describe one fixed past event, and a pass
+		// that read no body has nothing better to offer than what is already stored.
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool", bodyChars: 3619 }],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		expect(await invocations()).toMatchObject([{ body_chars: 3619 }]);
+	});
+
+	it("does NOT delete rows the newer read no longer mentions", async () => {
+		// A compacted conversation stops mentioning entries that did happen. The aggregate
+		// is rebuilt; the detail is add-or-update, so the history survives.
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						calls: 2,
+						invocations: [
+							{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" },
+							{ at: "2026-08-01T11:00:00.000Z", ok: true, entryPath: "tool" },
+						],
+					}),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({ invocations: [{ at: "2026-08-01T11:00:00.000Z", ok: true, entryPath: "tool" }] }),
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toHaveLength(2);
+	});
+
+	it("skips an entry whose instant cannot be parsed — it could not key a row", async () => {
+		// Kimi's converter yields "" for a malformed wire timestamp.
+		await applyStatsEvents([sessionEvent([skillBucket({ invocations: [{ at: "", ok: true }] })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect(await invocations()).toEqual([]);
+	});
+
+	it("ignores invocations on a bucket that is not a skill", async () => {
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					{
+						name: "Bash",
+						kind: "builtin",
+						calls: 1,
+						invocations: [{ at: "2026-08-01T10:00:00.000Z", ok: true, entryPath: "tool" }],
+					},
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await invocations()).toEqual([]);
+	});
+
+	it("stores the providing plugin on the aggregate row", async () => {
+		await applyStatsEvents([sessionEvent([skillBucket({ plugin: "superpowers" })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect(
+			await query<{ plugin: string | null }>("SELECT plugin FROM session_tool_use WHERE kind = 'skill'"),
+		).toEqual([{ plugin: "superpowers" }]);
+	});
+
+	it("keeps stored skill enrichment when a later read cannot reproduce it", async () => {
+		await applyStatsEvents(
+			[
+				sessionEvent([
+					skillBucket({
+						plugin: "superpowers",
+						lastCallAtMs: 1_754_041_600_000,
+						usage: { input: 7, output: 11, cached: 5, confidence: "attributed" },
+					}),
+				]),
+			],
+			{
+				producerKind: "cli",
+				dbPath,
+			},
+		);
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		expect(
+			await query<Record<string, unknown>>(
+				`SELECT last_call_at_ms, input_tokens, output_tokens, cached_tokens, usage_confidence, plugin
+				   FROM session_tool_use WHERE kind = 'skill'`,
+			),
+		).toEqual([
+			{
+				last_call_at_ms: 1_754_041_600_000,
+				input_tokens: 7,
+				output_tokens: 11,
+				cached_tokens: 5,
+				usage_confidence: "attributed",
+				plugin: "superpowers",
+			},
+		]);
 	});
 });
 

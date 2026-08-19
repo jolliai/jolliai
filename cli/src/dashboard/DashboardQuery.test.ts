@@ -26,7 +26,7 @@ import { MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 /** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
 const SH = "Asia/Shanghai";
 
-import { buildDashboardModel, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
+import { buildDashboardModel, buildSkillDetail, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
 import { volumeReachable } from "./RepoForget.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
@@ -1176,7 +1176,26 @@ describe("buildDashboardModel — tool usage", () => {
 
 	const sessionWith = (
 		sessionId: string,
-		tools?: ReadonlyArray<{ name: string; kind: "builtin" | "mcp" | "skill"; server?: string; calls: number }>,
+		tools?: ReadonlyArray<{
+			name: string;
+			kind: "builtin" | "mcp" | "skill";
+			server?: string;
+			calls: number;
+			/** Marks the bucket inferred; the writer copies it onto each of its entries. */
+			detection?: "heuristic";
+			plugin?: string;
+			lastCallAtMs?: number;
+			usage?: { input: number; output: number; cached: number; confidence: "attributed" | "estimated" };
+			/** Per-entry rows. Required to reach `skill_invocations` at all — see the detection tests. */
+			invocations?: ReadonlyArray<{
+				at: string;
+				ok: boolean;
+				entryPath?: "tool" | "command";
+				outcomeObserved?: boolean;
+				args?: string;
+				bodyChars?: number;
+			}>;
+		}>,
 		source: "claude" | "codex" | "cline" = "claude",
 	): StatsEventEnvelope => ({
 		producerKind: "cli",
@@ -1933,6 +1952,643 @@ describe("buildDashboardModel — tool usage", () => {
 		// know nothing about.
 		expect(page.rows.map(rowKey)).toEqual(["code-review"]);
 		expect(page.totalCount).toBe(1);
+	});
+
+	it("surfaces a skill namespace and degrades partial legacy usage to zero", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("legacy-usage", [
+					{
+						name: "code-review",
+						kind: "skill",
+						calls: 1,
+						plugin: "superpowers",
+						usage: { input: 9, output: 4, cached: 2, confidence: "estimated" },
+					},
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// These columns normally move together. A partially populated pre-migration
+		// row must still render instead of crashing or losing the attributed input.
+		await withDashboardDb(
+			(db) => db.exec("UPDATE session_tool_use SET output_tokens = NULL, cached_tokens = NULL"),
+			{ dbPath },
+		);
+
+		expect((await usage())?.skills[0]).toMatchObject({
+			name: "code-review",
+			plugin: "superpowers",
+			usage: { input: 9, output: 0, cached: 0, confidence: "estimated", sessions: 1 },
+		});
+	});
+
+	it("omits a plugin label when different plugins used the same bare skill name", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionWith("team-a", [{ name: "review", kind: "skill", calls: 1, plugin: "team-a" }]),
+				sessionWith("team-b", [{ name: "review", kind: "skill", calls: 1, plugin: "team-b" }]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const row = (await usage())?.skills.find((skill) => skill.name === "review");
+		expect(row).toMatchObject({ name: "review", sessions: 2, calls: 2 });
+		expect(row).not.toHaveProperty("plugin");
+		const detailRow = await withDashboardDb(
+			(db) => buildSkillDetail(db, { scope: { kind: "all" }, name: "review", timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(detailRow).not.toHaveProperty("plugin");
+	});
+
+	/**
+	 * `ToolUsageRow.detection` — the list row's inferred mark.
+	 *
+	 * The mark is read from `skill_invocations`, which is a DIFFERENT GRAIN from the
+	 * aggregate the rest of the row comes from (one row per entry, against one per
+	 * session+skill). Every case here is about that mismatch rather than about the
+	 * mark itself.
+	 */
+	describe("inferred marking", () => {
+		const entry = (at: string) => ({ at, ok: true, entryPath: "tool" as const });
+
+		it("marks a row when any entry behind it was inferred, and leaves an observed row clean", async () => {
+			await applySummaryEvents(
+				[
+					repoEvent,
+					sessionWith(
+						"s1",
+						[
+							{
+								name: "inferred-skill",
+								kind: "skill",
+								calls: 1,
+								detection: "heuristic",
+								invocations: [entry("2026-07-30T10:00:00.000Z")],
+							},
+							{
+								name: "observed-skill",
+								kind: "skill",
+								calls: 1,
+								invocations: [entry("2026-07-30T10:00:00.000Z")],
+							},
+						],
+						"codex",
+					),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const byName = new Map((await usage())?.skills.map((row) => [row.name, row]));
+			expect(byName.get("inferred-skill")?.detection).toBe("heuristic");
+			// Absent, not a second value — see `ToolUsageRow.detection` on why "observed"
+			// and "nothing on record" deliberately share the quiet case.
+			expect(byName.get("observed-skill")?.detection).toBeUndefined();
+		});
+
+		it("does not multiply the row's own figures by the number of entries behind it", async () => {
+			// THE REGRESSION THIS SUITE EXISTS FOR, and the assertions are deliberately on
+			// the numbers that have NOTHING to do with the mark. `skill_invocations` holds
+			// one row per entry, so reaching it with a JOIN instead of the correlated
+			// subquery fans the aggregate out: these four entries turn 3 calls into 12 and
+			// each token sum into four times itself. Nothing throws.
+			//
+			// FOUR ENTRIES AGAINST THREE CALLS, not a matching count, and the mismatch is
+			// the realistic shape rather than a contrivance — an inferred skill is entered
+			// once per session however many paged reads produced it, so the two numbers are
+			// independent by design. It also means a JOIN cannot be caught by comparing them.
+			//
+			// `sessions` is asserted for the opposite reason: it is a COUNT(DISTINCT) and so
+			// survives the fan-out unharmed. That is what makes the bug quiet on a real
+			// database — half the row keeps agreeing with itself.
+			await applySummaryEvents(
+				[
+					repoEvent,
+					sessionWith(
+						"s1",
+						[
+							{
+								name: "paged-reads",
+								kind: "skill",
+								calls: 3,
+								detection: "heuristic",
+								usage: { input: 500, output: 300, cached: 100, confidence: "attributed" },
+								invocations: [
+									entry("2026-07-30T10:00:00.000Z"),
+									entry("2026-07-30T10:01:00.000Z"),
+									entry("2026-07-30T10:02:00.000Z"),
+									entry("2026-07-30T10:03:00.000Z"),
+								],
+							},
+						],
+						"codex",
+					),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const row = (await usage())?.skills[0];
+			expect(row?.detection).toBe("heuristic");
+			expect(row?.calls).toBe(3);
+			expect(row?.sessions).toBe(1);
+			expect(row?.usage).toMatchObject({ input: 500, output: 300, cached: 100 });
+			// The per-agent split rides on its own query and must survive the same way.
+			expect(row?.agents).toEqual([{ source: "codex", calls: 3 }]);
+		});
+
+		it("leaves an MCP tool unmarked even when a heuristic skill shares its name", async () => {
+			// `skill_invocations` has no `kind` column, so the subquery matches on name
+			// alone and the two lists are separated only by `t.kind` — which the subquery
+			// cannot see. Without the `list` gate this MCP row inherits the skill's mark.
+			await applySummaryEvents(
+				[
+					repoEvent,
+					sessionWith(
+						"s1",
+						[
+							{
+								name: "exec",
+								kind: "skill",
+								calls: 1,
+								detection: "heuristic",
+								invocations: [entry("2026-07-30T10:00:00.000Z")],
+							},
+							{ name: "exec", kind: "mcp", server: "shell", calls: 1 },
+						],
+						"codex",
+					),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			const result = await usage();
+			expect(result?.skills.find((row) => row.name === "exec")?.detection).toBe("heuristic");
+			expect(result?.mcpTools.find((row) => row.name === "exec")?.detection).toBeUndefined();
+		});
+
+		it("leaves a row unmarked when no entry row survives to read a detection off", async () => {
+			// A count with no per-entry record — an archived commit's merged total, or a
+			// transcript the agent pruned. There is nothing to read, so the row falls quiet
+			// rather than claiming either nature.
+			await applySummaryEvents(
+				[repoEvent, sessionWith("s1", [{ name: "no-entries", kind: "skill", calls: 5 }], "codex")],
+				{ producerKind: "cli", dbPath },
+			);
+			const row = (await usage())?.skills[0];
+			expect(row?.calls).toBe(5);
+			expect(row?.detection).toBeUndefined();
+		});
+	});
+
+	describe("skill detail", () => {
+		const detail = async (name: string) =>
+			await withDashboardDb(
+				(db) => buildSkillDetail(db, { scope: { kind: "all" }, name, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+
+		it("returns undefined when the window contains no call of that skill", async () => {
+			await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
+			expect(await detail("missing")).toBeUndefined();
+		});
+
+		it("projects usage, agents, sessions, commits and every per-entry detail without join fan-out", async () => {
+			const firstAt = nowMs - 2 * 3_600_000;
+			const lastAt = nowMs - 3_600_000;
+			const hash = "d".repeat(40);
+			await applySummaryEvents(
+				[
+					repoEvent,
+					{
+						producerKind: "cli",
+						event: {
+							type: "session.upserted",
+							repoIdentity: "repo-1",
+							source: "claude",
+							sessionId: "rich",
+							title: "Review the release",
+							startedAtMs: firstAt - 60_000,
+							updatedAtMs: nowMs,
+							durationMs: 7_200_000,
+							messageCount: 9,
+							models: [
+								{
+									model: "claude-opus-4-8",
+									provider: "anthropic",
+									inputTokens: 100,
+									outputTokens: 50,
+									cachedTokens: 25,
+								},
+							],
+							tokenCoverage: "full",
+							tools: [
+								{
+									name: "code-review",
+									kind: "skill",
+									calls: 2,
+									plugin: "superpowers",
+									lastCallAtMs: lastAt,
+									usage: { input: 40, output: 20, cached: 10, confidence: "attributed" },
+									invocations: [
+										{
+											at: new Date(firstAt).toISOString(),
+											ok: true,
+											entryPath: "tool",
+											args: "--base main",
+											bodyChars: 3200,
+										},
+										{
+											at: new Date(lastAt).toISOString(),
+											ok: false,
+											entryPath: "tool",
+											bodyChars: 120,
+										},
+									],
+								},
+							],
+						},
+					},
+					sessionWith(
+						"inferred",
+						[
+							{
+								name: "code-review",
+								kind: "skill",
+								calls: 1,
+								lastCallAtMs: lastAt - 1,
+								detection: "heuristic",
+								usage: { input: 7, output: 3, cached: 2, confidence: "estimated" },
+								invocations: [
+									{ at: new Date(lastAt - 1).toISOString(), ok: true, entryPath: "command" },
+								],
+							},
+						],
+						"codex",
+					),
+					{
+						producerKind: "cli",
+						event: {
+							type: "commit.created",
+							repoIdentity: "repo-1",
+							hash,
+							branch: "main",
+							branches: ["main"],
+							message: "fix: review finding",
+							committedAtMs: lastAt,
+							filesChanged: 2,
+							insertions: 12,
+							deletions: 3,
+						},
+					},
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			await seedTopicRows(dbPath, hash, ["bugfix", "bugfix", "architecture"], { commitDateMs: lastAt });
+			await withDashboardDb(
+				(db) => {
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+						id: number;
+					};
+					db.prepare(
+						`UPDATE memories
+						    SET summary_json = json_set(summary_json,
+						        '$.branch', 'main',
+						        '$.commitMessage', 'fix: review finding',
+						        '$.diffStats.filesChanged', 2,
+						        '$.diffStats.insertions', 12,
+						        '$.diffStats.deletions', 3)
+						  WHERE repo_id = ? AND commit_hash = ?`,
+					).run(repoId, hash);
+					for (const transcriptId of ["t-rich-1", "t-rich-2"]) {
+						db.prepare(
+							"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, 1)",
+						).run(repoId, transcriptId, Buffer.from("fixture"));
+						db.prepare(
+							"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)",
+						).run(repoId, hash, transcriptId);
+						db.prepare(
+							"INSERT INTO transcript_sessions (repo_id, transcript_id, session_id, source) VALUES (?, ?, 'rich', 'claude')",
+						).run(repoId, transcriptId);
+					}
+				},
+				{ dbPath },
+			);
+
+			const result = await detail("code-review");
+			expect(result).toMatchObject({
+				name: "code-review",
+				sessions: 2,
+				calls: 3,
+				lastCallAtMs: lastAt,
+				plugin: "superpowers",
+				usage: { input: 47, output: 23, cached: 12, confidence: "estimated", sessions: 2 },
+				agents: [
+					{
+						source: "claude",
+						sessions: 1,
+						calls: 2,
+						usage: { input: 40, output: 20, cached: 10, confidence: "attributed", sessions: 1 },
+					},
+					{
+						source: "codex",
+						sessions: 1,
+						calls: 1,
+						usage: { input: 7, output: 3, cached: 2, confidence: "estimated", sessions: 1 },
+					},
+				],
+				outcomes: { measured: 2, failed: 1, assumed: 1 },
+				entryPaths: ["tool", "command"],
+				detection: "heuristic",
+				firstCallAtMs: firstAt,
+				bodyChars: 3200,
+				repos: ["jolli"],
+				categories: [
+					{ category: "architecture", commits: 1 },
+					{ category: "bugfix", commits: 1 },
+				],
+			});
+			expect(result?.commits).toEqual([
+				{
+					hash,
+					repoName: "jolli",
+					branch: "main",
+					message: "fix: review finding",
+					committedAtMs: lastAt,
+					filesChanged: 2,
+					insertions: 12,
+					deletions: 3,
+					categories: ["architecture", "bugfix"],
+				},
+			]);
+			expect(result?.linkedSessions[0]).toMatchObject({
+				sessionId: "rich",
+				title: "Review the release",
+				startedAtMs: firstAt - 60_000,
+				durationMs: 7_200_000,
+				messageCount: 9,
+				model: "claude-opus-4-8",
+				sessionTokens: 175,
+			});
+			expect(result?.invocations).toEqual([
+				{ atMs: firstAt, ok: true, outcomeKnown: true, args: "--base main", bodyChars: 3200 },
+				{ atMs: lastAt - 1, ok: true, outcomeKnown: false },
+				{ atMs: lastAt, ok: false, outcomeKnown: true, bodyChars: 120 },
+			]);
+			expect(result?.sessionSeries).toEqual([
+				{ atMs: lastAt - 1, tokens: 12 },
+				{ atMs: lastAt, tokens: 70 },
+			]);
+		});
+
+		it("keeps sparse calls visible without inventing usage, outcomes or optional session facts", async () => {
+			await applySummaryEvents([repoEvent, sessionWith("sparse", [{ name: "plain", kind: "skill", calls: 5 }])], {
+				producerKind: "cli",
+				dbPath,
+			});
+			const result = await detail("plain");
+			expect(result).toMatchObject({
+				name: "plain",
+				sessions: 1,
+				calls: 5,
+				agents: [{ source: "claude", sessions: 1, calls: 5 }],
+				commits: [],
+				categories: [],
+				entryPaths: [],
+				invocations: [],
+				sessionSeries: [{ atMs: nowMs - 3_600_000 }],
+			});
+			expect(result).not.toHaveProperty("usage");
+			expect(result).not.toHaveProperty("outcomes");
+			expect(result).not.toHaveProperty("plugin");
+			expect(result?.linkedSessions[0]).not.toHaveProperty("sessionTokens");
+			expect(result?.linkedSessions[0]).not.toHaveProperty("usage");
+		});
+
+		it("keeps the newest 400 session-series points in ascending order", async () => {
+			const points = Array.from({ length: 401 }, (_, i) => nowMs - (401 - i) * 60_000);
+			await applySummaryEvents(
+				[
+					repoEvent,
+					...points.map((atMs, i) =>
+						sessionWith(`series-${i}`, [
+							{ name: "long-running", kind: "skill", calls: 1, lastCallAtMs: atMs },
+						]),
+					),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+
+			const series = (await detail("long-running"))?.sessionSeries ?? [];
+			expect(series).toHaveLength(400);
+			expect(series[0]?.atMs).toBe(points[1]);
+			expect(series.at(-1)?.atMs).toBe(points.at(-1));
+			expect(series.map((point) => point.atMs)).toEqual(
+				[...series.map((point) => point.atMs)].sort((a, b) => a - b),
+			);
+			expect(series.some((point) => point.atMs === points[0])).toBe(false);
+		});
+
+		it("keeps a sparse linked commit and partially populated legacy token row readable", async () => {
+			const hash = "e".repeat(40);
+			await applySummaryEvents(
+				[
+					repoEvent,
+					sessionWith("legacy", [
+						{
+							name: "legacy-skill",
+							kind: "skill",
+							calls: 1,
+							usage: { input: 5, output: 2, cached: 1, confidence: "attributed" },
+						},
+					]),
+				],
+				{ producerKind: "cli", dbPath },
+			);
+			await seedTopicRows(dbPath, hash, [], { commitDateMs: nowMs - 1_000 });
+			await withDashboardDb(
+				(db) => {
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+						id: number;
+					};
+					db.prepare(
+						"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, 't-legacy', ?, 1)",
+					).run(repoId, Buffer.from("fixture"));
+					db.prepare(
+						"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, 't-legacy')",
+					).run(repoId, hash);
+					db.prepare(
+						"INSERT INTO transcript_sessions (repo_id, transcript_id, session_id, source) VALUES (?, 't-legacy', 'legacy', 'claude')",
+					).run(repoId);
+					// `full` with zero session tokens exercises the honest "known zero" path;
+					// the skill row itself simulates a partially populated legacy record.
+					db.prepare("UPDATE sessions SET token_coverage = 'full' WHERE session_id = 'legacy'").run();
+					db.prepare(
+						"UPDATE session_tool_use SET output_tokens = NULL, cached_tokens = NULL WHERE tool_name = 'legacy-skill'",
+					).run();
+				},
+				{ dbPath },
+			);
+
+			const result = await detail("legacy-skill");
+			expect(result?.commits).toEqual([
+				{
+					hash,
+					repoName: "jolli",
+					committedAtMs: nowMs - 1_000,
+					categories: [],
+				},
+			]);
+			expect(result?.usage).toMatchObject({ input: 5, output: 0, cached: 0 });
+			expect(result?.linkedSessions[0]).toMatchObject({
+				sessionId: "legacy",
+				usage: { input: 5, output: 0, cached: 0 },
+			});
+			expect(result?.linkedSessions[0]).not.toHaveProperty("sessionTokens");
+			expect(result?.sessionSeries).toEqual([{ atMs: nowMs - 3_600_000, tokens: 5 }]);
+		});
+	});
+});
+
+describe("buildDashboardModel — skill adoption band (skillDays)", () => {
+	let dir: string;
+	let dbPath: string;
+	// 20:00 local in Asia/Shanghai, so `custom` can name today without being clamped.
+	const nowMs = Date.parse("2026-07-30T12:00:00Z");
+	const ZONE = "Asia/Shanghai";
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-band-"));
+		dbPath = join(dir, "dashboard.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const repoEvent: StatsEventEnvelope = {
+		producerKind: "cli",
+		event: {
+			type: "repo.enabled",
+			repoIdentity: "repo-1",
+			repoName: "jolli",
+			worktreeRoot: "/w",
+			enabledAt: "t",
+		},
+	};
+
+	/**
+	 * A session whose skill rows carry their own call time.
+	 *
+	 * `lastCallAtMs` is what the band buckets on, and it is set per tool rather than
+	 * per session: the session's own `updatedAtMs` is the COALESCE fallback, so a
+	 * fixture that set only the session clock would still pass if the query read the
+	 * wrong one.
+	 */
+	const sessionAt = (sessionId: string, callAtMs: number, skills: ReadonlyArray<string>): StatsEventEnvelope => ({
+		producerKind: "cli",
+		event: {
+			type: "session.upserted",
+			repoIdentity: "repo-1",
+			source: "claude",
+			sessionId,
+			updatedAtMs: nowMs - 3_600_000,
+			tools: skills.map((name) => ({ name, kind: "skill" as const, calls: 1, lastCallAtMs: callAtMs })),
+		},
+	});
+
+	const band = async (customFrom: string, customTo: string) =>
+		(
+			await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "stats",
+						scope: { kind: "all" },
+						timeZone: ZONE,
+						nowMs,
+						range: "custom",
+						customFrom,
+						customTo,
+					}),
+				{ dbPath },
+			)
+		).stats?.toolUsage?.skillDays;
+
+	it("buckets by LOCAL day, not by the UTC day the epoch division would give", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				// 23:00 UTC on the 28th is 07:00 local on the 29th. A UTC bucket files
+				// this under the 28th — the divergence the whole switch is about.
+				sessionAt("s-late", Date.parse("2026-07-28T23:00:00Z"), ["deep-work"]),
+				// 20:00 UTC on the 27th is 04:00 local on the 28th, i.e. inside the
+				// window even though its UTC day sits before the window's first key.
+				sessionAt("s-early", Date.parse("2026-07-27T20:00:00Z"), ["deep-work"]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await band("2026-07-28", "2026-07-29")).toEqual([
+			{ date: "2026-07-28", bySeries: { "deep-work": 1 } },
+			{ date: "2026-07-29", bySeries: { "deep-work": 1 } },
+		]);
+	});
+
+	it("emits every day of the window, including days nothing ran", async () => {
+		await applySummaryEvents([repoEvent, sessionAt("s1", Date.parse("2026-07-28T04:00:00Z"), ["deep-work"])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		// The chart lays bars out by index, so the two silent days have to be present
+		// as empty points rather than dropped — otherwise a three-day window with one
+		// active day draws one full-width bar and reads as three busy days.
+		expect(await band("2026-07-28", "2026-07-30")).toEqual([
+			{ date: "2026-07-28", bySeries: { "deep-work": 1 } },
+			{ date: "2026-07-29", bySeries: {} },
+			{ date: "2026-07-30", bySeries: {} },
+		]);
+	});
+
+	it("counts a session once per skill, so one day's bar totals skill-sessions", async () => {
+		const at = Date.parse("2026-07-29T04:00:00Z");
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionAt("s1", at, ["deep-work", "code-review"]),
+				// A second session reaching for one of the same skills is a second
+				// session for THAT series only.
+				sessionAt("s2", at, ["deep-work"]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await band("2026-07-29", "2026-07-29")).toEqual([
+			{ date: "2026-07-29", bySeries: { "deep-work": 2, "code-review": 1 } },
+		]);
+	});
+
+	it("files a session under one day even when its calls straddled local midnight", async () => {
+		await applySummaryEvents([repoEvent, sessionAt("s1", Date.parse("2026-07-29T01:00:00Z"), ["deep-work"])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		// 01:00 UTC is 09:00 local on the 29th. The session may well have started on
+		// the 28th, but `session_tool_use` keeps only this one timestamp, so the whole
+		// contribution lands on the 29th — the documented cost of using the aggregate
+		// table rather than `skill_invocations`.
+		expect(await band("2026-07-28", "2026-07-29")).toEqual([
+			{ date: "2026-07-28", bySeries: {} },
+			{ date: "2026-07-29", bySeries: { "deep-work": 1 } },
+		]);
+	});
+
+	it("returns a point per day even with no skill rows at all", async () => {
+		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
+		// Not an empty array — the window is what decides the point count, not the data.
+		// This is why `bandHtml` tests for "no SERIES" rather than "no points": a
+		// `series.length` test would never fire here and would draw an empty axis
+		// instead of the "no skill invocations" note.
+		expect(await band("2026-07-29", "2026-07-30")).toEqual([
+			{ date: "2026-07-29", bySeries: {} },
+			{ date: "2026-07-30", bySeries: {} },
+		]);
 	});
 });
 

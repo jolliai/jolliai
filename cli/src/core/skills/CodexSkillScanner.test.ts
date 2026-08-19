@@ -327,6 +327,17 @@ describe("scanCodexSkillLines — the injected block (Codex Desktop)", () => {
 		expect(uses[0].plugin).toBe("documents");
 	});
 
+	it("learns a plugin when a bare id is followed by a namespaced id", () => {
+		// A bare id has no opinion about ownership. A later definite namespace may
+		// therefore fill the label without creating a second skill row.
+		const bare = CODEX_INJECTED_SKILL_BLOCK.split("documents:documents").join("documents");
+		const { uses } = scanCodexSkillLines([codexRecord(bare, T1), codexRecord(CODEX_INJECTED_SKILL_BLOCK, T2)], 0);
+
+		expect(uses).toHaveLength(1);
+		expect(uses[0].plugin).toBe("documents");
+		expect(uses[0].invocations.map((i) => i.at)).toEqual([T2, T1]);
+	});
+
 	it("ignores a user message that names a SKILL.md but carries no block", () => {
 		// The block requirement, isolated. Every other non-entry fixture is rejected by the
 		// role check first, so this is the only one that can fail when the block test alone
@@ -456,6 +467,44 @@ describe("scanCodexSkillLines — the injected block (Codex Desktop)", () => {
 		const plain = '{"type":"message","role":"user","content":[{"type":"input_text","text":"read the SKILL.md"}]}';
 
 		expect(scanCodexSkillLines([codexRecord(plain, T1)], 0).uses).toEqual([]);
+	});
+
+	it("ignores an injected block with no timestamp rather than inventing one", () => {
+		// Flat records exist, but an invocation without an observed instant cannot be
+		// keyed or ordered downstream.
+		expect(scanCodexSkillLines([CODEX_INJECTED_LOCAL_SKILL_BLOCK], 0).uses).toEqual([]);
+	});
+
+	it("ignores malformed message content parts independently", () => {
+		const block = "SKILL.md <skill><name>documents:documents</name></skill>";
+		const nonArray = JSON.stringify({ type: "message", role: "user", timestamp: T1, content: block });
+		const malformedParts = JSON.stringify({
+			type: "message",
+			role: "user",
+			timestamp: T1,
+			content: [null, { text: 42 }],
+		});
+
+		expect(scanCodexSkillLines([nonArray, malformedParts], 0).uses).toEqual([]);
+	});
+
+	it("ignores a non-message, non-call record that quotes a skill path", () => {
+		const output = JSON.stringify({
+			type: "custom_tool_call_output",
+			output: "cat /x/skills/documents/SKILL.md",
+			timestamp: T1,
+		});
+
+		expect(scanCodexSkillLines([output], 0).uses).toEqual([]);
+	});
+
+	it("advances across a sparse transcript line without reading it", () => {
+		const lines = Array<string>(2);
+		lines[1] = codexRecord(CODEX_INJECTED_LOCAL_SKILL_BLOCK, T1);
+
+		const result = scanCodexSkillLines(lines, 0);
+		expect(result.uses).toHaveLength(1);
+		expect(result.lastLine).toBe(2);
 	});
 
 	it("ignores a block whose name tag is empty", () => {

@@ -109,6 +109,11 @@ export const NEVER_SYNCED_TABLES = [
 	// leaving the machine) to make when the manager view actually consumes them, not
 	// a default to reach for on sight.
 	"session_activity",
+	// Per-entry skill history is local-only for now. It carries invocation arguments
+	// and outcomes, and no cloud page or request schema consumes it; uploading it
+	// would therefore be a privacy expansion that buys nothing. The aggregate skill
+	// counts already travel through session_tool_use.
+	"skill_invocations",
 	// The memory half. It travels on the commit-push channel, which has its own
 	// binding rules, and `commit_aliases` answers a rebase-matching question that
 	// does not exist on a server where commits and memories arrive together.
@@ -201,9 +206,12 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 	sessions: [],
 	session_model_usage: [],
 	session_usage_events: [],
-	// Dropped from the schema definition long ago (recall_receipts replaced it),
-	// but still present on databases created before that. No writer, no reader.
-	session_tool_use: ["metadata_json"],
+	// The skill-detail additions stay local until the cloud request schema and UI
+	// consume them. Listing them here preserves the channel's current payload rather
+	// than silently uploading every column a local dashboard feature adds. The legacy
+	// metadata_json column is also still present on databases created before it was
+	// dropped from the schema definition; no writer or reader uses it.
+	session_tool_use: ["input_tokens", "output_tokens", "cached_tokens", "usage_confidence", "plugin", "metadata_json"],
 };
 
 /**

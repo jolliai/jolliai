@@ -44,6 +44,7 @@
 import { execGit } from "../core/GitOps.js";
 import { PRICES_AS_OF } from "../core/Pricing.js";
 import { classifyScanError } from "../core/SqliteHelpers.js";
+import { skillOutcomeConfidence } from "../core/skills/SkillOutcomeConfidence.js";
 // import type { KnowledgeGraph } from "../graph/GraphSchema.js"; // parked with recordRepoGraph
 import { createLogger, errMsg } from "../Logger.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
@@ -998,11 +999,38 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 	// transcripts carry no tool records sends `undefined`, never `[]`, so
 	// re-upserting such a session cannot delete what a Claude read collected.
 	if (event.tools !== undefined) {
+		// The set is still replaced wholesale, but the enrichment on a surviving key
+		// is not always reproducible: a later slice can count the call without carrying
+		// its original timestamp, token attribution or plugin namespace. Snapshot those
+		// fields before the delete so the replacement can preserve them. The SQL upsert
+		// below cannot do that by itself — after this DELETE there is no old row left to
+		// conflict with.
+		type PreviousTool = {
+			tool_name: string;
+			kind: string;
+			last_call_at_ms: number | null;
+			input_tokens: number | null;
+			output_tokens: number | null;
+			cached_tokens: number | null;
+			usage_confidence: string | null;
+			plugin: string | null;
+		};
+		const previousTools = new Map<string, PreviousTool>();
+		for (const row of db
+			.prepare(
+				`SELECT tool_name, kind, last_call_at_ms, input_tokens, output_tokens,
+				        cached_tokens, usage_confidence, plugin
+				   FROM session_tool_use WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<PreviousTool>) {
+			previousTools.set(`${row.kind}\u0000${row.tool_name}`, row);
+		}
 		db.prepare("DELETE FROM session_tool_use WHERE session_event_id = ?").run(eventId);
 		const insertTool = db.prepare(
 			`INSERT INTO session_tool_use
-			   (session_event_id, tool_name, kind, server, calls, last_call_at_ms, updated_at_ms)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			   (session_event_id, tool_name, kind, server, calls, last_call_at_ms,
+			    input_tokens, output_tokens, cached_tokens, usage_confidence, plugin, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET
 			     calls = excluded.calls,
 			     -- The stamp must be in THIS branch too: a conflict is still a write,
@@ -1019,18 +1047,113 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			     -- epoch-0 instant, so the display's fallback to the session's own
 			     -- timestamp would never fire.
 			     last_call_at_ms = NULLIF(MAX(COALESCE(excluded.last_call_at_ms, 0),
-			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0)`,
+			                                  COALESCE(session_tool_use.last_call_at_ms, 0)), 0),
+			     -- COALESCE keeps the stored figure when the incoming read has none, for
+			     -- the same reason the MAX above does: attribution needs the whole session
+			     -- from line 0, so a pass that read a later slice — or any build whose
+			     -- scanner cannot attribute — must not blank a number an earlier read
+			     -- established. The four move together (see SKILL_TOKEN_USAGE_DDL), so
+			     -- \`usage_confidence\` is keyed off the same side its tokens came from
+			     -- rather than coalesced independently, which could otherwise label one
+			     -- read's tokens with another read's confidence.
+			     input_tokens     = COALESCE(excluded.input_tokens,  session_tool_use.input_tokens),
+			     output_tokens    = COALESCE(excluded.output_tokens, session_tool_use.output_tokens),
+			     cached_tokens    = COALESCE(excluded.cached_tokens, session_tool_use.cached_tokens),
+			     usage_confidence = CASE WHEN excluded.input_tokens IS NOT NULL THEN excluded.usage_confidence
+			                             ELSE session_tool_use.usage_confidence END,
+			     -- COALESCE for the same reason as the token columns: a namespace is only
+			     -- recoverable while the transcript that named it is readable, and a pass that
+			     -- could not resolve one (a contested name, or a scanner that reports none)
+			     -- must not blank a label an earlier read established.
+			     plugin           = COALESCE(excluded.plugin, session_tool_use.plugin)`,
+		);
+		// Per-invocation rows, and deliberately NOT preceded by a DELETE — unlike the
+		// aggregate above. Once an agent prunes a conversation its entries can never be
+		// re-derived, so a rebuild would discard them at the first scan that can no longer
+		// see them. Converging on the (session, skill, instant) key is what makes the
+		// repeated whole-conversation re-reads idempotent instead of duplicating rows.
+		const insertInvocation = db.prepare(
+			`INSERT INTO skill_invocations (session_event_id, skill_name, at_ms, ok, ok_confidence,
+			                               detection, entry_path, args, body_chars)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			 ON CONFLICT(session_event_id, skill_name, at_ms) DO UPDATE SET
+			     -- Outcome evidence upgrades in one direction. A completed re-read must
+			     -- replace an optimistic fragment, while a later partial read must not erase
+			     -- an outcome already observed for this same invocation.
+			     ok = CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                         AND excluded.ok_confidence <> 'observed'
+			                    THEN skill_invocations.ok ELSE excluded.ok END,
+			     ok_confidence = CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                                   OR excluded.ok_confidence = 'observed'
+			                          THEN 'observed' ELSE excluded.ok_confidence END,
+			     -- Also the latest reading: an observed entry supersedes an inferred one for
+			     -- the same name (see \`scanCodexSkillLines\`), so a later pass that found the
+			     -- injected block must be able to clear the heuristic mark.
+			     detection     = excluded.detection,
+			     entry_path    = excluded.entry_path,
+			     -- These two ARE coalesced: they describe one fixed past event, so a pass that
+			     -- read no argument string or no body length has nothing better to offer than
+			     -- what is already stored.
+			     args          = COALESCE(excluded.args, skill_invocations.args),
+			     body_chars    = COALESCE(excluded.body_chars, skill_invocations.body_chars)`,
 		);
 		for (const tool of event.tools) {
+			// All four are written together or not at all — a partially-filled row would
+			// let a reader take three tokens with no confidence to qualify them.
+			const previous = previousTools.get(`${tool.kind}\u0000${tool.name}`);
+			const incomingLastCallAtMs = tool.lastCallAtMs ?? null;
+			const previousLastCallAtMs = previous?.last_call_at_ms ?? null;
+			const lastCallAtMs =
+				incomingLastCallAtMs === null
+					? previousLastCallAtMs
+					: previousLastCallAtMs === null
+						? incomingLastCallAtMs
+						: Math.max(incomingLastCallAtMs, previousLastCallAtMs);
+			const inputTokens = tool.usage?.input ?? previous?.input_tokens ?? null;
+			const outputTokens = tool.usage?.output ?? previous?.output_tokens ?? null;
+			const cachedTokens = tool.usage?.cached ?? previous?.cached_tokens ?? null;
+			const usageConfidence = tool.usage ? tool.usage.confidence : (previous?.usage_confidence ?? null);
 			insertTool.run(
 				eventId,
 				tool.name,
 				tool.kind,
 				tool.server ?? null,
 				tool.calls,
-				tool.lastCallAtMs ?? null,
+				lastCallAtMs,
+				inputTokens,
+				outputTokens,
+				cachedTokens,
+				usageConfidence,
+				tool.plugin ?? previous?.plugin ?? null,
 				nowMs,
 			);
+			// Gated on the KIND, not merely on the field being present: the table holds skill
+			// entries, and a builtin bucket that somehow carried invocations would otherwise
+			// land in it silently. `ToolCallCount.invocations` documents the same restriction.
+			if (tool.kind !== "skill") continue;
+			for (const inv of tool.invocations ?? []) {
+				const atMs = Date.parse(inv.at);
+				// The instant IS the row's identity, so one that cannot be parsed is not a row —
+				// the same rule `parseInvocationLine` applies to the markdown mirror. Reachable
+				// rather than defensive: Kimi's converter yields "" for a malformed wire
+				// timestamp, and NaN in a primary key would be rejected by the STRICT table.
+				if (!Number.isFinite(atMs)) continue;
+				insertInvocation.run(
+					eventId,
+					tool.name,
+					atMs,
+					inv.ok ? 1 : 0,
+					// The source's own tag, never a guess from the bucket: whether an outcome could
+					// be read depends on the mechanism as well as the host.
+					skillOutcomeConfidence(event.source, inv.entryPath, inv.outcomeObserved),
+					// Skill-level, copied onto each row. Lossless — one scan pass emits a single
+					// nature per skill (see `ToolCallCount.detection`).
+					tool.detection ?? null,
+					inv.entryPath ?? null,
+					inv.args ?? null,
+					inv.bodyChars ?? null,
+				);
+			}
 		}
 	}
 
