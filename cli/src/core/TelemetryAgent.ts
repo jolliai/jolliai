@@ -67,14 +67,26 @@
  *    frozen at spawn from whichever proxy arrived first. It also beats env on
  *    the single-session path: a declaration outranks an inherited marker.
  *
- * So the gap is a CLI command run from a host with no marker of its own: `kimi`,
- * `copilot`, `cline`, `devin` and `antigravity` are attributed at commit time
- * but not on `command_invoked`. Closing one means a real capture of that host's
- * environment, added to {@link AGENT_ENV_MARKERS} — an unmeasured key would be
- * the guessing this module exists to refuse, and a wrong marker is worse than
- * the omission it replaces. Cursor was in this list until its environment was
- * actually captured; {@link AGENT_ENV_FAMILIES} records what that took, and it
- * is the worked example for closing another.
+ * So the gap is a CLI command run from a host with no marker of its own:
+ * `kimi`, `copilot`, `cline`, `devin` and `antigravity` are attributed at
+ * commit time but not on `command_invoked`. Closing one means a real capture of
+ * that host's environment, added to {@link AGENT_ENV_MARKERS} — an unmeasured
+ * key would be the guessing this module exists to refuse, and a wrong marker is
+ * worse than the omission it replaces. Cursor was in this list until its
+ * environment was actually captured; {@link AGENT_ENV_FAMILIES} records what
+ * that took, and it is the worked example for closing another.
+ *
+ * One of these has been probed and is CLOSED AS UNCLOSABLE by env: **kimi sets
+ * no environment variable at all in the shells it spawns** (kimi-code 0.34.0,
+ * macOS, 2026-08 — a real one-shot run dumped its shell child's full env: zero
+ * `KIMI_*`, zero `MOONSHOT_*`). The only kimi-shaped strings in that env were
+ * the user's own PATH entry (`~/.kimi-code/bin`, equally present in a human
+ * shell — a PATH sniff would label people as the agent) and the parent process
+ * name `kimi-code` (rejected as a signal for the reasons under
+ * {@link AGENT_ENV_FAMILIES}: a `ps` spawn on hook-hot paths, and detached
+ * workers are reparented away). Kimi therefore stays commit-time-attributed
+ * only — re-probe on a major kimi release rather than re-deriving this, and do
+ * not add a guessed key.
  *
  * ## The vocabulary is derived, not restated
  *
