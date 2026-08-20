@@ -133,11 +133,24 @@ export async function serveMcpInProcess(dir: string): Promise<void> {
 	let telemetry: typeof import("./core/TelemetryStartup.js") | null = null;
 	try {
 		telemetry = await import("./core/TelemetryStartup.js");
-		// `inferAgentFromEnv`: this server was spawned by the AI host for this
-		// session, so its env markers name that host. Measured: a Claude-spawned
-		// `mcp-serve` really does carry CLAUDECODE — which is also how the
-		// `surface` misattribution becomes visible, since the dist that wins
-		// arbitration may be a different host's plugin bundle entirely.
+		// `inferAgentFromEnv` is right HERE and wrong in the daemon, and the
+		// difference is sharing, not lifetime. This is the in-process fallback: it
+		// runs inside the per-session `mcp` proxy, which the host spawned for this
+		// session alone, so its env names that host and nothing else attaches to
+		// it. Measured: an `mcp` proxy whose parent is `claude` carries CLAUDECODE.
+		// `mcp-serve` is keyed by worktree and shared across hosts, so it must not
+		// infer — see the daemon note in `main()`.
+		//
+		// Two other measurements from the same sweep, both narrowing what env can
+		// answer: an `mcp` proxy spawned by `cursor-agent` carried no `CURSOR_*` at
+		// all, and one spawned by Codex carried no `CODEX_THREAD_ID`. So of the
+		// hosts checked, only Claude passes its marker down to an MCP child — the
+		// MCP path is largely unattributed even where the CLI path is not.
+		//
+		// The same sweep also caught the misattribution this dimension exists for,
+		// twice over: Claude Code serving from the CODEX plugin's dist, and Codex
+		// serving from the CURSOR plugin's dist. `surface` names the bundle that
+		// won dist arbitration, never the host.
 		await telemetry.bootstrapTelemetry({ cwd: dir, inferAgentFromEnv: true });
 	} catch (error: unknown) {
 		// stderr, never stdout — stdout is this session's JSON-RPC stream.
@@ -258,11 +271,32 @@ if (!process.env.VITEST) {
 				// Then prime telemetry before command dispatch so the commander preAction
 				// auto-emit and any in-command track() calls have a live context. Never
 				// throws; the VITEST guard keeps it (and its installId mint) out of tests.
-				// `inferAgentFromEnv`: a `jolli` invocation is short-lived and was
-				// launched by whoever is running it right now, so an inherited marker
-				// still names the current host. This is what attributes
-				// `command_invoked` for every CLI command.
-				await bootstrapTelemetry({ cwd: resolveProjectDir(), inferAgentFromEnv: true });
+				// `inferAgentFromEnv` for an ordinary invocation, NEVER for a detached
+				// daemon — the same predicate, for a related reason. A `jolli` command
+				// is short-lived and was launched by whoever is running it right now,
+				// so an inherited marker still names the current host; this is what
+				// attributes `command_invoked` for every CLI command.
+				//
+				// The daemons are the opposite case, and `mcp-serve` is the one that
+				// makes it concrete rather than theoretical. It is keyed by WORKTREE and
+				// shared: a tie attaches instead of evicting, so several hosts' sessions
+				// reach the same daemon, and it is the process that runs the tools and
+				// emits their `command_invoked`. Its env is frozen at spawn from
+				// whichever proxy happened to be first. Measured on one machine: an
+				// `mcp-serve` at ppid 1 carrying CLAUDECODE beside two carrying nothing.
+				// So inferring here would report `agent: "claude"` for a Cursor or Codex
+				// session's tool calls — a WRONG value, not a missing one, which is the
+				// exact failure `inferAgentFromEnv` defaults off to prevent. The global
+				// daemon is machine-wide and even further from any one session.
+				//
+				// The right signal for a shared daemon is the MCP `initialize`
+				// handshake's `clientInfo`, which names the host per connection rather
+				// than per process. Not attempted here: mapping those strings onto the
+				// vocabulary needs its own capture, and absent is the honest interim.
+				await bootstrapTelemetry({
+					cwd: resolveProjectDir(),
+					inferAgentFromEnv: !isDetachedDaemonInvocation(argv),
+				});
 				let failed = false;
 				try {
 					await main();

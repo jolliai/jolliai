@@ -60,6 +60,30 @@ describe("isDetachedDaemonInvocation", () => {
 		expect(isDetachedDaemonInvocation(["mcp-serve-status"])).toBe(false);
 		expect(isDetachedDaemonInvocation(["global-daemon-status"])).toBe(false);
 	});
+
+	/**
+	 * This predicate has a SECOND consumer in `main()`: it also decides whether the
+	 * process may infer its telemetry `agent` from the env markers. Recorded here
+	 * because the two uses justify the same answer for different reasons, and a
+	 * future edit that widens it for the stderr policy alone would silently change
+	 * attribution too.
+	 *
+	 * A daemon must not infer. `mcp-serve` is keyed by WORKTREE and shared — a
+	 * version tie attaches rather than evicting — so several hosts' sessions reach
+	 * one daemon, and it is the process that runs the tools and emits their
+	 * `command_invoked`. Its env is frozen at spawn from whichever proxy was first.
+	 * Measured on one machine: an `mcp-serve` at ppid 1 carrying CLAUDECODE beside
+	 * two carrying nothing. Inferring there reports `agent: "claude"` for a Cursor
+	 * or Codex session — a wrong value, not a missing one.
+	 */
+	it("covers every process that emits telemetry for sessions it does not own", () => {
+		for (const argv of [["mcp-serve"], ["global-daemon"], ["global-daemon-ensure"]]) {
+			expect(isDetachedDaemonInvocation(argv)).toBe(true);
+		}
+		// The per-session proxy is the counter-case: the host spawned it for one
+		// session, nothing else attaches to it, so its env does name its host.
+		expect(isDetachedDaemonInvocation(["mcp"])).toBe(false);
+	});
 });
 
 describe("serveMcpInProcess (the fast path's fallback)", () => {

@@ -208,10 +208,26 @@ export interface AgentEnvFamily {
  * `CURSOR_CONVERSATION_ID` and `CURSOR_RIPGREP_PATH` appear on both sides and so
  * could serve as the gate, but neither says "agent" in its name.
  *
- * One Cursor context stays unattributed and is not covered by any of this: an
- * MCP server Cursor spawned carries no `CURSOR_*` variable at all (measured on
- * two live servers). That path is attributed only by the Cursor plugin's own
- * bootstrap, which is structural.
+ * One Cursor context is measured unattributed, and the scope of that claim
+ * matters: an MCP server the **Cursor IDE** spawned carries no `CURSOR_*`
+ * variable at all (two live servers, both from the IDE's plugin cache). The
+ * likely mechanism is that `CURSOR_AGENT` / `CURSOR_CONVERSATION_ID` are
+ * per-conversation, while the IDE spawns MCP servers from a shared process
+ * before any workspace is known — the `WARN No workspace folders found` that
+ * AGENTS.md records for the same launch — so there is no conversation yet to
+ * name. Inference, not measurement.
+ *
+ * An MCP server `cursor-agent` spawned is **NOT measured**, and the two halves
+ * should not be assumed alike: `cursor-agent`'s shell-command children DO carry
+ * both markers (row 2 above), so if it spawns MCP the same way, such a server
+ * resolves to `cursor-cli` with no code change — this function reads whatever
+ * env a process was handed and does not care which parent handed it over. Treat
+ * the unattributed case as "the IDE's MCP servers", not as "Cursor's".
+ *
+ * Neither is rescued by the Cursor plugin's bootstrap, and that is worth being
+ * exact about too: the bootstrap attributes the events IT emits
+ * (`onboarding_progressed`, `app_installed`) structurally. It is a different
+ * process from the MCP server and does not label the server's tool calls.
  */
 export const AGENT_ENV_FAMILIES: ReadonlyArray<AgentEnvFamily> = [
 	{
