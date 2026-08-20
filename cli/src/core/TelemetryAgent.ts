@@ -68,8 +68,9 @@
  *    the single-session path: a declaration outranks an inherited marker.
  *
  * So the gap is a CLI command run from a host with no marker of its own:
- * `kimi`, `copilot`, `cline`, `devin` and `antigravity` are attributed at
- * commit time but not on `command_invoked`. Closing one means a real capture of
+ * `kimi` (measured: none exists — see below), `copilot-chat`, `cline` (the
+ * VS Code extension) and `devin` (probe blocked) are attributed at commit time
+ * but not on `command_invoked`. Closing one means a real capture of
  * that host's environment, added to {@link AGENT_ENV_MARKERS} — an unmeasured
  * key would be the guessing this module exists to refuse, and a wrong marker is
  * worse than the omission it replaces. Cursor was in this list until its
@@ -170,7 +171,50 @@ export const AGENT_ENV_MARKERS: ReadonlyArray<readonly [string, TelemetryAgent]>
 	["CODEX_THREAD_ID", "codex"],
 	["GEMINI_CLI", "gemini"],
 	["OPENCODE", "opencode"],
+	// Probed 2026-08-20 (one-shot agent runs dumping their shell child's full
+	// env; the human-shell control held none of these — see the sweep notes
+	// below for each host's complete inventory and the caveats):
+	["ANTIGRAVITY_AGENT", "antigravity"],
+	["COPILOT_CLI", "copilot"],
+	["CLINE_WRAPPER_PATH", "cline-cli"],
+	["CLINE_CONNECTOR_CLI_LAUNCH", "cline-cli"],
 ];
+
+/**
+ * Provenance for the 2026-08-20 marker sweep (macOS; same probe as kimi's —
+ * the agent writes `env` to a file, so nothing depends on output formatting).
+ *
+ * **antigravity** (`agy` cli-1.1.16, Antigravity's headless CLI): nine
+ * `ANTIGRAVITY_*` vars — AGENT=1 (the gate), CONVERSATION_ID, TRAJECTORY_ID,
+ * PROJECT_ID, CSRF_TOKEN, LS_ADDRESS, LS_VERSION, AGENTAPI_EXE,
+ * SOURCE_METADATA. Two things make this the clean case: the vocabulary has ONE
+ * antigravity token (no CLI/IDE variant to confuse — if the IDE's agent sets
+ * the same var the answer is identical, and if it does not, IDE work is merely
+ * unattributed), and the dump held **no `GEMINI_*` var at all**, so Google's
+ * own CLI marker cannot be tripped by Antigravity — a collision that would have
+ * mislabelled antigravity work as gemini's, checked for explicitly.
+ *
+ * **copilot** (GitHub Copilot CLI 1.0.80): COPILOT_CLI=1 (the mapped key,
+ * self-naming the CLI variant), COPILOT_AGENT_SESSION_ID,
+ * COPILOT_CLI_BINARY_VERSION. Caveat: the sibling source `copilot-chat`
+ * (VS Code) is UNMEASURED — the mapping rests on `COPILOT_CLI` naming the CLI
+ * itself. Falsifier: a Copilot Chat terminal command observed carrying
+ * COPILOT_CLI would demote this to a family key; until then the worst case is
+ * family-internal (cli vs chat), never human-vs-agent.
+ *
+ * **cline-cli** (standalone `cline`): CLINE_WRAPPER_PATH (the CLI's own bin
+ * wrapper — set by the launcher, so present in every mode) and
+ * CLINE_CONNECTOR_CLI_LAUNCH (launcher JSON) are mapped; CLINE_BUILD_ENV and
+ * CLINE_NO_INTERACTIVE were also present but are NOT mapped — BUILD_ENV says
+ * nothing about which variant, and NO_INTERACTIVE varies by mode. Same caveat
+ * shape as copilot: the `cline` VS Code extension is unmeasured, and the
+ * mapped keys are launcher artifacts the extension has no reason to set.
+ *
+ * **devin**: probe blocked — two consecutive runs died on a server-side
+ * retryable API error (`cognition.ai/retryable: true`) before any command ran.
+ * Not a measurement of absence; re-run the probe when the service cooperates
+ * (`devin --respect-workspace-trust false -p "<probe>"`).
+ */
 
 /**
  * A host family whose presence marker cannot name the variant on its own, plus

@@ -132,11 +132,31 @@ const SHORT_LIVED: ReadonlyArray<Row> = [
 		because: "a family present but unresolved abandons the answer rather than picking a side",
 	},
 	{
-		scenario: "Kimi / Copilot / Cline / Devin / Antigravity runs a command",
+		scenario: "Antigravity's agent (agy CLI) runs a command",
+		inferAgentFromEnv: true,
+		env: { ANTIGRAVITY_AGENT: "1", ANTIGRAVITY_CONVERSATION_ID: "c1" },
+		expected: "antigravity",
+		because: "measured 2026-08-20; the same dump held no GEMINI_* var, so it cannot trip Google's own marker",
+	},
+	{
+		scenario: "GitHub Copilot CLI runs a command",
+		inferAgentFromEnv: true,
+		env: { COPILOT_CLI: "1", COPILOT_AGENT_SESSION_ID: "s1" },
+		expected: "copilot",
+	},
+	{
+		scenario: "standalone cline CLI runs a command",
+		inferAgentFromEnv: true,
+		env: { CLINE_WRAPPER_PATH: "/x/bin/.cline", CLINE_BUILD_ENV: "production" },
+		expected: "cline-cli",
+	},
+	{
+		scenario: "Kimi / Devin / Copilot Chat / cline (VS Code ext) runs a command",
 		inferAgentFromEnv: true,
 		env: {},
 		expected: undefined,
-		because: "these hosts set no marker we have measured; they are attributed at commit time instead",
+		because:
+			"kimi measured as setting nothing; devin's probe was service-blocked; the two IDE-side variants are unmeasured — all attributed at commit time instead",
 	},
 	{
 		scenario: "Claude Code shells out to Codex, which runs a command",
