@@ -101,9 +101,24 @@ export type TelemetryAgent = TranscriptSource;
  * the instrument coming online reads as adoption exploding from zero.
  *
  * Stamped into `TELEMETRY.md` by `TelemetryDoc`, so the disclosure and this
- * constant cannot drift. Update it only if this dimension ships in a different
- * release than planned — never on an ordinary version bump, since the watershed
- * is a fact about history rather than about the current build.
+ * constant cannot drift, and `TELEMETRY.md` is the repo's public statement of
+ * what is collected — a wrong number here is a wrong public fact.
+ *
+ * **Deliberately hand-written, and deliberately NOT derived from
+ * `cli/package.json`.** It is a fact about history: once this dimension has
+ * shipped, the answer is frozen forever, so tracking the current build would
+ * rewrite it on every release and destroy the only thing it records. That also
+ * means it starts life as a PREDICTION — the release this lands in is not
+ * knowable while writing it — and a prediction that goes wrong fails silently:
+ * nothing in the build can tell a correct guess from a stale one.
+ *
+ * `TelemetryAgent.test.ts` narrows that hole as far as it can go, by asserting
+ * this is never BELOW `cli/package.json`'s version. The feature cannot ship in a
+ * release older than the constant, so if main's version overtakes it while this
+ * is still unreleased, the guess has been overtaken too and the test says so.
+ * The remaining gap is genuine: nothing can distinguish "ships next release, as
+ * predicted" from "will ship two releases later", so a release that moves this
+ * must update the constant AND re-run `npm run gen:telemetry-doc`.
  */
 export const AGENT_DIMENSION_SINCE_VERSION = "0.99.14";
 

@@ -1,4 +1,8 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { compareSemver } from "../install/SemverCompare.js";
 import { LOCAL_AGENT_CHILD_ENV } from "./AgentReentry.js";
 import type { PluginBootstrapHost } from "./localagent/PluginDefaults.js";
 import { SESSION_SOURCES } from "./sessions/SessionSources.js";
@@ -51,6 +55,21 @@ describe("TELEMETRY_AGENTS vocabulary", () => {
 
 	it("records the watershed as a concrete version", () => {
 		expect(AGENT_DIMENSION_SINCE_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
+	});
+
+	it("does not let the watershed fall behind the version being built", () => {
+		// The watershed starts as a prediction — which release this lands in is not
+		// knowable while writing it — and a stale prediction fails silently, in a
+		// PUBLIC doc. This is the one half that can be checked: the dimension cannot
+		// ship in a release older than the constant, so the constant must never sit
+		// below `cli/package.json`. If main's version overtakes it while this is
+		// still unreleased, the guess was overtaken and someone has to look.
+		//
+		// Resolved from this file rather than `process.cwd()` so it does not depend
+		// on which directory vitest was invoked from.
+		const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
+		const { version } = JSON.parse(readFileSync(pkgPath, "utf-8")) as { version: string };
+		expect(compareSemver(AGENT_DIMENSION_SINCE_VERSION, version)).toBeGreaterThanOrEqual(0);
 	});
 });
 
