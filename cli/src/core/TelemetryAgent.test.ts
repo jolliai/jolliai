@@ -14,6 +14,7 @@ import {
 	CLIENTINFO_AGENTS,
 	detectAgentFromEnv,
 	resolveClientInfoAgent,
+	resolveCommitOrigin,
 	resolveTelemetryAgent,
 	TELEMETRY_AGENTS,
 	type TelemetryAgent,
@@ -243,5 +244,57 @@ describe("resolveClientInfoAgent (MCP initialize handshake)", () => {
 		expect(resolveClientInfoAgent("constructor")).toBeUndefined();
 		expect(resolveClientInfoAgent("__proto__")).toBeUndefined();
 		expect(resolveClientInfoAgent("hasOwnProperty")).toBeUndefined();
+	});
+});
+
+describe("resolveCommitOrigin (who set a commit in motion)", () => {
+	it("labels an IDE Commit-button commit `ui`, with no agent", () => {
+		expect(resolveCommitOrigin({ fromPluginUi: true, isTTY: false })).toEqual({ trigger: "ui" });
+	});
+
+	it("lets the button beat an inherited agent marker — the misattribution this exists to stop", () => {
+		// An extension host cold-started from inside a Claude session carries
+		// CLAUDECODE for the window's whole life; the marker was written by the
+		// click handler milliseconds before THIS commit and is the more specific
+		// signal. Without this precedence, every button commit in that window
+		// would be labelled as the agent's work.
+		expect(resolveCommitOrigin({ fromPluginUi: true, isTTY: false, env: { CLAUDECODE: "1" } })).toEqual({
+			trigger: "ui",
+		});
+	});
+
+	it("labels an agent-session commit with the host", () => {
+		expect(resolveCommitOrigin({ fromPluginUi: false, isTTY: false, env: { CODEX_THREAD_ID: "t" } })).toEqual({
+			trigger: "agent",
+			agent: "codex",
+		});
+	});
+
+	it("prefers the agent marker over a TTY when both are present", () => {
+		// An agent session never gives the hook a TTY, so a present marker already
+		// falsifies the TTY reading.
+		expect(resolveCommitOrigin({ fromPluginUi: false, isTTY: true, env: { CLAUDECODE: "1" } })).toEqual({
+			trigger: "agent",
+			agent: "claude",
+		});
+	});
+
+	it("labels a human in a terminal `terminal`", () => {
+		expect(resolveCommitOrigin({ fromPluginUi: false, isTTY: true, env: {} })).toEqual({ trigger: "terminal" });
+	});
+
+	it("labels everything else `unknown`, never `terminal` — absence reads as unknown", () => {
+		// GUI git clients, cron, CI: no marker, no TTY.
+		expect(resolveCommitOrigin({ fromPluginUi: false, isTTY: false, env: {} })).toEqual({ trigger: "unknown" });
+	});
+
+	it("answers `agent` with no host for an unresolvable agent signal", () => {
+		// Two hosts' markers at once: detectAgentFromEnv refuses to name one, so
+		// the commit falls through to unknown rather than to a coin flip.
+		expect(
+			resolveCommitOrigin({ fromPluginUi: false, isTTY: false, env: { CLAUDECODE: "1", CODEX_THREAD_ID: "t" } }),
+		).toEqual({
+			trigger: "unknown",
+		});
 	});
 });

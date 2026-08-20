@@ -148,7 +148,7 @@ import {
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { mergeSkillRefs } from "../core/skills/SkillDelta.js";
-import { getTelemetryContext, track } from "../core/Telemetry.js";
+import { getTelemetryContext, setTelemetryAgent, track } from "../core/Telemetry.js";
 import { bootstrapTelemetry, flushTelemetryNow } from "../core/TelemetryStartup.js";
 import { getCurrentTraceId, runWithTrace, TRACE_ID_ENV, traceIdFromEnv } from "../core/TraceContext.js";
 import { generateTranscriptId } from "../core/TranscriptId.js";
@@ -177,6 +177,7 @@ import {
 	type CommitInfo,
 	type CommitSource,
 	type CommitSummary,
+	type CommitTrigger,
 	type CommitType,
 	type ContextRelevanceRef,
 	type ConversationTokenBreakdown,
@@ -648,6 +649,10 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 		try {
 			// Drain the queue: process all entries, then check for new ones (added during processing)
 			let processedCount = 0;
+			// One record per drained summary entry, stamped at enqueue time (or
+			// undefined for entries an older enqueuer wrote) — folded into
+			// queue_drained below only when the whole drain agrees.
+			const drainOrigins: Array<{ trigger?: CommitTrigger; agent?: TranscriptSource }> = [];
 			// Tracks whether any commit-typed op was processed this run, so we can
 			// debounce-trigger a repo-wide topic-KB ingest after the drain (SP3).
 			// Ingest ops do NOT set it — that would self-perpetuate the trigger.
@@ -765,6 +770,15 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 					// stop inside the inner loop so the outer while condition can re-check and
 					// exit cleanly. The subsequent chain-spawn (line below) picks up leftovers.
 					if (processedCount >= MAX_ENTRIES_PER_RUN) break;
+					// Scope this entry's stamped agent over everything its processing
+					// emits (error_occurred, ai_source_detected's fallback, …). The
+					// worker's own env is NOT consulted (see the bootstrap above): a
+					// chain-spawned worker's env belongs to whichever commit started
+					// the chain, while the stamp was resolved by that entry's own
+					// hook. An unstamped entry (older enqueuer) CLEARS the ambient
+					// value — absent reads as unknown, never as the previous entry's.
+					setTelemetryAgent(op.agent);
+					drainOrigins.push({ trigger: op.trigger, agent: op.agent });
 					try {
 						// Adopt the trace id stamped on the entry at enqueue time so this
 						// commit's summarize/consolidate logs + outbound LLM/push calls
@@ -802,9 +816,27 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 				}
 			}
 
+			// The drain is over; no entry's agent may leak onto drain-level events.
+			setTelemetryAgent(undefined);
 			if (processedCount > 0) {
 				log.info("Processed %d queue entries", processedCount);
-				track("queue_drained", { ops: processedCount, duration_ms: Date.now() - drainStart });
+				// `trigger` / `agent` are per-COMMIT facts on a per-DRAIN event, so they
+				// are reported only when every drained entry agrees (the dominant case —
+				// one commit per drain) and omitted otherwise: a drain that mixed a
+				// terminal commit into an agent's batch has no single honest answer, and
+				// an entry an older enqueuer left unstamped makes the batch mixed by
+				// definition. Omission over aggregation — same rule as everywhere else
+				// in this dimension.
+				const uniform = <T>(values: ReadonlyArray<T>): T | undefined =>
+					values.length === processedCount && values.every((v) => v === values[0]) ? values[0] : undefined;
+				const trigger = uniform(drainOrigins.map((o) => o.trigger).filter((t) => t !== undefined));
+				const agent = uniform(drainOrigins.map((o) => o.agent));
+				track("queue_drained", {
+					ops: processedCount,
+					duration_ms: Date.now() - drainStart,
+					...(trigger ? { trigger } : {}),
+					...(agent ? { agent } : {}),
+				});
 			}
 
 			// SP3 — a commit just landed, so debounce-trigger a repo-wide topic-KB
@@ -4974,11 +5006,17 @@ if (isMainScript()) {
 		// short-lived CLI / hook invocations only buffered. All best-effort;
 		// never blocks exit on a telemetry error.
 		runWithTrace(traceIdFromEnv(), () =>
-			// `inferAgentFromEnv`: this worker is a detached spawn of `post-commit`,
-			// which inherits the committing process's env — so a commit made from
-			// inside an agent session is attributed to it. Per-transcript events
-			// override this with the session's own source, which is more specific.
-			bootstrapTelemetry({ cwd, inferAgentFromEnv: true })
+			// No `inferAgentFromEnv` — this used to be opted in ("the worker inherits
+			// the committing process's env"), and that reasoning holds only for the
+			// FIRST commit: the worker chain-spawns successors and drains entries
+			// other commits enqueued while it ran, all under the env of whichever
+			// commit spawned the chain. A terminal commit drained by an agent-spawned
+			// chain would inherit `agent: "claude"` — a wrong value, not a missing
+			// one. The truth is stamped per ENTRY at enqueue time instead
+			// (CommitGitOperation.trigger/agent, resolved by the post-commit hook,
+			// the one process that still holds it), and the drain loop scopes it via
+			// setTelemetryAgent around each entry.
+			bootstrapTelemetry({ cwd })
 				.then(() => runWorker(cwd))
 				.then(() => flushTelemetryNow(cwd))
 				.catch((_error: unknown) => {

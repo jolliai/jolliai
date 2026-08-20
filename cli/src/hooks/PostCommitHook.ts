@@ -15,6 +15,7 @@ import { basename, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { currentAgentSessionId } from "../core/AgentSessionEnv.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
+import { resolveCommitOrigin } from "../core/TelemetryAgent.js";
 import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
@@ -68,9 +69,14 @@ export function postCommitEntry(cwd: string): { commitHash: string } | null {
 	}
 
 	// Detect commit source (plugin vs CLI)
-	const commitSource: CommitSource = existsSync(join(cwd, ".jolli", "jollimemory", "plugin-source"))
-		? "plugin"
-		: "cli";
+	const fromPluginUi = existsSync(join(cwd, ".jolli", "jollimemory", "plugin-source"));
+	const commitSource: CommitSource = fromPluginUi ? "plugin" : "cli";
+	// Who set this commit in motion, resolved HERE because only this process
+	// still holds the truth: the worker that drains the entry may be a
+	// chain-spawned survivor of an earlier commit, carrying that commit's env,
+	// and it never has the committing terminal's TTY. Stamped on the entry so
+	// the worker attributes this commit's telemetry per entry.
+	const origin = resolveCommitOrigin({ fromPluginUi, isTTY: process.stdout.isTTY === true });
 
 	// Read squash-pending.json if detectCommitOperation found it
 	let opType: GitOperation["type"] = detected.type;
@@ -123,6 +129,8 @@ export function postCommitEntry(cwd: string): { commitHash: string } | null {
 		...(branch && { branch }),
 		...(sourceHashes && { sourceHashes }),
 		commitSource,
+		trigger: origin.trigger,
+		...(origin.agent && { agent: origin.agent }),
 		createdAt: new Date().toISOString(),
 		...(traceId && { traceId }),
 		...(executingSessionId && { executingSessionId }),

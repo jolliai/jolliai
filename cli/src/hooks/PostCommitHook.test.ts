@@ -178,6 +178,16 @@ vi.mock("../core/SummaryStore.js", async (importOriginal) => {
 	};
 });
 
+// The worker's telemetry surface: `track` for queue_drained assertions,
+// `setTelemetryAgent` for the per-entry attribution scope, and a null context
+// so the ai_source_detected consent gate stays closed (matching what the real
+// module does in these tests, where telemetry is never initialized).
+vi.mock("../core/Telemetry.js", () => ({
+	track: vi.fn(),
+	getTelemetryContext: vi.fn(() => null),
+	setTelemetryAgent: vi.fn(),
+}));
+
 vi.mock("node:fs", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("node:fs")>();
 	return {
@@ -448,6 +458,7 @@ import {
 import type { SummaryResult } from "../core/Summarizer.js";
 import { generateSummary } from "../core/Summarizer.js";
 import { getSummary, mergeManyToOne, migrateOneToOne, storeSummary } from "../core/SummaryStore.js";
+import { setTelemetryAgent, track } from "../core/Telemetry.js";
 import { buildMultiSessionContext, readTranscript } from "../core/TranscriptReader.js";
 import type { CommitSummary } from "../Types.js";
 import { runPostCommitHook, runWorker } from "./PostCommitHook.js";
@@ -2618,5 +2629,113 @@ describe("queue-driven Worker", () => {
 				expect.anything(),
 			);
 		});
+	});
+});
+
+describe("queue_drained attribution (entry-stamped, uniform-only)", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		vi.useFakeTimers();
+		vi.mocked(acquireWorkerLock).mockResolvedValue(true);
+		vi.mocked(releaseWorkerLock).mockResolvedValue();
+	});
+
+	const entry = (
+		hash: string,
+		stamp?: { trigger: "agent" | "ui" | "terminal" | "unknown"; agent?: "claude" | "codex" },
+	) => ({
+		op: {
+			type: "commit" as const,
+			commitHash: hash,
+			commitSource: "cli" as const,
+			createdAt: "2026-02-19T00:00:00.000Z",
+			...(stamp ?? {}),
+		},
+		filePath: `/test/project/.jolli/jollimemory/git-op-queue/1-${hash}.json`,
+	});
+
+	const drained = () =>
+		vi.mocked(track).mock.calls.find(([name]) => name === "queue_drained")?.[1] as Record<string, unknown>;
+
+	it("carries trigger and agent when every drained entry agrees, scoping each entry's agent while it runs", async () => {
+		setupFullPipeline();
+		vi.mocked(dequeueAllGitOperations)
+			.mockReset()
+			.mockResolvedValueOnce([
+				entry("aaa111", { trigger: "agent", agent: "claude" }),
+				entry("bbb222", { trigger: "agent", agent: "claude" }),
+			])
+			.mockResolvedValue([]);
+
+		await runWorker("/test/project");
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(drained()).toMatchObject({ ops: 2, trigger: "agent", agent: "claude" });
+		// Each entry's stamped agent was scoped over its processing, and the scope
+		// was CLEARED before the drain-level event — the last call must be the
+		// clear, so no entry's agent can leak past its own entry.
+		const calls = vi.mocked(setTelemetryAgent).mock.calls.map(([a]) => a);
+		expect(calls.slice(0, 2)).toEqual(["claude", "claude"]);
+		expect(calls[calls.length - 1]).toBeUndefined();
+	});
+
+	it("omits both for a drain whose entries came from different origins", async () => {
+		// A terminal commit drained by the same run as an agent's has no single
+		// honest answer — omission over aggregation, like everywhere else.
+		setupFullPipeline();
+		vi.mocked(dequeueAllGitOperations)
+			.mockReset()
+			.mockResolvedValueOnce([
+				entry("aaa111", { trigger: "agent", agent: "claude" }),
+				entry("bbb222", { trigger: "terminal" }),
+			])
+			.mockResolvedValue([]);
+
+		await runWorker("/test/project");
+		await vi.advanceTimersByTimeAsync(0);
+
+		const props = drained();
+		expect(props.ops).toBe(2);
+		expect(props).not.toHaveProperty("trigger");
+		expect(props).not.toHaveProperty("agent");
+	});
+
+	it("treats an unstamped legacy entry as mixing the batch, and clears the scope for it", async () => {
+		// Entries written by an older enqueuer carry no stamp; their origin is
+		// unknown, so the batch cannot claim uniformity — and while such an entry
+		// runs, the ambient agent must be CLEARED, not inherited from the previous
+		// entry in the loop.
+		setupFullPipeline();
+		vi.mocked(dequeueAllGitOperations)
+			.mockReset()
+			.mockResolvedValueOnce([entry("aaa111", { trigger: "agent", agent: "codex" }), entry("bbb222")])
+			.mockResolvedValue([]);
+
+		await runWorker("/test/project");
+		await vi.advanceTimersByTimeAsync(0);
+
+		const props = drained();
+		expect(props).not.toHaveProperty("trigger");
+		expect(props).not.toHaveProperty("agent");
+		expect(
+			vi
+				.mocked(setTelemetryAgent)
+				.mock.calls.map(([a]) => a)
+				.slice(0, 2),
+		).toEqual(["codex", undefined]);
+	});
+
+	it("reports a uniform trigger without an agent for an all-terminal drain", async () => {
+		setupFullPipeline();
+		vi.mocked(dequeueAllGitOperations)
+			.mockReset()
+			.mockResolvedValueOnce([entry("aaa111", { trigger: "terminal" })])
+			.mockResolvedValue([]);
+
+		await runWorker("/test/project");
+		await vi.advanceTimersByTimeAsync(0);
+
+		expect(drained()).toMatchObject({ ops: 1, trigger: "terminal" });
+		expect(drained()).not.toHaveProperty("agent");
 	});
 });

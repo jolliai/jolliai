@@ -49,7 +49,10 @@ object TelemetryEvents {
             "error_occurred" to
                 "A structured error was raised. Content-free schema: { where, code, source?, retryable? }. " +
                 "Emitted via Telemetry.trackError(); never carries a message/stack/path.",
-            "queue_drained" to "QueueWorker finished a drain. Props: ops, duration_ms.",
+            "queue_drained" to
+                "QueueWorker finished a drain. Props: ops, duration_ms; trigger (discriminator: agent/ui/terminal/unknown — " +
+                "who set the drained commits in motion) and agent (which AI host, when trigger=agent) are present only when " +
+                "every drained entry agrees, and omitted for mixed or unstamped drains.",
             "sync_completed" to "A memory-bank sync round finished. Props: outcome (discriminator), duration_ms.",
             // ── IDE tool-window UI / engagement (IntelliJ, VS Code) ──
             "toolwindow_opened" to "The memory tool window was opened. Props: view.",

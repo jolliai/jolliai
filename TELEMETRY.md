@@ -97,7 +97,7 @@ disk **before** they are sent.
 | `settings_opened` | Settings UI opened (vscode/intellij). Props: tab (discriminator). |
 | `ingest_completed` | A drainIngest run finished. Props: outcome, ingested, idle (no-op when ingested=0), batches, route_calls, reconcile_calls, touched_slugs, topic_failures, duration_ms. Filter idle=true out for real-ingest latency/health metrics. |
 | `error_occurred` | A structured error was raised. Content-free schema: { where (stage/subsystem), code (enumerated), source? , retryable? }. Emitted via trackError(); never carries a message/stack/path. |
-| `queue_drained` | QueueWorker finished a drain. Props: ops, duration_ms. |
+| `queue_drained` | QueueWorker finished a drain. Props: ops, duration_ms; trigger (discriminator: agent/ui/terminal/unknown — who set the drained commits in motion) and agent (which AI host, when trigger=agent) are present only when every drained entry agrees, and omitted for mixed or unstamped drains. |
 | `sync_completed` | A memory-bank sync round finished. Props: outcome (discriminator), duration_ms. |
 | `toolwindow_opened` | The memory tool window was opened. Props: view. |
 | `view_switched` | Tool window view switched (current/bank/knowledge). Props: view (discriminator). |

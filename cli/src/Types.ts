@@ -509,6 +509,21 @@ export interface CommitGitOperation {
 	readonly sourceHashes?: ReadonlyArray<string>;
 	/** Whether the operation was triggered from the VSCode plugin or CLI */
 	readonly commitSource?: CommitSource;
+	/**
+	 * Who set this commit in motion, resolved at enqueue time — see
+	 * {@link CommitTrigger} for why the hook's process is the only honest place
+	 * to read it. Optional to tolerate entries written by older code; the worker
+	 * treats absence as unknown, never as a default.
+	 */
+	readonly trigger?: CommitTrigger;
+	/**
+	 * The AI host driving the session that made this commit, when
+	 * `trigger === "agent"` named one. Stamped beside {@link trigger} so the
+	 * worker can attribute this entry's telemetry per entry (via
+	 * `setTelemetryAgent`) instead of trusting its own inherited environment,
+	 * which belongs to whichever commit spawned the worker chain.
+	 */
+	readonly agent?: TranscriptSource;
 	/** Creation time — used for queue ordering and transcript time-based attribution */
 	readonly createdAt: string; // ISO 8601
 	/**
@@ -640,6 +655,26 @@ export type CommitType = "commit" | "amend" | "squash" | "rebase" | "cherry-pick
 
 /** Whether the operation was triggered from the VSCode plugin or CLI/other git client */
 export type CommitSource = "cli" | "plugin";
+
+/**
+ * Who set a commit in motion — the `trigger` telemetry dimension, resolved at
+ * ENQUEUE time by `resolveCommitOrigin` (core/TelemetryAgent.ts) and stamped on
+ * the queue entry, because only the post-commit hook's own process still holds
+ * the truth: the worker that drains the entry may be a chain-spawned survivor
+ * of an earlier commit, carrying that commit's environment.
+ *
+ *  - `ui`        — an IDE's Commit button (the `plugin-source` marker; the same
+ *                  signal `commitSource: "plugin"` reads).
+ *  - `agent`     — an AI host's session (env markers / families).
+ *  - `terminal`  — a human in a TTY.
+ *  - `unknown`   — none of the above (GUI git clients, cron, CI).
+ *
+ * Closed set; telemetry-safe by construction. Distinct from `CommitSource`,
+ * which answers a narrower question (plugin vs everything-else) and is stored
+ * on the summary itself — this one exists for telemetry and rides queue
+ * entries only.
+ */
+export type CommitTrigger = "agent" | "ui" | "terminal" | "unknown";
 
 /**
  * Closed enumeration of summary-error markers. Extend by adding a new

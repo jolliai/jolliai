@@ -165,12 +165,15 @@ const SHORT_LIVED: ReadonlyArray<Row> = [
 		expected: undefined,
 	},
 	{
-		scenario: "QueueWorker from the VS Code bundle, commit made inside Claude Code",
+		scenario: "post-commit hook resolving a commit's origin, running from the VS Code bundle's dist",
 		inferAgentFromEnv: true,
 		env: { CLAUDECODE: "1" },
 		expected: "claude",
 		because:
-			"reports `surface: vscode` yet MUST trust its env — this is why nothing may gate env-trust on the surface",
+			"reports `surface: vscode` yet MUST trust its env — this is why nothing may gate env-trust on the surface. " +
+			"(The QueueWorker used to hold this row and no longer infers at all: it chain-drains entries OTHER commits " +
+			"enqueued, so its env belongs to whichever commit spawned the chain — each entry now carries its own stamp, " +
+			"resolved by this hook at enqueue time.)",
 	},
 ];
 

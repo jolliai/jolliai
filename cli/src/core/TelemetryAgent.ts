@@ -88,7 +88,7 @@
  * every registered `SESSION_SOURCES` entry is spellable here.
  */
 
-import { isTranscriptSource, TRANSCRIPT_SOURCES, type TranscriptSource } from "../Types.js";
+import { type CommitTrigger, isTranscriptSource, TRANSCRIPT_SOURCES, type TranscriptSource } from "../Types.js";
 import { isLocalAgentChild } from "./AgentReentry.js";
 
 /**
@@ -310,6 +310,52 @@ export const CLIENTINFO_AGENTS: ReadonlyMap<string, TelemetryAgent> = new Map([
  * contract (closed set in, absent out), different key space — clientInfo names
  * are the hosts' own spellings, not our vocabulary.
  */
+/** Who set a commit in motion, plus which host when the answer is an agent. */
+export interface CommitOrigin {
+	readonly trigger: CommitTrigger;
+	/** Present only when `trigger === "agent"` and the family/marker named one host. */
+	readonly agent?: TelemetryAgent;
+}
+
+/**
+ * Resolve who set a commit in motion, at ENQUEUE time — inside the post-commit
+ * hook, whose process env and stdio are the last place the truth exists. The
+ * worker that drains the entry cannot re-derive any of this: it may be a
+ * chain-spawned survivor of an earlier commit (so its env belongs to that
+ * commit), and it never has the committing terminal's TTY.
+ *
+ * Precedence, and why each step beats the next:
+ *
+ *  1. **The IDE's Commit button** (`fromPluginUi` — the `plugin-source` marker
+ *     both IDE bridges write immediately before running `git commit`). Beats
+ *     the env markers deliberately: an extension host cold-started from inside
+ *     an agent session inherits that agent's marker for the window's whole
+ *     life, so a button commit would otherwise be labelled as the agent's work.
+ *     The marker is written milliseconds before THIS commit by the click
+ *     handler itself — the most specific signal there is — and the hook deletes
+ *     it after reading, so it cannot leak onto a later terminal commit. `ui`
+ *     also deliberately carries NO agent.
+ *  2. **An agent's markers** ({@link detectAgentFromEnv}) — the hook is git's
+ *     child, git is the committer's child, so the env chain is short and
+ *     current. Beats the TTY check because an agent session never gives the
+ *     hook a TTY, while a human's always does — so when a marker is present,
+ *     the TTY answer is already known to be false.
+ *  3. **A TTY** — a human typing `git commit`.
+ *  4. **`unknown`** — GUI git clients, cron, CI. NOT "terminal": absence of a
+ *     TTY is an absence, and the whole dimension's rule is that absence reads
+ *     as unknown rather than as the nearest plausible value.
+ */
+export function resolveCommitOrigin(opts: {
+	readonly fromPluginUi: boolean;
+	readonly isTTY: boolean;
+	readonly env?: NodeJS.ProcessEnv;
+}): CommitOrigin {
+	if (opts.fromPluginUi) return { trigger: "ui" };
+	const agent = detectAgentFromEnv(opts.env ?? process.env);
+	if (agent) return { trigger: "agent", agent };
+	return { trigger: opts.isTTY ? "terminal" : "unknown" };
+}
+
 export function resolveClientInfoAgent(name: string | undefined): TelemetryAgent | undefined {
 	// A Map, not a plain object: the name is host-authored input, and a bare
 	// object index would answer `Object` for "constructor" — a truthy Function
