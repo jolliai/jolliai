@@ -79,8 +79,10 @@
  *
  * One of these has been probed and is CLOSED AS UNCLOSABLE by env: **kimi sets
  * no environment variable at all in the shells it spawns** (kimi-code 0.34.0,
- * macOS, 2026-08 — a real one-shot run dumped its shell child's full env: zero
- * `KIMI_*`, zero `MOONSHOT_*`). The only kimi-shaped strings in that env were
+ * macOS, 2026-08 — measured in BOTH modes: a one-shot `--prompt` run and an
+ * interactive TUI session each dumped their shell child's full env, and both
+ * held zero `KIMI_*` and zero `MOONSHOT_*`; the two-mode check matters because
+ * cline demonstrably varies its vars by mode, `CLINE_NO_INTERACTIVE`). The only kimi-shaped strings in that env were
  * the user's own PATH entry (`~/.kimi-code/bin`, equally present in a human
  * shell — a PATH sniff would label people as the agent) and the parent process
  * name `kimi-code` (rejected as a signal for the reasons under
