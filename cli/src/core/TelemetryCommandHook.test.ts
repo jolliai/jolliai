@@ -112,6 +112,53 @@ describe("installCommandTelemetryHooks", () => {
 	});
 });
 
+describe("via (JOLLI_INVOKED_VIA consumption)", () => {
+	afterEach(() => {
+		delete process.env.JOLLI_INVOKED_VIA;
+	});
+
+	it("attaches a valid skill via to the success event, and CONSUMES the env var", async () => {
+		process.env.JOLLI_INVOKED_VIA = "skill:recall";
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toMatchObject({ command: "recall", ok: true, via: "skill:recall" });
+		// Deleted, not merely read: a child this command spawns (a detached daemon,
+		// a nested jolli) must not inherit a claim about THIS invocation.
+		expect(process.env.JOLLI_INVOKED_VIA).toBeUndefined();
+	});
+
+	it("attaches it to the failure event too", async () => {
+		process.env.JOLLI_INVOKED_VIA = "skill:search";
+		const program = programWith(() => {
+			throw new Error("boom");
+		});
+		await expect(program.parseAsync(["node", "jolli", "recall"])).rejects.toThrow("boom");
+		trackCommandFailureIfPending();
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toMatchObject({ command: "recall", ok: false, via: "skill:search" });
+	});
+
+	it("drops an unrecognised value whole — and still consumes it", async () => {
+		// The env var is settable by anything; an unknown name must neither reach
+		// the wire nor survive into children.
+		process.env.JOLLI_INVOKED_VIA = "skill:not-a-skill";
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).not.toHaveProperty("via");
+		expect(JSON.stringify(e.properties)).not.toContain("not-a-skill");
+		expect(process.env.JOLLI_INVOKED_VIA).toBeUndefined();
+	});
+
+	it("omits via for a directly-typed command", async () => {
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).not.toHaveProperty("via");
+	});
+});
+
 describe("shouldSkipExitFlush", () => {
 	// Mirrors the real CLI shape: a `telemetry` group with a default subcommand,
 	// plus a global option registered on the root before parsing.

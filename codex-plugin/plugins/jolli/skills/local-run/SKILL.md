@@ -40,7 +40,7 @@ security recipe and the dist resolver and will not produce valid output.
 Run the eligibility helper and read its JSON:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" workflow local-run
+JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" workflow local-run
 ```
 
 - `{ "type": "workflows", "workflows": [ { "id": 7, "name": "Impact Analysis", "autoMerges": true|false }, ... ] }`
@@ -95,7 +95,7 @@ Capture from its result:
 Pull the destination clone onto the server-derived work branch:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" docs pull --branch <writeTarget.workBranch>
+JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" docs pull --branch <writeTarget.workBranch>
 ```
 
 **Always `--branch`. NEVER `--agent`.** The `--agent` mode runs a destructive
@@ -130,7 +130,7 @@ fresh across the wait.
 1. Publish the branch as a pull request and capture the machine-readable result:
 
    ```bash
-   "$HOME/.jolli/jollimemory/run-cli" docs publish --json
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" docs publish --json
    ```
 
    `--json` prints exactly one JSON object on stdout (all human-readable progress
@@ -142,7 +142,7 @@ fresh across the wait.
    deterministically** — do not eyeball it yourself:
 
    ```bash
-   "$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>
    ```
 
    It prints `{ "match": true|false, "expected": "...", "actual": "..." }` and exits
@@ -198,7 +198,7 @@ fresh across the wait.
    chooses, shell:
 
    ```bash
-   "$HOME/.jolli/jollimemory/run-cli" open-url <url>
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" open-url <url>
    ```
 
    It prints one JSON line `{ "opened": true|false, "url": "..." }`. When `opened` is

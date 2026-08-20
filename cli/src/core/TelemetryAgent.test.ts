@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { compareSemver } from "../install/SemverCompare.js";
+import { INSTALLED_SKILL_NAMES } from "../install/SkillInstaller.js";
 import { LOCAL_AGENT_CHILD_ENV } from "./AgentReentry.js";
 import type { PluginBootstrapHost } from "./localagent/PluginDefaults.js";
 import { SESSION_SOURCES } from "./sessions/SessionSources.js";
@@ -15,7 +16,9 @@ import {
 	detectAgentFromEnv,
 	resolveClientInfoAgent,
 	resolveCommitOrigin,
+	resolveInvokedVia,
 	resolveTelemetryAgent,
+	SKILL_VIA_NAMES,
 	TELEMETRY_AGENTS,
 	type TelemetryAgent,
 } from "./TelemetryAgent.js";
@@ -296,5 +299,38 @@ describe("resolveCommitOrigin (who set a commit in motion)", () => {
 		).toEqual({
 			trigger: "unknown",
 		});
+	});
+});
+
+describe("resolveInvokedVia (the `via` dimension)", () => {
+	it("accepts skill:<name> for every name in the vocabulary", () => {
+		for (const name of SKILL_VIA_NAMES) {
+			expect(resolveInvokedVia(`skill:${name}`)).toBe(`skill:${name}`);
+		}
+	});
+
+	it("stays in lockstep with the installed-skill registry", () => {
+		// SKILL_VIA_NAMES is a deliberate hand-kept copy (this module is a leaf;
+		// deriving live would drag the install stack into every telemetry
+		// consumer). This assertion is what makes the copy safe: bare names here
+		// must equal SkillInstaller's registry with the `jolli-` prefix stripped.
+		const derived = INSTALLED_SKILL_NAMES.map((n) => (n.startsWith("jolli-") ? n.slice("jolli-".length) : n));
+		expect([...SKILL_VIA_NAMES].sort()).toEqual([...derived].sort());
+	});
+
+	it("drops an unknown name, a wrong prefix, and free-form input whole", () => {
+		for (const bad of [
+			"skill:windsurf",
+			"skill:jolli-recall", // the prefixed spelling the Codex renderer would corrupt — never valid
+			"skill:",
+			"menu:jolli",
+			"recall",
+			"skill:recall; rm -rf /",
+			"skill:recall extra",
+			"",
+			undefined,
+		]) {
+			expect(resolveInvokedVia(bad)).toBeUndefined();
+		}
 	});
 });

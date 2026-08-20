@@ -60,7 +60,7 @@ Then run this Bash, replacing the two `<DELIM>` occurrences with your
 delimiter token and replacing `<user-arg>` with the user's input verbatim:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" recall --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
+JOLLI_INVOKED_VIA=skill:recall "$HOME/.jolli/jollimemory/run-cli" recall --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
 <user-arg>
 JOLLI_ARG_<DELIM>_END
 ```

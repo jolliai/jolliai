@@ -21,6 +21,7 @@
  */
 import type { Command } from "commander";
 import { track } from "./Telemetry.js";
+import { JOLLI_INVOKED_VIA_ENV, resolveInvokedVia } from "./TelemetryAgent.js";
 
 /**
  * Space-joined command path excluding the root program, e.g. `recall` or
@@ -44,7 +45,7 @@ export function commandPath(cmd: Command): string {
  * command FAILED — `trackCommandFailureIfPending()` records that. A CLI runs one
  * command per process, so a single slot suffices.
  */
-let pending: { readonly command: string; readonly start: number } | null = null;
+let pending: { readonly command: string; readonly start: number; readonly via?: string } | null = null;
 
 /**
  * Root-level name of the command commander actually resolved this run (e.g.
@@ -99,11 +100,21 @@ export function getInvokedRootCommand(): string | null {
 export function installCommandTelemetryHooks(program: Command): void {
 	program.hook("preAction", (_thisCommand, actionCommand) => {
 		const command = commandPath(actionCommand);
-		pending = { command, start: Date.now() };
+		// `via` — how this invocation was reached (a skill's run-cli recipe sets
+		// `JOLLI_INVOKED_VIA=skill:<name>` on the one command it runs). CONSUMED,
+		// not merely read: the var is deleted before the action executes, so a
+		// child this command spawns — a detached daemon, a chained worker, a
+		// nested `jolli` — cannot inherit a claim that described only this
+		// invocation. Validated against the closed skill-name set; an
+		// unrecognised value is dropped whole (see resolveInvokedVia).
+		const via = resolveInvokedVia(process.env[JOLLI_INVOKED_VIA_ENV]);
+		delete process.env[JOLLI_INVOKED_VIA_ENV];
+		pending = { command, start: Date.now(), via };
 		invokedRootCommand = command.split(" ")[0] ?? null;
 	});
 	program.hook("postAction", (_thisCommand, actionCommand) => {
 		const start = pending?.start;
+		const via = pending?.via;
 		pending = null; // success — recorded below (or intentionally skipped for mcp)
 		// `mcp` is emitted per tool call by the MCP server's CallTool handler
 		// (JOLLI-1959, tagged with `tool`). The generic session-level event here
@@ -114,6 +125,7 @@ export function installCommandTelemetryHooks(program: Command): void {
 			command: commandPath(actionCommand),
 			duration_ms: start === undefined ? undefined : Date.now() - start,
 			ok: true,
+			...(via ? { via } : {}),
 		});
 	});
 }
@@ -131,5 +143,10 @@ export function trackCommandFailureIfPending(): void {
 	const p = pending;
 	pending = null;
 	if (!p || p.command === "mcp") return;
-	track("command_invoked", { command: p.command, duration_ms: Date.now() - p.start, ok: false });
+	track("command_invoked", {
+		command: p.command,
+		duration_ms: Date.now() - p.start,
+		ok: false,
+		...(p.via ? { via: p.via } : {}),
+	});
 }

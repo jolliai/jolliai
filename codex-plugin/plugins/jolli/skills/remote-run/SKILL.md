@@ -61,7 +61,7 @@ its outcome).
 Run the plugin's eligibility helper purely as a presence probe and read its JSON:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" workflow local-run
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" workflow local-run
 ```
 
 - `{ "type": "workflow_cli_required", "installHint": "..." }` — the workflow-cli
@@ -90,7 +90,7 @@ that handle drives the monitor in Step 4.
 Shell the deterministic monitor with the captured `runId`:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>
 ```
 
 It polls the run to a terminal state (with backoff, so you do not drive the poll
@@ -143,7 +143,7 @@ Offer to open any URL from the report in the user's default browser. For each UR
 the user chooses, shell:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" open-url <url>
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" open-url <url>
 ```
 
 It prints one JSON line `{ "opened": true|false, "url": "..." }`. When `opened` is

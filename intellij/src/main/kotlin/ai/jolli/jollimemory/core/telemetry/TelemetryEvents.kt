@@ -35,7 +35,10 @@ object TelemetryEvents {
                 "in_git_repo, repo_enabled, capture_configured, capture_method (discriminator: " +
                 "local-agent/anthropic/jolli/none), memories_generated, memories_bucket.",
             // ── feature usage / adoption ──
-            "command_invoked" to "Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms.",
+            "command_invoked" to
+                "Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms; via " +
+                "(discriminator: skill:<name> from a closed skill-name set — present only when a Jolli skill's recipe " +
+                "invoked the command, omitted for a directly-typed one).",
             "recall_performed" to "A recall was run. Props: hit, result_count_bucket.",
             "search_performed" to "A search was run. Props: query_len_bucket, result_count_bucket.",
             "memory_pushed" to "Memories pushed to a Space. Props: kind, created, plans_bucket.",

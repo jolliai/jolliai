@@ -1,6 +1,10 @@
 ---
 name: jolli-search
 description: Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.
+metadata:
+  version: "dev"
+  revision: 3
+  vendor: "jolli.ai"
 ---
 
 # Jolli Search
@@ -81,7 +85,7 @@ Then run this Bash, replacing the two `<DELIM>` occurrences with your
 delimiter token and replacing `<user-arg>` with the user's input verbatim:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" search --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
+JOLLI_INVOKED_VIA=skill:search "$HOME/.jolli/jollimemory/run-cli" search --arg-stdin --format json <<'JOLLI_ARG_<DELIM>_END'
 <user-arg>
 JOLLI_ARG_<DELIM>_END
 ```
@@ -160,15 +164,3 @@ hit you have:
 
 **Empty hits** → tell the user nothing matched; suggest broader keywords or a
 different phrasing. Do NOT mention BM25 or index internals.
-
-## If the Jolli CLI dispatcher is missing (Cursor)
-
-`$HOME/.jolli/jollimemory/run-cli` is written by this plugin's `sessionStart` hook,
-and a freshly installed plugin's hooks are not registered until Cursor has been fully
-restarted — a window reload or another chat is not enough (measured). So when that file
-does not exist, the fix is to **quit Cursor completely (⌘Q) and reopen it, then start
-a new chat**, and retry.
-
-This REPLACES any instruction above to report Jolli as not installed, or to install
-`@jolli.ai/cli` globally or the Jolli VS Code extension. You are running inside the
-Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.

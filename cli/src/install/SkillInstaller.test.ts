@@ -1471,10 +1471,10 @@ describe("skill revision is kept in lockstep with the body", () => {
 	// When a body legitimately changes: bump `revision`, then update `fingerprint`
 	// here. Both, in the same change.
 	const EXPECTED = {
-		recall: { build: buildRecallSkillTemplate, revision: 2, fingerprint: "5baf6ab3b7ce" },
-		search: { build: buildSearchSkillTemplate, revision: 2, fingerprint: "2fa504d6745f" },
-		localRun: { build: buildLocalRunSkillTemplate, revision: 5, fingerprint: "81db78096bb6" },
-		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 4, fingerprint: "9fd34e36c20e" },
+		recall: { build: buildRecallSkillTemplate, revision: 3, fingerprint: "07580a0b4ad3" },
+		search: { build: buildSearchSkillTemplate, revision: 3, fingerprint: "602cea610684" },
+		localRun: { build: buildLocalRunSkillTemplate, revision: 6, fingerprint: "d04d02ba2c73" },
+		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 5, fingerprint: "e3e5572715a3" },
 		menu: { build: buildJolliMenuSkillTemplate, revision: 8, fingerprint: "8db133d89c3b" },
 		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 9, fingerprint: "37225c630e7d" },
 	} as const;
@@ -1484,6 +1484,31 @@ describe("skill revision is kept in lockstep with the body", () => {
 			const body = want.build();
 			expect(body.match(/revision:\s*(\d+)/)?.[1]).toBe(String(want.revision));
 			expect(stableFingerprint(body)).toBe(want.fingerprint);
+		});
+	}
+
+	// Every run-cli invocation a skill body ships must carry its own
+	// `JOLLI_INVOKED_VIA=skill:<bare-name>` prefix — that is the whole `via`
+	// telemetry dimension for the CLI path, and a bare invocation added later
+	// would silently emit as "typed directly". Derived from the body rather than
+	// a per-skill count so a recipe gaining or losing a call stays covered.
+	// BARE names only: `skill:jolli-<x>` would be corrupted to `skill:jolli:<x>`
+	// by the Codex renderer's substring rewrite.
+	const VIA_SKILLS = [
+		{ name: "recall", build: buildRecallSkillTemplate },
+		{ name: "search", build: buildSearchSkillTemplate },
+		{ name: "local-run", build: buildLocalRunSkillTemplate },
+		{ name: "remote-run", build: buildRemoteRunSkillTemplate },
+	] as const;
+	for (const { name, build } of VIA_SKILLS) {
+		it(`${name}: every run-cli invocation carries via skill:${name}`, () => {
+			const body = build();
+			const invocations = body.match(/^.*\/run-cli" .*$/gm) ?? [];
+			expect(invocations.length).toBeGreaterThan(0);
+			for (const line of invocations) {
+				expect(line.trimStart().startsWith(`JOLLI_INVOKED_VIA=skill:${name} `)).toBe(true);
+			}
+			expect(body).not.toContain("skill:jolli-");
 		});
 	}
 

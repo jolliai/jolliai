@@ -310,6 +310,55 @@ export const CLIENTINFO_AGENTS: ReadonlyMap<string, TelemetryAgent> = new Map([
  * contract (closed set in, absent out), different key space — clientInfo names
  * are the hosts' own spellings, not our vocabulary.
  */
+/**
+ * Env var a skill's run-cli recipe sets on the ONE command it invokes:
+ * `JOLLI_INVOKED_VIA=skill:<bare-name>`. The `via` telemetry dimension — how a
+ * command was reached (a skill, vs typed directly), as distinct from which host
+ * ran it (`agent`). `TelemetryCommandHook` consumes it: read once, validated
+ * against {@link SKILL_VIA_NAMES}, then DELETED from the process env so a child
+ * the command spawns (a detached daemon, a chained worker) cannot inherit a
+ * claim that was only ever about this invocation.
+ */
+export const JOLLI_INVOKED_VIA_ENV = "JOLLI_INVOKED_VIA";
+
+/**
+ * The bare skill names that may appear in a `skill:<name>` via value.
+ *
+ * BARE names (`recall`, not `jolli-recall`) for a renderer reason: the Codex
+ * plugin generator rewrites `jolli-<name>` substrings to `jolli:<name>` across
+ * every shared skill body, so the prefixed spelling would ship corrupted in
+ * that bundle. Bare names also make the value host-neutral — all three plugin
+ * bundles and the installed copies emit the same token.
+ *
+ * A hand-kept copy of the installed-skill registry, kept deliberately: this
+ * module is a leaf that `Telemetry`, `TelemetryStartup` and the hooks all
+ * import, and deriving the list live would drag `install/SkillInstaller` (the
+ * whole install stack) into every one of them. The same trade
+ * `ClientHeader.PLUGIN_BUNDLE_KINDS` makes, policed the same way:
+ * `TelemetryAgent.test.ts` asserts it equals the names derived from
+ * `SkillInstaller.INSTALLED_SKILL_NAMES`, so the copy cannot drift silently.
+ *
+ * Includes names whose recipes do not carry the prefix yet (`jolli`, the menu)
+ * — the set answers "what could a legitimate via name be", so a recipe adopting
+ * it later is a skill-template change only, never a core change.
+ */
+export const SKILL_VIA_NAMES: ReadonlyArray<string> = ["recall", "search", "local-run", "remote-run", "jolli"];
+
+const SKILL_VIA_SET: ReadonlySet<string> = new Set(SKILL_VIA_NAMES);
+
+/**
+ * Validate a raw `JOLLI_INVOKED_VIA` value to a wire-safe `via` token, or
+ * `undefined`. Same contract as every other gate in this module: closed set in,
+ * absent out, never a pass-through — the env var is settable by anything, so an
+ * unrecognised value (wrong prefix, unknown name, free text) is dropped whole
+ * rather than partially honoured.
+ */
+export function resolveInvokedVia(value: string | undefined): string | undefined {
+	if (value === undefined || !value.startsWith("skill:")) return undefined;
+	const name = value.slice("skill:".length);
+	return SKILL_VIA_SET.has(name) ? value : undefined;
+}
+
 /** Who set a commit in motion, plus which host when the answer is an agent. */
 export interface CommitOrigin {
 	readonly trigger: CommitTrigger;

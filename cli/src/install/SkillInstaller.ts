@@ -140,6 +140,15 @@ const SKILLS: ReadonlyArray<SkillRegistration> = [
 ];
 
 /**
+ * Every installed skill's directory name, exported for the lockstep pin in
+ * `TelemetryAgent.test.ts`: `SKILL_VIA_NAMES` (the `via` telemetry vocabulary)
+ * is a hand-kept bare-name copy of this list — kept separate so the telemetry
+ * leaf never imports the install stack — and the test derives one from the
+ * other so the copy cannot drift when a skill is added or retired here.
+ */
+export const INSTALLED_SKILL_NAMES: ReadonlyArray<string> = SKILLS.map((skill) => skill.name);
+
+/**
  * Skill directory names Jolli USED to ship but no longer does. On every
  * `jolli enable` these are removed from the write targets so an upgrade doesn't
  * strand a dead skill in the user's repo. Removal is guarded by the Jolli
@@ -671,6 +680,16 @@ async function upsertSkill(skillsDir: string, name: string, content: string): Pr
  * The literal `<DELIM>` placeholder is intentional: the LLM is the one that
  * generates the random value each invocation, which is what makes pre-computed
  * prompt-injection payloads useless.
+ *
+ * The `JOLLI_INVOKED_VIA=skill:<name>` env prefix is the `via` telemetry
+ * dimension — how this command was reached, as distinct from which host ran it
+ * (`agent`). `TelemetryCommandHook` consumes and validates it against the
+ * closed skill-name set and DELETES it from the process env, so a child the
+ * command spawns cannot inherit the claim. A static assignment with no
+ * interpolation, so it adds nothing to the injection surface this recipe
+ * exists to close. The value uses the BARE name (`skill:recall`, never
+ * `skill:jolli-recall`): the Codex renderer rewrites `jolli-<name>` substrings
+ * to `jolli:<name>` and would corrupt the prefixed form.
  */
 function heredocInvocation(subcommand: "recall" | "search", flagSuffix: string): string {
 	return `${SHELL_PREREQUISITE_BLOCK}
@@ -686,7 +705,7 @@ Then run this Bash, replacing the two \`<DELIM>\` occurrences with your
 delimiter token and replacing \`<user-arg>\` with the user's input verbatim:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" ${subcommand} --arg-stdin${flagSuffix} <<'JOLLI_ARG_<DELIM>_END'
+JOLLI_INVOKED_VIA=skill:${subcommand} "$HOME/.jolli/jollimemory/run-cli" ${subcommand} --arg-stdin${flagSuffix} <<'JOLLI_ARG_<DELIM>_END'
 <user-arg>
 JOLLI_ARG_<DELIM>_END
 \`\`\`
@@ -710,7 +729,7 @@ name: jolli-recall
 description: Recall prior development context from Jolli for the current branch. Use when the user wants to recall, remember, or resume prior work on a branch.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 2
+  revision: 3
   vendor: "jolli.ai"
 ---
 
@@ -940,7 +959,7 @@ name: jolli-search
 description: Search structured commit memories across all branches — decisions, topics, files. Use when the user wants to find prior decisions, related commits, or how a topic was handled before.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 2
+  revision: 3
   vendor: "jolli.ai"
 ---
 
@@ -1085,7 +1104,7 @@ name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 5
+  revision: 6
   vendor: "jolli.ai"
 ---
 
@@ -1112,7 +1131,7 @@ ${SHELL_PREREQUISITE_BLOCK}
 Run the eligibility helper and read its JSON:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" workflow local-run
+JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" workflow local-run
 \`\`\`
 
 - \`{ "type": "workflows", "workflows": [ { "id": 7, "name": "Impact Analysis", "autoMerges": true|false }, ... ] }\`
@@ -1167,7 +1186,7 @@ Capture from its result:
 Pull the destination clone onto the server-derived work branch:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" docs pull --branch <writeTarget.workBranch>
+JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" docs pull --branch <writeTarget.workBranch>
 \`\`\`
 
 **Always \`--branch\`. NEVER \`--agent\`.** The \`--agent\` mode runs a destructive
@@ -1202,7 +1221,7 @@ fresh across the wait.
 1. Publish the branch as a pull request and capture the machine-readable result:
 
    \`\`\`bash
-   "$HOME/.jolli/jollimemory/run-cli" docs publish --json
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" docs publish --json
    \`\`\`
 
    \`--json\` prints exactly one JSON object on stdout (all human-readable progress
@@ -1214,7 +1233,7 @@ fresh across the wait.
    deterministically** — do not eyeball it yourself:
 
    \`\`\`bash
-   "$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" space verify-publish-branch <writeTarget.workBranch> <headBranch>
    \`\`\`
 
    It prints \`{ "match": true|false, "expected": "...", "actual": "..." }\` and exits
@@ -1270,7 +1289,7 @@ fresh across the wait.
    chooses, shell:
 
    \`\`\`bash
-   "$HOME/.jolli/jollimemory/run-cli" open-url <url>
+   JOLLI_INVOKED_VIA=skill:local-run "$HOME/.jolli/jollimemory/run-cli" open-url <url>
    \`\`\`
 
    It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
@@ -1316,7 +1335,7 @@ name: jolli-remote-run
 description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 4
+  revision: 5
   vendor: "jolli.ai"
 ---
 
@@ -1364,7 +1383,7 @@ its outcome).
 Run the plugin's eligibility helper purely as a presence probe and read its JSON:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" workflow local-run
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" workflow local-run
 \`\`\`
 
 - \`{ "type": "workflow_cli_required", "installHint": "..." }\` — the workflow-cli
@@ -1393,7 +1412,7 @@ that handle drives the monitor in Step 4.
 Shell the deterministic monitor with the captured \`runId\`:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" workflow run-status <runId>
 \`\`\`
 
 It polls the run to a terminal state (with backoff, so you do not drive the poll
@@ -1446,7 +1465,7 @@ Offer to open any URL from the report in the user's default browser. For each UR
 the user chooses, shell:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" open-url <url>
+JOLLI_INVOKED_VIA=skill:remote-run "$HOME/.jolli/jollimemory/run-cli" open-url <url>
 \`\`\`
 
 It prints one JSON line \`{ "opened": true|false, "url": "..." }\`. When \`opened\` is
