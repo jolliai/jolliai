@@ -1,5 +1,9 @@
 package ai.jolli.jollimemory.bridge
 
+import ai.jolli.jollimemory.core.JmLogger
+import com.google.gson.Gson
+import com.google.gson.JsonElement
+import com.google.gson.JsonObject
 import java.net.URI
 
 /**
@@ -11,12 +15,17 @@ import java.net.URI
  * always yield the same string regardless of clone transport or owner/repo
  * casing the user happened to type in their `git clone` invocation.
  *
- * Mirrors `vscode/src/util/GitRemoteUtils.ts` byte-for-byte in normalization
- * behavior — any change must be made in both places, otherwise a VS Code
- * teammate and an IntelliJ teammate on the same repo will produce different
- * `repoUrl` keys and end up with two separate bindings.
+ * The CLI (`cli/src/core/GitRemoteUtils.ts`) is the source of truth. Approach B
+ * of JOLLI-2135: [getCanonicalRepoUrl] routes through the `git-remote` ide-bridge
+ * action so the primary key is computed by that one canonicalizer — including its
+ * `~/.ssh/config` Host-alias resolution, which this Kotlin copy does NOT do. The
+ * local normalizer below is kept ONLY as a fallback for when the bridge is
+ * unreachable (no Node, no daemon): it is deliberately alias-UNAWARE, which is
+ * the "config unreadable → behaviour unchanged" degradation JOLLI-2135 specifies.
+ * It no longer needs to mirror the TS normalizer byte-for-byte; the daemon-backed
+ * path is what every online surface actually uses.
  *
- * Normalization rules:
+ * Normalization rules (fallback path):
  *   - SSH scp form `git@host:owner/repo[.git]`          → `https://host/owner/repo`
  *   - SSH URL  `ssh://git@host[:port]/path[.git]`       → `https://host[:port]/path`
  *   - git URL  `git://host[:port]/path[.git]`           → `https://host[:port]/path`
@@ -25,8 +34,11 @@ import java.net.URI
  *
  * Port handling:
  *   - HTTP(S): always preserve the port (self-hosted forges on non-default
- *     HTTPS ports are common).
- *   - ssh / git: preserve the port unless it's the scheme's default (22 / 9418).
+ *     HTTPS ports are common — there the port IS the identity).
+ *   - ssh: the port is a connection coordinate, not the https identity, so for a
+ *     self-hosted host it is dropped entirely — an ssh clone folds onto the
+ *     `https://host/x` key (JOLLI-2135 follow-up). Known forges keep it.
+ *   - git: a distinct transport; preserve the port unless it's the default (9418).
  *
  * Path-case handling:
  *   - github.com / gitlab.com / bitbucket.org → lowercase path (these hosts
@@ -39,7 +51,25 @@ import java.net.URI
  */
 object GitRemoteUtils {
 
+    private val log = JmLogger.create("GitRemoteUtils")
+    private val gson = Gson()
+
     private val CASE_INSENSITIVE_PATH_HOSTS: Set<String> = setOf(
+        "github.com",
+        "gitlab.com",
+        "bitbucket.org",
+    )
+
+    /**
+     * Hosts whose surviving ssh port is part of the canonical identity and is
+     * KEPT; every other (self-hosted) host has its ssh port DROPPED — see
+     * [sshIdentityPort]. Deliberately SEPARATE from [CASE_INSENSITIVE_PATH_HOSTS]
+     * even though the members coincide today: the two answer unrelated questions
+     * (path-case folding vs. port-as-identity), so a self-hosted forge added to
+     * the case list must not silently start preserving ssh ports here. Mirrors
+     * the CLI's `SSH_PORT_IDENTITY_HOSTS`.
+     */
+    private val SSH_PORT_IDENTITY_HOSTS: Set<String> = setOf(
         "github.com",
         "gitlab.com",
         "bitbucket.org",
@@ -58,8 +88,38 @@ object GitRemoteUtils {
 
     private val SSH_SCP_REGEX = Regex("""^([A-Za-z0-9_.+-]+@)([^:/\s]+):(.+)$""")
 
-    /** Returns the canonical, server-facing repo URL for the given workspace root. */
-    fun getCanonicalRepoUrl(workspaceRoot: String): String {
+    /**
+     * Returns the canonical, server-facing repo URL for the given workspace root.
+     *
+     * Primary path: the CLI's canonicalizer over the `git-remote` ide-bridge
+     * action (ssh-alias aware). Any bridge failure — no daemon, no Node, protocol
+     * error, or a reply without a usable `value` — falls back to the local,
+     * alias-UNAWARE normalizer so a push still resolves an identity.
+     *
+     * [runBridge] is an injectable seam for tests only; production callers pass a
+     * single argument and get the real bridge.
+     */
+    fun getCanonicalRepoUrl(
+        workspaceRoot: String,
+        runBridge: (String, String, String) -> JsonElement =
+            { dir, action, req -> CliIntegrations.runIdeBridge(dir, action, req) },
+    ): String {
+        try {
+            val request = JsonObject().apply { addProperty("operation", "canonical-url") }
+            val value = runBridge(workspaceRoot, "git-remote", gson.toJson(request))
+                ?.asJsonObject?.get("value")
+            if (value != null && !value.isJsonNull && value.asString.isNotEmpty()) {
+                return value.asString
+            }
+            // Fall through: the bridge answered without a usable value.
+        } catch (e: Exception) {
+            log.debug("git-remote canonical-url bridge failed; using local fallback: %s", e.message)
+        }
+        return localCanonicalRepoUrl(workspaceRoot)
+    }
+
+    /** Local, alias-UNAWARE canonicalizer — the no-Node / no-daemon fallback. */
+    private fun localCanonicalRepoUrl(workspaceRoot: String): String {
         val remote = GitOps(workspaceRoot)
             .exec("config", "--get", "remote.origin.url")
             ?.trim()
@@ -98,7 +158,12 @@ object GitRemoteUtils {
                 ?: return toFileUrl(workspaceRootForFallback)
             val rawPath = parsed.path.orEmpty().trimStart('/')
             val pathPart = normalizePathCase(host, stripGitSuffixAndSlashes(rawPath))
-            val port = if (parsed.port == -1) "" else parsed.port.toString()
+            val rawPort = if (parsed.port == -1) "" else parsed.port.toString()
+            // The ssh port is a CONNECTION coordinate, not the https identity, so for
+            // a self-hosted host it is dropped — an ssh clone folds onto the https key
+            // (JOLLI-2135 follow-up). git:// keeps its port. Mirrors the CLI's
+            // `sshIdentityPort`. (The scp branch above already emits no port.)
+            val port = if (scheme == "ssh") sshIdentityPort(host, rawPort) else rawPort
             val portSegment = canonicalPortSegment(scheme, port)
             return "https://$host$portSegment/$pathPart"
         }
@@ -173,6 +238,17 @@ object GitRemoteUtils {
 
     private fun normalizePathCase(host: String, pathPart: String): String {
         return if (host in CASE_INSENSITIVE_PATH_HOSTS) pathPart.lowercase() else pathPart
+    }
+
+    /**
+     * The port an ssh transport contributes to the https identity: dropped for a
+     * self-hosted host (the ssh connection port is not the repo's https identity),
+     * kept for a known forge ([SSH_PORT_IDENTITY_HOSTS]). Mirrors the CLI's
+     * `sshIdentityPort` (JOLLI-2135 follow-up). Only the ssh:// path needs this —
+     * the scp fallback emits no port.
+     */
+    private fun sshIdentityPort(host: String, port: String): String {
+        return if (host in SSH_PORT_IDENTITY_HOSTS) port else ""
     }
 
     private fun canonicalPortSegment(scheme: String, port: String): String {

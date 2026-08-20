@@ -24,7 +24,7 @@ import { execFileSyncHidden } from "../util/Subprocess.js";
 import type { ClaimVerdict, KBConfig, MemoryBankConfig, MemoryBankState } from "./KBTypes.js";
 import { MetadataManager } from "./MetadataManager.js";
 import { isPathInside } from "./PathUtils.js";
-import { resolveHostAlias } from "./SshAliasResolver.js";
+import { formatHostForUrl, resolveHostEndpoint } from "./SshAliasResolver.js";
 
 const log = createLogger("KBPathResolver");
 
@@ -571,14 +571,17 @@ function normalizeRemoteUrl(url: string): string {
  * Folds the SSH transport forms of a git remote URL into the https form so
  * all transports of the same repo compare equal:
  *
- *   - `ssh://[user@]host[:port]/path` (and `git+ssh://`) → `https://host[:port]/path`.
- *     The scheme's DEFAULT port (22) is dropped — it carries no identity —
- *     but a non-default port is preserved: two self-hosted forges on
- *     `host:2222` and `host:2223` are distinct repos and must not collapse.
- *     Same rule as `vscode/src/util/GitRemoteUtils.ts` (the server binding
- *     key), so the two canonicalizers agree on self-hosted SSH remotes.
- *   - `git://host[:port]/path` → `https://host[:port]/path` (default 9418
- *     dropped, same rule).
+ *   - `ssh://[user@]host[:port]/path` (and `git+ssh://`) → `https://host/path`.
+ *     The ssh port is a CONNECTION coordinate, not the repo's https identity,
+ *     so for a self-hosted host it is dropped (default AND non-default) via
+ *     {@link sshIdentityPort} — an ssh clone on `:2222` and an https clone of
+ *     the one repo must fold to one key (JOLLI-2135 follow-up). Same rule as
+ *     the server binding key (`GitRemoteUtils.ts`, which imports
+ *     {@link sshIdentityPort}), so the two canonicalizers agree. Accepted
+ *     cost: two distinct repos on one host reachable only via different ssh
+ *     ports (`:2222`/`:2223`) now collapse.
+ *   - `git://host[:port]/path` → `https://host[:port]/path`. The Git protocol is
+ *     a distinct transport, so its port is left untouched (default 9418 dropped).
  *   - SCP form `user@host:path` → `https://host/path`. The `user@` part is
  *     REQUIRED on purpose: a bare `host:path` was never folded by earlier
  *     releases either, and requiring the `@` keeps non-URL strings that
@@ -589,13 +592,15 @@ function normalizeRemoteUrl(url: string): string {
  *     distinction of the SCP path is preserved (`host:/srv/repo` →
  *     `…host//srv/repo` vs `host:srv/repo` → `…host/srv/repo`).
  *
- * The host token of every SSH/git transport is passed through
- * {@link resolveHostAlias}, which resolves a `~/.ssh/config` `Host` alias to
- * its real `HostName` (`git@github-jolli:owner/repo` → `https://github.com/
- * owner/repo` when `github-jolli` aliases `github.com`). Without this, a repo
- * cloned via an ssh alias and the same repo via `git@github.com:` folded to
- * different keys and split into `<repo>` / `<repo>-2` folders. The bare
- * `host:path` passthrough is unaffected — it never reaches the fold.
+ * The host token of the SSH transports (`ssh://` and the `git@host:` scp form)
+ * is passed through {@link resolveHostEndpoint}, which resolves a `~/.ssh/config`
+ * `Host` alias to its real `HostName` + `Port` (`git@github-jolli:owner/repo` →
+ * `https://github.com/owner/repo` when `github-jolli` aliases `github.com`) and
+ * maps a known ssh connection endpoint (`ssh.github.com`) back to its forge
+ * host. Without this, a repo cloned via an ssh alias and the same repo via
+ * `git@github.com:` folded to different keys and split into `<repo>` /
+ * `<repo>-2` folders. `git://` is the Git protocol, not ssh, so it is NOT
+ * alias-resolved; the bare `host:path` passthrough never reaches the fold.
  *
  * Anything else (https, file paths, bare names) passes through unchanged.
  *
@@ -608,36 +613,103 @@ function normalizeRemoteUrl(url: string): string {
  * The IntelliJ plugin resolves folder identity by calling this function over
  * the `kb` ide-bridge action (see `KBPathResolver.kt`, a thin adapter), so
  * this fix reaches IntelliJ with no Kotlin change. The *separate* server
- * binding-key normalizer in `cli/src/core/GitRemoteUtils.ts` and its Kotlin
- * twin `GitRemoteUtils.kt` are NOT alias-aware yet — a follow-up.
+ * binding-key normalizer in `cli/src/core/GitRemoteUtils.ts` shares the same
+ * {@link resolveHostEndpoint} machinery (JOLLI-2135) and is likewise reached from
+ * IntelliJ over the `git-remote` ide-bridge action, so both canonicalizers now
+ * agree on ssh aliases on every surface.
  */
 /**
  * Hosts whose owner/repo path is case-insensitive on the wire — clones typed
  * with different casing all resolve to the same repo, so canonicalizers must
  * lower-case the path for these hosts (and ONLY these: self-hosted forges may
  * be case-sensitive). Single shared source of truth for every comparer:
- * `sync/RepoIdentity.ts` (vault identity), `vscode/src/util/GitRemoteUtils.ts`
- * (server binding key — imports this set), and the whole-string-lowercasing
- * comparers (`normalizeRemoteUrl` above, `KBRepoDiscoverer`) which fold case
+ * `sync/RepoIdentity.ts` (vault identity), `core/GitRemoteUtils.ts` (server
+ * binding key — imports this set), and the whole-string-lowercasing comparers
+ * (`normalizeRemoteUrl` above, `KBRepoDiscoverer`) which fold case
  * unconditionally and need no per-host check. Add new entries only after
  * confirming the host actually treats the path as case-insensitive (assuming
  * wrong here merges distinct repos).
+ *
+ * This set is about PATH CASE only. Do NOT reuse it to answer any other
+ * host-classification question — {@link SSH_PORT_IDENTITY_HOSTS} is a separate
+ * concept (ssh-port-as-identity) that happens to list the same forges today.
  */
 export const CASE_INSENSITIVE_PATH_HOSTS: ReadonlySet<string> = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
 
+/**
+ * Hosts whose surviving SSH port is part of the canonical https identity and is
+ * therefore KEPT; every other (self-hosted) host has its ssh port DROPPED — see
+ * {@link sshIdentityPort}. Deliberately a SEPARATE list from
+ * {@link CASE_INSENSITIVE_PATH_HOSTS} even though the members coincide today:
+ * the two answer unrelated questions (path-case folding vs. port-as-identity),
+ * so a self-hosted forge added to the case list for its own reason must not
+ * silently start preserving ssh connection ports here. These public forges
+ * never carry a real non-default ssh identity port anyway (a documented
+ * ssh-over-443 endpoint is remapped and its port zeroed before this runs), so
+ * keeping their port is a safe no-op that limits the drop to exactly the
+ * self-hosted case. Add an entry only for a host where the ssh port genuinely
+ * IS canonical identity. Kept in step with the Kotlin mirror in
+ * `intellij/.../bridge/GitRemoteUtils.kt`.
+ */
+export const SSH_PORT_IDENTITY_HOSTS: ReadonlySet<string> = new Set(["github.com", "gitlab.com", "bitbucket.org"]);
+
+/**
+ * The port an SSH transport (`ssh://` or the `git@host:` scp form) contributes
+ * to the canonical https identity. For a self-hosted host it is ALWAYS dropped:
+ * an `~/.ssh/config` `Port 2222` (or an explicit `ssh://…:2222`) is a CONNECTION
+ * coordinate, not the repo's https identity, so an ssh clone and an https clone
+ * of the one self-hosted repo must not split on it (JOLLI-2135 follow-up). The
+ * known public forges ({@link SSH_PORT_IDENTITY_HOSTS}) keep whatever port
+ * survived upstream — they never carry a real non-default ssh identity port (a
+ * documented ssh-over-443 endpoint is remapped and zeroed before this runs), so
+ * gating on that set limits the fold to exactly the self-hosted case.
+ *
+ * Accepted trade-off: two DISTINCT repos on one host reachable only via different
+ * ssh gateway ports (`:2222` vs `:2223`) now collapse to one key — the dominant
+ * real case (one repo via ssh AND https) wins over that rare one. `host` must be
+ * lower-cased by the caller. Shared with the server binding-key canonicalizer
+ * (`core/GitRemoteUtils.ts` imports it) so the two rules cannot drift; `git://`
+ * (a distinct transport) and `http(s)` (where the port IS the identity) never
+ * use it.
+ */
+export function sshIdentityPort(host: string, port: string): string {
+	return SSH_PORT_IDENTITY_HOSTS.has(host) ? port : "";
+}
+
 export function foldGitTransportToHttps(url: string): string {
-	const ssh = url.match(/^(?:git\+)?ssh:\/\/(?:[^@/]+@)?([^/:]+)(?::(\d+))?\/(.+)$/i);
-	if (ssh) return `https://${resolveHostAlias(ssh[1])}${nonDefaultPortSegment(ssh[2], "22")}/${ssh[3]}`;
+	const ssh = url.match(/^(?:git\+)?ssh:\/\/(?:([^@/]+)@)?([^/:]+)(?::(\d+))?\/(.+)$/i);
+	if (ssh) {
+		// Thread the `user@` part so `Match user …` config blocks resolve.
+		const ep = resolveHostEndpoint(ssh[2], ssh[1] || undefined);
+		// A host remapped from a known ssh connection endpoint (`ssh.github.com:443`)
+		// carries the alt port on the connection, not the identity, so it is already
+		// zeroed. The remaining ssh port is a connection coordinate too, so it is
+		// dropped for a self-hosted host — an ssh clone must fold onto the https key.
+		const rawPort = ep.endpointRemapped ? "" : (ssh[3] ?? ep.port);
+		const port = sshIdentityPort(ep.host.toLowerCase(), rawPort);
+		return `https://${formatHostForUrl(ep.host)}${nonDefaultPortSegment(port, "22")}/${ssh[4]}`;
+	}
+	// `git://` is the Git protocol, not ssh — it never consults `~/.ssh/config`,
+	// so its host is NOT resolved through an alias and its port is left untouched.
 	const git = url.match(/^git:\/\/([^/:]+)(?::(\d+))?\/(.+)$/i);
-	if (git) return `https://${resolveHostAlias(git[1])}${nonDefaultPortSegment(git[2], "9418")}/${git[3]}`;
-	const scp = url.match(/^[^@/:]+@([^/:]+):(.+)$/);
-	if (scp) return `https://${resolveHostAlias(scp[1])}/${scp[2]}`;
+	if (git) return `https://${git[1]}${nonDefaultPortSegment(git[2], "9418")}/${git[3]}`;
+	const scp = url.match(/^([^@/:]+)@([^/:]+):(.+)$/);
+	if (scp) {
+		// The scp form has no port syntax; the alias's config Port is an ssh
+		// CONNECTION coordinate, not the repo's identity, so it is dropped for a
+		// self-hosted host (see {@link sshIdentityPort}) — the alias scp clone then
+		// folds onto the same key as the https clone. The `user@` part is threaded
+		// through so `Match user …` config blocks resolve.
+		const ep = resolveHostEndpoint(scp[2], scp[1] || undefined);
+		const port = sshIdentityPort(ep.host.toLowerCase(), ep.port);
+		return `https://${formatHostForUrl(ep.host)}${nonDefaultPortSegment(port, "22")}/${scp[3]}`;
+	}
 	return url;
 }
 
 /** `:<port>` when present and not the scheme's default, else empty. */
 function nonDefaultPortSegment(port: string | undefined, schemeDefault: string): string {
-	if (port === undefined || port === schemeDefault) return "";
+	if (!port || port === schemeDefault) return "";
 	return `:${port}`;
 }
 

@@ -143,9 +143,9 @@ describe("normalizeRemoteUrl", () => {
 			"https://git.internal.company.com:8443/team/repo",
 		],
 		[
-			"ssh:// URL with non-default port — port is preserved (distinct repo identity)",
+			"ssh:// URL with non-default port — port is dropped (ssh connection port is not the https identity)",
 			"ssh://git@git.internal.company.com:2222/team/repo.git",
-			"https://git.internal.company.com:2222/team/repo",
+			"https://git.internal.company.com/team/repo",
 		],
 		[
 			"git:// URL with non-default port — port is preserved",
@@ -160,9 +160,13 @@ describe("normalizeRemoteUrl", () => {
 		});
 	}
 
-	it("two repos on different non-default ssh ports do NOT collide", () => {
-		// Regression: dropping the port for every ssh:// URL collapsed two
-		// distinct self-hosted repos onto the same binding key.
+	it("accepted trade-off: two self-hosted repos differing ONLY by ssh port now collapse to one key (JOLLI-2135)", () => {
+		// The SSH *connection* port is not the repo's HTTPS identity, so an ssh
+		// clone folds onto its https twin. The cost: two DISTINCT repos reachable
+		// only via different ssh gateway ports on one host collapse to one key.
+		// The dominant real case (one repo via ssh:2222 AND https:443) wins over
+		// this rare one. Mirrors the CLI suite so the shared canonicalizer's
+		// trade-off is pinned on both surfaces.
 		const a = normalizeRemoteUrl(
 			"ssh://git@git.internal.company.com:2222/team/repo.git",
 			FAKE_ROOT,
@@ -171,7 +175,8 @@ describe("normalizeRemoteUrl", () => {
 			"ssh://git@git.internal.company.com:2223/team/repo.git",
 			FAKE_ROOT,
 		);
-		expect(a).not.toBe(b);
+		expect(a).toBe(b);
+		expect(a).toBe("https://git.internal.company.com/team/repo");
 	});
 
 	it("falls back to file:// for empty remote", () => {

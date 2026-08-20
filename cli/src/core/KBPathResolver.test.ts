@@ -369,10 +369,16 @@ esac
 			expect(foldGitTransportToHttps("git://github.com:9418/user/repo")).toBe("https://github.com/user/repo");
 		});
 
-		it("preserves non-default ssh/git ports (distinct self-hosted forges must not collapse)", () => {
+		it("drops the ssh port from a self-hosted identity (ssh connection port is not the https identity)", () => {
+			// JOLLI-2135 follow-up: an ssh clone on :2222 and an https clone of the
+			// same self-hosted repo must fold to one key, so the ssh port is dropped
+			// even when non-default. git:// keeps its port (see below).
 			expect(foldGitTransportToHttps("ssh://git@host.example:2222/team/repo")).toBe(
-				"https://host.example:2222/team/repo",
+				"https://host.example/team/repo",
 			);
+		});
+
+		it("preserves a non-default git:// port (the Git protocol is a distinct transport, left untouched)", () => {
 			expect(foldGitTransportToHttps("git://host.example:9419/team/repo")).toBe(
 				"https://host.example:9419/team/repo",
 			);
@@ -417,6 +423,61 @@ esac
 			it("does not resolve bare host:path (no user@) — passthrough stays literal even with an alias runner", () => {
 				__setSshRunnerForTests(() => "hostname github.com\n");
 				expect(foldGitTransportToHttps("mygit.local:repos/foo")).toBe("mygit.local:repos/foo");
+			});
+
+			it("Claim 2: maps a known ssh-over-443 endpoint (ssh.github.com) back to the forge host", () => {
+				__setSshRunnerForTests((host) =>
+					host === "github.com" ? "hostname ssh.github.com\nport 443\n" : `hostname ${host}\n`,
+				);
+				expect(foldGitTransportToHttps("git@github.com:user/repo.git")).toBe(
+					"https://github.com/user/repo.git",
+				);
+			});
+
+			it("Claim 1 (revised): the ssh config Port is NOT carried into the scp fold (folds onto the portless self-hosted key)", () => {
+				__setSshRunnerForTests((host) =>
+					host === "corp-git" ? "hostname git.example.com\nport 2222\n" : `hostname ${host}\n`,
+				);
+				// The config `Port 2222` is a connection coordinate, not the repo's
+				// identity, so the alias scp clone folds onto the same key as the
+				// https clone (JOLLI-2135 follow-up).
+				expect(foldGitTransportToHttps("git@corp-git:team/repo")).toBe("https://git.example.com/team/repo");
+			});
+
+			it("Claim 3: git:// is the Git protocol — its host is never resolved through ~/.ssh/config", () => {
+				__setSshRunnerForTests((host) =>
+					host === "gitproto-host" ? "hostname elsewhere.example\n" : `hostname ${host}\n`,
+				);
+				expect(foldGitTransportToHttps("git://gitproto-host/owner/repo")).toBe(
+					"https://gitproto-host/owner/repo",
+				);
+			});
+
+			it("drops an EXPLICIT alt port on an ssh-over-443 endpoint so it folds onto the forge key", () => {
+				__setSshRunnerForTests((host) => `hostname ${host}\n`);
+				expect(foldGitTransportToHttps("ssh://git@ssh.github.com:443/user/repo")).toBe(
+					"https://github.com/user/repo",
+				);
+			});
+
+			it("threads the git@ user so a `Match user …` alias resolves (scp and ssh:// both)", () => {
+				__setSshRunnerForTests((host, user) =>
+					host === "github-jolli" && user === "git" ? "hostname github.com\n" : `hostname ${host}\n`,
+				);
+				expect(foldGitTransportToHttps("git@github-jolli:jolliai/jolliai.git")).toBe(
+					"https://github.com/jolliai/jolliai.git",
+				);
+				expect(foldGitTransportToHttps("ssh://git@github-jolli/jolliai/jolliai")).toBe(
+					"https://github.com/jolliai/jolliai",
+				);
+			});
+
+			it("brackets an IPv6 HostName so the folded URL is a valid authority (scp and ssh:// both)", () => {
+				__setSshRunnerForTests((host) =>
+					host === "v6-alias" ? "hostname 2001:db8::1\n" : `hostname ${host}\n`,
+				);
+				expect(foldGitTransportToHttps("git@v6-alias:user/repo")).toBe("https://[2001:db8::1]/user/repo");
+				expect(foldGitTransportToHttps("ssh://git@v6-alias/user/repo")).toBe("https://[2001:db8::1]/user/repo");
 			});
 		});
 	});

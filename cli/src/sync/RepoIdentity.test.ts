@@ -227,9 +227,21 @@ describe("canonicalizeRepoIdentity", () => {
 		expect(canonicalizeRepoIdentity("https://github.com/a/foo.git")).toBe("https://github.com/a/foo");
 	});
 
-	it("preserves a non-default ssh port (self-hosted forges stay distinct)", () => {
-		expect(canonicalizeRepoIdentity("ssh://git@host.example:2222/a/b.git")).toBe("https://host.example:2222/a/b");
+	it("drops the ssh port from a self-hosted identity so ssh folds onto https (JOLLI-2135 follow-up)", () => {
+		// The ssh CONNECTION port is not the repo's https identity — an ssh clone
+		// on :2222 and an https clone of the one repo must produce one identity.
+		expect(canonicalizeRepoIdentity("ssh://git@host.example:2222/a/b.git")).toBe("https://host.example/a/b");
 		expect(canonicalizeRepoIdentity("ssh://git@host.example:22/a/b.git")).toBe("https://host.example/a/b");
+	});
+
+	it("KNOWN RESIDUAL: a row already frozen as https:<port> is NOT re-migrated by the ssh-port drop", () => {
+		// The port drop applies to the ssh TRANSPORT fold. A `repos.json` row that
+		// an older client already froze as `https://host:2222/...` (an https string,
+		// possibly the product of that client's old ssh fold) is a legitimate https
+		// identity with an explicit port and is left untouched — the canonical form
+		// has lost the transport, so it cannot be told apart from a genuine
+		// https:2222 clone. Pinned so this narrow migration gap stays visible.
+		expect(canonicalizeRepoIdentity("https://host.example:2222/a/b")).toBe("https://host.example:2222/a/b");
 	});
 });
 
