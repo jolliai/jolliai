@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { CommitSummary, SkillCommitRef } from "../Types.js";
+import type { CommitSummary, SkillCommitRef, SkillSource } from "../Types.js";
 import {
 	buildLiveSkillsMarkdown,
 	buildSkillsAggregateMarkdown,
@@ -11,6 +11,7 @@ import {
 
 const row = (over: Partial<SkillTableRow> = {}): SkillTableRow => ({
 	skill: "superpowers:brainstorming",
+	source: "claude",
 	invocationCount: 2,
 	usage: { input: 79, cached: 59796, output: 33944, confidence: "attributed" },
 	...over,
@@ -26,9 +27,9 @@ describe("buildSkillsTable", () => {
 	it("renders one row per skill with count, total, and the three-way split", () => {
 		// 79 + 59796 + 33944 = 93819
 		expect(buildSkillsTable([row()])).toEqual([
-			"| Skill | × | Tokens | Input | Output | Cached |",
-			"|---|---|---|---|---|---|",
-			"| superpowers:brainstorming | 2 | 93.8k | 79 | 33.9k | 59.8k |",
+			"| Skill | Agent | × | Tokens | Input | Output | Cached |",
+			"|---|---|---|---|---|---|---|",
+			"| superpowers:brainstorming | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |",
 		]);
 	});
 
@@ -38,9 +39,9 @@ describe("buildSkillsTable", () => {
 		// the row into extra columns and misaligns every remaining cell against its
 		// header, silently, with no malformed-file signal anywhere.
 		const lines = buildSkillsTable([row({ skill: "weird|name" })]);
-		expect(lines[2]).toBe("| weird\\|name | 2 | 93.8k | 79 | 33.9k | 59.8k |");
-		// Six cells, exactly as many as the header declares.
-		expect(lines[2].split(/(?<!\\)\|/).filter((c) => c !== "")).toHaveLength(6);
+		expect(lines[2]).toBe("| weird\\|name | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |");
+		// Seven cells, exactly as many as the header declares.
+		expect(lines[2].split(/(?<!\\)\|/).filter((c) => c !== "")).toHaveLength(7);
 	});
 
 	it("escapes the backslash BEFORE the pipe, so a `\\|` id cannot smuggle a live pipe", () => {
@@ -49,9 +50,9 @@ describe("buildSkillsTable", () => {
 		// escape produced the very cell split it was added to prevent. Backslash-first
 		// makes every pre-existing backslash inert before any pipe is escaped.
 		const lines = buildSkillsTable([row({ skill: "weird\\|name" })]);
-		expect(lines[2]).toBe("| weird\\\\\\|name | 2 | 93.8k | 79 | 33.9k | 59.8k |");
-		// Still six cells: no unescaped delimiter survived.
-		expect(lines[2].split(/(?<!\\)\|/).filter((c) => c !== "")).toHaveLength(6);
+		expect(lines[2]).toBe("| weird\\\\\\|name | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |");
+		// Still seven cells: no unescaped delimiter survived.
+		expect(lines[2].split(/(?<!\\)\|/).filter((c) => c !== "")).toHaveLength(7);
 	});
 
 	it("leaves a lone backslash inert rather than escaping the character after it", () => {
@@ -64,7 +65,7 @@ describe("buildSkillsTable", () => {
 		// row is parsed as body text instead of table content.
 		const lines = buildSkillsTable([row({ skill: "two\nlines" })]);
 		expect(lines).toHaveLength(3);
-		expect(lines[2]).toBe("| two lines | 2 | 93.8k | 79 | 33.9k | 59.8k |");
+		expect(lines[2]).toBe("| two lines | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |");
 	});
 
 	it("shows an em dash, never a zero, in EVERY token cell when nothing could be attributed", () => {
@@ -73,7 +74,7 @@ describe("buildSkillsTable", () => {
 		// that dashed only the total while zeroing the split would say exactly that
 		// about the three components.
 		const lines = buildSkillsTable([row({ usage: undefined })]);
-		expect(lines[2]).toBe("| superpowers:brainstorming | 2 | — | — | — | — |");
+		expect(lines[2]).toBe("| superpowers:brainstorming | Claude Code | 2 | — | — | — | — |");
 		expect(lines[2]).not.toContain("0");
 	});
 
@@ -81,7 +82,7 @@ describe("buildSkillsTable", () => {
 		// The marker qualifies how the number was arrived at, not its magnitude, so
 		// splitting the column must not leave three unqualified cells behind.
 		const lines = buildSkillsTable([row({ usage: { input: 10, cached: 0, output: 90, confidence: "estimated" } })]);
-		expect(lines[2]).toBe("| superpowers:brainstorming | 2 | ~100 | ~10 | ~90 | ~0 |");
+		expect(lines[2]).toBe("| superpowers:brainstorming | Claude Code | 2 | ~100 | ~10 | ~90 | ~0 |");
 	});
 
 	it("orders heaviest first by TOTAL, then by name on a tie", () => {
@@ -92,9 +93,9 @@ describe("buildSkillsTable", () => {
 			row({ skill: "a-light", usage: { input: 1, cached: 0, output: 1, confidence: "attributed" } }),
 		]);
 		expect(lines.slice(2)).toEqual([
-			"| heavy | 2 | 93.8k | 79 | 33.9k | 59.8k |",
-			"| a-light | 2 | 2 | 1 | 1 | 0 |",
-			"| b-light | 2 | 2 | 1 | 1 | 0 |",
+			"| heavy | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |",
+			"| a-light | Claude Code | 2 | 2 | 1 | 1 | 0 |",
+			"| b-light | Claude Code | 2 | 2 | 1 | 1 | 0 |",
 		]);
 	});
 
@@ -117,12 +118,15 @@ describe("buildSkillsTable", () => {
 			row({ skill: "same", invocationCount: 1, usage: undefined }),
 			row({ skill: "same", invocationCount: 7, usage: undefined }),
 		]);
-		expect(lines.slice(2)).toEqual(["| same | 1 | — | — | — | — |", "| same | 7 | — | — | — | — |"]);
+		expect(lines.slice(2)).toEqual([
+			"| same | Claude Code | 1 | — | — | — | — |",
+			"| same | Claude Code | 7 | — | — | — | — |",
+		]);
 	});
 
 	it("daggers an inferred row and spells the footnote out once", () => {
 		const lines = buildSkillsTable([row({ detection: "heuristic", usage: undefined }), row()]);
-		expect(lines).toContain("| superpowers:brainstorming † | 2 | — | — | — | — |");
+		expect(lines).toContain("| superpowers:brainstorming † | Claude Code | 2 | — | — | — | — |");
 		expect(lines.filter((l) => l.startsWith("†"))).toHaveLength(1);
 	});
 
@@ -130,10 +134,66 @@ describe("buildSkillsTable", () => {
 		expect(buildSkillsTable([row()]).some((l) => l.includes("†"))).toBe(false);
 	});
 
+	it("names each host by its display label rather than its wire id", () => {
+		// The column is read by a person, so it shows what `skillSourceLabel` shows
+		// everywhere else — "Claude Code", not the `claude` the registry keys on.
+		const lines = buildSkillsTable([
+			row({ skill: "a", source: "claude", usage: undefined }),
+			row({ skill: "b", source: "opencode", usage: undefined }),
+			row({ skill: "c", source: "codex", usage: undefined }),
+			row({ skill: "d", source: "cursor", usage: undefined }),
+			row({ skill: "e", source: "kimi", usage: undefined }),
+		]);
+		expect(lines.slice(2).map((l) => l.split(" | ")[1])).toEqual([
+			"Claude Code",
+			"OpenCode",
+			"Codex",
+			"Cursor",
+			"Kimi",
+		]);
+	});
+
+	it("shows an em dash, never the string `undefined`, for a row with no source", () => {
+		// Reachable from the untyped ide-bridge producer: `skillTableRows` casts the
+		// caller's JSON to SkillTableRow without checking fields, so an older IntelliJ
+		// sends rows with no source. Dashed for the same reason an unattributed token
+		// figure is — an absent field is honest, and inventing a host would credit one
+		// agent's work to another.
+		const lines = buildSkillsTable([row({ source: undefined, usage: undefined })]);
+		expect(lines[2]).toBe("| superpowers:brainstorming | — | 2 | — | — | — | — |");
+		expect(lines[2]).not.toContain("undefined");
+	});
+
+	it("escapes a pipe smuggled in through an unknown source's fallback label", () => {
+		// `skillSourceLabel` falls back to capitalising the RAW source string, which is
+		// host-supplied transcript text — so the Agent cell needs the same escaping the
+		// Skill cell has, or an unknown host can split the row.
+		// Cast because SkillSource cannot express it — which is the point: this stands
+		// for a host the union does not know, arriving through the untyped bridge.
+		const lines = buildSkillsTable([row({ source: "we|ird" as SkillSource, usage: undefined })]);
+		expect(lines[2]).toContain("| We\\|ird |");
+		expect(lines[2].split(/(?<!\\)\|/).filter((c) => c !== "")).toHaveLength(7);
+	});
+
+	it("distinguishes the same skill run by two different hosts", () => {
+		// The registry keys a row `<source>:<skill>`, so this is two legitimate rows,
+		// not a duplicate. The input is deliberately reverse source order: equal-token,
+		// equal-name rows must still render deterministically across callers that supply
+		// their refs in different orders.
+		const lines = buildSkillsTable([
+			row({ skill: "jolli", source: "codex", usage: undefined }),
+			row({ skill: "jolli", source: "claude", usage: undefined }),
+		]);
+		expect(lines.slice(2)).toEqual([
+			"| jolli | Claude Code | 2 | — | — | — | — |",
+			"| jolli | Codex | 2 | — | — | — | — |",
+		]);
+	});
+
 	it("renders a header-only table for an empty set", () => {
 		expect(buildSkillsTable([])).toEqual([
-			"| Skill | × | Tokens | Input | Output | Cached |",
-			"|---|---|---|---|---|---|",
+			"| Skill | Agent | × | Tokens | Input | Output | Cached |",
+			"|---|---|---|---|---|---|---|",
 		]);
 	});
 });
@@ -226,7 +286,7 @@ describe("buildLiveSkillsMarkdown", () => {
 
 	it("renders the rows it was given", () => {
 		expect(buildLiveSkillsMarkdown([row()])).toContain(
-			"| superpowers:brainstorming | 2 | 93.8k | 79 | 33.9k | 59.8k |",
+			"| superpowers:brainstorming | Claude Code | 2 | 93.8k | 79 | 33.9k | 59.8k |",
 		);
 	});
 });

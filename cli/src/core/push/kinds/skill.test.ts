@@ -190,7 +190,7 @@ describe("body", () => {
 			ref({ invocationCount: 1, usage: { input: 50, cached: 0, output: 24900, confidence: "attributed" } }),
 			{ cwd: CWD },
 		);
-		expect(body).toContain("| superpowers:brainstorming | 1 | 24.9k | 50 | 24.9k | 0 |");
+		expect(body).toContain("| superpowers:brainstorming | Claude Code | 1 | 24.9k | 50 | 24.9k | 0 |");
 	});
 
 	it("includes the host, plugin and entry paths", async () => {
@@ -205,9 +205,18 @@ describe("body", () => {
 			ref({ usage: { input: 12300, cached: 76500, output: 5000, confidence: "attributed" } }),
 			{ cwd: CWD },
 		);
-		expect(body).toContain("| Skill | × | Tokens | Input | Output | Cached |");
+		expect(body).toContain("| Skill | Agent | × | Tokens | Input | Output | Cached |");
 		// 12300 + 76500 + 5000 = 93.8k, formatted by buildSkillsTable.
 		expect(body).toContain("93.8k");
+	});
+
+	it("carries the host into the pushed table's Agent cell, not just the details list", async () => {
+		// `buildSkillsPushMarkdown` PICKS fields rather than spreading the ref, so a
+		// column added to the shared table renders as an em dash in the pushed article
+		// until it is named there too — silently, since the table still lines up.
+		const body = await skillKind.body(ref(), { cwd: CWD });
+		expect(body).toContain("| superpowers:brainstorming | Claude Code |");
+		expect(body).not.toContain("| superpowers:brainstorming | — |");
 	});
 
 	it("omits the three cumulative fields it used to carry", async () => {
@@ -261,10 +270,10 @@ describe("body", () => {
 		];
 		const [aggregated] = skillKind.aggregate?.(refs, summary()) ?? [];
 		const body = await skillKind.body(aggregated, { cwd: CWD });
-		expect(body).toContain("| a | 1 |");
-		expect(body).toContain("| b | 1 |");
-		// Identity sits below the table because it has no column there — and it is
-		// per-skill, so two hosts on one commit both survive.
+		expect(body).toContain("| a | Claude Code | 1 |");
+		expect(body).toContain("| b | Codex | 1 |");
+		// The detail list keeps the rest of each skill's identity after host became a
+		// table column; it is per-skill, so two hosts on one commit both survive.
 		expect(body).toContain("## Skill details");
 		expect(body).toContain("- **a** — Host: Claude Code");
 		expect(body).toContain("- **b** — Host: Codex");

@@ -347,6 +347,7 @@ vi.mock("../core/PrDescription.js", () => ({
 
 vi.mock("../core/SummaryFormat.js", () => ({
 	buildReferencePushTitle: vi.fn().mockReturnValue("Ref Title"),
+	skillSourceLabel: vi.fn((source: string) => (source === "claude" ? "Claude Code" : source)),
 }));
 
 vi.mock("../core/references/ReferenceStore.js", () => ({
@@ -3638,7 +3639,7 @@ describe("runIdeBridgeAction — shared-store", () => {
 			operation: "skills-live-markdown",
 		})) as { markdown: string };
 		expect(markdown).toContain("# Skills used — uncommitted");
-		expect(markdown).toContain("| brainstorming | 2 | 1.0k |");
+		expect(markdown).toContain("| brainstorming | Claude Code | 2 | 1.0k |");
 	});
 
 	// null rather than an empty table: committing archives every skill, so an empty
@@ -3690,8 +3691,10 @@ describe("runIdeBridgeAction — shared-store", () => {
 		})) as { markdown: string };
 		expect(markdown).toContain("# Skills used — abcdef12");
 		expect(markdown).toContain("commitHash: abcdef1234567890");
-		// Unattributed rows dash all four cells rather than showing a zero.
-		expect(markdown).toContain("| a | 1 | — | — | — | — |");
+		// Unattributed rows dash all four token cells rather than showing a zero, and
+		// the Agent cell dashes too: this payload carries no `source`, which is exactly
+		// what an older IntelliJ sends through this untyped operation.
+		expect(markdown).toContain("| a | — | 1 | — | — | — | — |");
 	});
 
 	it("returns a null committed markdown when the summary archived no skills", async () => {

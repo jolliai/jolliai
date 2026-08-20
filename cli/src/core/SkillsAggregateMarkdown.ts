@@ -7,7 +7,8 @@
  * surface later without importing a storage class.
  */
 
-import type { CommitSummary, SkillCommitRef, SkillUsage } from "../Types.js";
+import type { CommitSummary, SkillCommitRef, SkillSource, SkillUsage } from "../Types.js";
+import { skillSourceLabel } from "./SummaryFormat.js";
 
 /**
  * `skills--<hash8>` — the per-commit skill aggregate's identity.
@@ -26,7 +27,7 @@ export function skillsAggregateFileName(hash8: string): string {
 }
 
 /**
- * The four fields the table needs, and nothing else.
+ * The five fields the table needs, and nothing else.
  *
  * Deliberately narrower than either concrete type so ONE renderer serves both
  * sides of the commit boundary: `SkillCommitRef` (the archived snapshot behind
@@ -38,6 +39,17 @@ export function skillsAggregateFileName(hash8: string): string {
  */
 export interface SkillTableRow {
 	readonly skill: string;
+	/**
+	 * The AI host that ran the skill — the `Agent` column.
+	 *
+	 * OPTIONAL even though all three concrete types (`SkillEntry`, `ActiveSkill`,
+	 * `SkillCommitRef`) declare it as required, because one table-producing boundary
+	 * is not typed: the `skills-committed-markdown` ide-bridge operation casts the
+	 * caller's summary JSON to `CommitSummary`. An older IntelliJ can therefore send
+	 * archived rows with no `source` at all, and declaring it required would render
+	 * the string `undefined` into a cell rather than fail anywhere a test could see.
+	 */
+	readonly source?: SkillSource;
 	readonly invocationCount: number;
 	readonly usage?: SkillUsage;
 	readonly detection?: "heuristic";
@@ -61,25 +73,42 @@ export interface SkillTableRow {
  * rows are ORDERED by that total and the sidebar's group row summarises by it, so
  * dropping the column would leave both the sort key and the summary figure with no
  * counterpart in the table a reader is looking at.
+ *
+ * `Agent` sits second — beside the skill id and ahead of every figure — because it
+ * is identity, not measurement: the row reads "this skill, run by that host, N
+ * times, for this much". It also disambiguates a genuine duplicate the table could
+ * not previously explain. The registry keys a row `<source>:<skill>`, so one skill
+ * entered from two hosts is legitimately TWO rows; without this column they render
+ * as the same skill listed twice.
  */
 export function buildSkillsTable(skills: ReadonlyArray<SkillTableRow>): string[] {
-	const lines: string[] = ["| Skill | × | Tokens | Input | Output | Cached |", "|---|---|---|---|---|---|"];
+	const lines: string[] = [
+		"| Skill | Agent | × | Tokens | Input | Output | Cached |",
+		"|---|---|---|---|---|---|---|",
+	];
 
-	// Heaviest first, then by name, so the table reads as "what dominated this work".
+	// Heaviest first, then by name and source, so the table reads as "what dominated
+	// this work" while still giving the same skill used by two hosts a total order.
 	// `localeCompare` is deliberately avoided: it takes the ambient locale, and this
 	// file is regenerated on every write — under a different locale the rows would
 	// reorder and show up as a spurious diff for a colleague.
 	const ordered = [...skills].sort((a, b) => {
 		const byTokens = totalOf(b) - totalOf(a);
 		if (byTokens !== 0) return byTokens;
-		return a.skill < b.skill ? -1 : a.skill > b.skill ? 1 : 0;
+		const bySkill = a.skill < b.skill ? -1 : a.skill > b.skill ? 1 : 0;
+		if (bySkill !== 0) return bySkill;
+		const aSource = a.source ?? "";
+		const bSource = b.source ?? "";
+		return aSource < bSource ? -1 : aSource > bSource ? 1 : 0;
 	});
 
 	let anyInferred = false;
 	for (const ref of ordered) {
 		const marker = ref.detection === "heuristic" ? " †" : "";
 		if (marker !== "") anyInferred = true;
-		lines.push(`| ${escapeCell(ref.skill)}${marker} | ${ref.invocationCount} | ${tokenCells(ref).join(" | ")} |`);
+		lines.push(
+			`| ${escapeCell(ref.skill)}${marker} | ${agentCell(ref)} | ${ref.invocationCount} | ${tokenCells(ref).join(" | ")} |`,
+		);
 	}
 	if (anyInferred) {
 		// Spelled out rather than left as a bare dagger. A host with no skill tool
@@ -200,6 +229,31 @@ function escapeCell(value: string): string {
 function totalOf(ref: SkillTableRow): number {
 	const u = ref.usage;
 	return u === undefined ? 0 : u.input + u.cached + u.output;
+}
+
+/**
+ * The `Agent` cell — the host's display label, or an em dash when the row carries
+ * no source.
+ *
+ * Dashed rather than left blank or filled with a guess, for the same reason
+ * {@link tokenCells} dashes an unattributed figure: an absent field is honest.
+ * The only rows that reach here without a source come through the untyped
+ * ide-bridge boundary (see {@link SkillTableRow.source}), and inventing a host would
+ * attribute one agent's work to another.
+ *
+ * Escaped despite {@link skillSourceLabel} normally returning one of five in-repo
+ * constants: its fallback branch capitalises the RAW source string, which is
+ * host-supplied text from another program's transcript — the same untrusted input
+ * {@link escapeCell} exists for.
+ */
+function agentCell(ref: SkillTableRow): string {
+	// Widened to `string` on purpose. `SkillSource` cannot express `""`, but the
+	// ide-bridge boundary forwards unvalidated JSON into this table, so an empty string
+	// is reachable at runtime — and `skillSourceLabel` takes a bare `string` for exactly
+	// the same reason.
+	const source: string | undefined = ref.source;
+	if (source === undefined || source === "") return "—";
+	return escapeCell(skillSourceLabel(source));
 }
 
 /**

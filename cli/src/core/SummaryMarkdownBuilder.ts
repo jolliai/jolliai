@@ -334,9 +334,9 @@ export function buildReferencePushMarkdown(ref: ReferenceCommitRef, description?
  * aggregate and the sidebar use, which owns the em-dash-not-zero rule, the `~`
  * estimate marker, the `†` inferred footnote and the heaviest-first ordering. That
  * is what keeps this body byte-identical to the table VS Code shows for the same
- * commit, and it is also why the per-skill identity (host / plugin / entry paths)
- * is appended BELOW the table as a detail list rather than folded into it: those
- * are not measurements and have no column.
+ * commit. Per-skill identity is split deliberately: host is promoted into the table
+ * to disambiguate equal skill ids, while plugin and entry paths stay BELOW it as a
+ * detail list.
  *
  * **Every figure is THIS COMMIT's increment, read off the refs alone.** That is
  * the whole contract of this function, and it is a deliberate reversal: the body
@@ -383,6 +383,10 @@ export function buildSkillsPushMarkdown(refs: ReadonlyArray<SkillCommitRef>): st
 		...buildSkillsTable(
 			refs.map((ref) => ({
 				skill: ref.skill,
+				// Projected explicitly, like every other field here: this map picks fields
+				// rather than spreading the ref, so a column added to the table renders as
+				// an em dash in the pushed article until it is named here too.
+				source: ref.source,
 				invocationCount: ref.invocationCount,
 				...(ref.usage !== undefined && { usage: ref.usage }),
 				...(ref.detection !== undefined && { detection: ref.detection }),
@@ -390,7 +394,7 @@ export function buildSkillsPushMarkdown(refs: ReadonlyArray<SkillCommitRef>): st
 		),
 	];
 
-	// Identity, not measurement — see the header for why it sits below the table.
+	// The identity fields that are not columns stay below the table.
 	// Ordered by skill id rather than by weight: this list is looked up by name, and
 	// a stable order keeps a re-push from producing a spurious diff.
 	const detailed = [...refs].sort((a, b) => (a.skill < b.skill ? -1 : a.skill > b.skill ? 1 : 0));
