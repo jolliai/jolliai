@@ -2366,6 +2366,195 @@ describe("QueueWorker", () => {
 		});
 	});
 
+	describe("Transcript read safety net (zero-entry warn + cursor withhold)", () => {
+		it("withholds the cursor and warns when a consumed slice recognized nothing (no entries, no usage, no tools)", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-recognized-nothing.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-nothing",
+					transcriptPath: "/tmp/cline/nothing/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			vi.mocked(readClineTranscript).mockResolvedValue({
+				entries: [],
+				newCursor: {
+					transcriptPath: "/tmp/cline/nothing/ui_messages.json",
+					lineNumber: 5,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 5,
+			});
+
+			await runWorker("/test/cwd");
+
+			// A slice recognized as nothing at all (no entries, no usage, no tools) must
+			// not advance the cursor — advancing would permanently skip lines a future
+			// parser fix could still make sense of.
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cline/nothing/ui_messages.json" }),
+				"/test/cwd",
+			);
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("Not advancing read cursor"));
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("cline"));
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("/tmp/cline/nothing/ui_messages.json"));
+		});
+
+		it("advances the cursor and warns when a consumed slice has zero entries but carries usage tokens", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-usage-only.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-usage-only",
+					transcriptPath: "/tmp/cline/usage-only/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			vi.mocked(readClineTranscript).mockResolvedValue({
+				entries: [],
+				newCursor: {
+					transcriptPath: "/tmp/cline/usage-only/ui_messages.json",
+					lineNumber: 5,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 5,
+				usageTokens: 100,
+			});
+
+			await runWorker("/test/cwd");
+
+			// A legitimate tool-only/usage-only turn must still advance its cursor, or it
+			// would re-read and re-count its tokens on every future commit.
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({
+					transcriptPath: "/tmp/cline/usage-only/ui_messages.json",
+					lineNumber: 5,
+				}),
+				"/test/cwd",
+			);
+			expect(console.warn).toHaveBeenCalledWith(
+				expect.stringContaining("Transcript source read to zero conversation entries"),
+			);
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("cline"));
+			expect(console.warn).toHaveBeenCalledWith(
+				expect.stringContaining("/tmp/cline/usage-only/ui_messages.json"),
+			);
+		});
+
+		it("withholds the cursor when a zero-entry slice carries tool calls but an unrecognized shape (format drift)", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-drift.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-drift",
+					transcriptPath: "/tmp/cline/drift/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			// The mixed failure mode: the format moved conversation text into a shape
+			// this build cannot read (unrecognizedRows > 0), so parseLine produced no
+			// entries — but tool calls parse independently and are still present. The
+			// old (entries && usage && tools)-all-zero gate would have ADVANCED here and
+			// stranded the unread conversation; the drift signal must withhold instead.
+			vi.mocked(readClineTranscript).mockResolvedValue({
+				entries: [],
+				newCursor: {
+					transcriptPath: "/tmp/cline/drift/ui_messages.json",
+					lineNumber: 9,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 9,
+				usageTokens: 200,
+				toolUse: [{ name: "Bash", kind: "builtin", calls: 3 }],
+				unrecognizedRows: 2,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(saveCursor).not.toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: "/tmp/cline/drift/ui_messages.json" }),
+				"/test/cwd",
+			);
+			expect(console.warn).toHaveBeenCalledWith(expect.stringContaining("unrecognized conversation shape"));
+		});
+
+		it("advances the cursor without warning when the slice produced normal conversation entries", async () => {
+			const op = makeCommitOp();
+			const queueEntry = { op, filePath: "/tmp/queue/cline-normal.json" };
+
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([queueEntry])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isClineInstalled).mockResolvedValue(true);
+			vi.mocked(discoverClineSessions).mockResolvedValue([
+				{
+					sessionId: "cline-normal",
+					transcriptPath: "/tmp/cline/normal/ui_messages.json",
+					updatedAt: "2026-04-01T12:00:00.000Z",
+					source: "cline",
+				},
+			]);
+			vi.mocked(readClineTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Cline context", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: {
+					transcriptPath: "/tmp/cline/normal/ui_messages.json",
+					lineNumber: 1,
+					updatedAt: "2026-04-01T12:00:00.000Z",
+				},
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({
+					transcriptPath: "/tmp/cline/normal/ui_messages.json",
+					lineNumber: 1,
+				}),
+				"/test/cwd",
+			);
+			expect(console.warn).not.toHaveBeenCalledWith(expect.stringContaining("Not advancing read cursor"));
+			expect(console.warn).not.toHaveBeenCalledWith(
+				expect.stringContaining("Transcript source read to zero conversation entries"),
+			);
+		});
+	});
+
 	describe("OpenCode integration", () => {
 		it("should include discovered OpenCode sessions in the pipeline when enabled", async () => {
 			const op = makeCommitOp();

@@ -296,6 +296,13 @@ export interface TranscriptReadResult {
 	 *  must keep the two apart — reporting an uncovered agent as "used no tools"
 	 *  is the failure mode this distinction exists to prevent. */
 	readonly toolUse?: ReadonlyArray<ToolCallCount>;
+	/** Count of consumed rows whose conversation schema the parser did not
+	 *  recognize — the format-drift canary (JOLLI-2240). Computed independently of
+	 *  {@link entries}/{@link toolUse}, so a slice can carry usage and tool calls
+	 *  yet still report drift. Omitted (not 0) when the slice was fully recognized,
+	 *  so presence is itself the signal. The cursor gate withholds a zero-entry
+	 *  slice with a non-zero count so a fixed build re-reads it. */
+	readonly unrecognizedRows?: number;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────

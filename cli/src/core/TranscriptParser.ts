@@ -99,6 +99,15 @@ export interface TranscriptParser {
 	 *  source's transcripts expose no tool records, and every consumer must
 	 *  report that source as UNCOVERED rather than as "used no tools". */
 	parseToolUse?(lines: ReadonlyArray<string>): ToolCallCount[];
+	/** Count of consumed rows whose conversation-schema shape this parser does not
+	 *  recognize — the format-drift canary. Distinct from "a row we understood and
+	 *  chose to drop" (injection, a tool-only turn): those are recognized. A slice
+	 *  that produced zero conversation entries BUT carries unrecognized rows is the
+	 *  JOLLI-2240 failure mode (Codex moved conversation text into a shape we can no
+	 *  longer read) — the cursor must be withheld so a fixed build re-reads it,
+	 *  where a legitimately empty tool-only slice (all rows recognized) must advance.
+	 *  Absent method = the source has no schema this parser tracks drift against (0). */
+	parseUnrecognizedRows?(lines: ReadonlyArray<string>): number;
 }
 
 /**
@@ -308,44 +317,60 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 /**
  * OpenAI Codex transcript parser.
  *
- * Extracts user and assistant messages from the Codex JSONL event stream.
- * Only parses `event_msg` events with `user_message` and `agent_message`
- * payload types — these contain clean conversation text without system
- * injections or duplicated content from `response_item` entries.
+ * Extracts user and assistant messages from `response_item/message` entries
+ * in the Codex JSONL rollout stream (role `user` or `assistant`; the injected
+ * `developer` role — `<app-context>`, `<skills_instructions>` — is excluded).
+ * Codex retired the older `event_msg/{user_message,agent_message}` shape;
+ * `response_item` is a complete superset of it in every era (2214-rollout
+ * scan, zero counterexamples), so reading only `response_item` covers all
+ * history and never double-counts the transition-era rollouts that carry
+ * BOTH shapes for the same turns. `event_msg` conversation events are no
+ * longer parsed at all.
  *
- * Skipped event types: session_meta, turn_context, response_item/*,
- * compacted, token_count, task_started, task_complete, turn_aborted,
- * context_compacted, agent_reasoning.
+ * `parseToolUse` is unaffected by this — it reads its own event types
+ * independently of this method. (Codex implements no `parseUsageByModel`;
+ * `token_count` rows are not consumed for Codex, so usageTokens is
+ * effectively 0.)
+ *
+ * Skipped event types: event_msg/*, session_meta, turn_context,
+ * response_item/{function_call,function_call_output,reasoning}, compacted.
  */
 export class CodexTranscriptParser implements TranscriptParser {
 	parseLine(line: string, lineNum: number): TranscriptEntry | null {
 		try {
 			const data = JSON.parse(line) as Record<string, unknown>;
 			const timestamp = typeof data.timestamp === "string" ? data.timestamp : undefined;
-			const type = data.type;
 
-			// Only process event_msg events
-			if (type !== "event_msg") {
-				return null;
-			}
+			// Conversation turns now arrive as response_item/message (Codex retired the
+			// event_msg/{user_message,agent_message} shape). response_item is a complete
+			// superset of event_msg in every era (2214-rollout scan, zero counterexamples),
+			// so reading only it covers all history and never double-counts the transition-
+			// era rollouts that carry BOTH shapes for the same turns. See TranscriptParser
+			// class docstring / JOLLI-2240.
+			if (data.type !== "response_item") return null;
 
 			const payload = data.payload as Record<string, unknown> | undefined;
-			if (!payload || typeof payload !== "object") {
-				return null;
+			if (!payload || typeof payload !== "object") return null;
+			if (payload.type !== "message") return null;
+
+			// developer-role messages are pure injection (<app-context>, <skills_instructions>).
+			const role = payload.role;
+			if (role !== "user" && role !== "assistant") return null;
+
+			const rawText = extractCodexMessageText(payload.content);
+			if (rawText === null) return null;
+
+			// Codex appends its own memory-citation trailer to genuine turns; strip it
+			// so the captured conversation keeps only what was actually said. A turn
+			// that is nothing but the trailer carries no conversation and is dropped.
+			const text = stripCodexMemCitation(rawText);
+			if (text.length === 0) return null;
+
+			if (role === "user") {
+				if (isCodexInjectedUserText(text)) return null;
+				return { role: "human", content: text, timestamp };
 			}
-
-			const payloadType = payload.type;
-
-			if (payloadType === "user_message") {
-				return parseCodexUserMessage(payload, timestamp);
-			}
-
-			if (payloadType === "agent_message") {
-				return parseCodexAgentMessage(payload, timestamp);
-			}
-
-			// All other event_msg subtypes are skipped
-			return null;
+			return { role: "assistant", content: text, timestamp };
 		} catch (error: unknown) {
 			log.debug("Failed to parse Codex transcript line %d: %s", lineNum, (error as Error).message);
 			return null;
@@ -449,6 +474,33 @@ export class CodexTranscriptParser implements TranscriptParser {
 		for (const call of [...byCallId.values(), ...anonymous]) tally.add(call);
 		return tally.values();
 	}
+
+	/**
+	 * Counts consumed `response_item` rows whose `payload.type` this build does not
+	 * know (see {@link KNOWN_CODEX_RESPONSE_ITEM_TYPES}). A non-zero count on a slice
+	 * that yielded no conversation entries is the format-drift signal that keeps the
+	 * read cursor withheld — {@link parseToolUse} is computed independently of
+	 * {@link parseLine}, so without this a tool-heavy session whose message rows
+	 * changed shape would still report tool calls, advance the cursor, and strand
+	 * its unread conversation (the JOLLI-2240 failure mode, one shape further along).
+	 */
+	parseUnrecognizedRows(lines: ReadonlyArray<string>): number {
+		let unknown = 0;
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if ((parsed as { type?: unknown })?.type !== "response_item") continue;
+			const payload = (parsed as { payload?: unknown }).payload;
+			if (payload === null || typeof payload !== "object") continue;
+			const type = (payload as { type?: unknown }).type;
+			if (typeof type === "string" && !KNOWN_CODEX_RESPONSE_ITEM_TYPES.has(type)) unknown++;
+		}
+		return unknown;
+	}
 }
 
 /**
@@ -470,6 +522,35 @@ const CODEX_TOOL_CALL_TYPES: ReadonlySet<string> = new Set([
 	"custom_tool_call",
 	"local_shell_call",
 	"web_search_call",
+	"mcp_tool_call_end",
+]);
+
+/**
+ * Every `response_item` payload.type this build knows how to handle — whether it
+ * becomes a conversation entry (`message`), a tool call, or is deliberately
+ * ignored (`reasoning`, the `*_output` result rows). Enumerated from all 2026
+ * rollouts under `~/.codex/sessions` and kept deliberately GENEROUS: a value here
+ * that never occurs costs nothing, while a real value MISSING would misread a
+ * healthy slice as drift. The point is the complement — a `response_item` whose
+ * payload.type is NOT in this set is a shape Codex introduced after this build,
+ * the JOLLI-2240 canary (see {@link CodexTranscriptParser.parseUnrecognizedRows}).
+ * Only `response_item` is policed: other top-level `type`s (session_meta,
+ * event_msg, turn_context, token_count, …) are legitimately not conversation
+ * carriers and parseLine ignores them by design.
+ */
+const KNOWN_CODEX_RESPONSE_ITEM_TYPES: ReadonlySet<string> = new Set([
+	"message",
+	"reasoning",
+	"function_call",
+	"function_call_output",
+	"custom_tool_call",
+	"custom_tool_call_output",
+	"local_shell_call",
+	"local_shell_call_output",
+	"tool_search_call",
+	"tool_search_output",
+	"web_search_call",
+	"mcp_tool_call_begin",
 	"mcp_tool_call_end",
 ]);
 
@@ -651,35 +732,98 @@ export function extractKimiText(value: unknown): string | null {
 }
 
 /**
- * Extracts user text from a Codex `event_msg/user_message` payload.
- * Returns null if the message field is missing or empty.
+ * Concatenated text of a Codex `response_item/message` payload's content array.
+ * User turns carry `input_text` items, assistant turns `output_text`; both are
+ * joined with newlines. Non-text items (images, etc.) are ignored. Returns null
+ * when no text survives trimming.
  */
-function parseCodexUserMessage(
-	payload: Record<string, unknown>,
-	timestamp: string | undefined,
-): TranscriptEntry | null {
-	const message = payload.message;
-	if (typeof message !== "string" || message.trim().length === 0) {
-		return null;
+function extractCodexMessageText(content: unknown): string | null {
+	if (!Array.isArray(content)) return null;
+	const parts: string[] = [];
+	for (const item of content) {
+		if (!item || typeof item !== "object") continue;
+		const type = (item as { type?: unknown }).type;
+		const text = (item as { text?: unknown }).text;
+		if ((type === "input_text" || type === "output_text") && typeof text === "string") {
+			parts.push(text);
+		}
 	}
-	return { role: "human", content: message.trim(), timestamp };
+	const joined = parts.join("\n").trim();
+	return joined.length > 0 ? joined : null;
 }
 
 /**
- * Extracts assistant text from a Codex `event_msg/agent_message` payload.
- * Both `commentary` (intermediate reasoning) and `final_answer` phases are
- * included — the downstream mergeConsecutiveEntries() will combine them.
- * Returns null if the message field is missing or empty.
+ * True for user-role `response_item/message` text that is Codex-injected context
+ * rather than a genuine user submission. The `event_msg/user_message` stream
+ * excluded exactly these; the raw `response_item` stream does not. Prefixes are
+ * derived from real rollouts (JOLLI-2240 Observed Reality) and guarded by the
+ * captured fixture in TranscriptParserFixtures.test.ts. The `# Files mentioned by
+ * the user:` wrapper is deliberately NOT here — it is a real submission.
  */
-function parseCodexAgentMessage(
-	payload: Record<string, unknown>,
-	timestamp: string | undefined,
-): TranscriptEntry | null {
-	const message = payload.message;
-	if (typeof message !== "string" || message.trim().length === 0) {
-		return null;
+// Each Codex injection is recognized by its opening token PLUS a structural
+// companion signal, never by the opening token alone. The companion is what keeps
+// a GENUINE user turn that merely quotes or asks about one of these tokens (e.g.
+// "what does <turn_aborted> mean?", "# AGENTS.md instructions are confusing") from
+// being dropped wholesale — the P2 false-positive of a bare-prefix match. All
+// signatures are derived and verified against 2214 real codex-tui/codex_vscode
+// rollouts (JOLLI-2240): the structural form drops the identical 2631 injected
+// user turns the bare-prefix form did, with zero genuine turns lost.
+//
+//   - `<recommended_plugins>` / `<environment_context>` / `<skill>` / `<turn_aborted>`:
+//     wrapped blocks Codex injects as a user turn. The companion is the matching
+//     CLOSE tag — a real injection always closes, a user quoting the open tag does
+//     not. `<skill>` carries a full SKILL.md body (name/path/--- frontmatter/…);
+//     across 157 real rollouts none carried a `## My request` payload, so dropping
+//     the whole turn is safe.
+//   - `# AGENTS.md instructions[ for <cwd>]`: the AGENTS.md file injected as a user
+//     turn. Joined, it starts with the header rather than a tag (which is how a
+//     38 KB dump reached the conversation), so the companion is its injected body —
+//     an `<INSTRUCTIONS>` or `<environment_context>` block.
+//   - `The following is the Codex agent history`: the approval-reviewer wrapper
+//     ("untrusted evidence", not a user utterance); the companion is that framing.
+//
+// `# Context from my IDE setup:` / `# Review findings:` / `# Files mentioned by the
+// user:` are deliberately NOT injections — each ends with a real `## My request for
+// Codex:` submission, so dropping it would delete the user's actual ask.
+const CODEX_INJECTED_WRAPPED_TAGS: ReadonlyArray<string> = [
+	"recommended_plugins",
+	"environment_context",
+	"skill",
+	"turn_aborted",
+];
+function isCodexInjectedUserText(text: string): boolean {
+	const t = text.trimStart();
+	for (const tag of CODEX_INJECTED_WRAPPED_TAGS) {
+		if (t.startsWith(`<${tag}>`) && text.includes(`</${tag}>`)) return true;
 	}
-	return { role: "assistant", content: message.trim(), timestamp };
+	if (
+		t.startsWith("# AGENTS.md instructions") &&
+		(text.includes("<INSTRUCTIONS>") || text.includes("<environment_context>"))
+	) {
+		return true;
+	}
+	if (t.startsWith("The following is the Codex agent history") && text.includes("untrusted evidence")) {
+		return true;
+	}
+	// Image-only placeholder messages carry no real text once the tags are removed.
+	const withoutImages = text.replace(/<image\b[^>]*\/?>|<\/image>/g, "").trim();
+	return withoutImages.length === 0;
+}
+
+/**
+ * Codex's memory feature APPENDS an `<oai-mem-citation>…</oai-mem-citation>` block
+ * to a genuine turn (measured on 220 real assistant turns, JOLLI-2240: always a
+ * clean, fully-closed block at the very end, `\n\n`-separated from the real text).
+ * It is injected metadata — the citations Codex resolved for its own memory tool,
+ * not part of what the user or the model said — so unlike the injected user turns
+ * above it must NOT drop the whole turn (that would delete the entire assistant
+ * response); the trailer is stripped and the content before it is kept. The regex
+ * is greedy + `$`-anchored so it removes one or more trailing blocks in a single
+ * pass and never touches a block that has real content after it.
+ */
+const CODEX_MEM_CITATION_TRAILER = /\s*<oai-mem-citation>[\s\S]*<\/oai-mem-citation>\s*$/;
+function stripCodexMemCitation(text: string): string {
+	return text.replace(CODEX_MEM_CITATION_TRAILER, "").trimEnd();
 }
 
 /**
@@ -811,7 +955,7 @@ export function getParserForSource(source: "claude" | "codex" | "kimi"): Transcr
  * list to the factory's parameter type, so adding a parser without extending it
  * fails to build.
  */
-const PARSER_BACKED_SOURCES: ReadonlyArray<Parameters<typeof getParserForSource>[0]> = [
+export const PARSER_BACKED_SOURCES: ReadonlyArray<Parameters<typeof getParserForSource>[0]> = [
 	"claude",
 	"codex",
 	"kimi",

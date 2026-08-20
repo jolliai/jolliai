@@ -95,6 +95,7 @@ import {
 	normalizePlansRegistry,
 	pruneStaleQueueEntries,
 	pruneStaleSessions,
+	rewindCodexCursors,
 	saveConfig,
 	saveConfigScoped,
 	saveCursor,
@@ -608,6 +609,72 @@ describe("SessionTracker", () => {
 
 			const loaded = await loadCursorForTranscript("/path/1.jsonl", tempDir);
 			expect(loaded?.lineNumber).toBe(50);
+		});
+	});
+
+	describe("rewindCodexCursors", () => {
+		it("rewinds only Codex rollout cursors, leaving other sources untouched", async () => {
+			const codexA: TranscriptCursor = {
+				transcriptPath: "/Users/x/.codex/sessions/2026/08/rollout-A.jsonl",
+				lineNumber: 500,
+				updatedAt: "2026-08-01T10:00:00Z",
+			};
+			const claude: TranscriptCursor = {
+				transcriptPath: "/Users/x/.claude/projects/x/sess.jsonl",
+				lineNumber: 300,
+				updatedAt: "2026-08-01T10:00:00Z",
+			};
+			const codexB: TranscriptCursor = {
+				transcriptPath: "/Users/x/.codex/sessions/2026/08/rollout-B.jsonl",
+				lineNumber: 120,
+				updatedAt: "2026-08-01T10:00:00Z",
+			};
+			await saveCursor(codexA, tempDir);
+			await saveCursor(claude, tempDir);
+			await saveCursor(codexB, tempDir);
+
+			const result = await rewindCodexCursors(tempDir);
+
+			expect(result.rewound).toBe(2);
+			expect(result.paths.sort()).toEqual([codexA.transcriptPath, codexB.transcriptPath].sort());
+
+			const loadedA = await loadCursorForTranscript(codexA.transcriptPath, tempDir);
+			const loadedB = await loadCursorForTranscript(codexB.transcriptPath, tempDir);
+			const loadedClaude = await loadCursorForTranscript(claude.transcriptPath, tempDir);
+
+			expect(loadedA?.lineNumber).toBe(0);
+			expect(loadedB?.lineNumber).toBe(0);
+			expect(loadedClaude?.lineNumber).toBe(300);
+			expect(loadedClaude).toEqual(claude);
+		});
+
+		it("matches a Windows-separator Codex path", async () => {
+			const winCodex: TranscriptCursor = {
+				transcriptPath: "C:\\Users\\x\\.codex\\sessions\\2026\\08\\rollout.jsonl",
+				lineNumber: 999,
+				updatedAt: "2026-08-01T10:00:00Z",
+			};
+			await saveCursor(winCodex, tempDir);
+
+			const result = await rewindCodexCursors(tempDir);
+
+			expect(result).toEqual({ rewound: 1, paths: [winCodex.transcriptPath] });
+			const loaded = await loadCursorForTranscript(winCodex.transcriptPath, tempDir);
+			expect(loaded?.lineNumber).toBe(0);
+		});
+
+		it("returns {rewound: 0, paths: []} when there are no cursors at all", async () => {
+			const result = await rewindCodexCursors(tempDir);
+			expect(result).toEqual({ rewound: 0, paths: [] });
+		});
+
+		it("returns {rewound: 0, paths: []} when no cursor is a Codex rollout", async () => {
+			await saveCursor(
+				{ transcriptPath: "/Users/x/.claude/projects/x/sess.jsonl", lineNumber: 300, updatedAt: "t" },
+				tempDir,
+			);
+			const result = await rewindCodexCursors(tempDir);
+			expect(result).toEqual({ rewound: 0, paths: [] });
 		});
 	});
 

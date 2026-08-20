@@ -204,8 +204,11 @@ const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined
 // `claude` and `codex` delegate to the canonical TranscriptParser.ts
 // strategies (used by the post-commit summary pipeline). Reusing the same
 // parsers across the two consumers eliminates schema-drift bugs — Claude's
-// `isCompactSummary` skip and Codex's `event_msg/user_message` +
-// `event_msg/agent_message` event-type filtering both live in one place.
+// `isCompactSummary` skip and Codex's extraction of conversation turns from
+// `response_item/message` (role `user` → human, `assistant` → assistant;
+// `developer` and injected system wrappers skipped — the older
+// `event_msg/{user_message,agent_message}` conversation shape was retired)
+// both live in one place.
 // The `lineNum` argument is only used for diagnostic logging inside the
 // shared parsers; we pass 0 because the line-streaming caller above
 // already tracks its own parseSkipped counter and emits one summary log

@@ -69,8 +69,8 @@ describe("countTranscriptMessages", () => {
 		writeFileSync(
 			file,
 			[
-				'{"type":"event_msg","payload":{"type":"user_message","message":"x"}}',
-				'{"type":"event_msg","payload":{"type":"agent_message","message":"y"}}',
+				'{"timestamp":"2026-05-18T10:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"x"}]}}',
+				'{"timestamp":"2026-05-18T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"y"}]}}',
 				"",
 			].join("\n"),
 		);

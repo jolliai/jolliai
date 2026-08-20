@@ -213,7 +213,10 @@ export function parseTranscriptContent(
 	beforeTimestamp?: string,
 ): TranscriptReadResult {
 	const startLine = cursor?.lineNumber ?? 0;
-	const activeParser = parser ?? new ClaudeTranscriptParser();
+	// Typed as the interface (not the concrete fallback) so the optional
+	// parser methods — parseUsageByModel/parseToolUse/parseUnrecognizedRows — are
+	// reachable through `?.` regardless of which parser was supplied.
+	const activeParser: TranscriptParser = parser ?? new ClaudeTranscriptParser();
 	const parseFn = (line: string, num: number) => activeParser.parseLine(line, num);
 
 	const lines = splitTranscriptLines(content);
@@ -342,6 +345,12 @@ export function parseTranscriptContent(
 	// whose parser cannot see them, so downstream can tell "this agent used no
 	// tools" apart from "this agent's transcripts do not record tools".
 	const toolUse = activeParser.parseToolUse?.(consumedLines);
+	// Format-drift canary: rows in the consumed slice whose conversation schema this
+	// build does not recognize. Read independently of parseLine (like toolUse), so a
+	// slice can produce zero entries while this is > 0 — the signal that conversation
+	// text may be hiding in a shape we can no longer read (JOLLI-2240). The cursor
+	// gate in QueueWorker uses it to withhold such a slice for a fixed build to reread.
+	const unrecognizedRows = activeParser.parseUnrecognizedRows?.(consumedLines) ?? 0;
 
 	// When beforeTimestamp is set, advance cursor only to the last consumed line.
 	// Without beforeTimestamp (legacy/CLI path), advance to EOF for backward compatibility.
@@ -368,6 +377,9 @@ export function parseTranscriptContent(
 		// Kept even when empty: an empty array is the positive fact "this slice
 		// called no tools", which absence cannot express.
 		...(toolUse && { toolUse }),
+		// Omitted when zero so the field's presence means "this build saw a shape it
+		// did not recognize" — a signal, not routine bookkeeping.
+		...(unrecognizedRows > 0 && { unrecognizedRows }),
 	};
 }
 

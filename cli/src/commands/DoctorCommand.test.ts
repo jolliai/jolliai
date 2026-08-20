@@ -35,6 +35,7 @@ const h = vi.hoisted(() => ({
 	getGlobalConfigDir: vi.fn(),
 	loadAllSessions: vi.fn(),
 	loadConfig: vi.fn(),
+	rewindCodexCursors: vi.fn(),
 	traverseDistPaths: vi.fn(),
 	getStatus: vi.fn(),
 	install: vi.fn(),
@@ -98,6 +99,7 @@ vi.mock("../core/SessionTracker.js", () => ({
 	getGlobalConfigDir: h.getGlobalConfigDir,
 	loadAllSessions: h.loadAllSessions,
 	loadConfig: h.loadConfig,
+	rewindCodexCursors: h.rewindCodexCursors,
 }));
 vi.mock("../core/SotStorageResolver.js", () => ({ resolveSotBackend: h.resolveSotBackend }));
 // createStorage is the cutover router: on a real cutover repo it points the active
@@ -1612,5 +1614,46 @@ describe("doctor --repair-transcripts", () => {
 
 		expect(out).toContain("would repair");
 		expect((await getSummary(HASH, repo))?.transcripts ?? []).toHaveLength(0);
+	});
+});
+
+describe("DoctorCommand — --relink-codex", () => {
+	beforeEach(() => {
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+		h.resolveProjectDir.mockReturnValue("/repo");
+	});
+
+	afterEach(() => {
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+	});
+
+	it("rewinds Codex cursors and prints the follow-up steps when any were rewound", async () => {
+		h.rewindCodexCursors.mockResolvedValue({
+			rewound: 2,
+			paths: ["/home/x/.codex/sessions/2026/08/a.jsonl", "/home/x/.codex/sessions/2026/08/b.jsonl"],
+		});
+
+		const out = await runDoctor(["--relink-codex"]);
+		const joined = out.join("\n");
+
+		expect(h.rewindCodexCursors).toHaveBeenCalledWith("/repo");
+		expect(joined).toContain("Rewound 2 Codex read-cursor(s)");
+		expect(joined).toContain("Future commits will re-capture");
+		expect(joined).toContain("Regenerator.regenerateSummary");
+		// The unconditional-rewind blast radius must be stated so the user opts in knowingly.
+		expect(joined).toContain("rewinds ALL Codex cursors");
+		expect(joined).toContain("re-captured on the next commit (a duplicate)");
+	});
+
+	it("skips the follow-up steps when nothing was rewound", async () => {
+		h.rewindCodexCursors.mockResolvedValue({ rewound: 0, paths: [] });
+
+		const out = await runDoctor(["--relink-codex"]);
+		const joined = out.join("\n");
+
+		expect(joined).toContain("Rewound 0 Codex read-cursor(s)");
+		expect(joined).not.toContain("Future commits will re-capture");
 	});
 });

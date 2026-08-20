@@ -122,34 +122,27 @@ describe("loadTranscript", () => {
 		expect(result).toHaveLength(1);
 	});
 
-	// Codex JSONL schema (verified against real
-	// ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl produced by codex CLI
-	// 0.98.0+): each line is `{ timestamp, type, payload }`. Conversation
-	// turns live in `type: "event_msg"` with `payload.type:
-	// "user_message" | "agent_message"` — these carry the clean text the
-	// user typed and the assistant displayed. The `type: "response_item"`
-	// rows mirror the same turns but with system-injected wrappers
-	// (`<environment_context>`, `<permissions instructions>`, etc.) and
-	// must be skipped. This matches the CodexTranscriptParser used by the
-	// post-commit summary pipeline (TranscriptParser.ts) — both consumers
-	// share one source of truth.
-	it("loads codex JSONL extracting only event_msg/user_message and event_msg/agent_message", async () => {
+	it("loads codex JSONL extracting response_item/message user+assistant turns (event_msg retired, injections skipped)", async () => {
 		const file = join(dir, "codex.jsonl");
 		writeFileSync(
 			file,
 			[
 				'{"timestamp":"2026-05-18T10:00:00.000Z","type":"session_meta","payload":{"id":"s1","cwd":"/x"}}',
 				'{"timestamp":"2026-05-18T10:00:01.000Z","type":"event_msg","payload":{"type":"task_started"}}',
-				// response_item turns are the system-injected wrappers — must be skipped
+				// injected system wrapper as a user-role response_item — must be skipped
 				'{"timestamp":"2026-05-18T10:00:02.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context><cwd>/x</cwd></environment_context>"}]}}',
-				// the matching event_msg/user_message is the clean text — kept
-				'{"timestamp":"2026-05-18T10:00:03.000Z","type":"event_msg","payload":{"type":"user_message","message":"hi"}}',
-				'{"timestamp":"2026-05-18T10:00:04.000Z","type":"turn_context","payload":{"x":1}}',
-				'{"timestamp":"2026-05-18T10:00:05.000Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}',
-				'{"timestamp":"2026-05-18T10:00:06.000Z","type":"event_msg","payload":{"type":"agent_message","message":"hello"}}',
+				// genuine user turn — kept
+				'{"timestamp":"2026-05-18T10:00:03.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}}',
+				// event_msg conversation turns are RETIRED — Codex stopped writing them and they now duplicate response_item; must be skipped
+				'{"timestamp":"2026-05-18T10:00:04.000Z","type":"event_msg","payload":{"type":"user_message","message":"stale duplicate"}}',
+				'{"timestamp":"2026-05-18T10:00:05.000Z","type":"turn_context","payload":{"x":1}}',
+				'{"timestamp":"2026-05-18T10:00:06.000Z","type":"response_item","payload":{"type":"reasoning","summary":[]}}',
+				// genuine assistant turn — kept
+				'{"timestamp":"2026-05-18T10:00:07.000Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}}',
+				'{"timestamp":"2026-05-18T10:00:08.000Z","type":"event_msg","payload":{"type":"agent_message","message":"stale agent duplicate"}}',
 				// function_call rows are NOT conversation turns
-				'{"timestamp":"2026-05-18T10:00:07.000Z","type":"response_item","payload":{"type":"function_call","name":"bash"}}',
-				'{"timestamp":"2026-05-18T10:00:08.000Z","type":"response_item","payload":{"type":"function_call_output","output":"ok"}}',
+				'{"timestamp":"2026-05-18T10:00:09.000Z","type":"response_item","payload":{"type":"function_call","name":"bash"}}',
+				'{"timestamp":"2026-05-18T10:00:10.000Z","type":"response_item","payload":{"type":"function_call_output","output":"ok"}}',
 				"",
 			].join("\n"),
 		);
@@ -160,6 +153,7 @@ describe("loadTranscript", () => {
 		expect(result[0].timestamp).toBe("2026-05-18T10:00:03.000Z");
 		expect(result[1].role).toBe("assistant");
 		expect(result[1].content).toBe("hello");
+		expect(result[1].timestamp).toBe("2026-05-18T10:00:07.000Z");
 	});
 
 	it("skips codex message lines with empty body", async () => {

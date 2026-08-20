@@ -268,6 +268,60 @@ export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promis
 }
 
 /**
+ * Matches a Codex rollout transcript path, keyed under `.codex/sessions/` on
+ * either separator style. Windows-safe: `[\\/]` accepts both `\` and `/`
+ * rather than assuming the POSIX form every other cursor key happens to use.
+ */
+const CODEX_ROLLOUT_PATH = /[\\/]\.codex[\\/]sessions[\\/]/;
+
+/**
+ * Recovery lever for JOLLI-2240: before this PR's response-item parser fix,
+ * Codex conversations parsed to zero entries while their `cursors.json` read
+ * cursor still advanced — so the rollout content was marked consumed and
+ * could never attach to a commit again, even though the file is still on
+ * disk. This rewinds every Codex conversation cursor back to line 0 so a
+ * future commit re-reads (re-captures) those sessions.
+ *
+ * Deliberately scoped to `cursors.json` (the transcript CONVERSATION cursor)
+ * and never `discovery-cursors.json` — plan/reference/skill extraction reads
+ * that file and was never broken by the parser bug, so touching it would
+ * needlessly re-extract. `anchorId`/`extractors` are dropped on rewind:
+ * Codex is a linear source and carries neither, so this is defensive rather
+ * than lossy.
+ *
+ * The rewind is UNCONDITIONAL over Codex cursors — no cutoff by time, build
+ * version, or "was that read empty?" — and that is intentional, not an
+ * oversight: a cursor records only a line number, so a session stranded by the
+ * bug is indistinguishable here from a healthy one, and there is no cheap probe
+ * that separates them without re-reading. The accepted cost is that an
+ * already-captured session is re-captured on the next commit as a DUPLICATE;
+ * `--relink-codex` warns about this so the manual recovery is an informed
+ * choice. Do not add a silent partial filter here — it would strand exactly the
+ * sessions this lever exists to recover.
+ */
+export async function rewindCodexCursors(cwd: string): Promise<{ rewound: number; paths: string[] }> {
+	const dir = await ensureJolliMemoryDir(cwd);
+	return withSessionsLock(cwd, async () => {
+		const registry = await loadCursorsRegistry(dir, CURSORS_FILE);
+		const paths: string[] = [];
+		const cursors = { ...registry.cursors };
+		for (const [transcriptPath, cursor] of Object.entries(registry.cursors)) {
+			if (!CODEX_ROLLOUT_PATH.test(transcriptPath)) continue;
+			cursors[transcriptPath] = {
+				transcriptPath: cursor.transcriptPath,
+				lineNumber: 0,
+				updatedAt: new Date().toISOString(),
+			};
+			paths.push(transcriptPath);
+		}
+		if (paths.length > 0) {
+			await writeCursorsRegistry({ version: 1, cursors }, dir, CURSORS_FILE);
+		}
+		return { rewound: paths.length, paths };
+	});
+}
+
+/**
  * Saves the merged plan+reference discovery cursor to discovery-cursors.json,
  * keyed by the bare transcriptPath (no plan:/linear: prefix).
  */

@@ -865,13 +865,17 @@ describe("TranscriptReader", () => {
 				}),
 				JSON.stringify({
 					timestamp: "2026-03-22T00:00:01Z",
-					type: "event_msg",
-					payload: { type: "user_message", message: "Hello Codex" },
+					type: "response_item",
+					payload: { type: "message", role: "user", content: [{ type: "input_text", text: "Hello Codex" }] },
 				}),
 				JSON.stringify({
 					timestamp: "2026-03-22T00:00:02Z",
-					type: "event_msg",
-					payload: { type: "agent_message", message: "Hi there!", phase: "final_answer" },
+					type: "response_item",
+					payload: {
+						type: "message",
+						role: "assistant",
+						content: [{ type: "output_text", text: "Hi there!" }],
+					},
 				}),
 			].join("\n");
 

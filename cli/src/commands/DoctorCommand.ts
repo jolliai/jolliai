@@ -21,7 +21,13 @@ import { describeCandidate } from "../core/localagent/ExecutableResolver.js";
 import { localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { findStrandedRoots } from "../core/repair/StrandedTrees.js";
-import { countActiveQueueEntries, getGlobalConfigDir, loadAllSessions, loadConfig } from "../core/SessionTracker.js";
+import {
+	countActiveQueueEntries,
+	getGlobalConfigDir,
+	loadAllSessions,
+	loadConfig,
+	rewindCodexCursors,
+} from "../core/SessionTracker.js";
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { listSummaries, setActiveStorage } from "../core/SummaryStore.js";
@@ -1220,6 +1226,10 @@ export function registerDoctorCommand(program: Command): void {
 			"Upload pending session statistics now, ignoring the throttle and any 24h backend silence",
 		)
 		.option("--repair-transcripts", "Refill summaries written with no conversation from local transcript history")
+		.option(
+			"--relink-codex",
+			"Rewind consumed Codex conversation read-cursors so future commits re-capture those sessions (JOLLI-2240 recovery)",
+		)
 		.option("--cwd <dir>", "Project directory (default: git repo root)", resolveProjectDir())
 		.action(
 			async (options: {
@@ -1233,11 +1243,35 @@ export function registerDoctorCommand(program: Command): void {
 				markMigration?: string;
 				syncSessions?: boolean;
 				repairTranscripts?: boolean;
+				relinkCodex?: boolean;
 			}) => {
 				setLogDir(options.cwd);
 				log.info("Running 'doctor' command");
 				if (options.recover === true) {
 					await runRecover(options.from, options.fix === true);
+					return;
+				}
+				if (options.relinkCodex === true) {
+					const { rewound, paths } = await rewindCodexCursors(options.cwd);
+					console.log(
+						`Rewound ${rewound} Codex read-cursor(s). The rollout files on disk are now unconsumed.`,
+					);
+					if (rewound > 0) {
+						console.log("• Future commits will re-capture these Codex sessions automatically.");
+						console.log(
+							"• To re-attach them to already-committed memories, regenerate the affected commits",
+						);
+						console.log("  (Regenerate in the IDE, which calls Regenerator.regenerateSummary).");
+						// The rewind is unconditional (every Codex cursor, not only the sessions
+						// JOLLI-2240 stranded) because a cursor records only a line number, not
+						// whether its past read produced entries — a healthy session cannot be told
+						// from a broken one here. Say so, so the user opts in knowing the blast radius.
+						console.log("• Note: this rewinds ALL Codex cursors, not only the stranded ones —");
+						console.log(
+							"  a session already captured will be re-captured on the next commit (a duplicate).",
+						);
+					}
+					log.debug("Rewound Codex cursors: %s", paths.join(", "));
 					return;
 				}
 				// The repair implies the report, so `--mark-migration` reaches it on its
