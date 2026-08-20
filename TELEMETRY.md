@@ -1,5 +1,6 @@
 <!-- GENERATED FILE — do not edit by hand.
-     Regenerate with `npm run gen:telemetry-doc` (source: cli/src/core/TelemetryEvents.ts). -->
+     Regenerate with `npm run gen:telemetry-doc` (sources: cli/src/core/TelemetryEvents.ts,
+     cli/src/core/TelemetryAgent.ts, cli/src/core/Telemetry.ts). -->
 
 # Jolli Memory telemetry
 
@@ -10,12 +11,35 @@ collected — generated from the event registry the code actually uses.
 
 ## What we collect
 
-- A random per-machine identifier (`installId`) and the surface (`cli`,
-  `vscode`, `intellij`, `claude-plugin`, or `codex-plugin`) + version.
+- A random per-machine identifier (`installId`) and the surface — which Jolli
+  build sent the event — plus its version. The surfaces are:
+  `cli`, `vscode`, `intellij`, `claude-plugin`, `codex-plugin`,
+  `cursor-plugin`, `web-local`, `web`.
+- The `agent` property: which AI coding tool the work happened in, when that
+  is known. It is a fixed, low-cardinality list of tool names, never free-form:
+  `claude`, `codex`, `gemini`, `opencode`, `cursor`, `cursor-cli`,
+  `copilot`, `copilot-chat`, `cline`, `cline-cli`, `devin`, `antigravity`,
+  `kimi`. See below for when it is omitted.
 - Coarse environment facts: OS, architecture, runtime version, and which Jolli
   environment your client is pointed at (`local` / `dev` / `preview` / `prod`).
 - The events listed below, each with a small bag of **bucketed or boolean**
   properties (e.g. a result count as `"1-5"`, not the actual number).
+
+### About the `agent` property
+
+`agent` records the AI host — Claude Code, Codex, Cursor, Gemini, and so on —
+because the surface above only identifies which of our own builds ran, which is
+often not the tool you were using. It is a tool name and nothing else: not
+identity, not content, not a path, and not anything you typed.
+
+It is **omitted whenever the host is not actually known**, rather than defaulted
+to a guess. An absent `agent` means "not measured", never "the CLI". A host we
+do not recognise is omitted too — the value can only ever be one of the tokens
+listed above.
+
+Events recorded by earlier client versions carry no `agent` at all, and nothing
+reconstructs it retroactively. The first version to emit it is
+`0.99.14`.
 
 ## What we never collect
 
@@ -98,5 +122,7 @@ disk **before** they are sent.
 | `chart_split_changed` | A dashboard card's split-by control was changed. Props: card (discriminator: tokens/mcp), split (discriminator). |
 
 ---
-*Generated from `cli/src/core/TelemetryEvents.ts`. The IntelliJ plugin is an
-independent implementation that sends the same event names and envelope.*
+*Generated from `cli/src/core/TelemetryEvents.ts` (events),
+`cli/src/core/TelemetryAgent.ts` (agents) and `cli/src/core/Telemetry.ts`
+(surfaces). The IntelliJ plugin is an independent implementation that sends the
+same event names and envelope.*

@@ -620,10 +620,18 @@ describe("EnableCommand — repo-hooks-only onboarding funnel", () => {
 		vi.restoreAllMocks();
 	});
 
-	async function runRepoHooksOnly(): Promise<void> {
+	async function runRepoHooksOnly(sourceTag?: string): Promise<void> {
 		const program = new Command();
 		registerEnableCommand(program);
-		await program.parseAsync(["node", "jolli", "enable", "--cwd", "/repo", "--repo-hooks-only"]);
+		await program.parseAsync([
+			"node",
+			"jolli",
+			"enable",
+			"--cwd",
+			"/repo",
+			"--repo-hooks-only",
+			...(sourceTag ? ["--source-tag", sourceTag] : []),
+		]);
 	}
 
 	it("captures the shared onboarding snapshot on success, keyed on the requested cwd", async () => {
@@ -635,7 +643,24 @@ describe("EnableCommand — repo-hooks-only onboarding funnel", () => {
 		// --cwd), and its explicit flush replaces the exit flush that
 		// markSkipExitFlush() disarmed for this mode.
 		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledTimes(1);
-		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo");
+		// No source tag, so no host is known — the `agent` telemetry dimension is
+		// passed as undefined rather than guessed. See below.
+		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo", undefined, undefined);
+	});
+
+	it("passes the host as the agent dimension when a plugin source tag names one", async () => {
+		h.isValidSourceTag.mockReturnValue(true);
+		await runRepoHooksOnly("codex-plugin");
+		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo", undefined, "codex");
+	});
+
+	it("passes no agent for a source tag that is not a plugin host, rather than defaulting to claude", async () => {
+		// pluginBootstrapAgent, not pluginBootstrapHost: the latter falls back to
+		// "claude" so a hand-run --repo-hooks-only still gets Claude's assets, but
+		// that run proves nothing about which host the user is typing into.
+		h.isValidSourceTag.mockReturnValue(true);
+		await runRepoHooksOnly("cli");
+		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo", undefined, undefined);
 	});
 
 	it("captures on the failure branch too — a reconciliation that fails is exactly the drop-off the funnel observes", async () => {
@@ -644,7 +669,7 @@ describe("EnableCommand — repo-hooks-only onboarding funnel", () => {
 		await runRepoHooksOnly();
 
 		expect(process.exitCode).toBe(1);
-		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo");
+		expect(h.capturePluginOnboardingSnapshot).toHaveBeenCalledWith("/repo", undefined, undefined);
 	});
 
 	it("waits for the snapshot chain before returning", async () => {

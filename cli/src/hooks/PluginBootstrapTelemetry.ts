@@ -62,13 +62,38 @@ export interface PluginFunnelSnapshot {
  * `ensurePluginDefaultProvider` (see the module doc). Fire on the success AND
  * failure paths: a setup that installs but never reaches a working state is
  * precisely the drop-off the funnel exists to observe.
+ *
+ * `agent` is the `agent` telemetry dimension — the AI host the user is actually
+ * working in, which a plugin bootstrap knows STRUCTURALLY (its manifest hook
+ * only ever runs inside its own host). That is a stronger claim than the env
+ * markers `bootstrapTelemetry` falls back to, so it is passed explicitly rather
+ * than inferred. Omit it where the host genuinely is not known — a hand-run
+ * `enable --repo-hooks-only` with no source tag — and the dimension stays
+ * ABSENT, which reads as unknown; see `TelemetryAgent` for why that must never
+ * be defaulted instead.
  */
-export function capturePluginOnboardingSnapshot(worktreeRoot: string, sessionId?: string): PluginFunnelSnapshot {
+export function capturePluginOnboardingSnapshot(
+	worktreeRoot: string,
+	sessionId?: string,
+	agent?: string,
+): PluginFunnelSnapshot {
 	const done = (async (): Promise<void> => {
 		try {
 			const config = await loadConfig();
 			const loadOnce = async (): Promise<typeof config> => config;
-			await bootstrapTelemetry({ cwd: worktreeRoot, sessionId, deps: { loadConfig: loadOnce } });
+			// `inferAgentFromEnv` even though `agent` is usually explicit: this call
+			// REPLACES the context an earlier bootstrap primed, so leaving it off
+			// would clear a correctly-inferred agent on the one path that reaches
+			// here without a structural one — a hand-run `enable --repo-hooks-only`
+			// with no source tag, which is still a short-lived CLI process. An
+			// explicit `agent` takes precedence, so the plugin hooks are unaffected.
+			await bootstrapTelemetry({
+				cwd: worktreeRoot,
+				sessionId,
+				agent,
+				inferAgentFromEnv: true,
+				deps: { loadConfig: loadOnce },
+			});
 			await maybeEmitOnboardingProgress({ cwd: worktreeRoot, config });
 			await flushTelemetryNow(worktreeRoot, {
 				loadConfig: loadOnce,

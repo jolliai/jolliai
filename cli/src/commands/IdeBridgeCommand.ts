@@ -2226,6 +2226,11 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 		case "telemetry-track": {
 			const { bootstrapTelemetry } = await import("../core/TelemetryStartup.js");
 			const { bucket, track } = await import("../core/Telemetry.js");
+			// No `inferAgentFromEnv`: this runs inside the long-lived
+			// `ide-bridge-serve` process, whose env belongs to whatever launched the
+			// IDE, and the events it forwards describe the JVM host's own UI anyway.
+			// (Currently defensive — nothing in `intellij/` calls this action; the
+			// plugin still emits through its own Kotlin telemetry stack.)
 			await bootstrapTelemetry({ cwd, platformDisabled: request.platformDisabled === true });
 			const properties = {
 				...((request.properties as Readonly<Record<string, unknown>> | undefined) ?? {}),
@@ -2248,6 +2253,7 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			const { loadConfig } = await import("../core/SessionTracker.js");
 			const { shouldShowTelemetryNotice } = await import("../core/TelemetryConsent.js");
 			const platformDisabled = request.platformDisabled === true;
+			// No `inferAgentFromEnv` — same reasoning as `telemetry-track` above.
 			await bootstrapTelemetry({ cwd, platformDisabled });
 			return { shouldShowNotice: shouldShowTelemetryNotice({ config: await loadConfig(), platformDisabled }) };
 		}

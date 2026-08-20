@@ -17,6 +17,7 @@ import {
 	listPresentLocalAgents,
 	localAgentOverrideFrom,
 } from "../core/localagent/DetectAgents.js";
+import { pluginBootstrapAgent } from "../core/localagent/PluginDefaults.js";
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel, localAgentToolLoginHint } from "../core/localagent/ToolMeta.js";
 import { maybeEmitOnboardingProgress } from "../core/OnboardingFunnel.js";
 import { getGlobalConfigDir, loadConfig, loadConfigFromDir, saveConfigScoped } from "../core/SessionTracker.js";
@@ -454,7 +455,16 @@ export function registerEnableCommand(program: Command): void {
 					// and its explicit flush is what markSkipExitFlush() above made
 					// necessary. Nothing here writes to stdout, which the automatic
 					// (SessionStart bootstrap) callers need kept byte-clean.
-					await capturePluginOnboardingSnapshot(options.cwd).done;
+					// The `agent` dimension comes from the SOURCE TAG, via
+					// pluginBootstrapAgent rather than pluginBootstrapHost: this mode
+					// is also reachable as a hand-run `enable --repo-hooks-only` with
+					// no tag, where the host is genuinely unknown and must be omitted
+					// rather than defaulted to claude.
+					await capturePluginOnboardingSnapshot(
+						options.cwd,
+						undefined,
+						pluginBootstrapAgent(options.sourceTag),
+					).done;
 					return;
 				}
 

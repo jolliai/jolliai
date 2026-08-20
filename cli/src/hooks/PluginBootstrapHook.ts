@@ -161,7 +161,7 @@ export async function runPluginBootstrap(
 		// Snapshot on the failure branch too — a setup that installs but never
 		// reaches a working state is precisely the drop-off the funnel observes.
 		// Nothing to overlap here, so await inline.
-		await capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId).done;
+		await capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId, "claude").done;
 		return buildPluginBootstrapOutput(reloadSkills, null);
 	}
 
@@ -186,7 +186,7 @@ export async function runPluginBootstrap(
 				const config = await loadConfig();
 				if (config.claudeEnabled === false) return;
 				await ensurePluginDefaultProvider(SOURCE_TAG, config);
-				funnel = capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
+				funnel = capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId, "claude");
 				const hooksWereComplete = hookHealthAtEntry.stop && hookHealthAtEntry.sessionStart;
 				context = await buildSessionStartContext(worktreeRoot, SOURCE_TAG, {
 					includeBriefing: !hooksWereComplete,
@@ -197,7 +197,7 @@ export async function runPluginBootstrap(
 		);
 		contextDeferred = !contextPhase.acquired;
 	} finally {
-		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId);
+		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot, session?.sessionId, "claude");
 		await funnel.done;
 	}
 	if (contextDeferred) {

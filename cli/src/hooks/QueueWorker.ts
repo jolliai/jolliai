@@ -4504,8 +4504,19 @@ async function readAllTranscripts(
 		// so it never re-fires on later runs and can't skew the AI-source-mix view).
 		// Gated on telemetry being enabled so an opted-out/uninitialized run never
 		// writes the seen-sources ledger (also keeps it out of unit tests).
+		//
+		// `agent` is stamped from the SESSION rather than left to the worker's
+		// ambient value, and this loop is the one place that difference matters:
+		// the worker is a detached spawn whose env-derived agent describes the
+		// process that committed, which is not necessarily the host that produced
+		// the transcript being walked (and for the ten hosts with no hook of their
+		// own, is usually nothing at all). It is also how Gemini — the one
+		// push-based host, fed here by its AfterAgent hook rather than by a disk
+		// scan — gets attributed: it arrives as `source === "gemini"` like any
+		// other, so the push path needs no separate branch. `source` is a
+		// TranscriptSource, so it is already a member of the closed vocabulary.
 		if (getTelemetryContext()?.enabled && (await markAiSourceSeen(source))) {
-			track("ai_source_detected", { source });
+			track("ai_source_detected", { source, agent: source });
 		}
 
 		// Gemini, OpenCode, Cursor, Copilot, and Cline use dedicated readers (not JSONL line-based parsing).
@@ -4963,7 +4974,11 @@ if (isMainScript()) {
 		// short-lived CLI / hook invocations only buffered. All best-effort;
 		// never blocks exit on a telemetry error.
 		runWithTrace(traceIdFromEnv(), () =>
-			bootstrapTelemetry({ cwd })
+			// `inferAgentFromEnv`: this worker is a detached spawn of `post-commit`,
+			// which inherits the committing process's env — so a commit made from
+			// inside an agent session is attributed to it. Per-transcript events
+			// override this with the session's own source, which is more specific.
+			bootstrapTelemetry({ cwd, inferAgentFromEnv: true })
 				.then(() => runWorker(cwd))
 				.then(() => flushTelemetryNow(cwd))
 				.catch((_error: unknown) => {

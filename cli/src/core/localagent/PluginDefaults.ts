@@ -112,6 +112,29 @@ export function pluginBootstrapHost(sourceTag: string | undefined): PluginBootst
 	return (sourceTag === undefined ? undefined : PLUGIN_HOSTS[sourceTag]?.host) ?? "claude";
 }
 
+/**
+ * The `agent` telemetry token for a plugin bootstrap, or undefined when
+ * `sourceTag` names no plugin host.
+ *
+ * The `PluginBootstrapHost` values are themselves valid `TranscriptSource`
+ * tokens, so this is `PLUGIN_HOSTS[tag].host` — but WITHOUT
+ * {@link pluginBootstrapHost}'s `"claude"` fallback, and that difference is the
+ * whole point of a second function. There the fallback is right: an unmapped tag
+ * means a hand-run `jolli enable --repo-hooks-only`, which installed the Claude
+ * assets before the host split and must keep doing so. Here it would be a lie —
+ * a hand-run enable proves nothing about which host the user is typing into, and
+ * telemetry's rule is that an unknown host is OMITTED, never guessed. Reusing
+ * `pluginBootstrapHost` for this would tag every bare `--repo-hooks-only` run as
+ * a Claude session.
+ *
+ * This is a STRUCTURAL claim and so beats the env markers: a plugin's
+ * SessionStart bootstrap only ever runs inside its own host, whereas a marker
+ * can be inherited by a child or missing under a host's env policy.
+ */
+export function pluginBootstrapAgent(sourceTag: string | undefined): PluginBootstrapHost | undefined {
+	return sourceTag === undefined ? undefined : PLUGIN_HOSTS[sourceTag]?.host;
+}
+
 /** Outcome of {@link applyPluginInitLocalAgentTool}, for the caller's report line. */
 export interface PluginInitToolResult {
 	/** The tool this host would drive — written only when nothing was configured. */

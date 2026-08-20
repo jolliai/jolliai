@@ -157,6 +157,34 @@ class TelemetryTest {
         e.accountId shouldBe null
     }
 
+    /**
+     * The `agent` dimension (CLI-side `core/TelemetryAgent.ts`) records which AI
+     * host the work happened in. This port deliberately never emits it: an IDE is
+     * not one of the hosts that vocabulary enumerates, and `surface: "intellij"`
+     * already says where a tool-window click happened.
+     *
+     * Pinned with a marker PRESENT in the env because that is the tempting wrong
+     * fix. This is a long-lived IDE process, so an inherited `CLAUDECODE` names
+     * whatever launched the IDE — possibly days ago — and would then label every
+     * button click for the rest of the window's life. The TS side defaults
+     * `inferAgentFromEnv` to off for exactly this shape.
+     */
+    @Test
+    fun `track never stamps an agent, even under an inherited host marker`() {
+        Telemetry.init(
+            cwd = cwd,
+            installId = "install-1",
+            surfaceVersion = "1.2.0",
+            origin = "https://acme.jolli.ai",
+            env = mapOf("CLAUDECODE" to "1", "AI_AGENT" to "claude-code_2-1-234_agent"),
+        )
+        // The tool window's Commit button; the busiest JVM-side event.
+        Telemetry.track("memory_committed", mapOf("files_bucket" to "1-5", "has_conversations" to true))
+        val e = TelemetryBuffer.read(cwd).single()
+        e.surface shouldBe "intellij"
+        e.properties.containsKey("agent") shouldBe false
+    }
+
     @Test
     fun `track does not emit when consent is off`() {
         Telemetry.init(cwd = cwd, installId = "i", surfaceVersion = "1", telemetryFlag = "off", env = emptyMap())

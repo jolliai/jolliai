@@ -37,6 +37,13 @@ export interface TelemetryActivationDeps {
 
 /** Bootstrap telemetry for the extension and show the first-run notice once. Never throws. */
 export async function activateExtensionTelemetry(cwd: string, deps: TelemetryActivationDeps): Promise<void> {
+	// No `inferAgentFromEnv` — the extension host is the case that flag defaults
+	// off for. Cold-start VS Code with `code .` from inside a Claude Code session
+	// and this process inherits CLAUDECODE for as long as the window lives, so
+	// every UI event below would claim `agent: "claude"` while the user is
+	// clicking buttons rather than prompting an agent. An editor is not one of the
+	// AI hosts the dimension enumerates, so absent is the correct answer here, and
+	// `surface: "vscode"` already says where the click happened.
 	await bootstrapTelemetry({ cwd, platformDisabled: deps.platformDisabled });
 	// JOLLI-1963: count new + upgrade installs. Fires once per extension activation
 	// (a real session), carrying `surface_version` in the envelope; the metric dedups
@@ -89,5 +96,9 @@ export function flushExtensionTelemetry(cwd: string, platformDisabled: boolean):
  * first-run notice (that was handled at activate). Never throws.
  */
 export async function reinitExtensionTelemetry(cwd: string, platformDisabled: boolean): Promise<void> {
+	// Same reasoning as `activateExtensionTelemetry`, and it must stay consistent
+	// with it: this re-bootstrap REPLACES the context, so opting in here alone
+	// would make a mid-session telemetry toggle silently start attributing the
+	// window to an inherited marker.
 	await bootstrapTelemetry({ cwd, platformDisabled });
 }

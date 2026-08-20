@@ -144,7 +144,7 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		// Snapshot on the failure branch too — a setup that installs but never
 		// reaches a working state is precisely the drop-off the funnel observes.
 		// Nothing to overlap here, so await inline.
-		await capturePluginOnboardingSnapshot(worktreeRoot).done;
+		await capturePluginOnboardingSnapshot(worktreeRoot, undefined, "codex").done;
 		return null;
 	}
 
@@ -175,7 +175,7 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 				// with the Claude path precisely so the two hosts cannot seed different
 				// values for the same machine-global config.
 				await ensurePluginDefaultProvider(SOURCE_TAG, config);
-				funnel = capturePluginOnboardingSnapshot(worktreeRoot);
+				funnel = capturePluginOnboardingSnapshot(worktreeRoot, undefined, "codex");
 				// Always include the briefing: unlike the Claude path there is no
 				// repo-installed SessionStart hook that would also produce one, so
 				// skipping it here would mean no briefing at all.
@@ -188,7 +188,7 @@ export async function runCodexPluginBootstrap(projectDir: string): Promise<Codex
 		);
 		contextDeferred = !contextPhase.acquired;
 	} finally {
-		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot);
+		funnel ??= capturePluginOnboardingSnapshot(worktreeRoot, undefined, "codex");
 		await funnel.done;
 	}
 	if (contextDeferred) {

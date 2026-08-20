@@ -16,6 +16,41 @@ import java.util.UUID
  *     timestamp, scrubs, and appends one buffer line.
  *   - No-op until `init()` runs or when consent resolved to off.
  *   - `surface` is fixed to "intellij"; `surfaceVersion` is the plugin version.
+ *
+ * ## The `agent` dimension is deliberately absent here
+ *
+ * The CLI stamps an `agent` property — which AI host the work happened in, as
+ * opposed to which of our builds sent the event; see `core/TelemetryAgent.ts`.
+ * This port does not, and that is a decision rather than drift.
+ *
+ * The question arises at all because this stack is genuinely INDEPENDENT, not a
+ * thin shim over the CLI the way most of the plugin now is: ~20 `Telemetry.track`
+ * call sites across the tool window feed a Kotlin buffer that this module's
+ * `TelemetryFlusher` POSTs itself — which is precisely why that one file is the
+ * sole entry on `check-no-direct-llm-http.sh`'s allowlist. The `telemetry-track`
+ * and `telemetry-bootstrap` ide-bridge actions exist but have NO caller in
+ * `intellij/`; nothing here routes telemetry through the CLI today.
+ *
+ * Absent is nonetheless the correct value:
+ *
+ *  - The rule the dimension rests on is that an ABSENT `agent` reads as
+ *    *unknown* and is never defaulted. An IDE is not one of the AI hosts the
+ *    vocabulary enumerates — a person clicking Commit in the tool window is not
+ *    prompting an agent — and `surface: "intellij"` already says where the click
+ *    happened. The CLI reaches the same answer for VS Code's UI events.
+ *  - All three attribution channels are CLI-side (a plugin bootstrap's
+ *    structural host, the agent CLIs' own env markers, the QueueWorker's
+ *    per-session walk), and the plugin drives the bundled CLI for the work those
+ *    cover — so the events that CAN name a host already come from there.
+ *  - It rides inside `properties`, so nothing about the envelope contract this
+ *    port mirrors changes. `TelemetryEvents.kt` stays in lockstep as before.
+ *
+ * Do NOT "fix" this by inferring the host from the process environment. This is
+ * a long-lived IDE process, so an inherited marker names whatever launched the
+ * IDE, possibly days ago; `TelemetryStartup.inferAgentFromEnv` defaults to off
+ * on the TS side for exactly this shape. If a JVM call site ever genuinely knows
+ * its host, add the property through a closed enumeration mirroring
+ * `TELEMETRY_AGENTS` — never a pass-through string, and never a default.
  */
 object Telemetry {
     const val SCHEMA_VERSION = 1

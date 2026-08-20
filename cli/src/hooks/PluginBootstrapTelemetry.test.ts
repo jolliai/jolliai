@@ -49,6 +49,19 @@ describe("capturePluginOnboardingSnapshot", () => {
 		await expect(flushDeps.loadConfig()).resolves.toBe(config);
 	});
 
+	it("forwards the structural agent to the telemetry bootstrap", async () => {
+		await capturePluginOnboardingSnapshot("/repo", "s1", "codex").done;
+		expect(mocks.bootstrapTelemetry.mock.calls[0][0]).toMatchObject({ agent: "codex" });
+	});
+
+	it("passes no agent when the caller does not know the host", async () => {
+		// A hand-run `enable --repo-hooks-only` with no source tag: the bootstrap
+		// then falls back to env markers, and if those say nothing the dimension
+		// stays absent rather than being defaulted.
+		await capturePluginOnboardingSnapshot("/repo").done;
+		expect(mocks.bootstrapTelemetry.mock.calls[0][0].agent).toBeUndefined();
+	});
+
 	it("returns synchronously with the whole chain deferred, so the caller can overlap it", async () => {
 		let releaseConfig: (config: object) => void = () => {};
 		mocks.loadConfig.mockImplementation(

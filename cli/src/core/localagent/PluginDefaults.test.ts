@@ -3,6 +3,7 @@ import type { JolliMemoryConfig } from "../../Types.js";
 import { updateConfigTransactional } from "../SessionTracker.js";
 import {
 	applyPluginInitLocalAgentTool,
+	pluginBootstrapAgent,
 	pluginBootstrapHost,
 	pluginDefaultLocalAgentTool,
 	pluginSkillInvocation,
@@ -70,6 +71,27 @@ describe("pluginBootstrapHost", () => {
 			expect(pluginBootstrapHost(tag)).toBe("claude");
 		}
 		expect(pluginBootstrapHost(undefined)).toBe("claude");
+	});
+});
+
+describe("pluginBootstrapAgent", () => {
+	it("resolves each plugin tag to the same host token", () => {
+		expect(pluginBootstrapAgent("claude-plugin")).toBe("claude");
+		expect(pluginBootstrapAgent("codex-plugin")).toBe("codex");
+		expect(pluginBootstrapAgent("cursor-plugin")).toBe("cursor");
+	});
+
+	// The one difference from pluginBootstrapHost, and the reason both exist. There
+	// the claude fallback is right — a hand-run --repo-hooks-only must still get
+	// Claude's assets. Here it would be a lie: that run proves nothing about which
+	// host the user is typing into, and telemetry omits an unknown host rather than
+	// guessing one. Reusing pluginBootstrapHost would tag every bare run as claude.
+	it("answers undefined for an unmapped or missing tag instead of falling back to claude", () => {
+		for (const tag of ["cli", "vscode", "intellij", ""]) {
+			expect(pluginBootstrapAgent(tag)).toBeUndefined();
+			expect(pluginBootstrapHost(tag)).toBe("claude");
+		}
+		expect(pluginBootstrapAgent(undefined)).toBeUndefined();
 	});
 });
 

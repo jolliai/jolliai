@@ -2,6 +2,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { PLUGIN_BUNDLE_KINDS } from "./ClientHeader.js";
 import {
 	bucket,
 	getTelemetryContext,
@@ -10,7 +11,9 @@ import {
 	resolveTelemetryEnv,
 	saltedHash,
 	scrubProperties,
+	setTelemetryAgent,
 	shutdownTelemetry,
+	TELEMETRY_SURFACES,
 	track,
 	trackAs,
 	trackError,
@@ -321,5 +324,196 @@ describe("trackAs", () => {
 		const [e] = await readTelemetryEvents(cwd);
 		// The always-drop `token` key is gone; the safe discriminators survive.
 		expect(e.properties).toEqual({ card: "tokens", split: "model" });
+	});
+});
+
+describe("TELEMETRY_SURFACES", () => {
+	// The doc's surface list used to be hand-written prose inside the generator's
+	// own template, which the drift test cannot see — it had gone stale by three
+	// entries. These assertions are what the generated list now rests on.
+	it("contains every surface a plugin bundle's client kind produces", () => {
+		for (const kind of PLUGIN_BUNDLE_KINDS) {
+			expect(TELEMETRY_SURFACES).toContain(parseSurface(`${kind}/1.0.0`).surface);
+		}
+	});
+
+	it("contains the two surfaces parseSurface normalizes or passes through", () => {
+		expect(TELEMETRY_SURFACES).toContain(parseSurface("cli/1.2.0").surface);
+		expect(TELEMETRY_SURFACES).toContain(parseSurface("vscode-plugin/0.99.4").surface);
+	});
+
+	it("contains the surfaces no client kind can produce (independent Kotlin stack, hosted app, beacon)", () => {
+		expect(TELEMETRY_SURFACES).toContain("intellij");
+		expect(TELEMETRY_SURFACES).toContain("web");
+		expect(TELEMETRY_SURFACES).toContain("web-local");
+	});
+
+	it("holds no duplicates", () => {
+		expect(new Set(TELEMETRY_SURFACES).size).toBe(TELEMETRY_SURFACES.length);
+	});
+});
+
+describe("agent dimension", () => {
+	const baseInit = () => ({ cwd, installId: "install-1", origin: "https://acme.jolli.ai", config: {} });
+
+	it("stamps a known host into properties, not the envelope", async () => {
+		initTelemetry({ ...baseInit(), agent: "kimi" });
+		track("recall_performed", { hit: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ hit: true, agent: "kimi" });
+		// Deliberately NOT a top-level envelope field: the ingest handler builds
+		// its record from named fields only, so an unknown one is 204'd and dropped.
+		expect(e).not.toHaveProperty("agent");
+	});
+
+	it("omits the property entirely when the host is unknown — never defaults to the surface", async () => {
+		initTelemetry(baseInit());
+		track("recall_performed", { hit: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ hit: true });
+		expect(e.properties).not.toHaveProperty("agent");
+		expect(e.surface).toBe("cli"); // the surface is known; the agent is not
+	});
+
+	it("omits it for an unrecognised host rather than passing the string through", async () => {
+		initTelemetry({ ...baseInit(), agent: "windsurf" });
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+		track("recall_performed");
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).not.toHaveProperty("agent");
+	});
+
+	it("drops a free-form agent a caller put in properties (the value can never be free-form)", async () => {
+		initTelemetry(baseInit());
+		track("ai_source_detected", { source: "claude", agent: "totally-made-up" });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ source: "claude" });
+	});
+
+	it("lets a call site that knows its host override the ambient one", async () => {
+		// The QueueWorker case: the worker's env says one thing, the session being
+		// walked is authoritative about the transcript it produced.
+		initTelemetry({ ...baseInit(), agent: "claude" });
+		track("ai_source_detected", { source: "gemini", agent: "gemini" });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ source: "gemini", agent: "gemini" });
+	});
+
+	it("suppresses rather than falls back when the per-call value is rejected", async () => {
+		// The caller claimed to know the host and named something unusable, so the
+		// process's own host must NOT stand in — that would relabel the event as a
+		// host the caller explicitly said it was not.
+		initTelemetry({ ...baseInit(), agent: "codex" });
+		track("recall_performed", { agent: "nonsense" });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).not.toHaveProperty("agent");
+	});
+
+	it("uses the ambient host when the caller does not mention agent at all", async () => {
+		initTelemetry({ ...baseInit(), agent: "codex" });
+		track("recall_performed", { hit: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ hit: true, agent: "codex" });
+	});
+
+	it("treats an explicitly-undefined agent as unmentioned, not as a claim", async () => {
+		// `{ agent: undefined }` is what a spread of an optional field degrades to;
+		// reading it as "the caller owns this field" would silently drop the ambient
+		// host for callers who never meant to say anything.
+		initTelemetry({ ...baseInit(), agent: "codex" });
+		track("recall_performed", { agent: undefined });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ agent: "codex" });
+	});
+
+	it("does NOT stamp the ambient host on a trackAs event", async () => {
+		// A surface override means the event did not originate in this process, so
+		// this process's host is not the event's host either — otherwise a browser
+		// click in the local dashboard inherits whatever shell launched the server.
+		initTelemetry({ ...baseInit(), agent: "cursor" });
+		trackAs("web-local", "dashboard_opened", { first_run: true });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.surface).toBe("web-local");
+		expect(e.properties).toEqual({ first_run: true });
+	});
+
+	it("still honours an agent a trackAs caller states explicitly", async () => {
+		initTelemetry({ ...baseInit(), agent: "cursor" });
+		trackAs("web-local", "dashboard_opened", { agent: "claude" });
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ agent: "claude" });
+	});
+
+	it("stamps it on trackError events too", async () => {
+		initTelemetry({ ...baseInit(), agent: "devin" });
+		trackError("ingest", "ROUTE_FAILED");
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ where: "ingest", code: "ROUTE_FAILED", agent: "devin" });
+	});
+});
+
+describe("setTelemetryAgent", () => {
+	const init = (agent?: string) =>
+		initTelemetry({
+			cwd,
+			installId: "install-1",
+			origin: "https://acme.jolli.ai",
+			config: {},
+			...(agent ? { agent } : {}),
+		});
+
+	it("records a host learned after initialization", async () => {
+		init();
+		setTelemetryAgent("cline-cli");
+		expect(getTelemetryContext()?.agent).toBe("cline-cli");
+		track("recall_performed");
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).toEqual({ agent: "cline-cli" });
+	});
+
+	it("clears the dimension when handed undefined or an unknown host", async () => {
+		// Clearing is the safe direction: a stale agent is a wrong positive claim,
+		// an absent one correctly reads as unknown.
+		init("claude");
+		setTelemetryAgent(undefined);
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+		setTelemetryAgent("claude");
+		setTelemetryAgent("windsurf");
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+		track("recall_performed");
+		const [e] = await readTelemetryEvents(cwd);
+		expect(e.properties).not.toHaveProperty("agent");
+	});
+
+	it("leaves every other context field untouched", () => {
+		init();
+		const before = getTelemetryContext();
+		setTelemetryAgent("copilot-chat");
+		const after = getTelemetryContext();
+		expect(after).toMatchObject({
+			enabled: before?.enabled,
+			cwd: before?.cwd,
+			installId: before?.installId,
+			surface: before?.surface,
+			surfaceVersion: before?.surfaceVersion,
+			env: before?.env,
+		});
+	});
+
+	it("preserves a sessionId across the update", () => {
+		initTelemetry({
+			cwd,
+			installId: "install-1",
+			sessionId: "sess-9",
+			origin: "https://acme.jolli.ai",
+			config: {},
+		});
+		setTelemetryAgent("antigravity");
+		expect(getTelemetryContext()).toMatchObject({ sessionId: "sess-9", agent: "antigravity" });
+	});
+
+	it("is a no-op before initialization", () => {
+		setTelemetryAgent("claude");
+		expect(getTelemetryContext()).toBeNull();
 	});
 });

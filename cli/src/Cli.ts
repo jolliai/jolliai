@@ -133,7 +133,12 @@ export async function serveMcpInProcess(dir: string): Promise<void> {
 	let telemetry: typeof import("./core/TelemetryStartup.js") | null = null;
 	try {
 		telemetry = await import("./core/TelemetryStartup.js");
-		await telemetry.bootstrapTelemetry({ cwd: dir });
+		// `inferAgentFromEnv`: this server was spawned by the AI host for this
+		// session, so its env markers name that host. Measured: a Claude-spawned
+		// `mcp-serve` really does carry CLAUDECODE — which is also how the
+		// `surface` misattribution becomes visible, since the dist that wins
+		// arbitration may be a different host's plugin bundle entirely.
+		await telemetry.bootstrapTelemetry({ cwd: dir, inferAgentFromEnv: true });
 	} catch (error: unknown) {
 		// stderr, never stdout — stdout is this session's JSON-RPC stream.
 		console.error("telemetry unavailable for this MCP session:", error);
@@ -253,7 +258,11 @@ if (!process.env.VITEST) {
 				// Then prime telemetry before command dispatch so the commander preAction
 				// auto-emit and any in-command track() calls have a live context. Never
 				// throws; the VITEST guard keeps it (and its installId mint) out of tests.
-				await bootstrapTelemetry({ cwd: resolveProjectDir() });
+				// `inferAgentFromEnv`: a `jolli` invocation is short-lived and was
+				// launched by whoever is running it right now, so an inherited marker
+				// still names the current host. This is what attributes
+				// `command_invoked` for every CLI command.
+				await bootstrapTelemetry({ cwd: resolveProjectDir(), inferAgentFromEnv: true });
 				let failed = false;
 				try {
 					await main();

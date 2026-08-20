@@ -24,6 +24,7 @@
  */
 import { createHash, randomUUID } from "node:crypto";
 import { JOLLI_CLIENT_HEADER } from "./ClientHeader.js";
+import { resolveTelemetryAgent, type TelemetryAgent } from "./TelemetryAgent.js";
 import { appendTelemetryEvent, type TelemetryEnvelope } from "./TelemetryBuffer.js";
 import { resolveTelemetryConsent } from "./TelemetryConsent.js";
 import { isTelemetryEventName, type TelemetryEventName } from "./TelemetryEvents.js";
@@ -44,6 +45,15 @@ export interface TelemetryInit {
 	readonly installId: string;
 	/** Current AI/editor session id, when one exists. */
 	readonly sessionId?: string;
+	/**
+	 * The AI host this process is working in, when it is actually known — a
+	 * structural fact (a plugin bootstrap runs inside its own host) or a marker
+	 * the host set itself (`TelemetryAgent.detectAgentFromEnv`). Passed as a
+	 * plain string and gated through `resolveTelemetryAgent`, so an unrecognised
+	 * value leaves the dimension ABSENT rather than defaulted. See
+	 * `TelemetryAgent` for why absent must keep reading as *unknown*.
+	 */
+	readonly agent?: string;
 	/** Resolved jolli origin (key-derived or `getJolliUrl()`); maps to `env`. */
 	readonly origin?: string;
 	/** Telemetry-related config fields, for the consent gate. */
@@ -62,6 +72,8 @@ interface TelemetryContext {
 	readonly surface: string;
 	readonly surfaceVersion: string;
 	readonly env: TelemetryEnv;
+	/** Resolved agent, or absent when this process's host is not known. */
+	readonly agent?: TelemetryAgent;
 }
 
 let context: TelemetryContext | null = null;
@@ -77,6 +89,7 @@ export function initTelemetry(init: TelemetryInit): void {
 		platformDisabled: init.platformDisabled,
 	});
 	const { surface, surfaceVersion } = parseSurface();
+	const agent = resolveTelemetryAgent(init.agent);
 	context = {
 		enabled: consent.enabled,
 		cwd: init.cwd,
@@ -85,6 +98,41 @@ export function initTelemetry(init: TelemetryInit): void {
 		surface,
 		surfaceVersion,
 		env: resolveTelemetryEnv(init.origin, init.env),
+		...(agent ? { agent } : {}),
+	};
+}
+
+/**
+ * Record the AI host this process is working in, for a caller that learns it
+ * AFTER `initTelemetry` — a plugin bootstrap that resolved its host from an
+ * install source tag, or a pass that has narrowed down which session it is
+ * walking. Every later `track()` stamps it.
+ *
+ * Passing an unrecognised value — or `undefined` — CLEARS the dimension rather
+ * than leaving the previous one in place. Clearing is the safe direction: a
+ * stale agent is a wrong positive claim about the user's host, while an absent
+ * one correctly reads as unknown.
+ *
+ * No-op when uninitialized, so an un-wired surface stays silent instead of
+ * throwing. Deliberately process-wide and NOT async-scoped: the two callers
+ * either know their host for the whole process, or set it around a sequential
+ * pass. A caller that emits from concurrent work under two different hosts
+ * would need a scoped variant, and should add one rather than interleaving
+ * calls to this.
+ */
+export function setTelemetryAgent(agent: string | undefined): void {
+	if (!context) return;
+	const resolved = resolveTelemetryAgent(agent);
+	const { cwd, enabled, env, installId, sessionId, surface, surfaceVersion } = context;
+	context = {
+		enabled,
+		cwd,
+		installId,
+		sessionId,
+		surface,
+		surfaceVersion,
+		env,
+		...(resolved ? { agent: resolved } : {}),
 	};
 }
 
@@ -140,6 +188,45 @@ function emit(
 	if (!ctx || !ctx.enabled) return;
 	if (!isTelemetryEventName(eventName)) return;
 	try {
+		// `agent` is a NAMED dimension inside the properties bag, so it is stamped
+		// here rather than trusted from the caller's object: an explicit
+		// `properties.agent` is re-resolved against the closed vocabulary (a
+		// caller that knows its host beats the ambient one), and anything the gate
+		// rejects is DELETED rather than left to flow through the scrubber, which
+		// preserves an unrecognised string verbatim. So the wire value is always a
+		// known token or nothing at all.
+		//
+		// It rides in `properties` and not in the envelope on purpose: the ingest
+		// handler builds its stored record from named envelope fields only, so an
+		// unrecognised top-level field is accepted with a 204 and then silently
+		// dropped, whereas `properties` is scrubbed against a DENY-list that
+		// `agent` is not on — which is what makes this a client-only change.
+		// Promoting it to a first-class column later is a server-side schema
+		// change, not a reason to hold the data back now.
+		//
+		// `surfaceOverride` also suppresses the AMBIENT agent, and that follows from
+		// what the override MEANS: a caller reaches for `trackAs` precisely because
+		// the event did not originate in this process (today, a click in the local
+		// dashboard's web view). This process's host is then not the event's host
+		// either, so inheriting it would attribute a browser click to whatever
+		// shell happened to launch `jolli dashboard`. An explicitly passed agent
+		// still wins, since that caller is claiming to know the event's own host.
+		//
+		// A supplied `properties.agent` is AUTHORITATIVE, not merely preferred: if
+		// the gate rejects it the property is omitted, and the ambient value does
+		// NOT stand in. Falling back looks harmless and is the one shape that can
+		// manufacture a wrong value — a call site that named a host this build's
+		// vocabulary does not carry yet (a fourteenth host, an older dist) would
+		// have its event relabelled as the PROCESS's host, silently contradicting
+		// what the caller said it knew. Absent is recoverable; that is not. This
+		// also keeps `emit` consistent with `initTelemetry`, where an unrecognised
+		// explicit agent likewise suppresses rather than degrades.
+		const bag = scrubProperties(properties);
+		delete bag.agent;
+		const claimed = properties.agent !== undefined;
+		const ambient = surfaceOverride === undefined ? ctx.agent : undefined;
+		const agent = claimed ? resolveTelemetryAgent(properties.agent) : ambient;
+		if (agent) bag.agent = agent;
 		const envelope: TelemetryEnvelope = {
 			schemaVersion: SCHEMA_VERSION,
 			// Idempotency key minted once here, at buffer time. Written to disk and
@@ -159,7 +246,7 @@ function emit(
 			// Always null from the client; the backend attributes account_id
 			// from the Bearer key at ingest time (JOLLI-1785 as-built).
 			accountId: null,
-			properties: scrubProperties(properties),
+			properties: bag,
 		};
 		appendTelemetryEvent(ctx.cwd, envelope);
 	} catch {
@@ -236,6 +323,35 @@ export function resolveTelemetryEnv(origin?: string, env: NodeJS.ProcessEnv = pr
 	if (matches("jolli.ai")) return "prod";
 	return "unknown";
 }
+
+/**
+ * Every `surface` value the product emits, and therefore the complete list
+ * `TELEMETRY.md` discloses.
+ *
+ * Not derivable from this process: `surface` comes from a build-time `define`, so
+ * a running bundle can only ever name its OWN value — which is exactly how the
+ * doc's hand-written prose went stale (it was missing `cursor-plugin`,
+ * `web-local` and `web`). Enumerating it once here at least gives the staleness
+ * somewhere to be caught: `Telemetry.test.ts` runs every `PLUGIN_BUNDLE_KINDS`
+ * entry plus `cli` and `vscode-plugin` through `parseSurface` and asserts the
+ * result is a member, so adding a bundle without adding its surface fails.
+ *
+ * The remaining three cannot be derived that way and are asserted by name:
+ * `intellij` comes from the plugin's independent Kotlin stack and `web` from the
+ * hosted app, so no bundle here produces either, while `web-local` IS emitted
+ * here but only via `trackAs` from the local dashboard beacon. They are listed
+ * anyway because the doc describes the product, not one artifact.
+ */
+export const TELEMETRY_SURFACES: ReadonlyArray<string> = [
+	"cli",
+	"vscode",
+	"intellij",
+	"claude-plugin",
+	"codex-plugin",
+	"cursor-plugin",
+	"web-local",
+	"web",
+];
 
 /** Split `JOLLI_CLIENT_HEADER` ("cli/1.2.0", "vscode-plugin/0.99.4") into surface + version. */
 export function parseSurface(header: string = JOLLI_CLIENT_HEADER): {

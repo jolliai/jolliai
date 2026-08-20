@@ -64,6 +64,69 @@ describe("bootstrapTelemetry", () => {
 		getJolliUrl: () => "https://jolli.ai",
 	});
 
+	it("does NOT read the env markers unless the caller opts in", async () => {
+		// The default protects long-lived hosts: env vars are inherited by every
+		// descendant and never expire, so a VS Code window cold-started from inside
+		// a Claude session would otherwise claim `claude` for its whole lifetime.
+		await bootstrapTelemetry({
+			cwd,
+			env: { CODEX_THREAD_ID: "t-1", CLAUDECODE: "1" },
+			deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false),
+		});
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+	});
+
+	it("derives the agent from the host's own env marker once opted in", async () => {
+		await bootstrapTelemetry({
+			cwd,
+			inferAgentFromEnv: true,
+			env: { CODEX_THREAD_ID: "t-1" },
+			deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false),
+		});
+		expect(getTelemetryContext()?.agent).toBe("codex");
+	});
+
+	it("prefers an explicitly passed agent over the env markers (a structural claim wins)", async () => {
+		// A plugin bootstrap only ever runs inside its own host, which is stronger
+		// than a marker a child could have inherited.
+		await bootstrapTelemetry({
+			cwd,
+			agent: "cursor",
+			inferAgentFromEnv: true,
+			env: { CLAUDECODE: "1" },
+			deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false),
+		});
+		expect(getTelemetryContext()?.agent).toBe("cursor");
+	});
+
+	it("clears an agent an earlier bootstrap inferred when a re-bootstrap does not opt in", async () => {
+		// The trap behind PluginBootstrapTelemetry passing inferAgentFromEnv: a
+		// second bootstrap REPLACES the context rather than merging into it.
+		const env = { CLAUDECODE: "1" };
+		await bootstrapTelemetry({ cwd, inferAgentFromEnv: true, env, deps: deps({}, false) });
+		expect(getTelemetryContext()?.agent).toBe("claude");
+		await bootstrapTelemetry({ cwd, env, deps: deps({}, false) });
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+	});
+
+	it("leaves the agent absent when nothing knows the host", async () => {
+		await bootstrapTelemetry({ cwd, env: {}, deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false) });
+		const ctx = getTelemetryContext();
+		expect(ctx?.enabled).toBe(true);
+		expect(ctx?.agent).toBeUndefined();
+	});
+
+	it("leaves the agent absent for an unrecognised explicit value", async () => {
+		await bootstrapTelemetry({
+			cwd,
+			agent: "windsurf",
+			inferAgentFromEnv: true,
+			env: { CLAUDECODE: "1" },
+			deps: deps({ jolliUrl: "https://acme.jolli.ai" }, false),
+		});
+		expect(getTelemetryContext()?.agent).toBeUndefined();
+	});
+
 	it("initializes context and fires app_installed on first run (created=true)", async () => {
 		await bootstrapTelemetry({ cwd, deps: deps({ jolliUrl: "https://acme.jolli.ai" }, true) });
 		const ctx = getTelemetryContext();

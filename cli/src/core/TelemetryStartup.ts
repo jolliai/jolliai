@@ -28,6 +28,7 @@ import {
 	saveConfig as defaultSaveConfig,
 } from "./SessionTracker.js";
 import { initTelemetry, track } from "./Telemetry.js";
+import { detectAgentFromEnv } from "./TelemetryAgent.js";
 import { clearTelemetryBuffer } from "./TelemetryBuffer.js";
 import { isTelemetryEnabled, shouldShowTelemetryNotice } from "./TelemetryConsent.js";
 import { flushTelemetry } from "./TelemetryFlusher.js";
@@ -37,6 +38,38 @@ export interface BootstrapTelemetryOptions {
 	readonly cwd: string;
 	/** Current AI/editor session id, when known. */
 	readonly sessionId?: string;
+	/**
+	 * The AI host this process is working in, for a caller that knows it
+	 * STRUCTURALLY — a plugin bootstrap only ever runs inside its own host, which
+	 * is a stronger claim than any marker. Beats {@link inferAgentFromEnv} when
+	 * both are given. An unrecognised value leaves the dimension absent rather
+	 * than defaulted — see `TelemetryAgent`.
+	 */
+	readonly agent?: string;
+	/**
+	 * Whether this process may infer its host from the env markers
+	 * (`TelemetryAgent.detectAgentFromEnv`). **Defaults to false — opt in.**
+	 *
+	 * The markers are only trustworthy under one condition: *this process is the
+	 * one the AI host just launched*. Env vars are inherited by every descendant
+	 * and never expire, so the condition holds for a short-lived CLI invocation or
+	 * a git hook, and fails for anything long-lived that has outlived the shell
+	 * that started it — a GUI extension host, the `ide-bridge` server. Cold-start
+	 * VS Code with `code .` from inside a Claude session and its extension host
+	 * carries `CLAUDECODE` for days, so every button click in that window would
+	 * report `agent: "claude"` while the user is clicking, not prompting.
+	 *
+	 * Off by default because the two mistakes are not symmetric, which is the same
+	 * asymmetry the whole dimension rests on: forgetting to opt a short-lived path
+	 * IN costs one channel's data, and data can be backfilled from the day someone
+	 * notices. Forgetting to opt a long-lived host OUT produces confident wrong
+	 * values that no later fix can separate from the true ones.
+	 *
+	 * Note it must be ON for anything that re-bootstraps mid-process — a second
+	 * bootstrap REPLACES the context, so leaving it off would clear an agent an
+	 * earlier bootstrap had correctly inferred.
+	 */
+	readonly inferAgentFromEnv?: boolean;
 	/** Host-platform opt-out (VS Code passes `!vscode.env.isTelemetryEnabled`). */
 	readonly platformDisabled?: boolean;
 	/** Env for the `DO_NOT_TRACK` check. Defaults to `process.env`. */
@@ -79,6 +112,7 @@ export async function bootstrapTelemetry(opts: BootstrapTelemetryOptions): Promi
 			cwd: opts.cwd,
 			installId,
 			sessionId: opts.sessionId,
+			agent: opts.agent ?? (opts.inferAgentFromEnv ? detectAgentFromEnv(opts.env) : undefined),
 			origin,
 			config,
 			platformDisabled: opts.platformDisabled,
