@@ -10,38 +10,46 @@
  *     invocation is an `exec_command` reading a `SKILL.md`. Covered here, with
  *     `detection: "heuristic"` on every entry, after 976 real calls across 1,503
  *     session files were measured.
- *   - **A skill concept whose only record is an inference, in a store this table
- *     cannot read** — Cursor. An earlier note here said a scan of 139 chat files and
- *     the IDE composer store found ZERO references, and concluded that no envelope
- *     existed to pin a matcher against; that is OUT OF DATE. Measured on Cursor
- *     3.15.x: `state.vscdb` under the app's `globalStorage` holds one `cursorDiskKV`
- *     row per conversation, keyed `composerData:<composerId>`, whose
- *     `fullConversationHeadersOnly` array carries one entry per bubble with `type`
- *     (1 = user, 2 = assistant), a millisecond `createdAt`, and — on a tool bubble —
- *     `grouping.toolCallCase` plus `grouping.toolDisplayPath`. A skill appears as
- *     `toolCallCase: "readToolCall"` whose path ends `skills/<name>/SKILL.md`, and it
- *     was captured live: a natural-language request naming the skill, then 44 s later
- *     a read of `.claude/skills/jolli-recall/SKILL.md`.
+ *   - **A skill concept with an explicit envelope, in a store an earlier
+ *     measurement never opened** — Cursor. Both Cursor sources are covered here.
+ *     A previous note said a scan of 139 chat files and the IDE composer store
+ *     found ZERO references and concluded no envelope existed; that was right about
+ *     where it looked and wrong about the conclusion. The block lives in
+ *     `~/.cursor/projects/<enc>/agent-transcripts/`, is explicit
+ *     (`<manually_attached_skills>` with `Skill Name:` / `Path:` pairs), and was
+ *     found in 4 of 10 real transcripts with an IDENTICAL shape for the IDE and the
+ *     CLI. Because it is a real record of the act, it carries NO `detection`
+ *     marker. It covers only the user-attached entry path — see
+ *     {@link scanCursorSkillLines} for why the agent-decided path is a separate,
+ *     complementary signal rather than a gap in this one.
  *
- *     An envelope therefore EXISTS, and it is the same KIND as Codex CLI's — a file
- *     read, not an entry event — so it would carry `detection: "heuristic"`. Two
- *     things still block a scanner, and neither of them is "no data". It is not
- *     line-oriented JSONL, so it needs a reader of its own the way OpenCode does
- *     rather than an entry in this table. And its coverage is UNMEASURED: in that
- *     same capture the agent read the `SKILL.md` and then went straight to
- *     `getMcpToolsToolCall`, so a skill whose body routes to MCP may well be entered
- *     with no file read to infer from at all. One conversation is not a corpus, which
- *     is what the warning below is about.
+ *     That complement has been LOCATED and is deliberately not served from this
+ *     table. Measured on Cursor 3.15.x: `state.vscdb` under the app's `globalStorage`
+ *     holds one `cursorDiskKV` row per conversation, keyed `composerData:<composerId>`,
+ *     whose `fullConversationHeadersOnly` array carries one entry per bubble with
+ *     `type` (1 = user, 2 = assistant), a millisecond `createdAt`, and — on a tool
+ *     bubble — `grouping.toolCallCase` plus `grouping.toolDisplayPath`. A skill
+ *     appears there as `toolCallCase: "readToolCall"` whose path ends
+ *     `skills/<name>/SKILL.md`, captured live: a natural-language request naming the
+ *     skill, then 44 s later a read of `.claude/skills/jolli-recall/SKILL.md`. It is
+ *     the same KIND of signal as Codex CLI's — a file read, not an entry event — so
+ *     it would carry `detection: "heuristic"`. Two things keep it out of this table
+ *     specifically, and neither of them is "no data": that store is not line-oriented
+ *     JSONL, so it needs a reader of its own the way OpenCode does; and its coverage
+ *     is UNMEASURED in both directions — in that same capture the agent read the
+ *     `SKILL.md` and then went straight to `getMcpToolsToolCall`, so a skill whose
+ *     body routes to MCP may well be entered with no file read to infer from at all,
+ *     while on the three manually-attached captures it matched 0 of 3 because the
+ *     block inlines the body. One conversation is not a corpus.
  *
- *     `ItemTable`'s `cursor.skills.recentlyUsed` is NOT a second source: a
+ *     `ItemTable`'s `cursor.skills.recentlyUsed` is NOT a further source: a
  *     machine-global LRU of `<name>/SKILL.md` strings carrying no time, no
  *     conversation and no entry path, so it can prove a skill was used and no more.
- *
  *   - **A skill concept with no on-disk invocation record at all** — Copilot CLI,
- *     whose `forge_skill_proposals` is an authoring table, not an invocation log. No
- *     matcher may be written until a real invocation is captured from a live run —
- *     this repo has shipped a parser whose fixtures and code were both imagined,
- *     which agreed with each other and with nothing real.
+ *     whose `forge_skill_proposals` is an authoring table, not an invocation log.
+ *     No matcher may be written until a real invocation is captured from a live
+ *     run — this repo has shipped a parser whose fixtures and code were both
+ *     imagined, which agreed with each other and with nothing real.
  *
  * OpenCode IS covered, but not through this table: its transcripts are SQLite rows
  * rather than JSONL lines, so it has its own reader
@@ -52,6 +60,7 @@
 import type { SkillSource, TranscriptSource } from "../../Types.js";
 import { type SkillScanResult, scanClaudeSkillLines } from "./ClaudeSkillScanner.js";
 import { scanCodexSkillLines } from "./CodexSkillScanner.js";
+import { scanCursorSkillLines } from "./CursorSkillScanner.js";
 import { scanKimiSkillLines } from "./KimiSkillScanner.js";
 
 /** Scans already-read transcript lines for skill invocations. */
@@ -67,6 +76,14 @@ const SCANNERS: Partial<Record<TranscriptSource, { source: SkillSource; scan: Sk
 	// Kimi ships a real `Skill` tool, so its invocations are OBSERVED (no
 	// `detection` marker) — its wire.jsonl carries a `tool.call` named "Skill".
 	kimi: { source: "kimi", scan: scanKimiSkillLines },
+	// BOTH Cursor sources, one scanner, one `SkillSource`. They read the same
+	// `agent-transcripts` JSONL and the envelope's shape is identical in each, so a
+	// second entry would only duplicate the matcher. `source: "cursor"` for both
+	// deliberately: the two share one user-facing "Cursor" toggle (`cursorEnabled`),
+	// so splitting the registry key `<source>:<skill>` would show one user's skill
+	// twice for a distinction nothing else in the product makes.
+	cursor: { source: "cursor", scan: scanCursorSkillLines },
+	"cursor-cli": { source: "cursor", scan: scanCursorSkillLines },
 };
 
 /** The scanner for `source`, or undefined when that source has no skill extraction. */

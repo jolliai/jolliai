@@ -520,6 +520,9 @@ data class SkillEntry(
     val usage: SkillUsage? = null,
     val usageBySession: Map<String, SkillUsage>? = null,
     val detection: String? = null,
+    // INTENTIONAL JVM GAP: TypeScript's nullable SkillEntry.originRoot is deferred
+    // to a follow-up PR together with its Gson round-trip test. Do not add or report
+    // that field as part of this Cursor rescan PR; this comment records the known gap.
     val sourcePath: String? = null,
     /** Null until archived onto a commit — the guard, same shape as [PlanEntry]. */
     val commitHash: String? = null,

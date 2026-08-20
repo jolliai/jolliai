@@ -30,7 +30,14 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 import { createLogger, getJolliMemoryDir } from "../../Logger.js";
-import type { SkillEntryPath, SkillInvocation, SkillSource, SkillUsage, SkillUse } from "../../Types.js";
+import type {
+	SkillEntryPath,
+	SkillInvocation,
+	SkillOriginRoot,
+	SkillSource,
+	SkillUsage,
+	SkillUse,
+} from "../../Types.js";
 
 const log = createLogger("SkillStore");
 
@@ -134,6 +141,8 @@ export interface WriteSkillResult {
 	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
 	/** Post-fold detection quality — sticky once heuristic. */
 	readonly detection?: "heuristic";
+	/** Post-fold origin root — NEWEST wins, unlike sticky `detection`. */
+	readonly originRoot?: SkillOriginRoot;
 }
 
 /**
@@ -186,6 +195,7 @@ export async function writeSkillMarkdown(use: SkillUse, cwd: string): Promise<Wr
 		...(folded.usage !== undefined ? { usage: folded.usage } : {}),
 		...(folded.usageBySession !== undefined ? { usageBySession: folded.usageBySession } : {}),
 		...(folded.detection !== undefined ? { detection: folded.detection } : {}),
+		...(folded.originRoot !== undefined ? { originRoot: folded.originRoot } : {}),
 	};
 }
 
@@ -205,6 +215,16 @@ export interface SkillFileContent {
 	readonly usageBySession?: Readonly<Record<string, SkillUsage>>;
 	/** Sticky: a skill inferred once stays marked inferred. */
 	readonly detection?: "heuristic";
+	/**
+	 * Which skill root the host last loaded this skill from.
+	 *
+	 * Deliberately NOT sticky, which is the one way it differs from `detection`
+	 * beside it: a skill genuinely moves between roots (a repo gains
+	 * `.cursor/skills/` when `.agents/skills/` stops supplying it), so the newest
+	 * observation is the truth and pinning the first would report a root the host
+	 * has stopped using.
+	 */
+	readonly originRoot?: SkillOriginRoot;
 	/** Sticky once set: a file that has announced a trim keeps saying so. */
 	readonly trimmed: boolean;
 }
@@ -340,6 +360,14 @@ export function foldSkillUse(use: SkillUse, prior: SkillFileContent | undefined)
 		...(use.detection !== undefined || prior?.detection !== undefined
 			? { detection: use.detection ?? prior?.detection }
 			: {}),
+		// The OPPOSITE of sticky, and the opposite order of the line above: this pass's
+		// root wins when it has one, and the prior value survives only as the fallback
+		// for a pass that reports none. A skill really does move between roots, so the
+		// newest observation is the truth — pinning the first would keep naming a root
+		// the host has stopped loading from.
+		...(use.originRoot !== undefined || prior?.originRoot !== undefined
+			? { originRoot: use.originRoot ?? prior?.originRoot }
+			: {}),
 		trimmed,
 	};
 }
@@ -401,6 +429,7 @@ export function renderSkillMarkdown(content: SkillFileContent): string {
 	lines.push(`firstUsedAt: ${JSON.stringify(content.firstUsedAt)}`);
 	lines.push(`lastUsedAt: ${JSON.stringify(content.lastUsedAt)}`);
 	if (content.detection !== undefined) lines.push(`detection: ${JSON.stringify(content.detection)}`);
+	if (content.originRoot !== undefined) lines.push(`originRoot: ${JSON.stringify(content.originRoot)}`);
 	if (content.usage !== undefined) lines.push(`usage: ${JSON.stringify(content.usage)}`);
 	// The per-session split is the authoritative record, so it must survive the
 	// round-trip; `usage` above is its recomputed total.
@@ -467,6 +496,7 @@ export function parseSkillMarkdownFromString(content: string): SkillFileContent 
 	const usage = scalars.get("usage");
 	const usageBySession = scalars.get("usageBySession");
 	const detection = scalars.get("detection");
+	const originRoot = scalars.get("originRoot");
 	const entryPaths = scalars.get("entryPaths");
 	const invocationCount = scalars.get("invocationCount");
 	const firstUsedAt = scalars.get("firstUsedAt");
@@ -486,6 +516,11 @@ export function parseSkillMarkdownFromString(content: string): SkillFileContent 
 		...(isSkillUsage(usage) ? { usage } : {}),
 		...(isUsageBySession(usageBySession) ? { usageBySession } : {}),
 		...(detection === "heuristic" ? { detection: "heuristic" as const } : {}),
+		// Validated against the union rather than accepted as any string: this file is
+		// hand-editable, and an unrecognised value would flow into the panel as a root
+		// that does not exist. A bad value degrades to absent, which reads as "the
+		// source does not report a path" — the honest answer for a value we cannot trust.
+		...(isSkillOriginRoot(originRoot) ? { originRoot } : {}),
 		trimmed: content.includes(SKILL_TRIM_SENTINEL),
 	};
 }
@@ -553,6 +588,26 @@ function parseInvocationLine(line: string): SkillInvocation | null {
 		...(outcomeObserved !== undefined ? { outcomeObserved } : {}),
 		ok,
 	};
+}
+
+/**
+ * The valid {@link SkillOriginRoot} values, for validating a hand-editable file.
+ *
+ * Listed rather than derived: the type is a string union, which erases at runtime,
+ * so a `Set` is the only way to check one. Adding a member to the union means
+ * adding it here — `SkillStore.test.ts` pins the pair.
+ */
+const SKILL_ORIGIN_ROOTS: ReadonlySet<string> = new Set<SkillOriginRoot>([
+	"cursor-global",
+	"repo-agents",
+	"repo-cursor",
+	"plugin-bundle",
+	"other-host",
+	"unknown",
+]);
+
+function isSkillOriginRoot(value: unknown): value is SkillOriginRoot {
+	return typeof value === "string" && SKILL_ORIGIN_ROOTS.has(value);
 }
 
 function isUsageBySession(value: unknown): value is Readonly<Record<string, SkillUsage>> {

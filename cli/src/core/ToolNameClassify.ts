@@ -17,12 +17,21 @@
  *
  *   - `mcp__<server>__<tool>` — Claude, and Kimi verbatim (see
  *     `KimiEnvelopeParser`, which reuses Claude's match path for exactly this
- *     reason). Also cursor-agent and the Cline CLI, both of which speak the
- *     Anthropic block format.
+ *     reason). Also the Cline CLI, which speaks the Anthropic block format.
  *   - `<namespace>` + bare `<name>` — Codex, whose MCP identity lives in a
  *     sibling field (`payload.namespace`, or `invocation.server`) rather than
  *     inside the name. Its builtin names are bare and undecorated
  *     (`exec_command`, `wait`, `apply_patch` — real 2026-07/08 rollouts).
+ *   - **one generic builtin + identity in `input`** — Cursor (both the IDE's
+ *     Agents Window and cursor-agent). This entry used to say cursor-agent spoke
+ *     the `mcp__` dialect "because it speaks the Anthropic block format"; the
+ *     block format is real but the naming inference from it was wrong. Measured
+ *     across 10 real transcripts: every MCP call is a `tool_use` named
+ *     `CallMcpTool` whose `input` carries `{server, toolName, arguments}`, and the
+ *     corpus contains ZERO `mcp__` names. Run through the `mcp__` classifier
+ *     those three real calls to `jollimemory/search` all landed as one
+ *     `builtin:CallMcpTool` bucket with no server — which is precisely the silent
+ *     failure the paragraph above describes, shipped.
  *   - bare names only — Gemini (`run_shell_command`, `read_file`, `grep_search`
  *     — real `~/.gemini/tmp/<project>/chats/session-*.json`) and OpenCode
  *     (`data.tool`, see `OpenCodeSkillScanner`). Neither corpus contains a name
@@ -105,6 +114,41 @@ export function classifyCodexToolName(name: string, namespace?: string): ToolCal
 	return mcpTool(server, name);
 }
 
+/** The generic builtin Cursor routes every MCP invocation through. */
+const CURSOR_MCP_TOOL = "CallMcpTool";
+
+/**
+ * Classifies a Cursor tool call, whose MCP identity lives in `input` rather than
+ * in the name.
+ *
+ * Cursor exposes exactly one MCP entry point — `CallMcpTool` — and puts the
+ * server and tool inside its arguments:
+ *
+ *     { "name": "CallMcpTool",
+ *       "input": { "server": "jollimemory", "toolName": "search",
+ *                  "description": "…", "arguments": { … } } }
+ *
+ * Everything else is a bare builtin (`Shell`, `Read`, `WebSearch`, `WebFetch` —
+ * real 2026-08 transcripts).
+ *
+ * `GetMcpTools` is deliberately NOT treated as an MCP call. It is Cursor's
+ * DISCOVERY call — it lists or filters the available tools (`{"pattern":"jolli"}`,
+ * `{"server":"jollimemory","toolName":"search"}`) and invokes nothing — so
+ * counting it as `mcp` would inflate every MCP figure with calls that never
+ * reached a server. It stays a builtin, which is what it is.
+ *
+ * A `CallMcpTool` whose `input` names no server is kept as a builtin rather than
+ * filed under an empty server: the call is real and must not be dropped, but
+ * inventing a server for it would put a nameless row in the dashboard's
+ * group-by-server ranking.
+ */
+export function classifyCursorToolName(name: string, input?: unknown): ToolCallCount {
+	if (name !== CURSOR_MCP_TOOL || input === null || typeof input !== "object") return builtinTool(name);
+	const { server, toolName } = input as { server?: unknown; toolName?: unknown };
+	if (typeof server !== "string" || server.length === 0) return builtinTool(name);
+	return mcpTool(server, typeof toolName === "string" ? toolName : "");
+}
+
 /**
  * Accumulates one slice's tool calls into the `ToolCallCount[]` the readers
  * return.
@@ -150,7 +194,18 @@ function mergeLastCallAt(a: ToolCallCount, b: ToolCallCount): { lastCallAtMs?: n
  * switches on the source instead of on the field's presence goes stale the
  * moment a parser is taught to stamp one.
  */
-export const TOOL_CALL_TIME_SOURCES: ReadonlyArray<string> = ["claude", "codex", "kimi", "cursor-cli", "antigravity"];
+export const TOOL_CALL_TIME_SOURCES: ReadonlyArray<string> = [
+	"claude",
+	"codex",
+	"kimi",
+	// Both Cursor sources, because both are now read by the same JSONL reader. The
+	// stamp is not a record field — the JSONL carries none — but every user turn's
+	// TEXT embeds `<timestamp>Thursday, Aug 20, 2026, 4:00 PM (UTC+8)</timestamp>`,
+	// present in 10/10 real transcripts at minute resolution.
+	"cursor",
+	"cursor-cli",
+	"antigravity",
+];
 
 export class ToolUseTally {
 	private readonly byKey = new Map<string, ToolCallCount>();

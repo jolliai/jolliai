@@ -112,6 +112,22 @@ describe("recordSessionFromHook", () => {
 		expect(String(repos[0].repo_identity)).toMatch(/^local:[0-9a-f]{32}$/);
 	});
 
+	it("persists a metadata-only row when a live hook has no transcript path", async () => {
+		const ok = await recordSessionFromHook(
+			"/repo",
+			{
+				sessionId: "pathless",
+				updatedAt: "2026-07-30T08:05:00Z",
+				source: "cursor",
+			},
+			dbPath,
+		);
+		expect(ok).toBe(true);
+
+		const rows = await readRows("SELECT source, session_id, message_count FROM sessions");
+		expect(rows).toEqual([{ source: "cursor", session_id: "pathless", message_count: null }]);
+	});
+
 	it("skips silently when the runtime lacks flag-free node:sqlite", async () => {
 		vi.mocked(canUseDashboardDb).mockReturnValue(false);
 		const ok = await recordSessionFromHook("/repo", sessionInfo(), dbPath);

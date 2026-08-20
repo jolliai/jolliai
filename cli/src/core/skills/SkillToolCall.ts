@@ -34,6 +34,7 @@ export function skillUseToToolCall(use: SkillUse, usage: SkillUsage | undefined)
 		kind: "skill",
 		calls: use.invocations.length,
 		...(use.plugin !== undefined ? { plugin: use.plugin } : {}),
+		...(use.originRoot !== undefined ? { originRoot: use.originRoot } : {}),
 		...(Number.isFinite(lastCallAtMs) ? { lastCallAtMs } : {}),
 		// Absent stays absent — see `ToolCallCount.usage`. A zeroed bucket would price
 		// an unmeasured skill at nothing rather than reporting it as unmeasured.

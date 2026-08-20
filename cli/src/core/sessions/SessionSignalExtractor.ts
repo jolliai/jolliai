@@ -186,6 +186,9 @@ export function mergeToolCalls(groups: ReadonlyArray<ReadonlyArray<ToolCallCount
 			   resolves a namespace or marks an inference, so at most one side has a value. */
 			const detection = seen.detection ?? call.detection;
 			const plugin = seen.plugin ?? call.plugin;
+			/* Same rule again: only the skill extractor reads a skill's path, so at most
+			   one side carries a root. */
+			const originRoot = seen.originRoot ?? call.originRoot;
 			merged.set(key, {
 				...seen,
 				// `server` rides along from whichever side has it: only MCP buckets carry
@@ -203,6 +206,7 @@ export function mergeToolCalls(groups: ReadonlyArray<ReadonlyArray<ToolCallCount
 				...(invocations !== undefined ? { invocations } : {}),
 				...(detection !== undefined ? { detection } : {}),
 				...(plugin !== undefined ? { plugin } : {}),
+				...(originRoot !== undefined ? { originRoot } : {}),
 			});
 		}
 	}

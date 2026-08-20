@@ -59,6 +59,19 @@ import { observeWorktree } from "./StatsWriter.js";
 const log = createLogger("DashboardCollector");
 
 /**
+ * The facts a live hook can know before a transcript is nameable.
+ *
+ * Discoverers always supply a full {@link SessionInfo}. Cursor's stop hook normally
+ * does too, but a defensive fallback must still be able to persist the host-provided
+ * session id when neither transcript-path channel was populated. Keeping that narrower
+ * shape at this collector boundary avoids inventing a path and putting it into the
+ * resumable `sessions.json` registry.
+ */
+export type SessionEventInfo = Omit<SessionInfo, "transcriptPath"> & {
+	readonly transcriptPath?: string;
+};
+
+/**
  * Normalises a transcript's per-model usage into the dashboard's own shape,
  * pricing each model as it goes. Shared by the live read path
  * ({@link sessionEventFromInfo}) and the stored-transcript path
@@ -353,6 +366,30 @@ export interface CollectSessionsOptions {
 	 * `(source, sessionId)` reconciles; the cost of a missing one is lost sessions.
 	 */
 	readonly checkoutRoots?: ReadonlyArray<string>;
+	/**
+	 * The AI-agent toggles, as a predicate. Absent means "every source", which is what
+	 * a caller with no opinion wants and what every pre-existing caller gets.
+	 *
+	 * Applied TWICE, deliberately, because a session reaches this function by two
+	 * different kinds of route and one filter cannot cover both:
+	 *
+	 *   - It narrows the SOURCE REGISTRY, so a switched-off agent's store is never
+	 *     OPENED — neither by the caller's machine-wide pre-scan (which it narrows
+	 *     separately, with the same predicate) nor by `scanForRepoThunks`' per-repo
+	 *     fallback, which would otherwise fire for exactly the sources the pre-scan
+	 *     skipped and turn "do not scan this" into "scan it once per repo instead".
+	 *   - It drops SESSIONS the hook registry supplied. `sessions.json` is one
+	 *     per-project file holding every source's hook-written rows, so it is read
+	 *     regardless and the rows have to be filtered rather than the read avoided.
+	 *     This is what `QueueWorker` has always done via
+	 *     `filterSessionsByEnabledIntegrations`.
+	 *
+	 * The second is not redundant, and the reason is easy to miss: **`gemini` is not in
+	 * {@link SESSION_SOURCES} at all** — it has no disk discoverer, so the registry is
+	 * its ONLY route. Filtering sessions by registry membership instead of by this
+	 * predicate would delete every Gemini session on the machine.
+	 */
+	readonly isSourceAllowed?: (source: TranscriptSource) => boolean;
 	/** Injected for tests. Defaults to {@link loadAllSessions}. */
 	readonly loadSessions?: SessionLoader;
 	/**
@@ -540,26 +577,35 @@ async function resolveTitle(s: SessionInfo): Promise<string | undefined> {
  */
 export async function sessionEventFromInfo(
 	repoIdentity: string,
-	s: SessionInfo,
+	s: SessionEventInfo,
 	readUsage: typeof readTranscript = readTranscript,
 ): Promise<SessionUpsertedEvent | null> {
 	const source: TranscriptSource = s.source ?? "claude";
 	const updatedAtMs = Date.parse(s.updatedAt);
 	if (!Number.isFinite(updatedAtMs)) return null;
-	const title = await resolveTitle(s);
+	const transcriptPath = s.transcriptPath;
+	// Resolving a fallback title reads the transcript too. With no path, retain only a
+	// native title the hook happened to know and build the metadata-only row below.
+	const title = transcriptPath ? await resolveTitle({ ...s, transcriptPath }) : s.title || undefined;
 	const base = {
 		type: "session.upserted" as const,
 		repoIdentity,
 		source,
 		sessionId: s.sessionId,
+		...(!transcriptPath ? { metadataOnly: true as const } : {}),
 		...(title ? { title } : {}),
 		updatedAtMs,
 	};
+	// Cursor normally names this path in both the payload and the environment. If a
+	// build supplies neither, the session id is still durable evidence of a completed
+	// conversation. Do not fabricate a path: a later disk discovery can enrich this
+	// same `(source, sessionId)` row with the full transcript.
+	if (!transcriptPath) return base;
 	// One memoised view of this conversation, shared by the token/duration read below
 	// and by every extractor. Without the memo, each extractor that wanted the
 	// transcript would open it again — so adding one would silently add a whole-file
 	// read per session.
-	const sessionContent = sessionContentFor(source, s.transcriptPath, readUsage);
+	const sessionContent = sessionContentFor(source, transcriptPath, readUsage);
 	try {
 		// Cursor-less, so this is the WHOLE session rather than a slice. Two things
 		// downstream depend on that and would fail quietly against a partial read:
@@ -597,7 +643,7 @@ export async function sessionEventFromInfo(
 		const signals = await extractSessionSignals({
 			source,
 			sessionId: s.sessionId,
-			transcriptPath: s.transcriptPath,
+			transcriptPath,
 			content: sessionContent,
 		});
 		return {
@@ -826,8 +872,13 @@ export async function collectSessionEvents(opts: CollectSessionsOptions): Promis
 	// linked checkouts and reaches no other clone's `.git` — while `worktreeRoots` is
 	// deliberately a union ACROSS clones (two checkouts of one remote share an
 	// identity). See `CollectSessionsOptions.checkoutRoots`.
-	const spanning = SESSION_SOURCES.filter((def) => def.forRepoSpansWorktrees);
-	const perRootDefs = SESSION_SOURCES.filter((def) => !def.forRepoSpansWorktrees);
+	// Narrowed by the AI-agent toggles BEFORE the split, so a switched-off agent's
+	// store is not opened by either half — see `CollectSessionsOptions.isSourceAllowed`
+	// for why the per-repo fallback is the half that matters here.
+	const allowed = opts.isSourceAllowed ?? (() => true);
+	const definitions = SESSION_SOURCES.filter((def) => allowed(def.source));
+	const spanning = definitions.filter((def) => def.forRepoSpansWorktrees);
+	const perRootDefs = definitions.filter((def) => !def.forRepoSpansWorktrees);
 	const checkouts = dedupeRoots([opts.cwd, ...(opts.checkoutRoots ?? [])]);
 	const perRoot = await Promise.all(
 		roots.map(async (root) => [
@@ -845,7 +896,13 @@ export async function collectSessionEvents(opts: CollectSessionsOptions): Promis
 			...(await preScannedForRepo(preScanned, root, opts.windowMs, spanning)),
 		]),
 	);
-	const sessions = [...perRoot.flat(), ...perCheckout.flat()];
+	// The second application of the gate, and NOT redundant with narrowing the registry
+	// above: the hook registry (`sessions.json`) is one per-project file holding every
+	// source's rows, so it is read whatever the toggles say and its rows have to be
+	// dropped here. Filtering on the PREDICATE rather than on `definitions` is
+	// load-bearing — `gemini` has no `SESSION_SOURCES` entry (no disk discoverer), so a
+	// membership test would delete every Gemini session on the machine.
+	const sessions = [...perRoot.flat(), ...perCheckout.flat()].filter((s) => allowed(s.source ?? "claude"));
 
 	// Dedupe on (source, id), newest wins — two discoverers can surface the same
 	// session (e.g. a registry entry and a rescan of the same store).

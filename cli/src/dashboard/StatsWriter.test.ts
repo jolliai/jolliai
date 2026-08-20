@@ -1173,6 +1173,41 @@ describe("skill_invocations projection", () => {
 		).toEqual([{ plugin: "superpowers" }]);
 	});
 
+	it("stores the skill's origin root — the only provenance a non-namespacing host has", async () => {
+		// Cursor does not namespace plugin skills, so `plugin` is permanently NULL there
+		// and the ROOT is the only thing separating a plugin-supplied skill from the
+		// repo's own. Both columns exist because they answer different questions.
+		await applyStatsEvents([sessionEvent([skillBucket({ originRoot: "plugin-bundle" })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect(
+			await query<{ plugin: string | null; origin_root: string | null }>(
+				"SELECT plugin, origin_root FROM session_tool_use WHERE kind = 'skill'",
+			),
+		).toEqual([{ plugin: null, origin_root: "plugin-bundle" }]);
+	});
+
+	it("lets a MOVED skill re-root itself, unlike a namespace", async () => {
+		// A skill really does move between roots (a repo gains `.cursor/skills/` when
+		// `.agents/skills/` stops supplying it) and the scanner already resolves that by
+		// taking its newest observation — so an incoming value must WIN rather than be
+		// coalesced away. Contrast the enrichment test below, where absence preserves.
+		await applyStatsEvents([sessionEvent([skillBucket({ originRoot: "repo-agents" })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await applyStatsEvents([sessionEvent([skillBucket({ originRoot: "repo-cursor" })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect(
+			await query<{ origin_root: string | null }>(
+				"SELECT origin_root FROM session_tool_use WHERE kind = 'skill'",
+			),
+		).toEqual([{ origin_root: "repo-cursor" }]);
+	});
+
 	it("keeps stored skill enrichment when a later read cannot reproduce it", async () => {
 		await applyStatsEvents(
 			[
@@ -1192,7 +1227,8 @@ describe("skill_invocations projection", () => {
 		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
 		expect(
 			await query<Record<string, unknown>>(
-				`SELECT last_call_at_ms, input_tokens, output_tokens, cached_tokens, usage_confidence, plugin
+				`SELECT last_call_at_ms, input_tokens, output_tokens, cached_tokens, usage_confidence, plugin,
+				        origin_root
 				   FROM session_tool_use WHERE kind = 'skill'`,
 			),
 		).toEqual([
@@ -1203,8 +1239,25 @@ describe("skill_invocations projection", () => {
 				cached_tokens: 5,
 				usage_confidence: "attributed",
 				plugin: "superpowers",
+				origin_root: null,
 			},
 		]);
+	});
+
+	it("keeps a stored origin root when a later read reports none", async () => {
+		// The other half of the rule above: "the incoming value wins" applies to a read
+		// that HAS one. A pass that could not resolve a path at all (a slice with no
+		// skill block in it) must not blank a root an earlier read established.
+		await applyStatsEvents([sessionEvent([skillBucket({ originRoot: "repo-agents" })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		expect(
+			await query<{ origin_root: string | null }>(
+				"SELECT origin_root FROM session_tool_use WHERE kind = 'skill'",
+			),
+		).toEqual([{ origin_root: "repo-agents" }]);
 	});
 });
 
@@ -1848,6 +1901,40 @@ describe("projectSession — monotonic guard", () => {
 
 		expect(await query("SELECT model, input_tokens FROM session_model_usage")).toEqual([
 			{ model: "claude-opus-5", input_tokens: 900 },
+		]);
+	});
+
+	it("does not let a pathless hook row block the later full disk read", async () => {
+		await applyStatsEvents([envelope(read({ updatedAtMs: 1_700_000_000_000, messageCount: 4 }))], {
+			producerKind: "cli",
+			dbPath,
+		});
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						updatedAtMs: 1_700_000_200_000,
+						metadataOnly: true,
+						messageCount: undefined,
+						models: undefined,
+						tokenCoverage: undefined,
+					}),
+				),
+			],
+			{ producerKind: "stop-hook", dbPath },
+		);
+		// The hook's wall clock is newer than the transcript, but must not become the
+		// content high-water mark when it carried no content at all.
+		expect(await query("SELECT updated_at_ms, message_count FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_000_000, message_count: 4 },
+		]);
+
+		await applyStatsEvents([envelope(read({ updatedAtMs: 1_700_000_100_000, messageCount: 9 }))], {
+			producerKind: "recovery",
+			dbPath,
+		});
+		expect(await query("SELECT updated_at_ms, message_count FROM sessions")).toEqual([
+			{ updated_at_ms: 1_700_000_100_000, message_count: 9 },
 		]);
 	});
 
