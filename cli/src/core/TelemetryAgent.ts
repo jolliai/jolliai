@@ -62,11 +62,13 @@
  *    than by a disk scan — can reach `ai_source_detected`.
  *
  * So the gap is a CLI command run from a host with no marker of its own: `kimi`,
- * `copilot`, `cline`, `devin`, `antigravity` and the two Cursor tokens are
- * attributed at commit time but not on `command_invoked`. Closing one means a
- * real capture of that host's environment, added to {@link AGENT_ENV_MARKERS} —
- * an unmeasured key would be the guessing this module exists to refuse, and a
- * wrong marker is worse than the omission it replaces.
+ * `copilot`, `cline`, `devin` and `antigravity` are attributed at commit time
+ * but not on `command_invoked`. Closing one means a real capture of that host's
+ * environment, added to {@link AGENT_ENV_MARKERS} — an unmeasured key would be
+ * the guessing this module exists to refuse, and a wrong marker is worse than
+ * the omission it replaces. Cursor was in this list until its environment was
+ * actually captured; {@link AGENT_ENV_FAMILIES} records what that took, and it
+ * is the worked example for closing another.
  *
  * ## The vocabulary is derived, not restated
  *
@@ -125,12 +127,21 @@ export const AGENT_DIMENSION_SINCE_VERSION = "0.99.14";
 /**
  * Env markers that name **exactly one** host, each set by that host itself.
  *
- * Taken from `CaptureProgress.AGENT_ENV_KEYS`, which the post-commit hook
- * already trusts to decide whether a human is watching stdout — the same
- * measured set, read for a different question. `CODEX_THREAD_ID` in particular
- * is the measured Codex entry (present across interactive TUI and `codex exec`,
- * sandboxed and full-access alike, and scoped to command execution so Codex's
- * own lifecycle hooks cannot mistake themselves for the agent's shell).
+ * Drawn from `CaptureProgress.AGENT_ENV_KEYS`, which the post-commit hook uses
+ * to decide whether a human is watching stdout — a different question off the
+ * same signal. Deliberately NOT imported from it, and the two must not be
+ * merged: that list only needs "is an agent driving this", so one entry per
+ * family is enough, while this one has to name WHICH host and therefore splits
+ * families (see {@link AGENT_ENV_FAMILIES}) and refuses ambiguous keys.
+ *
+ * Keeping them separate is not hypothetical tidiness — that list's Cursor entry
+ * (`CURSOR_TRACE_ID`) turns out not to exist; see
+ * {@link AMBIGUOUS_AGENT_ENV_KEYS}. So treat "it is in that list" as a lead, not
+ * as evidence: every entry here should be traceable to a capture. `CODEX_THREAD_ID`
+ * is (present across interactive TUI and `codex exec`, sandboxed and full-access
+ * alike, and scoped to command execution so Codex's own lifecycle hooks cannot
+ * mistake themselves for the agent's shell), and `CLAUDECODE` was confirmed on a
+ * live machine, including in an MCP server Claude Code had spawned.
  *
  * Order carries no meaning: {@link detectAgentFromEnv} requires the matches to
  * agree rather than taking the first, so a precedence here could only hide an
@@ -144,19 +155,91 @@ export const AGENT_ENV_MARKERS: ReadonlyArray<readonly [string, TelemetryAgent]>
 ];
 
 /**
- * Markers that mark an agent session but not **which** agent, so they are
- * deliberately unmapped:
+ * A host family whose presence marker cannot name the variant on its own, plus
+ * the markers that do.
  *
- *  - `AI_AGENT` is generic — Claude Code sets it, and it names no host at all.
- *  - `CURSOR_TRACE_ID` names the Cursor *family*, and we have no measurement
- *    separating the IDE (`cursor`) from `cursor-agent` (`cursor-cli`). That
- *    distinction is part of what makes this dimension worth adding — `surface`
- *    can never draw it — so collapsing the two would spend the value we are
- *    here to gain. Mapping it needs a real capture of both, not a guess.
+ * Cursor is the only one, and it is the reason this shape exists rather than a
+ * second flat entry: `cursor` (the IDE) and `cursor-cli` (`cursor-agent`) must
+ * stay separate tokens — `surface` can never draw that line, and drawing it is
+ * part of what makes this dimension worth having — so collapsing them to a
+ * single "cursor" would spend the value we are here to gain.
+ */
+export interface AgentEnvFamily {
+	/** Set in every one of this family's contexts, and in no other. */
+	readonly familyKey: string;
+	/** Evidence for one variant each. Must be mutually exclusive. */
+	readonly variants: ReadonlyArray<readonly [string, TelemetryAgent]>;
+}
+
+/**
+ * Measured on Cursor (macOS, 2026-08) by dumping `CURSOR_*` in the three
+ * contexts that matter, which is what makes the split safe. The parent process
+ * is recorded beside each because it is what proves the three samples really
+ * came from three different places, rather than three runs of one shell:
  *
- * They are listed rather than merely absent so the omission reads as a decision.
- * Cursor is therefore a **known gap** in env-based attribution; the Cursor
- * plugin's own bootstrap still attributes structurally.
+ *   IDE agent    parent `Cursor Helper (Plugin): extension-host`
+ *                CURSOR_AGENT, CURSOR_CONVERSATION_ID, CURSOR_LAYOUT,
+ *                CURSOR_RIPGREP_PATH, CURSOR_WORKSPACE_LABEL
+ *   cursor-agent parent `~/.local/bin/agent`
+ *                CURSOR_AGENT, CURSOR_ASKPASS_SECRET, CURSOR_ASKPASS_SOCKET,
+ *                CURSOR_CONVERSATION_ID, CURSOR_INVOKED_AS, CURSOR_RIPGREP_PATH
+ *   human shell  parent `Cursor Helper: terminal pty-host`
+ *                (nothing at all)
+ *
+ * Those parent names separate the three contexts more sharply than the env does,
+ * and were still rejected as the SIGNAL. Reading them costs a `ps` subprocess on
+ * macOS (no `/proc`, and Node exposes only `ppid`) on a path that runs ahead of
+ * every command dispatch and inside `<5ms` git hooks. They are display strings
+ * that vary by platform and version, and `agent` is a basename from one install
+ * layout. Decisively, the parent link is broken exactly where env inheritance is
+ * most useful: `QueueWorker` is a DETACHED spawn, so it is reparented away from
+ * whatever committed, while the env it was handed survives intact.
+ *
+ * `CURSOR_AGENT` is the family gate because the third row is what makes it
+ * usable: it is absent when a person types in Cursor's own integrated terminal,
+ * so mapping it cannot label human work as an agent's — a failure that would be
+ * worse than the gap it replaces, since it attacks the field's whole meaning.
+ *
+ * The variant keys are chosen for semantics, not just for having differed once:
+ * a CLI has no workspace label or editor layout, and `CURSOR_INVOKED_AS` names
+ * how the binary was started. `CURSOR_LAYOUT` (IDE) and the `CURSOR_ASKPASS_*`
+ * pair (CLI) discriminated identically and are held in reserve — one key per
+ * side keeps a future rename degrading to *unknown* rather than to a coin flip.
+ * `CURSOR_CONVERSATION_ID` and `CURSOR_RIPGREP_PATH` appear on both sides and so
+ * could serve as the gate, but neither says "agent" in its name.
+ *
+ * One Cursor context stays unattributed and is not covered by any of this: an
+ * MCP server Cursor spawned carries no `CURSOR_*` variable at all (measured on
+ * two live servers). That path is attributed only by the Cursor plugin's own
+ * bootstrap, which is structural.
+ */
+export const AGENT_ENV_FAMILIES: ReadonlyArray<AgentEnvFamily> = [
+	{
+		familyKey: "CURSOR_AGENT",
+		variants: [
+			["CURSOR_WORKSPACE_LABEL", "cursor"],
+			["CURSOR_INVOKED_AS", "cursor-cli"],
+		],
+	},
+];
+
+/**
+ * Markers that mark an agent session but not **which** agent, and that no
+ * variant marker rescues — so they are deliberately unmapped.
+ *
+ *  - `AI_AGENT` is generic. Claude Code sets it, and while its VALUE encodes a
+ *    host (`claude-code_2-1-234_agent` / `…_harness`, captured live), parsing a
+ *    value prefix is a guess until other hosts have been sampled — and for
+ *    Claude it is redundant with `CLAUDECODE` anyway.
+ *  - `CURSOR_TRACE_ID` was this list's original reason to exist, as the Cursor
+ *    family marker that could not name a variant. The capture above found it in
+ *    **none** of the three contexts, so it is kept here only as a guard: if some
+ *    other Cursor build does set it, it still cannot discriminate, and
+ *    `CURSOR_AGENT` is the marker that actually appears. Note
+ *    `CaptureProgress.AGENT_ENV_KEYS` still keys Cursor off it, which is a
+ *    separate, pre-existing bug in a different feature.
+ *
+ * Listed rather than merely absent so each omission reads as a decision.
  */
 export const AMBIGUOUS_AGENT_ENV_KEYS: ReadonlyArray<string> = ["AI_AGENT", "CURSOR_TRACE_ID"];
 
@@ -198,10 +281,27 @@ export function resolveTelemetryAgent(value: unknown): TelemetryAgent | undefine
 export function detectAgentFromEnv(env: NodeJS.ProcessEnv = process.env): TelemetryAgent | undefined {
 	if (isLocalAgentChild(env)) return undefined;
 	let found: TelemetryAgent | undefined;
+	const claim = (agent: TelemetryAgent): boolean => {
+		if (found !== undefined && found !== agent) return false;
+		found = agent;
+		return true;
+	};
 	for (const [key, agent] of AGENT_ENV_MARKERS) {
 		if (!isTruthyEnv(env[key])) continue;
-		if (found !== undefined && found !== agent) return undefined;
-		found = agent;
+		if (!claim(agent)) return undefined;
+	}
+	for (const family of AGENT_ENV_FAMILIES) {
+		if (!isTruthyEnv(env[family.familyKey])) continue;
+		// A present family gate that resolves to no single variant abandons the
+		// WHOLE answer rather than contributing nothing. Contributing nothing would
+		// let another host's marker win an environment this family is also present
+		// in — reporting a confident single host for a nested session — and it would
+		// equally let a future Cursor build that renamed both variant keys fall
+		// through to whatever else happened to be set.
+		const matched = new Set(family.variants.filter(([key]) => isTruthyEnv(env[key])).map(([, agent]) => agent));
+		const [only] = matched;
+		if (matched.size !== 1 || only === undefined) return undefined;
+		if (!claim(only)) return undefined;
 	}
 	return found;
 }

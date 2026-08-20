@@ -105,12 +105,31 @@ const SHORT_LIVED: ReadonlyArray<Row> = [
 	},
 	{ scenario: "OpenCode runs a command", inferAgentFromEnv: true, env: { OPENCODE: "1" }, expected: "opencode" },
 	{
-		scenario: "Cursor runs a command",
+		scenario: "Cursor IDE's agent runs a command",
 		inferAgentFromEnv: true,
-		env: { CURSOR_TRACE_ID: "abc" },
+		env: { CURSOR_AGENT: "1", CURSOR_CONVERSATION_ID: "c1", CURSOR_WORKSPACE_LABEL: "snake-game" },
+		expected: "cursor",
+	},
+	{
+		scenario: "cursor-agent CLI runs a command",
+		inferAgentFromEnv: true,
+		env: { CURSOR_AGENT: "1", CURSOR_CONVERSATION_ID: "c1", CURSOR_INVOKED_AS: "cursor-agent" },
+		expected: "cursor-cli",
+		because: "the IDE/CLI split `surface` can never draw, and the reason the family shape exists",
+	},
+	{
+		scenario: "human types in Cursor's own integrated terminal",
+		inferAgentFromEnv: true,
+		env: {},
 		expected: undefined,
-		because:
-			"the marker names the Cursor family and cannot separate `cursor` from `cursor-cli` — a known gap, not a default",
+		because: "measured: no CURSOR_* var reaches a human shell, so no agent is claimed for a person's own command",
+	},
+	{
+		scenario: "a Cursor build that renamed both variant markers",
+		inferAgentFromEnv: true,
+		env: { CURSOR_AGENT: "1" },
+		expected: undefined,
+		because: "a family present but unresolved abandons the answer rather than picking a side",
 	},
 	{
 		scenario: "Kimi / Copilot / Cline / Devin / Antigravity runs a command",
@@ -140,7 +159,7 @@ const SHORT_LIVED: ReadonlyArray<Row> = [
 		expected: "claude",
 	},
 	{
-		scenario: "MCP server Cursor spawned (measured: no marker at all)",
+		scenario: "MCP server Cursor spawned (measured: not even a CURSOR_* var)",
 		inferAgentFromEnv: true,
 		env: {},
 		expected: undefined,
@@ -199,7 +218,8 @@ const STRUCTURAL: ReadonlyArray<Row> = [
 		inferAgentFromEnv: true,
 		env: {},
 		expected: "cursor",
-		because: "the one place Cursor IS attributed, since env cannot do it",
+		because:
+			"still the only thing that attributes a Cursor MCP session — those servers carry no CURSOR_* var at all (measured)",
 	},
 	{
 		scenario: "hand-run `jolli enable --repo-hooks-only` (no source tag) inside Claude Code",

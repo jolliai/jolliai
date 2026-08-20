@@ -8,6 +8,7 @@ import type { PluginBootstrapHost } from "./localagent/PluginDefaults.js";
 import { SESSION_SOURCES } from "./sessions/SessionSources.js";
 import {
 	AGENT_DIMENSION_SINCE_VERSION,
+	AGENT_ENV_FAMILIES,
 	AGENT_ENV_MARKERS,
 	AMBIGUOUS_AGENT_ENV_KEYS,
 	detectAgentFromEnv,
@@ -124,12 +125,52 @@ describe("detectAgentFromEnv", () => {
 	});
 
 	it("refuses to guess from a marker that names a family rather than a host", () => {
-		// AI_AGENT is generic; CURSOR_TRACE_ID cannot separate `cursor` from
-		// `cursor-cli`. A partially-known case must not fall through to a value.
+		// AI_AGENT is generic; CURSOR_TRACE_ID was measured absent everywhere and is
+		// kept only as a guard. A partially-known case must not reach a value.
 		for (const key of AMBIGUOUS_AGENT_ENV_KEYS) {
 			expect(detectAgentFromEnv({ [key]: "abc" })).toBeUndefined();
 		}
 		expect(AMBIGUOUS_AGENT_ENV_KEYS).toContain("CURSOR_TRACE_ID");
+	});
+
+	it("splits the Cursor family into the IDE and the CLI (measured)", () => {
+		expect(detectAgentFromEnv({ CURSOR_AGENT: "1", CURSOR_WORKSPACE_LABEL: "snake-game" })).toBe("cursor");
+		expect(detectAgentFromEnv({ CURSOR_AGENT: "1", CURSOR_INVOKED_AS: "cursor-agent" })).toBe("cursor-cli");
+	});
+
+	it("does not treat a human in Cursor's own terminal as an agent", () => {
+		// The measurement this whole mapping rests on: a person typing in Cursor's
+		// integrated terminal has NO CURSOR_* vars, so the family gate cannot fire.
+		// Labelling human work as an agent's would attack the field's whole meaning.
+		expect(detectAgentFromEnv({ CURSOR_RIPGREP_PATH: "/rg", CURSOR_LAYOUT: "x" })).toBeUndefined();
+	});
+
+	it("abandons the answer when the family gate resolves to no single variant", () => {
+		// Both sides present (a future build setting both) and neither side present
+		// (a future build renaming both) are the same class of thing: a Cursor agent
+		// is here and we cannot say which. Neither may degrade to a coin flip.
+		expect(detectAgentFromEnv({ CURSOR_AGENT: "1" })).toBeUndefined();
+		expect(
+			detectAgentFromEnv({ CURSOR_AGENT: "1", CURSOR_WORKSPACE_LABEL: "w", CURSOR_INVOKED_AS: "a" }),
+		).toBeUndefined();
+	});
+
+	it("does not let an unresolved family hand the answer to another host's marker", () => {
+		// The subtle one: if a present-but-unresolved family merely contributed
+		// nothing, a nested session would report a confident single host.
+		expect(detectAgentFromEnv({ CURSOR_AGENT: "1", CLAUDECODE: "1" })).toBeUndefined();
+		expect(detectAgentFromEnv({ CURSOR_AGENT: "1", CURSOR_INVOKED_AS: "a", CLAUDECODE: "1" })).toBeUndefined();
+	});
+
+	it("declares every family variant as a known agent, and the gate as agent-named", () => {
+		for (const family of AGENT_ENV_FAMILIES) {
+			expect(family.variants.length).toBeGreaterThan(1);
+			for (const [, agent] of family.variants) expect(TELEMETRY_AGENTS).toContain(agent);
+			// Distinct variants, or the split cannot discriminate anything.
+			expect(new Set(family.variants.map(([, a]) => a)).size).toBe(family.variants.length);
+			// The gate must not double as a single-host marker.
+			expect(AGENT_ENV_MARKERS.map(([k]) => k)).not.toContain(family.familyKey);
+		}
 	});
 
 	it("still answers when an ambiguous marker sits beside a decisive one", () => {
