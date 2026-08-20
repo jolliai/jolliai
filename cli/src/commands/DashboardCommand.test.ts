@@ -164,6 +164,12 @@ function registered(repos: RegisteredRepo[]): void {
 
 beforeEach(() => {
 	configDir = mkdtempSync(join(tmpdir(), "jolli-cmd-"));
+	// This suite's call-count assertions (e.g. opportunisticSnapshot toHaveBeenCalledTimes(1))
+	// depend on cleared call state between tests. That comes from `clearMocks: true` in the
+	// cli vitest config — but there is no root config, so running from the repo root rather
+	// than the cli workspace leaks earlier tests' calls and the counts explode. Clear here so
+	// the suite is correct under any runner (idempotent when clearMocks is already in effect).
+	vi.clearAllMocks();
 	// clearMocks resets implementations between tests — re-arm the defaults here.
 	vi.mocked(canUseDashboardDb).mockReturnValue(true);
 	vi.mocked(registerRepo).mockResolvedValue({
@@ -1423,6 +1429,12 @@ describe("printSessionSummary", () => {
 describe("createDeferredWriter", () => {
 	it("holds every line until something reveals it, then prints in order", () => {
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		// `console.log` is already spied in the global beforeEach, so vi.spyOn hands
+		// back that same instance carrying earlier tests' calls; clear it here (as the
+		// third case below already does) so the absolute-sequence assertions hold even
+		// when clearMocks is not in effect — e.g. run from the repo root rather than
+		// the cli workspace, where no vitest config applies it.
+		log.mockClear();
 		const out = createDeferredWriter();
 		out.write("  first");
 		out.write("  second");
@@ -1438,6 +1450,7 @@ describe("createDeferredWriter", () => {
 
 	it("drops what was never revealed, and reveals only once", () => {
 		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		log.mockClear(); // shared spy — drop earlier tests' calls (see the case above)
 		const out = createDeferredWriter();
 		out.write("  held");
 		out.reveal();
