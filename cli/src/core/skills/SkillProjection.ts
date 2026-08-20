@@ -30,7 +30,14 @@
  */
 
 import { createLogger } from "../../Logger.js";
-import type { SkillArchivedTotals, SkillEntry, SkillEntryPath, SkillSource, SkillUsage } from "../../Types.js";
+import type {
+	SkillArchivedTotals,
+	SkillEntry,
+	SkillEntryPath,
+	SkillOriginRoot,
+	SkillSource,
+	SkillUsage,
+} from "../../Types.js";
 import { loadPlansRegistry } from "../SessionTracker.js";
 import { uncommittedDelta } from "./SkillDelta.js";
 
@@ -60,6 +67,8 @@ export interface ActiveSkill {
 	readonly lastUsedAt: string;
 	/** Absent when the source could not attribute tokens — never rendered as a zero. */
 	readonly usage?: SkillUsage;
+	/** Which skill root the host loaded it from — see {@link SkillEntry.originRoot}. */
+	readonly originRoot?: SkillOriginRoot;
 	readonly sourcePath: string;
 	/** Present when the invocation was inferred rather than observed (Codex). */
 	readonly detection?: "heuristic";
@@ -113,6 +122,7 @@ function toActiveSkill(mapKey: string, entry: SkillEntry, delta: SkillArchivedTo
 		// rendered as having spent zero.
 		...(delta.usage !== undefined ? { usage: delta.usage } : {}),
 		...(entry.detection !== undefined ? { detection: entry.detection } : {}),
+		...(entry.originRoot !== undefined ? { originRoot: entry.originRoot } : {}),
 		sourcePath: entry.sourcePath,
 		lastModified: entry.lastUsedAt,
 	};

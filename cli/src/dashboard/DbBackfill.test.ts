@@ -135,6 +135,7 @@ import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
 import type { SkillUsage, StoredTranscript, ToolCallCount } from "../Types.js";
+import { withIsolatedHome } from "../testUtils/isolatedHome.js";
 import {
 	collectCommitEvents,
 	collectRepoGraph,
@@ -199,6 +200,26 @@ const worktreeEvent: WorktreeStatusEvent = {
 	deletions: 3,
 	observedAtMs: 1_700_000_060_000,
 };
+
+/**
+ * Runs `fn` against a machine config with these keys set.
+ *
+ * A real `config.json` in a real (scratch) HOME rather than a mock, because the thing
+ * under test is precisely that these tiers now READ that file — mocking `loadConfig`
+ * would assert the wiring against itself. The harness already points HOME at a
+ * per-worker scratch directory, so the default in every other test is "no config file",
+ * i.e. every source enabled.
+ */
+async function withDisabledSources<T>(config: Record<string, boolean>, fn: () => Promise<T>): Promise<T> {
+	const home = mkdtempSync(join(tmpdir(), "jolli-gate-home-"));
+	mkdirSync(join(home, ".jolli", "jollimemory"), { recursive: true });
+	writeFileSync(join(home, ".jolli", "jollimemory", "config.json"), JSON.stringify(config));
+	try {
+		return await withIsolatedHome(home, fn);
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
+}
 
 beforeEach(() => {
 	dir = mkdtempSync(join(tmpdir(), "jolli-backfill-"));
@@ -317,7 +338,7 @@ describe("dbBackfillRepo — bootstrap", () => {
 			// full transcript read produced the stored session rows, and it is the only
 			// thing that makes the per-session skip safe to trust. See
 			// `SESSION_READ_GENERATION`.
-			{ source: "sessions-read-generation", cursor: "8" },
+			{ source: "sessions-read-generation", cursor: "9" },
 			// The memory import's own signal: the orphan tip (a hash of everything it
 			// reads) plus the mode, since seed and catch-up do not write the same rows.
 			{ source: "sot-import", cursor: `${"ab".repeat(20)}#seed` },
@@ -766,6 +787,25 @@ describe("dbBackfillRepos", () => {
 		expect(scanCursorComposersOnDisk).not.toHaveBeenCalled();
 	});
 
+	it("does not open a store the user switched off in Settings", async () => {
+		// The toggle used to reach four surfaces and not this one: a user who turned
+		// Cursor off saw it vanish from the sidebar and from their commit summaries while
+		// `jolli dashboard` kept scanning its store and writing its sessions on every run.
+		await withDisabledSources({ cursorEnabled: false }, () => dbBackfillRepos([repo], { dbPath }));
+
+		expect(scanCursorComposersOnDisk).not.toHaveBeenCalled();
+		// The other sources are untouched — this is a per-source switch, not a kill switch.
+		expect(scanCodexSessionsOnDisk).toHaveBeenCalled();
+		expect(scanClaudeSessionsOnDisk).toHaveBeenCalled();
+	});
+
+	it("opens every store when nothing is switched off", async () => {
+		// The other direction, so the test above cannot pass by the scan never running.
+		await dbBackfillRepos([repo], { dbPath });
+
+		expect(scanCursorComposersOnDisk).toHaveBeenCalled();
+	});
+
 	it("hands the session tier its checkouts and its worktrees as SEPARATE lists", async () => {
 		// Two granularities, and conflating them loses sessions. `worktreeRoots` is the
 		// union of every linked worktree of every registered checkout, because a
@@ -1132,7 +1172,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ source: string; cursor: string }>(
 			"SELECT source, cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "8" }]);
+		expect(cursors).toEqual([{ source: "sessions-read-generation", cursor: "9" }]);
 		// And the second sweep is the one that gets a predicate.
 		await dbBackfillRepo({ repo, dbPath });
 		expect(vi.mocked(collectSessionEvents).mock.calls.at(-1)?.[0].isAlreadyCurrent).toBeDefined();
@@ -1167,7 +1207,7 @@ describe("dbBackfillRepo — per-session skip", () => {
 		const cursors = await query<{ cursor: string }>(
 			"SELECT cursor FROM ingest_cursors WHERE source = 'sessions-read-generation'",
 		);
-		expect(cursors).toEqual([{ cursor: "8" }]);
+		expect(cursors).toEqual([{ cursor: "9" }]);
 	});
 });
 
@@ -2997,6 +3037,23 @@ describe("dbRescanSessions", () => {
 			// `jolli dashboard` for a count of zero repos.
 			idleReason: "no-sources",
 		});
+	});
+
+	it("skips a re-scanned source the user switched off, and names it apart from the off switch", async () => {
+		// A timer is where ignoring the toggle is least defensible: a user who turned
+		// Codex off would have had its rollout tree stat-ed and its conversations re-read
+		// every 30 seconds for the machine's whole uptime, with nothing on screen to say
+		// it was still happening.
+		//
+		// `sources-disabled`, not `no-sources`: the latter is the documented build-level
+		// off switch ("no definition declares daemonRescan"), and reporting it here would
+		// describe the build rather than the user's own decision.
+		const result = await withDisabledSources({ codexEnabled: false }, () =>
+			dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() }),
+		);
+
+		expect(result.idleReason).toBe("sources-disabled");
+		expect(scanCodexSessionsOnDisk).not.toHaveBeenCalled();
 	});
 
 	it("names 'no live checkout' apart from a missing baseline", async () => {

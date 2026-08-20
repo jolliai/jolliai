@@ -27,8 +27,19 @@ PLUGIN_DIR="$SRC/plugins/jolli"
 # No McpLauncher.js: unlike Codex, this host's MCP entry is repo-scoped
 # (`.cursor/mcp.json`) and needs no per-launch runtime resolution.
 # Kept in lockstep with plugins/jolli/scripts/build.mjs entryPoints.
+#
+# The dashboard-assets/js/ entries are exactly DashboardServer.DASHBOARD_SCRIPT_FILES,
+# in the same order — the page assembler inlines them one by one, so both directions of
+# drift are silent-or-late. Pinned by PluginDashboardAssets.test.ts, which this bundle
+# was missing from: `repositories.js` outlived the page here while `knowledge.js`,
+# `graph.js` and `settings.js` were never added, so every Cursor publish target was
+# refusing at publish_assert_dist_built before this was fixed.
+#
+# Annotate ABOVE this array, never inside it: the test parses the block by splitting on
+# whitespace and drops only tokens starting with `#`, so every other word of an inline
+# comment reads back as a required filename.
 PUBLISH_REQUIRED_DIST=(
-	Cli.js CursorPluginBootstrapHook.js StopHook.js SessionStartHook.js
+	Cli.js CursorPluginBootstrapHook.js CursorStopHook.js CursorDiscoveryWorker.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
 	QueueWorker.js PrePushWorker.js
 	dashboard-assets/index.html

@@ -22,6 +22,12 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { createLogger } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
+import {
+	getCursorHomeDir,
+	getCursorProjectsDir,
+	listCursorProjectBuckets,
+	resolveCursorTranscriptPath,
+} from "./CursorTranscriptLocator.js";
 import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { normalizePathForCompare } from "./PathUtils.js";
 
@@ -46,13 +52,17 @@ interface CursorCliMeta {
 
 /** ~/.cursor (home-relative on all platforms; cursor-agent uses ~/.cursor on every OS). */
 export function getCursorCliDir(home: string = homedir()): string {
-	return join(home, ".cursor");
+	return getCursorHomeDir(home);
 }
 export function getCursorCliChatsDir(home: string = homedir()): string {
 	return join(getCursorCliDir(home), "chats");
 }
+/**
+ * Re-exported through this module's name for its existing callers; the store is
+ * SHARED with the IDE source, so the definition lives in `CursorTranscriptLocator`.
+ */
 export function getCursorCliProjectsDir(home: string = homedir()): string {
-	return join(getCursorCliDir(home), "projects");
+	return getCursorProjectsDir(home);
 }
 
 /** Detected when the chats/ dir exists — pure JSON/JSONL, so no hasNodeSqliteSupport() gate. */
@@ -62,43 +72,6 @@ export async function isCursorCliInstalled(home: string = homedir()): Promise<bo
 	} catch {
 		return false;
 	}
-}
-
-/** Is projects/<bucket>/agent-transcripts/<uuid>/<uuid>.jsonl a readable file? */
-async function transcriptInBucket(projectsDir: string, bucket: string, uuid: string): Promise<string | undefined> {
-	const candidate = join(projectsDir, bucket, "agent-transcripts", uuid, `${uuid}.jsonl`);
-	try {
-		return (await stat(candidate)).isFile() ? candidate : undefined;
-	} catch {
-		return undefined; // not this project bucket
-	}
-}
-
-/**
- * Locate the plaintext JSONL transcript for `uuid` under projects/<any>/agent-transcripts/,
- * returning both the path and the bucket it lived in.
- * `projectBuckets` is the projects/ listing, read once by the caller — re-reading it
- * per session was O(sessions × dirents) for no benefit (the listing is stable per scan).
- * Every session of a single repo lives in the *same* projects/<encoded-cwd> bucket, but
- * the encoding is lossy so we can't derive it — instead the caller feeds back the last
- * `preferredBucket` we resolved, which we try first, collapsing the per-session lookup
- * from O(buckets) to O(1) once the repo's bucket is known.
- */
-async function resolveTranscriptPath(
-	projectsDir: string,
-	projectBuckets: readonly string[],
-	uuid: string,
-	preferredBucket?: string,
-): Promise<{ path: string; bucket: string } | undefined> {
-	if (preferredBucket !== undefined) {
-		const hit = await transcriptInBucket(projectsDir, preferredBucket, uuid);
-		if (hit !== undefined) return { path: hit, bucket: preferredBucket };
-	}
-	for (const p of projectBuckets) {
-		const hit = await transcriptInBucket(projectsDir, p, uuid);
-		if (hit !== undefined) return { path: hit, bucket: p };
-	}
-	return undefined;
 }
 
 /**
@@ -173,24 +146,19 @@ export async function scanCursorCliSessionsOnDisk(
 	const cutoffMs = Date.now() - staleMs;
 	const sessions: DiskSession[] = [];
 
-	// Read the projects/ listing once — resolveTranscriptPath reuses it for every
-	// matching session. A MISSING projects/ dir (ENOENT) is benign: chats can exist
-	// before any transcript is written, so it degrades to an empty listing and every
-	// session skips. Any OTHER failure (EACCES, or cursor-agent renaming projects/)
-	// is a whole-source failure — with no buckets no transcript can be resolved — so
+	// Read the projects/ listing once — the locator reuses it for every matching
+	// session. A MISSING projects/ dir (ENOENT) is benign: chats can exist before any
+	// transcript is written, so it degrades to an empty listing and every session
+	// skips. Any OTHER failure (EACCES, or cursor-agent renaming projects/) is a
+	// whole-source failure — with no buckets no transcript can be resolved — so
 	// surface it via the error channel instead of silently reporting "0 sessions".
 	// Mirrors the ENOENT-vs-other split on the chats readdir above; without it a
 	// permission/schema-drift failure looks healthy-empty to the aggregator's
-	// failedSources set and the status "Cursor" row.
-	let projectBuckets: string[];
-	try {
-		projectBuckets = await readdir(projectsDir);
-	} catch (error: unknown) {
-		const code = (error as NodeJS.ErrnoException).code;
-		if (code !== "ENOENT") {
-			return { sessions: [], error: { kind: "fs", message: (error as Error).message } };
-		}
-		projectBuckets = [];
+	// failedSources set and the status "Cursor" row. `undefined` is what carries that
+	// distinction out of the shared locator — see `listCursorProjectBuckets`.
+	const projectBuckets = await listCursorProjectBuckets(projectsDir);
+	if (projectBuckets === undefined) {
+		return { sessions: [], error: { kind: "fs", message: `cannot read ${projectsDir}` } };
 	}
 	// Every session under one chats/<hash> shares a cwd and therefore one projects/
 	// bucket, so remembering the last resolved bucket keeps the lookup O(1) within a
@@ -221,7 +189,7 @@ export async function scanCursorCliSessionsOnDisk(
 				continue;
 			}
 			if (updatedAtMs < cutoffMs) continue;
-			const resolved = await resolveTranscriptPath(projectsDir, projectBuckets, uuid, preferredBucket);
+			const resolved = await resolveCursorTranscriptPath(projectsDir, projectBuckets, uuid, preferredBucket);
 			if (!resolved) {
 				log.debug("Skipping Cursor CLI session %s: no transcript JSONL found", uuid);
 				continue;

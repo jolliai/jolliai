@@ -30,6 +30,11 @@
  *     SQLite's writer lock. Only the apply phase, which is skipped when nothing moved,
  *     opens for writing.
  *
+ * A third is a rounding error but belongs on the list so the list stays true: one small
+ * `readFile` of the machine-global config, so the pass can honour the AI-agent toggles
+ * (`readSourceGate`). It is async and ~200 bytes; it is named here only because this
+ * header is the place the per-tick costs are supposed to be enumerated honestly.
+ *
  * Both are small today and the first scales with how much the user has used the agent, so
  * treat the interval as a budget against them rather than against zero. Do not re-derive
  * that budget from a stale reading of it: this list claimed a first-line read of every
@@ -408,6 +413,11 @@ export function sessionRescanTask(tickIntervalMs: number = SESSION_RESCAN_TICK_M
 			// repos that in one case no longer exist. `no-sources` in particular is the
 			// documented one-line off switch and is supposed to read as "nothing to do".
 			if (result.idleReason === "no-sources") return "no source has opted in -- nothing to do";
+			// Distinct from the line above on purpose: this is the user's own switch, not
+			// the build's. Saying "no source has opted in" about an agent they turned off
+			// describes the wrong thing and reads like a defect.
+			if (result.idleReason === "sources-disabled")
+				return `every re-scanned source is switched off (${sourceTag}) -- nothing to do`;
 			if (result.idleReason === "no-live-repos") return `no live checkout for ${repos.length} repo(s)`;
 			// Not a fault and not a missing baseline: this machine has never opened the
 			// dashboard, so there is no database to read. Said plainly rather than as the

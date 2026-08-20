@@ -38,6 +38,11 @@ import { join } from "node:path";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { SessionInfo } from "../Types.js";
 import { getCursorGlobalDbPath } from "./CursorDetector.js";
+import {
+	getCursorProjectsDir,
+	listCursorProjectBuckets,
+	resolveCursorTranscriptPath,
+} from "./CursorTranscriptLocator.js";
 import { classifyScanError, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
 import { findVscodeWorkspaceHash, getVscodeWorkspaceStorageDir } from "./VscodeWorkspaceLocator.js";
 
@@ -248,7 +253,9 @@ export async function scanCursorComposersOnDisk(): Promise<CursorDiskScanResult>
 				out.push({
 					session: {
 						sessionId: composerId,
-						// Synthetic path: global DB path + composer discriminator (matches OpenCode pattern)
+						// Synthetic path: global DB path + composer discriminator (matches OpenCode
+						// pattern). Upgraded to the real JSONL below when one exists — see
+						// `upgradeToJsonlTranscripts`.
 						transcriptPath: `${globalDbPath}#${composerId}`,
 						updatedAt: new Date(lastUpdatedAt).toISOString(),
 						source: "cursor",
@@ -260,7 +267,7 @@ export async function scanCursorComposersOnDisk(): Promise<CursorDiskScanResult>
 		});
 
 		log.debug("Cursor disk scan: %d composer(s) in the global store", out.length);
-		return { composers: out };
+		return { composers: await upgradeToJsonlTranscripts(out) };
 	} catch (error: unknown) {
 		const scanError = classifyScanError(error);
 		/* v8 ignore start -- TOCTOU race: the DB passed stat() but vanished or became unreadable before DatabaseSync opened it. Requires a filesystem-level mock; classifier behavior is covered by classifyScanError unit tests. */
@@ -272,6 +279,57 @@ export async function scanCursorComposersOnDisk(): Promise<CursorDiskScanResult>
 		log.error("Cursor scan failed (%s): %s", scanError.kind, scanError.message);
 		return { composers: [], error: scanError };
 	}
+}
+
+/**
+ * Points each composer at its plaintext JSONL transcript, where one exists.
+ *
+ * The IDE writes the SAME `agent-transcripts` JSONL that cursor-agent does, and
+ * that file is strictly richer than the composer store this source discovers from:
+ * it carries `tool_use` blocks (which the bubble reader drops outright) and the
+ * `<manually_attached_skills>` envelope, and it does not lose turns — measured,
+ * `38cbc0cb` had 0 bubbles in `composerData` while its JSONL held a real message.
+ *
+ * A composer with NO JSONL keeps its synthetic handle and is still returned. That
+ * is the whole reason this upgrades per conversation rather than switching the
+ * source wholesale: `readTranscriptForSource` routes on the path shape, so such a
+ * conversation is read from the composer store exactly as before — and reports NO
+ * `toolUse` at all rather than an empty array, which is the difference between
+ * "cannot say" and the false claim "called no tools". On a real machine the only
+ * two JSONL-less composers were `bubbles=0` empty drafts, but nothing guarantees
+ * that: the JSONL store is newer than the composer store, so an old enough
+ * conversation may exist only in the latter.
+ *
+ * Failure to LIST the bucket root is not propagated — every composer keeps its
+ * handle. This runs on the discovery path of a source that already works, so an
+ * unreadable `projects/` must degrade to the previous behaviour, not fail the scan.
+ */
+async function upgradeToJsonlTranscripts(
+	composers: ReadonlyArray<CursorDiskComposer>,
+	projectsDir: string = getCursorProjectsDir(),
+): Promise<CursorDiskComposer[]> {
+	const buckets = await listCursorProjectBuckets(projectsDir);
+	if (buckets === undefined || buckets.length === 0) return [...composers];
+	const out: CursorDiskComposer[] = [];
+	// Carried across composers for the reason the CLI discoverer carries it: every
+	// conversation of one repo lives in one bucket, so the remembered hit collapses
+	// the lookup from O(buckets) to O(1) after the first.
+	let preferredBucket: string | undefined;
+	for (const composer of composers) {
+		const resolved = await resolveCursorTranscriptPath(
+			projectsDir,
+			buckets,
+			composer.session.sessionId,
+			preferredBucket,
+		);
+		if (resolved === undefined) {
+			out.push(composer);
+			continue;
+		}
+		preferredBucket = resolved.bucket;
+		out.push({ ...composer, session: { ...composer.session, transcriptPath: resolved.path } });
+	}
+	return out;
 }
 
 /**

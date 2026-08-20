@@ -211,7 +211,15 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 	// than silently uploading every column a local dashboard feature adds. The legacy
 	// metadata_json column is also still present on databases created before it was
 	// dropped from the schema definition; no writer or reader uses it.
-	session_tool_use: ["input_tokens", "output_tokens", "cached_tokens", "usage_confidence", "plugin", "metadata_json"],
+	session_tool_use: [
+		"input_tokens",
+		"output_tokens",
+		"cached_tokens",
+		"usage_confidence",
+		"plugin",
+		"origin_root",
+		"metadata_json",
+	],
 };
 
 /**

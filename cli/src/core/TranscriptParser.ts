@@ -1153,8 +1153,23 @@ export const PARSER_BACKED_SOURCES: ReadonlyArray<Parameters<typeof getParserFor
  * the sources deliberately kept OUT), while the evidence that each reader really
  * extracts something lives in that reader's own test file, asserting a non-empty
  * extraction over a real capture. Adding a source here means adding both.
+ *
+ * `cursor` joined once its conversations started being READ from the same
+ * `agent-transcripts` JSONL `cursor-cli` uses, which is where its `tool_use` blocks
+ * live — the composer store it used to be read from drops them, which is why it sat
+ * in the excluded list before. One residual is deliberate: a composer with no JSONL
+ * is still read from that store, and reports NO `toolUse` rather than an empty one,
+ * so it degrades to "unavailable" per-conversation instead of claiming zero calls.
  */
-const READER_BACKED_TOOL_SOURCES = ["gemini", "opencode", "antigravity", "cursor-cli", "cline-cli", "devin"] as const;
+const READER_BACKED_TOOL_SOURCES = [
+	"gemini",
+	"opencode",
+	"antigravity",
+	"cursor",
+	"cursor-cli",
+	"cline-cli",
+	"devin",
+] as const;
 
 /**
  * Sources whose transcripts can report tool calls at all — i.e. whose parser

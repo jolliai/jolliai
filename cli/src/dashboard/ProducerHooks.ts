@@ -32,7 +32,12 @@ import { getSummary, readTranscriptsForCommits } from "../core/SummaryStore.js";
 import { getTranscriptIds } from "../core/SummaryTree.js";
 import { createLogger, errMsg, isManuallyDisabled } from "../Logger.js";
 import type { RecallOutcome, SessionInfo } from "../Types.js";
-import { collectFilesForCommits, sessionEventFromInfo, summaryEventFromCommitSummary } from "./DashboardCollector.js";
+import {
+	collectFilesForCommits,
+	type SessionEventInfo,
+	sessionEventFromInfo,
+	summaryEventFromCommitSummary,
+} from "./DashboardCollector.js";
 import { canUseDashboardDb } from "./DashboardDb.js";
 import type {
 	CommitCreatedEvent,
@@ -155,11 +160,11 @@ async function safeApply(
 }
 
 /**
- * Records one just-ended agent session. Called by StopHook after it saved the
- * session registry entry; reads the transcript once for token usage (the hook
- * already scans the same file for plan/reference discovery).
+ * Records one just-ended agent session. Called by StopHook after it gathered the
+ * host's session metadata; reads the transcript once for token usage when a path
+ * is available (the hook already scans the same file for plan/reference discovery).
  */
-export async function recordSessionFromHook(cwd: string, session: SessionInfo, dbPath?: string): Promise<boolean> {
+export async function recordSessionFromHook(cwd: string, session: SessionEventInfo, dbPath?: string): Promise<boolean> {
 	return safeApply(
 		cwd,
 		"stop-hook",

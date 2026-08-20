@@ -57,11 +57,16 @@ function result(tag: string): TranscriptReadResult {
 	};
 }
 
-/** Every dedicated reader, paired with the source tag that must reach it. */
+/**
+ * Every dedicated reader, paired with the source tag that must reach it.
+ *
+ * `cursor` is deliberately ABSENT: it is the one source whose reader is chosen by the
+ * path's shape rather than by the tag, so it cannot take part in a loop that asserts
+ * one tag reaches exactly one reader. Its two routes are covered on their own below.
+ */
 const DEDICATED = [
 	{ source: "gemini", reader: readGeminiTranscript },
 	{ source: "opencode", reader: readOpenCodeTranscript },
-	{ source: "cursor", reader: readCursorTranscript },
 	{ source: "copilot", reader: readCopilotTranscript },
 	{ source: "devin", reader: readDevinTranscript },
 	{ source: "cursor-cli", reader: readCursorCliTranscript },
@@ -96,6 +101,45 @@ describe("readTranscriptForSource", () => {
 			}
 		});
 	}
+
+	// ── cursor: one tag, two readers, chosen by the path ────────────────────────
+	//
+	// Both Cursor sources now read the same `agent-transcripts` JSONL, which is where
+	// the IDE's tool_use blocks and skill envelope live at all — the composer store
+	// drops both. A composer with no JSONL still carries the synthetic
+	// `<dbPath>#<composerId>` handle and must keep reaching the store reader.
+
+	it("sends a cursor JSONL path to the shared JSONL reader", async () => {
+		vi.mocked(readCursorCliTranscript).mockResolvedValue(result("cursor-cli"));
+
+		await expect(readTranscriptForSource("cursor", "/tmp/abc.jsonl", CURSOR)).resolves.toEqual(
+			result("cursor-cli"),
+		);
+
+		expect(readCursorCliTranscript).toHaveBeenCalledWith("/tmp/abc.jsonl", CURSOR);
+		expect(readCursorTranscript).not.toHaveBeenCalled();
+	});
+
+	it("sends a cursor synthetic store handle to the composer reader", async () => {
+		vi.mocked(readCursorTranscript).mockResolvedValue(result("cursor"));
+		const handle = "/tmp/state.vscdb#composer-1";
+
+		await expect(readTranscriptForSource("cursor", handle, CURSOR)).resolves.toEqual(result("cursor"));
+
+		expect(readCursorTranscript).toHaveBeenCalledWith(handle, CURSOR);
+		expect(readCursorCliTranscript).not.toHaveBeenCalled();
+	});
+
+	it("passes a null cursor through both cursor routes unchanged", async () => {
+		vi.mocked(readCursorCliTranscript).mockResolvedValue(result("cursor-cli"));
+		vi.mocked(readCursorTranscript).mockResolvedValue(result("cursor"));
+
+		await readTranscriptForSource("cursor", "/tmp/abc.jsonl", null);
+		expect(readCursorCliTranscript).toHaveBeenCalledWith("/tmp/abc.jsonl", null);
+
+		await readTranscriptForSource("cursor", "/tmp/state.vscdb#c1", null);
+		expect(readCursorTranscript).toHaveBeenCalledWith("/tmp/state.vscdb#c1", null);
+	});
 
 	for (const { source, reader } of DEDICATED) {
 		const expected = UNDEFINED_ON_NULL.has(source) ? undefined : null;
@@ -163,6 +207,28 @@ describe("readTranscriptLinesForSource", () => {
 		// opened. The file is not touched at all.
 		expect(await readTranscriptLinesForSource("opencode", PATH)).toBeUndefined();
 		expect(readFile).not.toHaveBeenCalled();
+	});
+
+	// ── cursor: line-orientation is a property of the PATH, not of the source ────
+	//
+	// This is the pair the constant's comment warns about. With Cursor missing from
+	// the line-oriented side, its skill scanner was correctly registered, its matcher
+	// passed its own tests, and every Cursor conversation still reported zero skills —
+	// because `undefined` lines make the extractor return early, silently.
+
+	it("reads lines for a cursor JSONL path", async () => {
+		vi.mocked(readFile).mockResolvedValue('{"a":1}\n{"b":2}\n' as never);
+		expect(await readTranscriptLinesForSource("cursor", "/tmp/abc.jsonl")).toEqual(['{"a":1}', '{"b":2}']);
+	});
+
+	it("answers undefined for a cursor synthetic store handle — it has no lines", async () => {
+		expect(await readTranscriptLinesForSource("cursor", "/tmp/state.vscdb#c1")).toBeUndefined();
+		expect(readFile).not.toHaveBeenCalled();
+	});
+
+	it("reads lines for cursor-cli, which always writes a JSONL", async () => {
+		vi.mocked(readFile).mockResolvedValue('{"a":1}\n' as never);
+		expect(await readTranscriptLinesForSource("cursor-cli", PATH)).toEqual(['{"a":1}']);
 	});
 
 	for (const source of ["claude", "codex", "kimi"] as const) {

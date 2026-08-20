@@ -827,6 +827,77 @@ describe("cursorSessionsForRepo", () => {
 		await rm(tmpHome, { recursive: true, force: true });
 	});
 
+	/** Plants `~/.cursor/projects/<bucket>/agent-transcripts/<id>/<id>.jsonl`. */
+	async function plantJsonl(bucket: string, composerId: string): Promise<string> {
+		const dir = join(tmpHome, ".cursor", "projects", bucket, "agent-transcripts", composerId);
+		await mkdir(dir, { recursive: true });
+		const path = join(dir, `${composerId}.jsonl`);
+		await writeFile(path, "{}\n");
+		return path;
+	}
+
+	it("points a composer at its agent-transcripts JSONL when one exists", async () => {
+		// The IDE writes the same JSONL cursor-agent does, and it is strictly richer than
+		// the composer store: tool_use blocks and the skill envelope live only there.
+		const now = Date.now();
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "has-jsonl", createdAtMs: now, lastUpdatedAtMs: now }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+		const want = await plantJsonl("Users-flyer-work-proj-a", "has-jsonl");
+
+		const { composers } = await scanCursorComposersOnDisk();
+		expect(composers.map((c) => c.session.transcriptPath)).toEqual([want]);
+	});
+
+	it("keeps the synthetic store handle for a composer with NO JSONL", async () => {
+		// The fallback that makes this an upgrade rather than a switch. Such a
+		// conversation is read from the composer store exactly as before — and reports
+		// NO toolUse rather than an empty one, which is the difference between "cannot
+		// say" and the false claim "called no tools".
+		const now = Date.now();
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "no-jsonl", createdAtMs: now, lastUpdatedAtMs: now }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+
+		const { composers } = await scanCursorComposersOnDisk();
+		expect(composers).toHaveLength(1);
+		expect(composers[0].session.transcriptPath).toContain("state.vscdb#no-jsonl");
+		expect(composers[0].session.transcriptPath.endsWith(".jsonl")).toBe(false);
+	});
+
+	it("upgrades only the composers that have a JSONL, leaving the rest alone", async () => {
+		const now = Date.now();
+		await setupCursorHome(tmpHome, {
+			globalComposers: [
+				{ composerId: "with", createdAtMs: now, lastUpdatedAtMs: now },
+				{ composerId: "without", createdAtMs: now, lastUpdatedAtMs: now },
+			],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+		const want = await plantJsonl("Users-flyer-work-proj-a", "with");
+
+		const { composers } = await scanCursorComposersOnDisk();
+		const byId = new Map(composers.map((c) => [c.session.sessionId, c.session.transcriptPath]));
+		expect(byId.get("with")).toBe(want);
+		expect(byId.get("without")).toContain("state.vscdb#without");
+	});
+
+	it("degrades to the previous behaviour when projects/ is absent entirely", async () => {
+		// An unreadable bucket root must not fail the scan of a source that works —
+		// every composer simply keeps its handle.
+		const now = Date.now();
+		await setupCursorHome(tmpHome, {
+			globalComposers: [{ composerId: "solo", createdAtMs: now, lastUpdatedAtMs: now }],
+			workspaces: [{ folder: toFileUri("/Users/flyer/work/proj-a"), pointers: null }],
+		});
+
+		const { composers } = await scanCursorComposersOnDisk();
+		expect(composers).toHaveLength(1);
+		expect(composers[0].session.transcriptPath).toContain("state.vscdb#solo");
+	});
+
 	it("claims nothing for a repo Cursor has no workspace for", async () => {
 		// The composer is inside the window, so only the missing workspace can exclude it.
 		// This is the coarse-attribution rule's one limit: with no workspace, a repo is not

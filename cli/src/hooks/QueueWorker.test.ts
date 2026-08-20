@@ -2211,6 +2211,81 @@ describe("QueueWorker", () => {
 			);
 		});
 
+		it("reads a JSONL-upgraded composer with the JSONL reader, not the composer store", async () => {
+			// `upgradeToJsonlTranscripts` points an IDE composer at its `agent-transcripts`
+			// JSONL whenever one exists — measured, 4 of 4 composers on a real machine. That
+			// path has no `#composerId`, so `readCursorTranscript`'s `parseSyntheticPath`
+			// throws, this branch's catch logs "Skipping Cursor session", and the whole
+			// conversation is silently missing from the commit summary.
+			const jsonl = "/Users/me/.cursor/projects/enc/agent-transcripts/cur-2/cur-2.jsonl";
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cursor-jsonl.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCursorSessions).mockResolvedValue([
+				{ sessionId: "cur-2", transcriptPath: jsonl, updatedAt: "2026-04-01T12:00:00.000Z", source: "cursor" },
+			]);
+			vi.mocked(readCursorCliTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "From the JSONL", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: { transcriptPath: jsonl, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(readCursorCliTranscript).toHaveBeenCalledWith(jsonl, null, "2026-04-01T12:00:00.000Z");
+			expect(readCursorTranscript).not.toHaveBeenCalled();
+			expect(saveCursor).toHaveBeenCalledWith(
+				expect.objectContaining({ transcriptPath: jsonl, lineNumber: 1 }),
+				"/test/cwd",
+			);
+		});
+
+		it("reads a conversation ONCE when the registry and the discoverer both report it", async () => {
+			// The shape a lifecycle hook creates: `CursorStopHook` writes the conversation
+			// into `sessions.json` while its discoverer still finds it on disk. Both rows
+			// reach `readAllTranscripts`, whose on-disk cursor has not moved yet (the new
+			// positions are `pendingCursors`, persisted only after the store), so the second
+			// read returns the same slice and `perSessionTokens` ACCUMULATES it — doubling
+			// tokens, tool calls and entry counts with nothing to flag it.
+			//
+			// Deliberately a SYNTHETIC composer path, so this exercises the dedupe alone:
+			// the JSONL path would also route through the dispatch fix above, and a test
+			// that fails for either reason cannot say which one it is pinning.
+			const path = "/tmp/cursor.vscdb#cur-3";
+			const row = {
+				sessionId: "cur-3",
+				transcriptPath: path,
+				updatedAt: "2026-04-01T12:00:00.000Z",
+				source: "cursor" as const,
+			};
+			const op = makeCommitOp();
+			vi.mocked(dequeueAllGitOperations)
+				.mockResolvedValueOnce([{ op, filePath: "/tmp/queue/cursor-dupe.json" }])
+				.mockResolvedValueOnce([])
+				.mockResolvedValueOnce([]);
+
+			setupPipelineMocks();
+			vi.mocked(loadConfig).mockResolvedValue({} as Awaited<ReturnType<typeof loadConfig>>);
+			vi.mocked(loadAllSessions).mockResolvedValue([row]);
+			vi.mocked(isCursorInstalled).mockResolvedValue(true);
+			vi.mocked(discoverCursorSessions).mockResolvedValue([row]);
+			vi.mocked(readCursorTranscript).mockResolvedValue({
+				entries: [{ role: "human", content: "Once", timestamp: "2026-04-01T12:00:00.000Z" }],
+				newCursor: { transcriptPath: path, lineNumber: 1, updatedAt: "2026-04-01T12:00:00.000Z" },
+				totalLinesRead: 1,
+			});
+
+			await runWorker("/test/cwd");
+
+			expect(readCursorTranscript).toHaveBeenCalledTimes(1);
+		});
+
 		it("skips discovery when cursorEnabled is explicitly false", async () => {
 			const op = makeCommitOp();
 			const queueEntry = { op, filePath: "/tmp/queue/cursor-disabled.json" };

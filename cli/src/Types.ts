@@ -224,6 +224,16 @@ export interface ToolCallCount {
 	 * attributed to whichever was seen first; see `observeSkillEntry`.
 	 */
 	readonly plugin?: string;
+	/**
+	 * Which skill ROOT the host loaded the skill from. Present only when `kind` is
+	 * `"skill"`, and only for a source whose scanner reports a path — Cursor today.
+	 *
+	 * Not a weaker {@link plugin}: it answers a different question, and on a host that
+	 * does not namespace its skills it is the ONLY thing distinguishing a plugin-supplied
+	 * skill from the repo's own. See `SKILL_ORIGIN_ROOT_DDL` for why one does not derive
+	 * the other.
+	 */
+	readonly originRoot?: SkillOriginRoot;
 	readonly calls: number;
 	/**
 	 * When the LAST call in this bucket was made, from the transcript line that
@@ -1417,6 +1427,42 @@ export interface ReferenceCommitRef {
 export type SkillSource = "claude" | "opencode" | "codex" | "cursor" | "kimi";
 
 /**
+ * Which skill ROOT a skill was loaded from, when the host names the file it read.
+ *
+ * This answers "where did this skill come from" and deliberately NOT "was it
+ * installed by a plugin". The distinction is forced by what the hosts actually
+ * record. Cursor is the case that drove it: its transcript envelope carries a
+ * `Path:` and no plugin attribution of any kind — the host does not namespace
+ * plugin skills (the invocation name is just the directory name, and plugin
+ * identity exists only as a UI icon), so there is no plugin field to read. Worse,
+ * a plugin-provided skill reaches the agent through a MIRROR into an ordinary
+ * skill root, and on a real machine both the plugin's `mirror/*` and the mirrored
+ * `.agents/skills/*` were plain directories rather than symlinks — so the path
+ * shape of a plugin skill and a `jolli enable` skill are identical.
+ *
+ * "Which root" is decidable from the path as a pure string test, and stays
+ * decidable for a historical transcript whose files have since moved or been
+ * deleted. "Is it a plugin" would need an fs lookup that rots. So this records the
+ * former and does not guess at the latter.
+ *
+ * Absent on a `SkillUse` means the source reports no path — not that the root is
+ * unknown, which is what `"unknown"` says.
+ */
+export type SkillOriginRoot =
+	/** `~/.cursor/skills/` — machine-global, shared by every repo. */
+	| "cursor-global"
+	/** `<repo>/.agents/skills/` — the host-neutral per-repo tree. */
+	| "repo-agents"
+	/** `<repo>/.cursor/skills/` — the Cursor-only per-repo mirror. */
+	| "repo-cursor"
+	/** Inside a plugin bundle, i.e. read directly rather than through a mirror. */
+	| "plugin-bundle"
+	/** Another host's tree that this host also reads (`.claude/skills/`, `.codex/skills/`, …). */
+	| "other-host"
+	/** A path that matched no known root. */
+	| "unknown";
+
+/**
  * How the agent entered the skill.
  *
  * `tool` — a `Skill` tool_use block (the agent decided to invoke it).
@@ -1556,6 +1602,17 @@ export interface SkillEntry {
 	 * nothing to hang it on. Detection quality and token quality are independent.
 	 */
 	readonly detection?: "heuristic";
+	/**
+	 * Which skill root the host loaded this skill FROM — see {@link SkillOriginRoot}.
+	 *
+	 * Not to be confused with the adjacent {@link SkillEntry.sourcePath}, which is
+	 * Jolli's OWN archived markdown copy and says nothing about where the skill came
+	 * from. Absent for every source that does not report a path (all of them but
+	 * Cursor today), and sticky-free: unlike `detection`, a skill can legitimately
+	 * move between roots, so the fold takes the NEWEST observation rather than
+	 * pinning the first.
+	 */
+	readonly originRoot?: SkillOriginRoot;
 	/** Absolute path to `<jolliMemoryDir>/skills/<source>/<stem>.md`. */
 	readonly sourcePath: string;
 	/** Null until archived onto a commit — same guard shape as {@link PlanEntry}. */
@@ -1611,6 +1668,8 @@ export interface SkillUse {
 	readonly usage?: SkillUsage;
 	/** See {@link SkillEntry.detection}. */
 	readonly detection?: "heuristic";
+	/** See {@link SkillEntry.originRoot}. */
+	readonly originRoot?: SkillOriginRoot;
 	/**
 	 * Which conversation this pass read, keyed `<source>:<sessionId>`.
 	 *

@@ -58,7 +58,9 @@ import { readCopilotTranscript } from "../core/CopilotTranscriptReader.js";
 import { discoverCursorCliSessions, isCursorCliInstalled } from "../core/CursorCliSessionDiscoverer.js";
 import { readCursorCliTranscript } from "../core/CursorCliTranscriptReader.js";
 import { isCursorInstalled } from "../core/CursorDetector.js";
+import { discoverCursorConversations } from "../core/CursorDiscovery.js";
 import { discoverCursorSessions } from "../core/CursorSessionDiscoverer.js";
+import { isCursorJsonlTranscript } from "../core/CursorTranscriptLocator.js";
 import { readCursorTranscript } from "../core/CursorTranscriptReader.js";
 import { discoverDevinSessions, isDevinInstalled } from "../core/DevinSessionDiscoverer.js";
 import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
@@ -722,14 +724,19 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 			// contract. The handler resolves `true` either way: the flag means "did not time
 			// out", and the failure has already been reported on its own line.
 			//
-			// Codex and Kimi are BOTH hookless sources with no lifecycle hook, each
-			// self-checking manual-disable / `<source>Enabled` / installed and each
-			// contracted never to reject. They run CONCURRENTLY and race the pair against
-			// ONE shared deadline, so the total time on this user-waited path stays bounded
-			// no matter how many hookless sources exist — previously each was awaited in its
-			// own serial `Promise.race`, so two 3 s deadlines could consume 6 s (and a third
-			// source 9 s) of a 15 s window that every summary milestone also has to fit in.
-			// Per-source rejection handlers keep one source's failure from voiding the other.
+			// Codex, Kimi and Cursor are all hook-poor sources, each self-checking
+			// manual-disable / `<source>Enabled` / installed and each contracted never to
+			// reject. They run CONCURRENTLY and race the group against ONE shared deadline,
+			// so the total time on this user-waited path stays bounded no matter how many
+			// such sources exist — previously each was awaited in its own serial
+			// `Promise.race`, so two 3 s deadlines could consume 6 s (and a third source
+			// 9 s) of a 15 s window that every summary milestone also has to fit in. That
+			// bound is exactly why adding Cursor here costs nothing. Per-source rejection
+			// handlers keep one source's failure from voiding the others.
+			//
+			// Cursor is "hook-poor" rather than hookless: its IDE does deliver a `stop`
+			// event, but `cursor-agent -p` does not (measured), so a headless CLI run has
+			// no event-driven route and this pass is its only one.
 			try {
 				const finished = await Promise.race([
 					Promise.all([
@@ -738,6 +745,9 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						}),
 						discoverKimiConversations(cwd).then(undefined, (error: unknown) => {
 							log.warn("Kimi artifact discovery failed (non-fatal): %s", (error as Error).message);
+						}),
+						discoverCursorConversations(cwd).then(undefined, (error: unknown) => {
+							log.warn("Cursor artifact discovery failed (non-fatal): %s", (error as Error).message);
 						}),
 					]).then(() => true),
 					deadline(ARTIFACT_DISCOVERY_DEADLINE_MS),
@@ -4050,6 +4060,49 @@ async function loadSessionTranscripts(
 		}
 	}
 
+	// ONE row per conversation, keyed `(source, sessionId)` — the same identity
+	// `DashboardCollector` dedupes on, not a new one invented here.
+	//
+	// Everything above this point is a plain concat: `trackedSessions` (the hook-written
+	// registry) plus one array per discoverer, with a dedupe on only ONE of the joins
+	// (the ledger's, against the registry, and on the full triple). That was safe only
+	// while no source could arrive by two routes at once. A hook-poor source that gains a
+	// lifecycle hook has exactly that shape — the hook writes it into `sessions.json`
+	// while its discoverer still finds it on disk — and reading a conversation twice is
+	// never a partial error: `readAllTranscripts` re-reads it from the SAME on-disk cursor
+	// (the new positions are `pendingCursors`, persisted only after the store), so both
+	// passes return the same slice and `perSessionTokens` ACCUMULATES it. Tokens, tool
+	// calls and entry counts all double, and the overlay reconciliation cannot notice
+	// because its pre/post counts double together.
+	//
+	// FIRST wins, which is the registry over a discoverer. That is the right direction
+	// rather than an arbitrary one: a hook is told its transcript path by the host
+	// itself, while a discoverer reconstructs it. A duplicate carrying a DIFFERENT path
+	// is the case where that choice is load-bearing, so it is logged rather than
+	// silently resolved — the two routes disagreeing about where a conversation lives is
+	// a fact worth seeing.
+	const bySessionKey = new Map<string, (typeof allSessions)[number]>();
+	for (const session of allSessions) {
+		const key = conversationKey(session.source ?? "claude", session.sessionId);
+		const kept = bySessionKey.get(key);
+		if (kept === undefined) {
+			bySessionKey.set(key, session);
+			continue;
+		}
+		if (kept.transcriptPath !== session.transcriptPath) {
+			log.warn(
+				"Conversation %s reached this commit by two routes with different transcripts — keeping %s, dropping %s",
+				key,
+				kept.transcriptPath,
+				session.transcriptPath,
+			);
+		}
+	}
+	if (bySessionKey.size < allSessions.length) {
+		log.info("Deduped %d duplicate conversation row(s)", allSessions.length - bySessionKey.size);
+		allSessions = [...bySessionKey.values()];
+	}
+
 	if (allSessions.length === 0) {
 		log.info("No active sessions found — will infer topics from diff if available");
 	}
@@ -4589,8 +4642,24 @@ async function readAllTranscripts(
 				continue;
 			}
 		} else if (source === "cursor") {
+			// TWO readers, chosen by the PATH SHAPE rather than by the source — the same
+			// rule `readTranscriptForSource` applies, sharing its predicate rather than
+			// restating it. `upgradeToJsonlTranscripts` points an IDE composer at its
+			// `agent-transcripts` JSONL whenever one exists, and that path has no
+			// `#composerId`, so the composer-store reader's `parseSyntheticPath` THROWS on
+			// it — which this branch's own catch turns into "Skipping Cursor session", i.e.
+			// the conversation silently missing from the commit summary. Measured on a real
+			// machine: 4 of 4 composers carried a JSONL path, so every Cursor IDE
+			// conversation was being dropped.
+			//
+			// This dispatch cannot be `readTranscriptForSource` itself: that entry point
+			// takes no `beforeTimestamp`, and the per-commit cutoff is what decides which
+			// turns belong to THIS commit. The whole dispatch in this function is the
+			// with-cutoff parallel of that one, by construction.
 			try {
-				result = await readCursorTranscript(session.transcriptPath, cursor, beforeTimestamp);
+				result = isCursorJsonlTranscript(session.transcriptPath)
+					? await readCursorCliTranscript(session.transcriptPath, cursor, beforeTimestamp)
+					: await readCursorTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Cursor session %s: %s", session.sessionId, (error as Error).message);
 				continue;

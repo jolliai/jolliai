@@ -18,6 +18,9 @@ import { createReadStream } from "node:fs";
 import { createInterface } from "node:readline";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { TranscriptEntry, TranscriptSource } from "../Types.js";
+// Static, unlike the readers below: a pure string predicate in a leaf module that
+// touches no `node:sqlite`, so it carries none of the cost the dynamic imports avoid.
+import { isCursorJsonlTranscript } from "./CursorTranscriptLocator.js";
 import { getParserForSource } from "./TranscriptParser.js";
 
 const log = createLogger("TranscriptLoader");
@@ -62,7 +65,16 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 		}
 	}
 	if (opts.source === "cursor") {
+		// Path-shape dispatch, sharing `readTranscriptForSource`'s predicate rather than
+		// restating it: an IDE composer whose `agent-transcripts` JSONL was found at
+		// discovery time carries that real path, and the composer-store reader rejects it
+		// (no `#composerId`). The catch below would swallow that into an EMPTY transcript,
+		// so the panel would render "no entries" for a conversation that has plenty.
 		try {
+			if (isCursorJsonlTranscript(opts.transcriptPath)) {
+				const { readCursorCliTranscript } = await import("./CursorCliTranscriptReader.js");
+				return [...(await readCursorCliTranscript(opts.transcriptPath)).entries];
+			}
 			const { readCursorTranscript } = await import("./CursorTranscriptReader.js");
 			const result = await readCursorTranscript(opts.transcriptPath);
 			return [...result.entries];

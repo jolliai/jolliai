@@ -56,6 +56,14 @@ export interface SessionUpsertedEvent {
 	readonly repoIdentity: string;
 	readonly source: TranscriptSource;
 	readonly sessionId: string;
+	/**
+	 * The live host named a completed session but supplied no transcript path.
+	 *
+	 * Such an event may create or refresh a bare row, but must not advance the
+	 * high-water mark of an existing transcript-derived row: doing that would make
+	 * the later disk discovery look older and strand the content it came to add.
+	 */
+	readonly metadataOnly?: true;
 	readonly title?: string;
 	readonly startedAtMs?: number;
 	readonly updatedAtMs: number;

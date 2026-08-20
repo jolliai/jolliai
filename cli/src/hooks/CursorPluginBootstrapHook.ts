@@ -62,15 +62,24 @@ import { fileURLToPath } from "node:url";
 import { isLocalAgentChild } from "../core/AgentReentry.js";
 import { execGit, isInsideGitRepo } from "../core/GitOps.js";
 import { withRepoHooksLock } from "../core/Locks.js";
-import { isPluginBundleCwd } from "../core/PluginBundlePaths.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
 import { removeCursorGlobalMenu } from "../install/CursorPluginSkills.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install, reconcileRuntimeRegistry, uninstall } from "../install/Installer.js";
 import { createLogger, setLogDir } from "../Logger.js";
+import { resolveCursorProjectDir } from "./CursorProjectDir.js";
 import { readStdin } from "./HookUtils.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
+
+/**
+ * Re-exported so the existing importers and tests keep their path.
+ *
+ * The decision itself moved to {@link file://./CursorProjectDir.ts} once the `stop` hook
+ * needed the same order plus the channel that supplied it — see that module's header for
+ * why one decision with two projections beats two copies of the candidate list.
+ */
+export { resolveCursorProjectDir };
 
 const log = createLogger("CursorPluginBootstrapHook");
 const SOURCE_TAG = "cursor-plugin";
@@ -95,60 +104,6 @@ export interface CursorBootstrapOutput {
 
 export function buildCursorBootstrapOutput(additionalContext: string | null): CursorBootstrapOutput | null {
 	return additionalContext ? { additional_context: additionalContext } : null;
-}
-
-/**
- * The workspace this session is for, or null when the host did not name one.
- *
- * **`process.cwd()` is NOT a usable fallback here, and that is measured.** Cursor runs
- * a plugin hook with the PLUGIN INSTALL DIRECTORY as its cwd — captured live on Cursor
- * 3.15.6, where a `sessionStart` probe reported
- * `pwd=~/.cursor/plugins/local/<plugin>` while `workspace_roots` named the real
- * workspace. (`_getHookCwd` in Cursor's bundle returns `file(installPath)` for every
- * plugin-sourced hook; only `stop` and `subagentStop` get `workspace.folders[0]`.) So
- * trusting cwd would hand this bootstrap the bundle it was launched from — and because
- * a marketplace served over git leaves its cache as a REAL checkout, `rev-parse
- * --show-toplevel` would succeed there and jolli would install git hooks into the
- * plugin cache repository. Same class of failure as a plugin-launched MCP server
- * answering for its own cache directory.
- *
- * Order, therefore:
- *   1. `workspace_roots[0]` — the documented common field, present on every event this
- *      hook sees (verified in the capture above).
- *   2. `CURSOR_PROJECT_DIR` — documented as always present, and confirmed set to the
- *      workspace even while cwd was the bundle. Covers a build that drops the array.
- *   3. `process.cwd()` — kept so a future Cursor that runs hooks in the workspace still
- *      works.
- *
- * **Every candidate is screened, not just cwd.** The harm being prevented is installing
- * this repo's git hooks into a marketplace cache — which is itself a real checkout, so
- * `rev-parse` would happily accept it — and that harm is identical whichever channel
- * supplied the path. The screen is a pure string compare, so applying it uniformly
- * costs nothing and removes the need to trust each source separately. A screened-out
- * candidate falls through to the next one rather than aborting: a bundle-valued
- * `workspace_roots` should not suppress a perfectly good `CURSOR_PROJECT_DIR`.
- *
- * Returning null when all three are unusable is deliberate: no bootstrap is a safe
- * no-op, whereas bootstrapping the wrong directory is not.
- *
- * A multi-root workspace yields several roots; the first is taken and the rest
- * ignored, matching every other surface's "one repository per install" model.
- */
-export function resolveCursorProjectDir(input: { workspace_roots?: unknown }, env: NodeJS.ProcessEnv): string | null {
-	const roots = input.workspace_roots;
-	const candidates: ReadonlyArray<string | undefined> = [
-		Array.isArray(roots)
-			? roots.find((root): root is string => typeof root === "string" && root.trim().length > 0)
-			: undefined,
-		env.CURSOR_PROJECT_DIR,
-		process.cwd(),
-	];
-	for (const candidate of candidates) {
-		if (candidate === undefined || candidate.trim().length === 0) continue;
-		if (isPluginBundleCwd(candidate)) continue;
-		return candidate;
-	}
-	return null;
 }
 
 export async function runCursorPluginBootstrap(projectDir: string): Promise<CursorBootstrapOutput | null> {

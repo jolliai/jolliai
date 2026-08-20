@@ -495,6 +495,25 @@ describe("collectSessionEvents", () => {
 		expect(event?.models).toBeUndefined();
 	});
 
+	it("builds a bare session row without attempting a read when no transcript path is known", async () => {
+		const event = await sessionEventFromInfo("repo-1", {
+			sessionId: "pathless",
+			source: "cursor",
+			updatedAt: "2026-08-11T10:41:00.000Z",
+		});
+
+		expect(event).toEqual({
+			type: "session.upserted",
+			repoIdentity: "repo-1",
+			source: "cursor",
+			sessionId: "pathless",
+			metadataOnly: true,
+			updatedAtMs: Date.parse("2026-08-11T10:41:00.000Z"),
+		});
+		expect(readTranscript).not.toHaveBeenCalled();
+		expect(readTranscriptForSource).not.toHaveBeenCalled();
+	});
+
 	it("omits activityBuckets entirely when no entry is timestamped", async () => {
 		vi.mocked(readTranscriptForSource).mockResolvedValueOnce({
 			entries: [{ role: "human", content: "hi" }],
@@ -633,6 +652,66 @@ describe("collectSessionEvents", () => {
 			preScanned: { claude: [diskSession()] },
 		});
 		expect(events.map((e) => e.sessionId).sort()).toEqual(["d1", "g1"]);
+	});
+
+	it("drops a switched-off source's registry rows", async () => {
+		// `sessions.json` is one per-project file holding every source's hook-written
+		// rows, so the read happens whatever the toggles say and the ROWS have to go.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [
+				claudeSession({ source: "cursor", sessionId: "c1" }),
+				claudeSession({ sessionId: "k1" }),
+			],
+			isSourceAllowed: (source) => source !== "cursor",
+		});
+		expect(events.map((e) => e.sessionId)).toEqual(["k1"]);
+	});
+
+	it("keeps GEMINI, which has no SESSION_SOURCES entry at all", async () => {
+		// The regression the predicate exists to avoid. Gemini has no disk discoverer, so
+		// the registry is its ONLY route — filtering sessions by registry MEMBERSHIP
+		// rather than by the toggle would delete every Gemini session on the machine,
+		// including under a gate as permissive as this one.
+		vi.mocked(readTranscript).mockResolvedValue(transcript({ usageByModel: [] }));
+		const events = await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: WORKTREE,
+			loadSessions: async () => [claudeSession({ source: "gemini", sessionId: "g1" })],
+			isSourceAllowed: (source) => source !== "cursor",
+		});
+		expect(events.map((e) => e.sessionId)).toEqual(["g1"]);
+	});
+
+	it("never opens a switched-off source's store — not even by the per-repo fallback", async () => {
+		// The half that would silently undo the whole thing: absence from `preScanned` is
+		// what makes the collector fall back to a source's PER-REPO scan, so narrowing
+		// only the machine-wide scan would turn "do not scan this" into "scan it once per
+		// repo instead".
+		//
+		// `loadSessions` is deliberately NOT injected: that fallback lives inside the
+		// DEFAULT loader, so an injected one bypasses the very code under test.
+		vi.mocked(loadRegistrySessions).mockResolvedValue([]);
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/tmp/definitely-no-agents-here",
+			isSourceAllowed: (source) => source !== "codex",
+		});
+		expect(discoverCodexSessions).not.toHaveBeenCalled();
+	});
+
+	it("still runs that fallback for a source that is switched ON", async () => {
+		// The other direction, so the test above cannot pass by the gate rejecting
+		// everything — or by the fallback simply never running in this harness.
+		vi.mocked(loadRegistrySessions).mockResolvedValue([]);
+		await collectSessionEvents({
+			repoIdentity: "r",
+			cwd: "/tmp/definitely-no-agents-here",
+			isSourceAllowed: () => true,
+		});
+		expect(discoverCodexSessions).toHaveBeenCalled();
 	});
 
 	it("keeps the registry copy when both routes surface one session (its instant is later)", async () => {

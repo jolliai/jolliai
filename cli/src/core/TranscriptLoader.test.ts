@@ -244,6 +244,22 @@ describe("loadTranscript", () => {
 		expect(result).toEqual([{ role: "human", content: "cursor hi" }]);
 	});
 
+	it("dispatches cursor source to the JSONL reader when discovery upgraded the path", async () => {
+		// `upgradeToJsonlTranscripts` points an IDE composer at its `agent-transcripts`
+		// JSONL whenever one exists — measured, 4 of 4 composers on a real machine. That
+		// path has no `#composerId`, so the composer-store reader THROWS on it, and this
+		// function's catch turns a throw into an EMPTY transcript: the conversation
+		// detail pane would render "no entries" for a conversation full of them.
+		const jsonl = "/Users/me/.cursor/projects/enc/agent-transcripts/u1/u1.jsonl";
+		vi.mocked(readCursorCliTranscript).mockResolvedValueOnce(
+			readResult([{ role: "human", content: "from the jsonl" }], jsonl),
+		);
+		const result = await loadTranscript({ source: "cursor", transcriptPath: jsonl });
+		expect(readCursorCliTranscript).toHaveBeenCalledWith(jsonl);
+		expect(readCursorTranscript).not.toHaveBeenCalled();
+		expect(result).toEqual([{ role: "human", content: "from the jsonl" }]);
+	});
+
 	it("dispatches copilot source to readCopilotTranscript with the synthetic path", async () => {
 		vi.mocked(readCopilotTranscript).mockResolvedValueOnce({
 			entries: [{ role: "assistant", content: "copilot reply" }],

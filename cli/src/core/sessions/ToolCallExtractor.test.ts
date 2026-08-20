@@ -34,7 +34,17 @@ describe("toolCallExtractor.supports", () => {
 	it("declines a source the set does not carry", () => {
 		// A source wrongly included would report `toolUse: []`, which every consumer
 		// reads as the positive claim "this agent called no tools".
-		expect(toolCallExtractor.supports("cursor" as TranscriptSource)).toBe(false);
+		//
+		// `cursor` used to be the example here and no longer is: its conversations are
+		// now read from the same agent-transcripts JSONL as `cursor-cli`, which is where
+		// their tool_use blocks live at all. `copilot` takes its place — its tool records
+		// are still unproven, and the set's membership is pinned in
+		// `TranscriptParserToolUse.test.ts`.
+		expect(toolCallExtractor.supports("copilot" as TranscriptSource)).toBe(false);
+	});
+
+	it("accepts cursor, whose reader now populates toolUse", () => {
+		expect(toolCallExtractor.supports("cursor" as TranscriptSource)).toBe(true);
 	});
 });
 

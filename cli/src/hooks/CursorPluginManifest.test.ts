@@ -107,13 +107,21 @@ describe("Cursor plugin MCP config", () => {
 });
 
 describe("Cursor plugin hooks", () => {
-	// Exactly one sessionStart bootstrap, no business hooks: the capture hooks are
-	// repo-installed and dispatched through run-hook, so a manifest-registered `stop`
-	// hook would double-run against the repo one.
-	it("registers only the sessionStart bootstrap", () => {
+	/*
+	 * Two entries and no more: the `sessionStart` bootstrap and the `stop` probe.
+	 *
+	 * The GIT capture hooks stay repo-installed and dispatched through `run-hook` — a
+	 * manifest-registered post-commit would double-run against the repo one. `stop` is
+	 * not in that category: it is an AGENT-level event with no repo-installed
+	 * counterpart on this host (nothing writes `.cursor/hooks.json`), so it duplicates
+	 * nothing. It is registered because scanning is the only way a Cursor conversation
+	 * currently reaches the dashboard, and a scan cannot see a conversation that is
+	 * still running — see `CursorStopHook`.
+	 */
+	it("registers the sessionStart bootstrap and the stop probe, and nothing else", () => {
 		const manifest = readJson(pluginRoot, "hooks", "hooks.json");
 		const hooks = manifest.hooks as Record<string, unknown>;
-		expect(Object.keys(hooks)).toEqual(["sessionStart"]);
+		expect(Object.keys(hooks).sort()).toEqual(["sessionStart", "stop"]);
 	});
 
 	// Cursor's event names are camelCase (`sessionStart`), NOT Claude's and Codex's
@@ -177,31 +185,35 @@ describe("Cursor plugin hooks", () => {
 	 * to an array of `{ command, … }`. Reusing the other hosts' intermediate
 	 * `{ hooks: [...] }` group would parse as one entry with no `command` at all.
 	 */
-	it("maps the event straight to command entries, with no nested hooks group", () => {
+	it("maps every event straight to command entries, with no nested hooks group", () => {
 		const hooks = readJson(pluginRoot, "hooks", "hooks.json").hooks as Record<
 			string,
 			Array<Record<string, unknown>>
 		>;
-		const entries = hooks.sessionStart;
-		expect(entries).toHaveLength(1);
-		expect(entries[0]).not.toHaveProperty("hooks");
-		expect(typeof entries[0].command).toBe("string");
+		for (const entries of Object.values(hooks)) {
+			expect(entries).toHaveLength(1);
+			expect(entries[0]).not.toHaveProperty("hooks");
+			expect(typeof entries[0].command).toBe("string");
+		}
 	});
 
-	it("launches the Cursor bootstrap through CURSOR_PLUGIN_ROOT", () => {
+	it("launches every hook through CURSOR_PLUGIN_ROOT", () => {
 		const hooks = readJson(pluginRoot, "hooks", "hooks.json").hooks as Record<
 			string,
 			Array<Record<string, string>>
 		>;
-		const command = hooks.sessionStart[0].command;
-		expect(command).toContain("CursorPluginBootstrapHook.js");
-		// Cursor provides its own plugin-root variable; the other hosts' names are not
-		// aliases here, so an unexpanded `${PLUGIN_ROOT}` would produce a command that
-		// fails silently on every session. Matched with a regex because the literal
-		// `${…}` reads as a template placeholder to the linter, which it is not.
-		expect(command).toMatch(/\$\{CURSOR_PLUGIN_ROOT\}/u);
-		expect(command).not.toContain("CLAUDE_PLUGIN_ROOT");
-		expect(command).not.toMatch(/\$\{PLUGIN_ROOT\}/u);
+		expect(hooks.sessionStart[0].command).toContain("CursorPluginBootstrapHook.js");
+		expect(hooks.stop[0].command).toContain("CursorStopHook.js");
+		for (const entries of Object.values(hooks)) {
+			const command = entries[0].command;
+			// Cursor provides its own plugin-root variable; the other hosts' names are not
+			// aliases here, so an unexpanded `${PLUGIN_ROOT}` would produce a command that
+			// fails silently on every session. Matched with a regex because the literal
+			// `${…}` reads as a template placeholder to the linter, which it is not.
+			expect(command).toMatch(/\$\{CURSOR_PLUGIN_ROOT\}/u);
+			expect(command).not.toContain("CLAUDE_PLUGIN_ROOT");
+			expect(command).not.toMatch(/\$\{PLUGIN_ROOT\}/u);
+		}
 	});
 });
 
@@ -261,6 +273,43 @@ describe("Cursor plugin dist entry set", () => {
 	// and REQUIRED_RUNTIME_FILES does not cover it.
 	it("bundles its own bootstrap entry", () => {
 		expect(buildScript).toContain('out: "CursorPluginBootstrapHook"');
+	});
+
+	// The `stop` hook the manifest registers. Same launch path as the bootstrap —
+	// ${CURSOR_PLUGIN_ROOT}, not dist-paths/.
+	it("bundles its own stop-hook entry", () => {
+		expect(buildScript).toContain('out: "CursorStopHook"');
+	});
+
+	// The stop hook returns after detaching this sibling process; omitting the explicit
+	// entry would make the child die on MODULE_NOT_FOUND with stdio ignored.
+	it("bundles the stop hook's detached discovery worker", () => {
+		expect(buildScript).toContain('out: "CursorDiscoveryWorker"');
+	});
+
+	/*
+	 * All Cursor-only entries must stay OUT of REQUIRED_RUNTIME_FILES, and this is the
+	 * assertion that keeps the tempting "it's a hook, hooks go in that list" edit from
+	 * landing.
+	 *
+	 * That list decides whether a dist is COMPLETE, and an incomplete dist is refused
+	 * registration. It is machine-global and shared by every surface, so adding an entry
+	 * only this bundle ships makes every already-installed CLI, VS Code and Claude/Codex
+	 * plugin dist fail the check and de-register itself — taking the shared git hooks
+	 * with it. Same reason McpLauncher.js is excluded on the Codex side.
+	 *
+	 * The blocked-commit hazard that motivates the list does not reach these three: the
+	 * first two are launched by Cursor directly and the worker by the stop hook beside
+	 * them, so a missing file costs capture/discovery rather than aborting a git operation.
+	 */
+	it("keeps the Cursor-only entries out of REQUIRED_RUNTIME_FILES", () => {
+		const writerText = readFileSync(join(repoRoot, "cli", "src", "install", "DistPathWriter.ts"), "utf-8");
+		const block = writerText.split("const REQUIRED_RUNTIME_FILES = [")[1]?.split("]")[0] ?? "";
+
+		expect(block.length).toBeGreaterThan(0);
+		expect(block).not.toContain("CursorPluginBootstrapHook");
+		expect(block).not.toContain("CursorStopHook");
+		expect(block).not.toContain("CursorDiscoveryWorker");
 	});
 
 	// Codex ships McpLauncher because it registers MCP into a global config.toml and

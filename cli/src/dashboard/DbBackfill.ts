@@ -36,6 +36,7 @@ import type { AlreadyCurrent } from "../core/DiskSessionScan.js";
 import { execGit, getHeadHash, resolveWorktreeRoots } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
 import { isJolliInternalRef } from "../core/JolliRefs.js";
+import { isSourceEnabled, loadConfig } from "../core/SessionTracker.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import type { StorageProvider } from "../core/StorageProvider.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
@@ -222,8 +223,21 @@ const CURSOR_SOT = "sot-import";
  * fix: 72 detail rows on a real database and NOT ONE with `ok_confidence = 'observed'`,
  * because every observed entry arrives by the `Skill` tool. A generation-7 database has
  * those sessions logged as current, so only a bump re-reads them.
+ *
+ * `9` — Cursor. Three separate things a full read now yields that `8` did not, all
+ * measured against 10 real transcripts. (a) MCP calls are classified as `mcp` with a
+ * server: Cursor routes every one through a generic `CallMcpTool` whose `input`
+ * carries `{server, toolName}`, and the old `mcp__`-prefix test filed all of them as
+ * `builtin:CallMcpTool` with the server discarded — so no Cursor session in any
+ * existing database has a single `mcp` row. (b) IDE conversations are read from the
+ * `agent-transcripts` JSONL instead of the composer store, which is where their
+ * `tool_use` blocks live at all; those sessions currently hold ZERO tool rows and a
+ * message count short by roughly half. (c) skills are extracted for both Cursor
+ * sources for the first time. None of those instants move on their own, so the
+ * un-skipped pass this bump buys is the only way an existing database picks any of
+ * it up.
  */
-const SESSION_READ_GENERATION = "8";
+const SESSION_READ_GENERATION = "9";
 
 /**
  * Content fingerprint of the summary index — the summaries cursor value.
@@ -311,6 +325,16 @@ export interface DbBackfillOptions {
 	 * scanning that one per repo, exactly as before.
 	 */
 	readonly preScanned?: PreScannedSessions;
+	/**
+	 * The AI-agent toggles, forwarded to the collector — see
+	 * {@link CollectSessionsOptions.isSourceAllowed}.
+	 *
+	 * Resolved once by {@link dbBackfillRepos} and threaded down, for the same reason
+	 * {@link preScanned} is: the config is machine-global, so reading it per repo is
+	 * re-reading one answer inside the loop this function's caller exists to hoist work
+	 * out of. Absent means "every source", which is what a direct caller gets.
+	 */
+	readonly isSourceAllowed?: (source: TranscriptSource) => boolean;
 	/** Test seam: read source for the SOT import; defaults to the orphan branch. */
 	readonly storage?: StorageProvider;
 	/**
@@ -2007,6 +2031,7 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				checkoutRoots: worktrees,
 				// The one caller that widens the horizon past every source's 48 h default.
 				windowMs: BACKFILL_SESSION_WINDOW_MS,
+				...(opts.isSourceAllowed ? { isSourceAllowed: opts.isSourceAllowed } : {}),
 				...(opts.preScanned ? { preScanned: opts.preScanned } : {}),
 				...(maySkip ? { isAlreadyCurrent: alreadyCurrentFrom(known) } : {}),
 				...(opts.loadSessions ? { loadSessions: opts.loadSessions } : {}),
@@ -2354,6 +2379,37 @@ interface ScanAllStoresResult {
 	readonly failures: ReadonlyArray<ScanFailure>;
 }
 
+/**
+ * The AI-agent toggles, resolved ONCE for a whole pass and returned as a predicate.
+ *
+ * Every other surface honours these — the sidebar's Active Conversations, `jolli
+ * status`, the post-commit summary, each hook-driven discovery pass — and this tier did
+ * not. A user who switched Cursor off in Settings saw it vanish from the sidebar and
+ * from their commit summaries while `jolli dashboard` kept scanning its store and
+ * writing its sessions, tool calls and skills into the database on every run, forever.
+ * The switch is one fact; it cannot mean "off" on four surfaces and "on" here.
+ *
+ * ONCE per pass, not once per repo: the config is machine-global
+ * (`~/.jolli/jollimemory/config.json`), so asking per repo is the same answer re-read N
+ * times inside a loop whose whole purpose is to hoist shared work out of it.
+ *
+ * A config that cannot be read answers ENABLED for everything — `loadConfig` already
+ * returns `{}` for an absent or unparseable file, and `isSourceEnabled` treats every
+ * value but an explicit `false` as on. Erring towards scanning is right here and is the
+ * opposite of the repo-level disable switch's rule: a missing toggle has never meant
+ * "off", so reading it as "off" would silently stop importing on a machine whose config
+ * merely failed to load.
+ *
+ * Note this does NOT retroactively remove anything: rows a source wrote before it was
+ * switched off stay in the database and stay on the page. "Off" means stop collecting,
+ * not erase the history — deleting on a toggle would make an accidental click
+ * unrecoverable, and the transcripts behind those rows are routinely gone.
+ */
+async function readSourceGate(): Promise<(source: TranscriptSource) => boolean> {
+	const config = await loadConfig();
+	return (source: TranscriptSource) => isSourceEnabled(source, config);
+}
+
 async function scanAllStores(opts: ScanAllStoresOptions): Promise<ScanAllStoresResult> {
 	const { alreadyRecorded, sources = SESSION_SOURCES, windowMs } = opts;
 	const scanned = new Map<TranscriptSource, ReadonlyArray<unknown>>();
@@ -2636,12 +2692,27 @@ export async function dbBackfillRepos(
 	// transcript itself (see `acceptFacts` for what that costs instead).
 	//
 	// Do not reintroduce a carried parse here without a byte cap on the total.
+	// Resolved before the scan and threaded into BOTH halves — the machine-wide scan
+	// here and each repo's collect below. Two call sites for one fact because they
+	// consume it in different shapes (a narrowed definition list vs. a predicate), and
+	// narrowing only the scan would be worse than not narrowing at all: absence from
+	// `preScanned` is precisely what makes the collector fall back to that source's
+	// PER-REPO scan, so a store skipped once here would be opened once per repo instead.
+	const allowSource = await readSourceGate();
+	const enabledSources = SESSION_SOURCES.filter((def) => allowSource(def.source));
+	if (enabledSources.length < SESSION_SOURCES.length) {
+		const off = SESSION_SOURCES.filter((def) => !allowSource(def.source)).map((def) => def.source);
+		log.info("skipping %d switched-off source(s): %s", off.length, off.join(", "));
+	}
 	const preScanned =
 		rest.preScanned ??
 		(live.length === 0 || rest.loadSessions
 			? {}
 			: await scanAllStoresLoggingFailures(
-					{ alreadyRecorded: await readRecordedSessions(live, rest.dbPath) },
+					{
+						alreadyRecorded: await readRecordedSessions(live, rest.dbPath),
+						sources: enabledSources,
+					},
 					// The back-fill's own consequence, which is NOT the re-scan's: absence from
 					// `preScanned` is what makes the collector fall back to this source's per-repo
 					// scan, so the sessions may still be picked up. Once per run, because a
@@ -2663,6 +2734,7 @@ export async function dbBackfillRepos(
 					...rest,
 					...perRepo,
 					preScanned,
+					isSourceAllowed: allowSource,
 					repo,
 				}),
 			);
@@ -2868,7 +2940,7 @@ export interface SessionRescanResult {
 	 * an inference across a module boundary that a fifth early return would silently
 	 * invalidate.
 	 */
-	readonly idleReason?: "no-sources" | "no-live-repos" | "no-database" | "database-unusable";
+	readonly idleReason?: "no-sources" | "sources-disabled" | "no-live-repos" | "no-database" | "database-unusable";
 }
 
 /**
@@ -2998,7 +3070,18 @@ export interface SessionRescanResult {
  * one. Phase 3 stays writable because it writes.
  */
 export async function dbRescanSessions(opts: SessionRescanOptions): Promise<SessionRescanResult> {
-	const sources = opts.sources ?? DAEMON_RESCAN_SOURCES;
+	// Narrowed by the AI-agent toggles, exactly like the back-fill and for the same
+	// reason — see {@link readSourceGate}. A timer is the surface where ignoring the
+	// switch is least defensible: a user who turned Codex off would have had its rollout
+	// tree stat-ed and its moved conversations re-read every 30 seconds for the machine's
+	// whole uptime, with nothing on any screen to show it was still happening.
+	//
+	// Only the source list needs it here, unlike the back-fill: this pass hands the
+	// collector an EMPTY loader, so the hook registry — the route that carries a
+	// switched-off source's rows past a narrowed registry — is never read at all.
+	const requested = opts.sources ?? DAEMON_RESCAN_SOURCES;
+	const allowSource = await readSourceGate();
+	const sources = requested.filter((def) => allowSource(def.source));
 	const now = opts.now ?? Date.now;
 	// `bootstrap`, like the back-fill: this reconstructs state from records already on
 	// disk, which is what that producer means. Deliberately not a new `ProducerKind` —
@@ -3037,7 +3120,12 @@ export async function dbRescanSessions(opts: SessionRescanOptions): Promise<Sess
 		idleReason,
 	});
 
-	if (sources.length === 0) return idleWith("no-sources");
+	// Two different situations, two different answers, and collapsing them would print a
+	// sentence that is false: `no-sources` is the documented one-line off switch (no
+	// definition declares `daemonRescan`), while `sources-disabled` means one DID and the
+	// user switched that agent off. Telling them "no source has opted in" describes the
+	// build rather than their own decision.
+	if (sources.length === 0) return idleWith(requested.length === 0 ? "no-sources" : "sources-disabled");
 	// Same predicate the back-fill uses, and for the same reason: `existingWorktrees`
 	// falls back to the recorded path, so a repo whose checkout is gone would have this
 	// pass narrowing sessions against a directory that does not exist.
