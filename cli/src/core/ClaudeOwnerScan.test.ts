@@ -95,6 +95,17 @@ describe("scanOwnerEdges", () => {
 		expect(edges.size).toBe(0);
 	});
 
+	it("skips a RELATIVE cwd without even resolving it (it would anchor against the reader's own cwd)", () => {
+		const always = vi.fn(() => "/root");
+		const { edges } = scanOwnerEdges(
+			[line(".", "2026-08-17T10:00:00.000Z"), line("/abs", "2026-08-17T10:01:00.000Z")],
+			0,
+			always,
+		);
+		expect(always).not.toHaveBeenCalledWith(".");
+		expect([...edges.keys()]).toEqual(["/root"]);
+	});
+
 	it("falls back to a caller-supplied instant when a line carries no timestamp", () => {
 		const lines = [JSON.stringify({ cwd: "/repo/a" })];
 		const edge = scanOwnerEdges(lines, 0, roots, () => "2026-08-17T12:00:00.000Z").edges.get("/repo/a");
@@ -254,6 +265,23 @@ describe("resolveClaudeTranscriptPath", () => {
 
 	it("returns null when the projects directory does not exist", async () => {
 		expect(await resolveClaudeTranscriptPath("sid", join(tmpdir(), "jolli-no-such-dir-xyz"))).toBeNull();
+	});
+
+	it("rejects an unsafe (traversal) session id before it can become a path segment", async () => {
+		const projects = await mkdtemp(join(tmpdir(), "jolli-proj3-"));
+		const proj = join(projects, "-Users-me-repo");
+		await mkdir(proj);
+		// A traversal id would escape `projects`; must be refused outright.
+		expect(await resolveClaudeTranscriptPath("../../../etc/hosts", projects)).toBeNull();
+	});
+
+	it("returns null when the candidate exists but is not a regular file", async () => {
+		const projects = await mkdtemp(join(tmpdir(), "jolli-proj4-"));
+		const proj = join(projects, "-Users-me-repo");
+		await mkdir(proj);
+		// A directory (or fifo) named like the transcript must not be accepted and read.
+		await mkdir(join(proj, "sid-dir.jsonl"));
+		expect(await resolveClaudeTranscriptPath("sid-dir", projects)).toBeNull();
 	});
 });
 

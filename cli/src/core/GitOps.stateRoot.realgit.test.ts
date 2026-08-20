@@ -59,4 +59,36 @@ describe("resolveStateRoot (real git)", () => {
 		const plain = makeTempDir();
 		expect(resolveStateRoot(plain)).toBe(plain);
 	});
+
+	// Regression for the ownership-ledger defect: a post-commit hook in a linked
+	// worktree runs with GIT_DIR exported, the detached worker inherits it, and the
+	// resolver's git fallback used to forward it — so `rev-parse` answered for the
+	// ambient repo instead of the asked-about directory, breaking the ledger's keys.
+	// With GIT_DIR set, the FS fast path declines (gitLocationIsOverridden), so this
+	// exercises exactly that fallback; the strip is what keeps it correct.
+	it("ignores an inherited GIT_DIR and resolves the asked-about directory's own repo", () => {
+		const repoA = makeTempDir();
+		execFileSync("git", ["init"], { cwd: repoA, stdio: ["ignore", "ignore", "ignore"] });
+		const repoB = makeTempDir();
+		execFileSync("git", ["init"], { cwd: repoB, stdio: ["ignore", "ignore", "ignore"] });
+		const deepB = join(repoB, "sub", "deeper");
+		mkdirSync(deepB, { recursive: true });
+		const expectedB = execFileSync("git", ["rev-parse", "--show-toplevel"], {
+			cwd: repoB,
+			encoding: "utf-8",
+		}).trim();
+
+		const savedGitDir = process.env.GIT_DIR;
+		try {
+			process.env.GIT_DIR = join(repoA, ".git"); // as a hook running in repoA would export
+			resetStateRootCache();
+			// Without the strip, GIT_DIR=repoA would misdirect this to repoA (or to the
+			// cwd itself); with it, we get repoB's real toplevel.
+			expect(resolveStateRoot(deepB)).toBe(expectedB);
+		} finally {
+			if (savedGitDir === undefined) delete process.env.GIT_DIR;
+			else process.env.GIT_DIR = savedGitDir;
+			resetStateRootCache();
+		}
+	});
 });

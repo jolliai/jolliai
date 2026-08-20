@@ -19,9 +19,10 @@
  */
 
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
+import { atomicWriteFileSync } from "./AtomicWrite.js";
 import { getGlobalConfigDir } from "./SessionTracker.js";
 
 const log = createLogger("SessionPushCursor");
@@ -266,7 +267,14 @@ export function writeSessionPushChannel(state: SessionPushChannelState, configDi
 	const path = getSessionPushChannelPath(configDir);
 	try {
 		mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-		writeFileSync(path, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
+		// Atomic (tmpfile + rename), NOT a bare in-place write: this channel holds
+		// no lock and three producers (the daemon tick, the commit-drain tail, and
+		// `doctor --sync-sessions`) can overlap, so an in-place write let a reader —
+		// or the next producer — observe a half-written file. The rename makes every
+		// write all-or-nothing; the accepted residual is last-writer-wins on the
+		// whole file, which costs one duplicated delivery into an upsert, never a
+		// corrupt cursor map.
+		atomicWriteFileSync(path, `${JSON.stringify(state, null, 2)}\n`, 0o600);
 	} catch (err) {
 		log.debug("could not write session push channel state: %s", errMsg(err));
 	}

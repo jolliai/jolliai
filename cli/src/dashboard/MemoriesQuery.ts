@@ -37,6 +37,8 @@ import { sanitizeNativeIdForPath } from "../core/references/ReferenceStore.js";
 import { firstUserMessageTitleFromEntries } from "../core/SessionTitleResolver.js";
 import { buildSkillsAggregateMarkdown, buildSkillsSummaryLabel } from "../core/SkillsAggregateMarkdown.js";
 import { assembleMemoryTree } from "../core/SqliteStorage.js";
+import { createStorage } from "../core/StorageFactory.js";
+import type { StorageProvider } from "../core/StorageProvider.js";
 import { formatProviderLabel } from "../core/SummaryFormat.js";
 import {
 	aggregateConversationTokenBreakdown,
@@ -1001,9 +1003,67 @@ export async function readMemoryTranscriptRepairState(
 			| { repo_id: number; commit_hash: string; summary_json: string; worktree_root: string | null }
 			| undefined;
 		if (!row?.worktree_root) return undefined;
+		const worktreeRoot = row.worktree_root; // captured for the storage closure below (narrowing does not survive it)
 		const summary = (assembleMemoryTree(db, row.repo_id, row.commit_hash) ??
 			JSON.parse(row.summary_json)) as CommitSummary;
-		return await transcriptRepairState(summary, row.worktree_root);
+		// The repo's empty-OR-repaired siblings, so the verdict reflects the dedup
+		// floor a real `doctor --repair-transcripts` run would hand this memory (the
+		// only repair path a user can trigger) rather than the lone-repair window —
+		// otherwise the panel shows "repairable" for a memory the batch would dedup to
+		// empty. Read from the dashboard DB, NOT `listSummaries`: this process must
+		// never touch the post-cutover frozen orphan branch (JOLLI-2231). Two shapes
+		// count and both bound the floor: a memory with no `memory_transcripts` rows is
+		// an empty CANDIDATE, and one whose summary carries `transcriptsRepairedAt` was
+		// REPAIRED in a prior run (it has transcript rows, so the NOT EXISTS clause
+		// misses it — the LIKE catches it). `dedupFloorForTarget` re-filters the parsed
+		// rows via `isTranscriptRepairCandidate`/`transcriptsRepairedAt`, so a LIKE
+		// false-positive is harmless.
+		//
+		// A LAZY provider: `transcriptRepairState` short-circuits for the
+		// present/repaired majority before it needs siblings, so this repo-wide query
+		// runs only for an actual empty candidate.
+		// Assembled as a TREE, exactly like `summary` above: a squash/amend sibling
+		// keeps its transcripts on the folded children, so the bare `summary_json`
+		// row (children emptied) would read as an empty candidate and inject a
+		// phantom entry into the floor replay. `commit_hash` is selected for that
+		// assembly; the raw row is the fallback for a tree that cannot be rebuilt.
+		const siblingSummaries = (): Promise<readonly CommitSummary[]> =>
+			Promise.resolve(
+				(
+					db
+						.prepare(
+							`SELECT m.commit_hash, m.summary_json
+							   FROM memories m
+							  WHERE m.repo_id = ?
+							    AND (
+							        NOT EXISTS (
+							            SELECT 1 FROM memory_transcripts mt
+							             WHERE mt.repo_id = m.repo_id AND mt.commit_hash = m.commit_hash
+							        )
+							        OR m.summary_json LIKE '%"transcriptsRepairedAt"%'
+							    )`,
+						)
+						.all(row.repo_id) as ReadonlyArray<{ commit_hash: string; summary_json: string }>
+				).map(
+					(r) =>
+						(assembleMemoryTree(db, row.repo_id, r.commit_hash) ??
+							JSON.parse(r.summary_json)) as CommitSummary,
+				),
+			);
+		// The floor replay reads each sibling's STORED transcripts, which is NOT
+		// storage-independent: `readTranscriptsBatch` resolves an absent storage
+		// through the process-global active storage, and this dashboard process is
+		// machine-global — a guided-front-door run may have set that global to the
+		// launching repo, so every OTHER repo's detail row would read its siblings
+		// back as unreadable. Build storage from THIS memory's own worktree root and
+		// thread it in. LAZY, like `siblingSummaries`: `transcriptRepairState` resolves
+		// it only past the present/repaired short-circuit, so the routing (and any
+		// SQLite open it entails) is not paid on the hot path. `createStorage` routes a
+		// cutover/legacy-fenced repo to SQLite (never the frozen orphan branch,
+		// JOLLI-2231) and rejects only for a blocked one, which the outer catch renders
+		// as the plainest sentence.
+		const storage = (): Promise<StorageProvider> => createStorage(worktreeRoot, worktreeRoot);
+		return await transcriptRepairState(summary, worktreeRoot, { siblingSummaries, storage });
 	} catch (err) {
 		log.debug("transcript repair state unavailable for %s: %s", hash, errMsg(err));
 		return undefined;

@@ -753,6 +753,30 @@ export class JolliMemoryPushClient {
 					"the backend may not implement this endpoint",
 			);
 		}
+		if (Object.keys(payload.tables).length > 0 && json.accepted === undefined && json.cursor === undefined) {
+			// A well-formed JSON 2xx that carries NEITHER an accepted count nor a
+			// cursor is not a valid acknowledgement — an ingesting endpoint always
+			// answers with at least one. Left as "full success" it defaulted both to
+			// `{}`, so every table fell through to the batch's own high-water mark and
+			// the cursor advanced over rows the server never stored (the parse-failure
+			// case above is only the non-JSON shape of this same hole). Same CLASS as a
+			// missing endpoint: fail loudly, never advance. A conforming backend that
+			// genuinely has no per-table cursor opinion still returns an `accepted`
+			// map, so this rejects only the empty-ack shape.
+			//
+			// GATED on rows actually being SENT. This guard's whole rationale is "do not
+			// advance the cursor over unstored rows", and the empty-batch RECONCILE ping
+			// (`SessionSyncRunner.sync`'s one request per throttle window with `tables:
+			// {}`) has no rows to advance over — its `localMaxima` is empty, so it cannot
+			// move the cursor regardless of the answer, and its purpose is served entirely
+			// by the server's own 409/cursor-behind reply, not by this ack. Without the
+			// gate, a backend that answers that idle ping with a bare `{}` would silence
+			// the whole channel for 24h over the steady-state request of an idle machine.
+			throw new SessionEndpointMissingError(
+				`Response from /api/push/jollimemory/sessions (HTTP ${status}) carried neither an accepted count nor a ` +
+					"cursor — treating as an unimplemented endpoint rather than advancing the cursor over unstored rows",
+			);
+		}
 		return { accepted: json.accepted ?? {}, cursor: json.cursor ?? {} };
 	}
 

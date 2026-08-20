@@ -2471,3 +2471,39 @@ describe("unparkStuckEvents", () => {
 		expect(() => unparkStuckEvents(handle)).toThrow(/malformed/);
 	});
 });
+
+describe("applyStatsEvents — rollup cache invalidation on a session day-move", () => {
+	it("forgets the SOURCE day's cached rows when a session's updated_at_ms moves to another day", async () => {
+		const T1 = 1_700_000_000_000; // 2023-11-14 (UTC)
+		const T2 = T1 + 3 * 86_400_000; // three days later — a different local day
+		const day1 = new Date(T1).toISOString().slice(0, 10);
+
+		// The session lands on day1 and a rollup is settled for that day.
+		await applyStatsEvents([envelope(session({ updatedAtMs: T1 }))], { producerKind: "cli", dbPath });
+		await withDashboardDb(
+			(db) => {
+				const repoId = (
+					db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as { id: number }
+				).id;
+				const ins = db.prepare(
+					`INSERT INTO stats_daily (repo_id, tz, day, kind, series_key, value, cost_usd, built_at_ms, updated_at_ms)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				);
+				ins.run(0, "UTC", day1, "built", "", 0, 0, T1, T1); // sentinel: day1 is settled
+				ins.run(repoId, "UTC", day1, "model", "claude-opus-5", 150, 0.5, T1, T1); // its data
+			},
+			{ dbPath },
+		);
+
+		// The SAME session, its clock moved to a different day. The staleness scan
+		// only notices the destination, so without an explicit forget day1 would stay
+		// cached and overstate forever.
+		await applyStatsEvents([envelope(session({ updatedAtMs: T2 }))], { producerKind: "cli", dbPath });
+
+		const remaining = await query<{ n: number }>(
+			"SELECT COUNT(*) AS n FROM stats_daily WHERE tz = 'UTC' AND day = ?",
+			day1,
+		);
+		expect(remaining[0].n).toBe(0);
+	});
+});

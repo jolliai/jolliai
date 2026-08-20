@@ -13,10 +13,11 @@
  * notions of "line N" cannot drift apart.
  */
 
-import { access, readdir, readFile } from "node:fs/promises";
+import { readdir, readFile, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createLogger } from "../Logger.js";
+import { isSafeSessionId } from "./AgentSessionEnv.js";
 import { type ClaudeOwnerEdge, recordClaudeOwners } from "./ClaudeOwnership.js";
 import { resolveWorktreeRootOrNull } from "./GitOps.js";
 import { loadExtractorCursorLine, saveExtractorCursor } from "./SessionTracker.js";
@@ -123,6 +124,14 @@ export function scanOwnerEdges(
 		}
 		const cwd = typeof raw.cwd === "string" ? raw.cwd : "";
 		if (cwd.length === 0) continue;
+		// A RELATIVE cwd cannot identify a worktree root on its own — resolving it
+		// would anchor against THIS process's own working directory (the draining
+		// worker's = the committing worktree), so a transcript whose lines carry a
+		// relative cwd (e.g. `"."`) would mint an owner edge keyed to whatever
+		// checkout happens to be draining, regardless of what the transcript is
+		// about. Real producer transcripts always stamp an absolute cwd, so
+		// requiring one loses no genuine edge and closes that minting vector.
+		if (!isAbsolute(cwd)) continue;
 
 		const at = typeof raw.timestamp === "string" && raw.timestamp.length > 0 ? raw.timestamp : now();
 
@@ -200,6 +209,11 @@ export async function resolveClaudeTranscriptPath(
 	sessionId: string,
 	projectsDir: string = join(homedir(), ".claude", "projects"),
 ): Promise<string | null> {
+	// The id becomes a path segment below, and it arrives unvalidated from the
+	// environment or from a schema-less queue entry — so a traversal value would
+	// escape `projectsDir` here. Reject anything that is not a plain segment
+	// before it can reach `join` (see isSafeSessionId).
+	if (!isSafeSessionId(sessionId)) return null;
 	let slugs: string[];
 	try {
 		slugs = (await readdir(projectsDir, { withFileTypes: true })).filter((d) => d.isDirectory()).map((d) => d.name);
@@ -209,8 +223,10 @@ export async function resolveClaudeTranscriptPath(
 	for (const slug of slugs) {
 		const candidate = join(projectsDir, slug, `${sessionId}.jsonl`);
 		try {
-			await access(candidate);
-			return candidate;
+			// Require a REGULAR FILE, not merely "something exists": the whole file
+			// is read next, and `access` would happily accept a directory or a fifo
+			// (which a `readFile` could block on).
+			if ((await stat(candidate)).isFile()) return candidate;
 		} catch {
 			// not in this project dir — keep looking
 		}

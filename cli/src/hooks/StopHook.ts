@@ -279,10 +279,12 @@ async function discoverFromTranscript(sessionInfo: SessionInfo, cwd: string): Pr
 	// plan/reference cursor, and vice versa.
 	await scanSkillsWithCursor(transcriptPath, cwd, "claude");
 
-	// Fourth extractor, same protocol. This is the ONLY writer of the machine-global
-	// ownership ledger, and it is what lets a DIFFERENT checkout later prove it owns
-	// a slice of this session: the transcript's own `cwd` lines are the evidence, and
-	// they are only visible while the file is being scanned here.
+	// Fourth extractor, same protocol. This is the FORWARD writer of the
+	// machine-global ownership ledger (the commit-time backfill in QueueWorker is
+	// the other, through this same scanOwnersWithCursor + recordClaudeOwners), and
+	// it is what lets a DIFFERENT checkout later prove it owns a slice of this
+	// session: the transcript's own `cwd` lines are the evidence, and they are only
+	// visible while the file is being scanned here.
 	await scanOwnersWithCursor(transcriptPath, sessionInfo.sessionId, cwd);
 
 	// Hold the cursor if the plan scan threw: advancing past its window (the

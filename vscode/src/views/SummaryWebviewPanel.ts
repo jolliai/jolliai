@@ -42,14 +42,12 @@ import {
 	groupArchivedSessions,
 } from "../../../cli/src/core/ArchivedConversations.js";
 import { resolveSessionTitle } from "../../../cli/src/core/SessionTitleResolver.js";
-import {
-	type TranscriptRepairState,
-	transcriptRepairState,
-} from "../../../cli/src/core/TranscriptRepair.js";
+import { type TranscriptRepairState, transcriptRepairState } from "../../../cli/src/core/TranscriptRepair.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import { runWithTrace } from "../../../cli/src/core/TraceContext.js";
 import {
 	getTranscriptHashes as coreGetTranscriptHashes,
+	listSummaries,
 	readNoteFromBranch,
 	readPlanFromBranch,
 	readReferenceFromBranch,
@@ -3982,19 +3980,36 @@ export class SummaryWebviewPanel {
 	 * unreadable owners ledger must not cost them the rows. Guessing the other
 	 * way would invite a repair that has nothing to work from.
 	 *
-	 * `this.workspaceRoot` is the cwd even in foreign-storage mode, matching
-	 * every other read in this class. A foreign memory's owner edges are keyed by
-	 * ITS worktree root, which this panel does not have, so such a memory falls to
-	 * `unrepairable` — the conservative answer, and the honest one: the repair
-	 * itself is per-repo and could not run from here either.
+	 * In foreign-storage mode the memory belongs to ANOTHER repository, whose owner
+	 * edges are keyed by ITS worktree root — which this panel does not have. Asking
+	 * the engine with `this.workspaceRoot` (the cwd, as every other read here uses)
+	 * would judge the foreign memory against the CURRENT repo's owned-session ledger
+	 * and could answer `repairable` for a commit whose repair could never run from
+	 * here — the false promise the JVM host avoids by resolving the memory in the
+	 * current repo and missing. So a foreign memory short-circuits to `unrepairable`,
+	 * the conservative and honest answer; the engine is asked only for a local one.
 	 */
 	private async readTranscriptRepairState(): Promise<TranscriptRepairState> {
 		const summary = this.currentSummary;
 		if (!summary) {
 			return "unrepairable";
 		}
+		if (this.foreignRepoName) {
+			return "unrepairable";
+		}
 		try {
-			return await transcriptRepairState(summary, this.workspaceRoot);
+			// The repo's empty-or-repaired siblings, so the verdict reflects the dedup
+			// floor a real `doctor --repair-transcripts` run would hand this memory (the
+			// only user-triggerable repair path), not the lone-repair window. Passed as a
+			// LAZY provider: `transcriptRepairState` short-circuits for the present/repaired
+			// majority before it needs siblings, so an eager `listSummaries(MAX)` (a read
+			// per memory) would be paid on every detail open and thrown away. The engine
+			// also owns the "which siblings count" filter — a repaired sibling still bounds
+			// the floor — so this passes the raw list rather than pre-filtering to empties.
+			// Local storage routed by workspaceRoot, as every other read in this panel is.
+			return await transcriptRepairState(summary, this.workspaceRoot, {
+				siblingSummaries: () => listSummaries(Number.MAX_SAFE_INTEGER, this.workspaceRoot),
+			});
 		} catch (err) {
 			log.warn(
 				"Transcript repair state unavailable: %s",

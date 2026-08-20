@@ -36,6 +36,21 @@
 export const SESSION_ID_ENV_VARS: ReadonlyArray<string> = ["CLAUDE_CODE_SESSION_ID"];
 
 /**
+ * True when `id` is safe to interpolate as a single path segment when locating a
+ * session's transcript (`<projectsDir>/<slug>/<id>.jsonl`). The id reaches that
+ * `join` from two attacker-influenceable sources — the process environment, and
+ * the executing-session field of a queue entry, which is an ordinary JSON file
+ * parsed with no schema — so an unvalidated value carrying `../` traversal
+ * escapes the producer's transcript directory (`join` normalises the traversal
+ * rather than rejecting it). A real producer session id is a plain token; this
+ * predicate admits exactly that and rejects any separator, traversal, or empty /
+ * dot-only name, which closes the escape at the point the id becomes a path.
+ */
+export function isSafeSessionId(id: string): boolean {
+	return /^[A-Za-z0-9._-]+$/.test(id) && id !== "." && id !== "..";
+}
+
+/**
  * The agent session this process is running inside, or `undefined` for a plain
  * terminal and for every host in the note above. A blank value is treated as
  * absent rather than returned as an empty id.
@@ -43,7 +58,10 @@ export const SESSION_ID_ENV_VARS: ReadonlyArray<string> = ["CLAUDE_CODE_SESSION_
 export function currentAgentSessionId(): string | undefined {
 	for (const name of SESSION_ID_ENV_VARS) {
 		const id = process.env[name]?.trim();
-		if (id) return id;
+		// A malformed value (traversal, separators) is treated as absent rather
+		// than carried forward: an invented/hostile id must never become a path
+		// segment downstream, and "no id" is the honest answer for one we refuse.
+		if (id && isSafeSessionId(id)) return id;
 	}
 	return undefined;
 }

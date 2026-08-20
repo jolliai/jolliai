@@ -104,7 +104,7 @@ afterEach(() => {
 
 describe("transcriptRepairState", () => {
 	it("is present when the summary already references a transcript", async () => {
-		expect(await transcriptRepairState(summary({ transcripts: ["t1"] }), repo, globalDir)).toBe("present");
+		expect(await transcriptRepairState(summary({ transcripts: ["t1"] }), repo, { globalDir })).toBe("present");
 	});
 
 	it("is repaired when the marker is set", async () => {
@@ -112,7 +112,7 @@ describe("transcriptRepairState", () => {
 			await transcriptRepairState(
 				summary({ transcripts: ["t1"], transcriptsRepairedAt: "2026-08-17T12:00:00.000Z" }),
 				repo,
-				globalDir,
+				{ globalDir },
 			),
 		).toBe("repaired");
 	});
@@ -122,11 +122,11 @@ describe("transcriptRepairState", () => {
 			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
 			globalDir,
 		);
-		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, globalDir)).toBe("repairable");
+		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, { globalDir })).toBe("repairable");
 	});
 
 	it("is unrepairable when no owner edge proves this checkout", async () => {
-		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, globalDir)).toBe("unrepairable");
+		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, { globalDir })).toBe("unrepairable");
 	});
 
 	it("is unrepairable when the transcript file is gone", async () => {
@@ -138,7 +138,7 @@ describe("transcriptRepairState", () => {
 			},
 			globalDir,
 		);
-		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, globalDir)).toBe("unrepairable");
+		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, { globalDir })).toBe("unrepairable");
 	});
 
 	it("is unrepairable when the owner window holds no turns, despite the transcript existing", async () => {
@@ -154,7 +154,7 @@ describe("transcriptRepairState", () => {
 			},
 			globalDir,
 		);
-		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, globalDir)).toBe("unrepairable");
+		expect(await transcriptRepairState(summary({ transcripts: [] }), repo, { globalDir })).toBe("unrepairable");
 	});
 
 	it("is unrepairable when the summary carries no upper bound, despite owner and transcript", async () => {
@@ -165,11 +165,9 @@ describe("transcriptRepairState", () => {
 			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
 			globalDir,
 		);
-		const state = await transcriptRepairState(
-			summary({ transcripts: [], generatedAt: "", commitDate: "" }),
-			repo,
+		const state = await transcriptRepairState(summary({ transcripts: [], generatedAt: "", commitDate: "" }), repo, {
 			globalDir,
-		);
+		});
 		expect(state).toBe("unrepairable");
 	});
 
@@ -181,10 +179,155 @@ describe("transcriptRepairState", () => {
 			globalDir,
 		);
 
-		const state = await transcriptRepairState(summary({ transcripts: [] }), repo, globalDir);
+		const state = await transcriptRepairState(summary({ transcripts: [] }), repo, { globalDir });
 
 		expect(resolveStateRoot).toHaveBeenCalledWith(repo);
 		expect(state).toBe("repairable");
+	});
+
+	it("is unrepairable for a later memory whose only turns an earlier empty sibling claims in a batch run", async () => {
+		// The drift the sibling-aware path removes: memory B alone LOOKS repairable
+		// (its window holds the 10:00 turn), but the ONLY repair a user can run is
+		// the multi-memory batch, which archives that turn to the earlier-bounded A
+		// and dedups B to empty. The transcript holds nothing after A's bound, so B
+		// is genuinely unrepairable — and the UI must say so, not promise a repair
+		// the batch then refuses.
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		const a = summary({ commitHash: "a".repeat(40), transcripts: [], generatedAt: "2026-08-17T10:15:00.000Z" });
+		const b = summary({ commitHash: "b".repeat(40), transcripts: [], generatedAt: "2026-08-17T11:00:00.000Z" });
+
+		// Alone (no siblings), B still over-promises — the single-memory verdict.
+		expect(await transcriptRepairState(b, repo, { globalDir })).toBe("repairable");
+
+		// With the repo's empty siblings, B reflects the batch's dedup floor (A's
+		// bound) and correctly reports unrepairable, while A itself stays repairable.
+		const siblings = () => Promise.resolve([a, b]);
+		expect(await transcriptRepairState(b, repo, { globalDir, siblingSummaries: siblings })).toBe("unrepairable");
+		expect(await transcriptRepairState(a, repo, { globalDir, siblingSummaries: siblings })).toBe("repairable");
+	});
+
+	it("is unrepairable when an ALREADY-REPAIRED earlier sibling claims its only turns (cross-run dedup)", async () => {
+		// The cross-run gap: A was repaired in an EARLIER `doctor --repair-transcripts`
+		// run (so it carries `transcriptsRepairedAt` and is no longer a candidate), and
+		// B fails capture and is repaired in a SECOND run. A's window [firstSeen..10:15]
+		// already archived the only turn (10:00); B's real floor is what A PROVABLY
+		// archived from that session, so B is genuinely unrepairable. Filtering siblings
+		// to candidates alone would drop the repaired A, hand B an undefined floor, and
+		// re-archive A's turn into B — so the UI must fold repaired siblings into the
+		// floor exactly as the batch run does. A is REPAIRED FOR REAL here (its
+		// transcript is stored and read back readable): the floor now rests on A's
+		// proven per-session content, not on the retired unreadable-fallback bound.
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		// Distinct hashes (beforeEach seeds "a".repeat(40)); A bounded at 10:15 so it
+		// sorts before B and its stored slice covers the only turn (10:00).
+		const aHash = "e".repeat(40);
+		const bHash = "f".repeat(40);
+		await storeSummary(
+			summary({ commitHash: aHash, transcripts: [], generatedAt: "2026-08-17T10:15:00.000Z" }),
+			repo,
+		);
+		expect((await repairSummaryTranscripts(aHash, repo, { apply: true, globalDir })).repaired).toBe(true);
+		const a = (await getSummary(aHash, repo)) as CommitSummary;
+		const b = summary({ commitHash: bHash, transcripts: [], generatedAt: "2026-08-17T11:00:00.000Z" });
+
+		// Alone, B still over-promises (the single-memory verdict, no dedup).
+		expect(await transcriptRepairState(b, repo, { globalDir })).toBe("repairable");
+		// With the repaired sibling A folded into the floor, B is correctly unrepairable.
+		expect(
+			await transcriptRepairState(b, repo, { globalDir, siblingSummaries: () => Promise.resolve([a, b]) }),
+		).toBe("unrepairable");
+	});
+
+	it("keeps a later memory repairable when a repaired sibling never archived a newly-owned session (cross-run, per-session floor)", async () => {
+		// The P1 data-loss shape: the dedup floor must be PER SESSION, not one
+		// worktree-wide bound. In run 1 only session sX was owned, so repaired
+		// sibling A archived sX up to its 10:15 bound. AFTER that run a second
+		// session sY becomes owned by this worktree, and sY's only turn (10:05)
+		// predates A's bound — but A never saw sY, so that turn was archived
+		// NOWHERE. A single global floor of 10:15 would suppress it and report B
+		// empty; a per-session floor (derived from what A actually archived) leaves
+		// sY untouched, so B stays repairable.
+		const sX = join(globalDir, "sX.jsonl");
+		const sY = join(globalDir, "sY.jsonl");
+		await writeFile(
+			sX,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:00:00.000Z", message: { role: "user", content: "x" } })}\n`,
+			"utf-8",
+		);
+		await writeFile(
+			sY,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:05:00.000Z", message: { role: "user", content: "y" } })}\n`,
+			"utf-8",
+		);
+		// Distinct hashes: the beforeEach already seeds one at "a".repeat(40), and
+		// storeSummary is first-write-wins on generatedAt — colliding there would
+		// silently keep the default bound and mis-order the two siblings.
+		const aHash = "c".repeat(40);
+		const bHash = "d".repeat(40);
+		await storeSummary(
+			summary({ commitHash: aHash, transcripts: [], generatedAt: "2026-08-17T10:15:00.000Z" }),
+			repo,
+		);
+		await storeSummary(
+			summary({ commitHash: bHash, transcripts: [], generatedAt: "2026-08-17T11:00:00.000Z" }),
+			repo,
+		);
+
+		// Run 1: only sX owned. Actually repair A so it stores what it archived.
+		await recordClaudeOwners(
+			{ sessionId: "sX", transcriptPath: sX, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		expect((await repairSummaryTranscripts(aHash, repo, { apply: true, globalDir })).repaired).toBe(true);
+
+		// Between runs: sY (an older, un-archived turn) becomes owned by this worktree.
+		await recordClaudeOwners(
+			{ sessionId: "sY", transcriptPath: sY, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+
+		const a = (await getSummary(aHash, repo)) as CommitSummary;
+		const b = (await getSummary(bHash, repo)) as CommitSummary;
+		expect(a.transcriptsRepairedAt).toBeTruthy();
+		// Guards the fixture: A must carry its 10:15 bound (so it sorts before B and
+		// its floor is a real threat to sY's 10:05 turn), not the default 11:00:05.
+		expect(a.generatedAt).toBe("2026-08-17T10:15:00.000Z");
+		expect(
+			await transcriptRepairState(b, repo, { globalDir, siblingSummaries: () => Promise.resolve([a, b]) }),
+		).toBe("repairable");
+	});
+
+	it("keeps a later memory repairable when an earlier repaired sibling's stored transcript is UNREADABLE", async () => {
+		// A repaired sibling whose stored transcript cannot be read contributes
+		// NOTHING to the floor. Its archived copy is invisible to the user, so using
+		// its bound as a worktree-wide floor would suppress a later memory's turns and
+		// hide them from BOTH places — the P1 shape one step along. Sibling A is
+		// repaired (carries `transcriptsRepairedAt`) and names transcript "t-a", but
+		// that artifact was never stored, so `archivedSessionFloor` reads it back
+		// unreadable. Its 10:15 bound is at-or-after the only owned turn (10:00), so
+		// the RETIRED worktree-wide fallback would have dropped that turn and reported
+		// B unrepairable; the current rule leaves the session untouched.
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		const a = summary({
+			commitHash: "c".repeat(40),
+			transcripts: ["t-a"], // named but never stored → unreadable on read-back
+			transcriptsRepairedAt: "2026-08-18T00:00:00.000Z",
+			generatedAt: "2026-08-17T10:15:00.000Z", // sorts before B; bound covers the 10:00 turn
+		});
+		const b = summary({ commitHash: "d".repeat(40), transcripts: [], generatedAt: "2026-08-17T11:00:00.000Z" });
+
+		expect(
+			await transcriptRepairState(b, repo, { globalDir, siblingSummaries: () => Promise.resolve([a, b]) }),
+		).toBe("repairable");
 	});
 });
 
@@ -344,5 +487,66 @@ describe("repairSummaryTranscripts", () => {
 		await storeSummary(summary({ commitHash: presentHash, transcripts: ["existing-id"] }), repo);
 		const out = await repairSummaryTranscripts(presentHash, repo, { apply: true, globalDir });
 		expect(out.reason).toBe("already-present");
+	});
+});
+
+describe("repairSummaryTranscripts — cross-memory de-duplication (afterExclusive)", () => {
+	it("drops turns at or before the dedup floor, keeping the lower bound at firstSeenLine", async () => {
+		// Two turns; the earlier one was already archived to an earlier-bounded
+		// commit in this run, so a later commit's repair must not re-archive it.
+		// A user turn then an assistant turn, so they stay two distinct entries with
+		// distinct timestamps (the parser merges consecutive SAME-role turns).
+		await writeFile(
+			transcript,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:00:00.000Z", message: { role: "user", content: "first" } })}\n` +
+				`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:30:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "reply" }] } })}\n`,
+			"utf-8",
+		);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		await storeSummary(summary({ transcripts: [] }), repo);
+
+		// No dedup floor → both turns.
+		const full = await repairSummaryTranscripts(HASH, repo, { apply: false, globalDir });
+		expect(full.entries).toBe(2);
+
+		// Floor at the first turn's instant → only the later turn survives.
+		const deduped = await repairSummaryTranscripts(HASH, repo, {
+			apply: false,
+			globalDir,
+			afterExclusive: "2026-08-17T10:00:00.000Z",
+		});
+		expect(deduped.entries).toBe(1);
+	});
+
+	it("compares the dedup floor NUMERICALLY, so an offset-form floor does not lexicographically drop a Z-form turn", async () => {
+		// The floor arrives as `generatedAt || commitDate`, which for a backfilled
+		// commit is git `%aI` offset form (`…+08:00`), while transcript timestamps
+		// are Claude's `Z` form. `2026-08-17T18:00:00.000+08:00` is the SAME instant
+		// as `2026-08-17T10:00:00.000Z`, but as a STRING it sorts AFTER the 10:30 Z
+		// turn — so a lexicographic `>` would drop that later turn too and report
+		// `no-entries-in-window` (silent data loss). Numeric comparison keeps it.
+		await writeFile(
+			transcript,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:00:00.000Z", message: { role: "user", content: "first" } })}\n` +
+				`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:30:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "reply" }] } })}\n`,
+			"utf-8",
+		);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[resolveStateRoot(repo), EDGE]]) },
+			globalDir,
+		);
+		await storeSummary(summary({ transcripts: [] }), repo);
+
+		const deduped = await repairSummaryTranscripts(HASH, repo, {
+			apply: false,
+			globalDir,
+			afterExclusive: "2026-08-17T18:00:00.000+08:00", // == 10:00:00Z, the first turn
+		});
+		// The 10:30Z turn is strictly after 10:00:00Z, so it survives.
+		expect(deduped.repaired).toBe(true);
+		expect(deduped.entries).toBe(1);
 	});
 });

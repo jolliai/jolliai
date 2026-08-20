@@ -1221,9 +1221,34 @@ describe("pushSessions", () => {
 		).rejects.toBeInstanceOf(SessionPreconditionFailedError);
 	});
 
-	it("accepts a valid but empty JSON body", async () => {
-		// `{}` is a real answer from a backend that ingested nothing and holds no
-		// cursor — not a parse failure, and must not be treated as one.
+	it("accepts a body that carries an accepted map but no cursor (ingested, no cursor opinion)", async () => {
+		// A conforming backend that stored the rows but holds no per-table cursor
+		// acknowledges via `accepted` (even empty). That is a real success; the runner
+		// then advances via its own high-water fallback, which is safe BECAUSE the
+		// server acknowledged.
+		const c = client(async () => jsonResponse(200, { accepted: {} }));
+		await expect(c.pushSessions(payload)).resolves.toEqual({ accepted: {}, cursor: {} });
+	});
+
+	it("rejects a 2xx that carries NEITHER an accepted map nor a cursor when rows WERE sent", async () => {
+		// `{}` is not a valid acknowledgement for a payload that carried rows: an
+		// ingesting endpoint always answers with at least one of the two. Treated as
+		// full success it defaulted both to `{}`, so every table fell to the batch's own
+		// high-water mark and the cursor advanced over rows the server never stored —
+		// the JSON-body twin of the non-JSON hole above. Same CLASS as a missing
+		// endpoint. Note the NON-EMPTY payload: the guard is gated on rows being sent.
+		const nonEmpty = { ...payload, tables: { sessions: [{ id: "s1" }] } };
+		const c = client(async () => jsonResponse(200, {}));
+		await expect(c.pushSessions(nonEmpty)).rejects.toBeInstanceOf(SessionEndpointMissingError);
+	});
+
+	it("does NOT reject a bare {} for an EMPTY reconcile ping (no rows to advance over)", async () => {
+		// The idle-machine steady state: `SessionSyncRunner.sync` sends one empty-tables
+		// request per throttle window purely to let a fresh backend answer 409/
+		// cursor-behind. That ping has no rows, so it cannot advance the cursor whatever
+		// the answer, and the empty-ack guard's rationale ("do not advance over unstored
+		// rows") does not apply. Gating the guard on rows-sent is what stops a backend
+		// that answers the ping with a bare `{}` from silencing the whole channel for 24h.
 		const c = client(async () => jsonResponse(200, {}));
 		await expect(c.pushSessions(payload)).resolves.toEqual({ accepted: {}, cursor: {} });
 	});

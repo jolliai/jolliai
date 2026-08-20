@@ -5,6 +5,9 @@ const h = vi.hoisted(() => ({
 	writeFile: vi.fn(),
 	rename: vi.fn(),
 	rm: vi.fn(),
+	writeFileSync: vi.fn(),
+	renameSync: vi.fn(),
+	rmSync: vi.fn(),
 }));
 
 vi.mock("node:crypto", () => ({
@@ -17,7 +20,13 @@ vi.mock("node:fs/promises", () => ({
 	rm: h.rm,
 }));
 
-import { atomicWriteFile } from "./AtomicWrite.js";
+vi.mock("node:fs", () => ({
+	writeFileSync: h.writeFileSync,
+	renameSync: h.renameSync,
+	rmSync: h.rmSync,
+}));
+
+import { atomicWriteFile, atomicWriteFileSync } from "./AtomicWrite.js";
 
 describe("atomicWriteFile", () => {
 	beforeEach(() => {
@@ -26,6 +35,9 @@ describe("atomicWriteFile", () => {
 		h.writeFile.mockResolvedValue(undefined);
 		h.rename.mockResolvedValue(undefined);
 		h.rm.mockResolvedValue(undefined);
+		h.writeFileSync.mockReturnValue(undefined);
+		h.renameSync.mockReturnValue(undefined);
+		h.rmSync.mockReturnValue(undefined);
 	});
 
 	it("writes through a unique tmp file and renames it into place", async () => {
@@ -66,6 +78,19 @@ describe("atomicWriteFile", () => {
  * so both arms are pinned here.
  */
 describe("atomicWriteFile — mode", () => {
+	// Reset between tests, exactly as the sibling blocks do: without it the mock
+	// CALL HISTORY accumulates across this block's cases, so the EPERM-fallback
+	// test's `toHaveBeenNthCalledWith(2, …)` matches the SECOND case's tmpfile
+	// write rather than its own fallback write, and fails whenever the whole block
+	// runs (green only when that one test is run in isolation).
+	beforeEach(() => {
+		for (const fn of Object.values(h)) fn.mockReset();
+		h.randomUUID.mockReturnValue("uuid");
+		h.writeFile.mockResolvedValue(undefined);
+		h.rename.mockResolvedValue(undefined);
+		h.rm.mockResolvedValue(undefined);
+	});
+
 	it("applies mode to the tmpfile, so the rename carries it to the target", async () => {
 		await atomicWriteFile("/repo/state.json", "next", 0o600);
 
@@ -91,5 +116,57 @@ describe("atomicWriteFile — mode", () => {
 			encoding: "utf-8",
 			mode: 0o600,
 		});
+	});
+});
+
+describe("atomicWriteFileSync", () => {
+	beforeEach(() => {
+		for (const fn of Object.values(h)) fn.mockReset();
+		h.randomUUID.mockReturnValue("uuid");
+		h.writeFileSync.mockReturnValue(undefined);
+		h.renameSync.mockReturnValue(undefined);
+		h.rmSync.mockReturnValue(undefined);
+	});
+
+	it("writes through a unique tmp file and renames it into place, applying mode", () => {
+		atomicWriteFileSync("/repo/state.json", '{"ok":true}', 0o600);
+
+		const tmpPath = `/repo/state.json.${process.pid}.uuid.tmp`;
+		expect(h.writeFileSync).toHaveBeenCalledWith(tmpPath, '{"ok":true}', { encoding: "utf-8", mode: 0o600 });
+		expect(h.renameSync).toHaveBeenCalledWith(tmpPath, "/repo/state.json");
+		expect(h.rmSync).not.toHaveBeenCalled();
+	});
+
+	it("omits the mode option entirely when no mode is given", () => {
+		atomicWriteFileSync("/repo/state.json", "next");
+
+		const tmpPath = `/repo/state.json.${process.pid}.uuid.tmp`;
+		expect(h.writeFileSync).toHaveBeenCalledWith(tmpPath, "next", "utf-8");
+	});
+
+	it.each(["EPERM", "EACCES"])("falls back to direct overwrite and removes tmp on %s", (code) => {
+		h.renameSync.mockImplementationOnce(() => {
+			throw Object.assign(new Error(code), { code });
+		});
+
+		atomicWriteFileSync("/repo/state.json", "next", 0o600);
+
+		const tmpPath = `/repo/state.json.${process.pid}.uuid.tmp`;
+		expect(h.writeFileSync).toHaveBeenNthCalledWith(1, tmpPath, "next", { encoding: "utf-8", mode: 0o600 });
+		expect(h.writeFileSync).toHaveBeenNthCalledWith(2, "/repo/state.json", "next", {
+			encoding: "utf-8",
+			mode: 0o600,
+		});
+		expect(h.rmSync).toHaveBeenCalledWith(tmpPath, { force: true });
+	});
+
+	it("rethrows non-recoverable rename failures", () => {
+		const err = Object.assign(new Error("nope"), { code: "EISDIR" });
+		h.renameSync.mockImplementationOnce(() => {
+			throw err;
+		});
+
+		expect(() => atomicWriteFileSync("/repo/state.json", "next")).toThrow(err);
+		expect(h.rmSync).not.toHaveBeenCalled();
 	});
 });

@@ -207,6 +207,7 @@ const {
 	mockStoreNotes,
 	mockStorePlans,
 	mockStoreSummary,
+	mockListSummaries,
 } = vi.hoisted(() => ({
 	mockGetTranscriptHashes: vi.fn().mockResolvedValue(new Set<string>()),
 	// Default: every read returns null so the inline-edit / preview "snapshot
@@ -220,6 +221,9 @@ const {
 	mockStoreNotes: vi.fn().mockResolvedValue(undefined),
 	mockStorePlans: vi.fn().mockResolvedValue(undefined),
 	mockStoreSummary: vi.fn().mockResolvedValue(undefined),
+	// The repo's empty siblings the panel now feeds to `transcriptRepairState`;
+	// none by default (the stubbed predicate answer is what these tests assert).
+	mockListSummaries: vi.fn().mockResolvedValue([]),
 }));
 
 vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
@@ -233,6 +237,7 @@ vi.mock("../../../cli/src/core/SummaryStore.js", () => ({
 	storeNotes: mockStoreNotes,
 	storePlans: mockStorePlans,
 	storeSummary: mockStoreSummary,
+	listSummaries: mockListSummaries,
 }));
 
 const { mockResolveSessionTitle } = vi.hoisted(() => ({
@@ -258,6 +263,11 @@ const { mockTranscriptRepairState } = vi.hoisted(() => ({
 
 vi.mock("../../../cli/src/core/TranscriptRepair.js", () => ({
 	transcriptRepairState: mockTranscriptRepairState,
+	// The panel hands `transcriptRepairState` a LAZY sibling provider (the engine,
+	// not the host, filters which siblings count), so it no longer imports
+	// `isTranscriptRepairCandidate` — this export is kept only so the module mock
+	// stays shape-complete for any other importer.
+	isTranscriptRepairCandidate: () => true,
 }));
 
 const { mockDeleteTopicInTree, mockUpdateTopicInTree } = vi.hoisted(() => ({
@@ -5294,11 +5304,47 @@ describe("SummaryWebviewPanel", () => {
 				);
 				expect(call?.[0].transcriptRepairState).toBe("repairable");
 				// The rule stays in the CLI: this host forwards the summary it is
-				// showing and its workspace root, and restates nothing.
+				// showing, its workspace root, and a LAZY provider for the repo's
+				// siblings (so the enumeration is paid only for a real candidate and the
+				// verdict reflects the batch dedup floor), and restates nothing.
 				expect(mockTranscriptRepairState).toHaveBeenCalledWith(
 					expect.objectContaining({ commitHash: makeSummary().commitHash }),
 					workspaceRoot,
+					expect.objectContaining({ siblingSummaries: expect.any(Function) }),
 				);
+			});
+
+			it("short-circuits a FOREIGN memory to unrepairable without consulting the current-repo ledger", async () => {
+				// A foreign memory's owner edges are keyed by ITS worktree root, which
+				// this panel does not have. Asking the core with THIS workspace's root
+				// could answer "repairable" for a repair that could never run here — the
+				// false promise the JVM host avoids by missing. Foreign mode must answer
+				// the mildest verdict and never call the predicate.
+				mockTranscriptRepairState.mockResolvedValue("repairable");
+				mockGetTranscriptHashes.mockResolvedValue(new Set());
+				mockReadTranscriptsForCommits.mockResolvedValue(new Map());
+				const foreignStorage = {
+					kind: "foreign-storage-stub",
+				} as unknown as import("../../../cli/src/core/StorageProvider.js").StorageProvider;
+				await SummaryWebviewPanel.show(
+					makeSummary(),
+					extensionUri,
+					workspaceRoot,
+					stubBridge,
+					mainBranch,
+					"memory",
+					"other-repo",
+					"https://github.com/x/foreign.git",
+					foreignStorage,
+				);
+				const dispatch = captureMessageHandler();
+
+				dispatch({ command: "loadConversations" });
+				await flushPromises();
+
+				const call = postMessage.mock.calls.find((c) => c[0]?.command === "conversationsData");
+				expect(call?.[0].transcriptRepairState).toBe("unrepairable");
+				expect(mockTranscriptRepairState).not.toHaveBeenCalled();
 			});
 
 			it("falls back to unrepairable when the panel holds no summary to ask about", async () => {

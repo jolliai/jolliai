@@ -1523,6 +1523,43 @@ describe("doctor --repair-transcripts", () => {
 		expect(out).toContain("No summaries need transcript repair");
 	});
 
+	it("does not re-archive turns an ALREADY-REPAIRED earlier sibling holds (cross-run dedup)", async () => {
+		// A is repaired in a PRIOR run (run 1 below) and archives the only turn (10:00)
+		// in its window [firstSeen..10:15]. B fails capture later and is a candidate in
+		// run 2. Folding what A PROVABLY archived into the per-session dedup floor bounds
+		// B's session at 10:00, so B has nothing left and is skipped. Without the fold,
+		// B's floor is undefined, it re-reads from firstSeenLine, and the 10:00 turn
+		// lands on TWO memories — the exact cross-run break this guards. A is repaired
+		// FOR REAL (readable stored transcript), so the floor rests on its proven
+		// per-session content, not the retired unreadable-fallback bound.
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+		// Run 1: only A present, bounded at 10:15 so its window covers the 10:00 turn.
+		await storeSummary(
+			summary({ commitHash: "a".repeat(40), transcripts: [], generatedAt: "2026-08-17T10:15:00.000Z" }),
+			repo,
+		);
+		await captureLog(() => runRepairTranscripts(repo, true));
+		const aAfter = await getSummary("a".repeat(40), repo);
+		expect(aAfter?.transcriptsRepairedAt).toBeTruthy();
+		expect(aAfter?.transcripts).toHaveLength(1);
+
+		// Run 2: B fails capture and is now the only candidate; A is a repaired sibling.
+		await storeSummary(
+			summary({ commitHash: "b".repeat(40), transcripts: [], generatedAt: "2026-08-17T11:00:00.000Z" }),
+			repo,
+		);
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		expect(out).toContain(`${"b".repeat(8)}  skipped — no-entries-in-window`);
+		expect(out).toContain("Repaired 0 of 1 summaries.");
+		expect((await getSummary("b".repeat(40), repo))?.transcripts ?? []).toHaveLength(0);
+		// A is untouched in run 2 — it was no longer a candidate.
+		expect((await getSummary("a".repeat(40), repo))?.transcripts).toEqual(aAfter?.transcripts);
+	});
+
 	it("continues past a candidate whose repair throws, and the totals still add up", async () => {
 		// Two candidates: the default HASH one (which the mock lets through to
 		// the real engine and succeeds) and a second at the sentinel `throwHash`
@@ -1611,6 +1648,81 @@ describe("doctor --repair-transcripts", () => {
 
 		const lines = await runDoctor(["--repair-transcripts", "--cwd", repo]);
 		const out = lines.join("\n");
+
+		expect(out).toContain("would repair");
+		expect((await getSummary(HASH, repo))?.transcripts ?? []).toHaveLength(0);
+	});
+
+	it("de-duplicates turns across candidates in one run, so no turn is archived to two memories", async () => {
+		// Two turns with distinct timestamps (a user then an assistant turn — the
+		// parser merges consecutive same-role turns).
+		await writeFile(
+			transcript,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:00:00.000Z", message: { role: "user", content: "first" } })}\n` +
+				`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:30:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "reply" }] } })}\n`,
+			"utf-8",
+		);
+		// Two empty memories owned by the same session, with distinct upper bounds.
+		// Earlier-bounded A closes just after the first turn; later-bounded B spans both.
+		await storeSummary(summary({ commitHash: "a".repeat(40), generatedAt: "2026-08-17T10:15:00.000Z" }), repo);
+		await storeSummary(summary({ commitHash: "b".repeat(40), generatedAt: "2026-08-17T11:00:00.000Z" }), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		// Each memory reports exactly one entry — A the first turn, B only the turn A
+		// did not take. Without dedup, B (spanning both) would report two, archiving
+		// the first turn twice.
+		const perCandidate = out.split("\n").filter((l) => l.includes("repaired —"));
+		expect(perCandidate).toHaveLength(2);
+		expect(perCandidate.every((l) => l.includes("1 entries"))).toBe(true);
+	});
+
+	it("orders candidates by NUMERIC upper bound, so a mixed-format bound is not mis-sequenced", async () => {
+		await writeFile(
+			transcript,
+			`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:00:00.000Z", message: { role: "user", content: "first" } })}\n` +
+				`${JSON.stringify({ cwd: repo, timestamp: "2026-08-17T10:30:00.000Z", message: { role: "assistant", content: [{ type: "text", text: "reply" }] } })}\n`,
+			"utf-8",
+		);
+		// A's bound (10:15 UTC) is EARLIER than B's (11:00 UTC), so A must be
+		// processed first and become B's dedup floor. But A's bound is written in
+		// offset form, whose STRING sorts AFTER B's Z-form bound — a lexicographic
+		// sort would run B first, give B both turns, then dedup A's only turn away
+		// and skip A with `no-entries-in-window`. Numeric ordering keeps A first.
+		await storeSummary(summary({ commitHash: "a".repeat(40), generatedAt: "2026-08-17T18:15:00.000+08:00" }), repo);
+		await storeSummary(summary({ commitHash: "b".repeat(40), generatedAt: "2026-08-17T11:00:00.000Z" }), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+
+		const out = await captureLog(() => runRepairTranscripts(repo, true));
+
+		// Both repaired with exactly one entry each — A the 10:00 turn, B the 10:30
+		// turn. No `skipped — no-entries-in-window`, no candidate with two entries.
+		const perCandidate = out.split("\n").filter((l) => l.includes("repaired —"));
+		expect(perCandidate).toHaveLength(2);
+		expect(perCandidate.every((l) => l.includes("1 entries"))).toBe(true);
+		expect(out).not.toContain("no-entries-in-window");
+	});
+
+	it("honors --dry-run even alongside --fix, writing nothing", async () => {
+		// A repair rewrites a stored memory and stamps its own idempotency key in the
+		// same write, so applying one under --dry-run would both contradict the flag
+		// and make the write non-re-attemptable. --dry-run must force report-only.
+		await storeSummary(summary(), repo);
+		await recordClaudeOwners(
+			{ sessionId: "s", transcriptPath: transcript, edges: new Map([[repo, EDGE]]) },
+			globalDir,
+		);
+		const st = await import("../core/SessionTracker.js");
+		vi.mocked(st.getGlobalConfigDir).mockReturnValue(globalDir);
+
+		const out = (await runDoctor(["--repair-transcripts", "--dry-run", "--fix", "--cwd", repo])).join("\n");
 
 		expect(out).toContain("would repair");
 		expect((await getSummary(HASH, repo))?.transcripts ?? []).toHaveLength(0);

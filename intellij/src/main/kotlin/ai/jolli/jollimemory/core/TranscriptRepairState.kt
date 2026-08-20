@@ -23,8 +23,16 @@ import com.google.gson.JsonObject
  * than on the dashboard about the same memory.
  *
  * What DOES live here is presentation: [emptyConversationsText] is the wording,
- * which is the host's job. The three sentences are identical on all four
- * surfaces (spec §9).
+ * which is the host's job. The three sentences are duplicated across THREE
+ * rendering surfaces — this Kotlin copy, the dashboard webview
+ * (assets/js/memories.js) and the VS Code editor webview
+ * (SummaryScriptBuilder.ts) — because each host draws that panel itself and they
+ * share no code here. TranscriptRepairWordingLockstep.test.ts is the forcing
+ * function that holds them together: it pins the canonical triple and fails if
+ * any surface drifts OR misroutes a guarded sentence to the wrong state, so a
+ * reword means updating that pinned triple AND all three surfaces in one change.
+ * (The CLI doctor --repair-transcripts output is NOT one of them: it prints its
+ * own operator-facing wording, not these sentences.)
  */
 object TranscriptRepairState {
 

@@ -14,8 +14,8 @@
  * is a later task's job.
  */
 
-import { readFile } from "node:fs/promises";
-import { join } from "node:path";
+import { readFile, rename } from "node:fs/promises";
+import { basename, join } from "node:path";
 import { createLogger, errMsg } from "../Logger.js";
 import { atomicWriteFile } from "./AtomicWrite.js";
 import { withClaudeOwnersLock } from "./Locks.js";
@@ -129,7 +129,12 @@ function hasValidOwners(session: unknown): session is ClaudeOwnedSession {
 /**
  * Reads the ledger. A missing or unparseable file reads as empty: this is
  * consulted from the post-commit path, where throwing would take the whole
- * summary down over a state file that the next Stop hook rewrites anyway.
+ * summary down over a state file. Reading empty is safe for a LOOKUP (it returns
+ * no owners); it is emphatically NOT safe as the basis of a WRITE — a write that
+ * started from this empty snapshot would overwrite every other session's edges
+ * with the one it is recording. The write path therefore uses
+ * {@link readLedgerForWrite}, which distinguishes "absent" from "present but
+ * corrupt" and quarantines the latter rather than overwriting it.
  * The same never-throw posture extends to each individual session: one whose
  * `owners` field is missing or malformed is dropped rather than surfaced, so
  * every session `loadClaudeOwners` returns is safe for a caller to index into
@@ -148,6 +153,104 @@ export async function loadClaudeOwners(globalDir?: string): Promise<ClaudeOwners
 		log.debug("claude-owners.json unreadable (%s) — treating as empty", errMsg(err));
 		return EMPTY;
 	}
+}
+
+/**
+ * Reads the ledger for the WRITE path, distinguishing THREE outcomes a merge
+ * must treat differently:
+ *
+ *   - present & parseable — the base to merge into (`corrupt`/`unavailable` both
+ *     false).
+ *   - genuinely absent (ENOENT) — normal on a fresh machine; an empty base
+ *     (`corrupt`/`unavailable` both false, `ledger` = EMPTY).
+ *   - present but the CONTENT is bad — read succeeded, but parse failed, the
+ *     top-level shape is wrong, OR any single session entry is malformed:
+ *     `corrupt: true`, quarantine before overwriting. A torn per-session entry
+ *     counts here (unlike the lenient READ path) precisely because this base is
+ *     about to be rewritten — see the loop below.
+ *   - could not be READ at all — a transient I/O error (EACCES, EMFILE/ENFILE
+ *     under FD exhaustion, EIO): `unavailable: true`. The file was NEVER read,
+ *     so it is NOT evidence of corruption; treating it as corrupt would move a
+ *     healthy ledger aside and rewrite it from empty over a momentary error.
+ *
+ * The merge must never overwrite from an empty base for either of the last two:
+ * doing so replaces every session's edges with the single one being written,
+ * and because the per-transcript `owners` marks have already advanced past the
+ * lines those edges came from, the loss is unrecoverable. `corrupt` says
+ * "quarantine, then start fresh"; `unavailable` says "leave it entirely alone
+ * and retry next pass".
+ */
+async function readLedgerForWrite(
+	globalDir?: string,
+): Promise<{ ledger: ClaudeOwnersLedger; corrupt: boolean; unavailable: boolean }> {
+	let text: string;
+	try {
+		text = await readFile(claudeOwnersPath(globalDir), "utf-8");
+	} catch (err) {
+		if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+			return { ledger: EMPTY, corrupt: false, unavailable: false };
+		}
+		// A failed READ is not a failed PARSE: the bytes on disk are unknown, so
+		// they must not be classified corrupt (which would quarantine + rewrite).
+		log.debug("claude-owners.json could not be read (%s) — deferring the write", errMsg(err));
+		return { ledger: EMPTY, corrupt: false, unavailable: true };
+	}
+	try {
+		const raw = JSON.parse(text) as Partial<ClaudeOwnersLedger>;
+		if (!raw || typeof raw !== "object" || typeof raw.sessions !== "object" || raw.sessions === null) {
+			return { ledger: EMPTY, corrupt: true, unavailable: false };
+		}
+		const sessions: Record<string, ClaudeOwnedSession> = {};
+		for (const [key, session] of Object.entries(raw.sessions)) {
+			// A per-session entry whose `owners` is malformed is corruption too, not
+			// something to filter away. The READ path (`loadClaudeOwners`) drops it
+			// because a lookup has nothing to gain from a torn entry, but the WRITE
+			// path must NOT: merging from a silently-filtered base and rewriting the
+			// file permanently deletes that session on the next successful write.
+			// Treat it exactly like a top-level shape failure — quarantine the whole
+			// file (preserving the torn entry for recovery) rather than overwrite it.
+			// Same "present-but-corrupt" posture, applied consistently to both
+			// granularities.
+			if (!hasValidOwners(session)) {
+				return { ledger: EMPTY, corrupt: true, unavailable: false };
+			}
+			sessions[key] = session;
+		}
+		return { ledger: { version: 1, sessions }, corrupt: false, unavailable: false };
+	} catch {
+		return { ledger: EMPTY, corrupt: true, unavailable: false };
+	}
+}
+
+/**
+ * Moves a present-but-corrupt ledger aside so a fresh one can be written without
+ * destroying the sessions it held (they remain in the quarantine file for manual
+ * recovery). Returns `false` when the file could not be moved — in which case the
+ * caller MUST NOT overwrite it, since that would be the very data loss this
+ * guards against.
+ */
+async function quarantineCorruptLedger(globalDir?: string): Promise<boolean> {
+	const path = claudeOwnersPath(globalDir);
+	const dest = `${path}.corrupt-${Date.now()}`;
+	try {
+		await rename(path, dest);
+		log.warn(
+			"claude-owners.json was unparseable; quarantined to %s and starting fresh — prior sessions' edges are preserved there for recovery",
+			basename(dest),
+		);
+		return true;
+		/* v8 ignore start -- reached only when the rename itself fails (a read-only
+		 * parent, a vanished directory): fault-injection-only, and the behaviour it
+		 * guards — never overwrite a file we could not move aside — is asserted through
+		 * the caller's return value in the reachable corrupt-file test. */
+	} catch (err) {
+		log.warn(
+			"claude-owners.json is unparseable and could not be quarantined (%s); refusing to overwrite it",
+			errMsg(err),
+		);
+		return false;
+	}
+	/* v8 ignore stop */
 }
 
 /**
@@ -177,7 +280,23 @@ export async function recordClaudeOwners(
 		async (acquired) => {
 			// Read inside the lock: a snapshot taken before it would merge a peer's
 			// write away, which is the exact race the lock exists for.
-			const ledger = await loadClaudeOwners(globalDir);
+			const { ledger, corrupt, unavailable } = await readLedgerForWrite(globalDir);
+			if (unavailable) {
+				// A transient I/O error read no bytes, so it is no evidence the file is
+				// corrupt. Overwriting it (or quarantining it) would destroy every other
+				// session's edges over a momentary failure. Leave it untouched and report
+				// non-durable so the caller keeps its cursor mark put and re-emits these
+				// edges next pass, once the file is readable again.
+				return false;
+			}
+			if (corrupt) {
+				// A present-but-unparseable file must not be overwritten with just this
+				// session. Move it aside first; if that fails, abort the write entirely
+				// and leave the caller's cursor mark put so nothing is lost.
+				/* v8 ignore next -- the abort fires only when quarantine's rename failed
+				 * (fault-injection-only; see quarantineCorruptLedger). */
+				if (!(await quarantineCorruptLedger(globalDir))) return false;
+			}
 			const key = sessionKey(input.sessionId);
 			const existing = ledger.sessions[key];
 			const owners: Record<string, ClaudeOwnerEdge> = { ...(existing?.owners ?? {}) };
@@ -207,7 +326,11 @@ export async function recordClaudeOwners(
 				),
 			};
 			await atomicWriteFile(claudeOwnersPath(globalDir), JSON.stringify(next, null, "\t"));
-			return acquired;
+			// A recovered-from-corrupt write started from an emptied base, so it is
+			// NOT a durable merge of prior state: report non-durable so the caller
+			// leaves its cursor mark put and re-emits these edges next pass into the
+			// now-fresh (or peer-repopulated) ledger.
+			return corrupt ? false : acquired;
 		},
 		globalDir === undefined ? {} : { globalDir },
 	);

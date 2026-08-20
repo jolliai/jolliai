@@ -31,8 +31,13 @@ import {
 import { resolveSotBackend } from "../core/SotStorageResolver.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { listSummaries, setActiveStorage } from "../core/SummaryStore.js";
-import { getTranscriptIds } from "../core/SummaryTree.js";
-import { repairSummaryTranscripts } from "../core/TranscriptRepair.js";
+import {
+	archivedSessionFloor,
+	isTranscriptRepairCandidate,
+	mergeSessionFloor,
+	orderTranscriptRepairCandidates,
+	repairSummaryTranscripts,
+} from "../core/TranscriptRepair.js";
 import { probeGlobalDaemon } from "../daemon/EnsureGlobalDaemon.js";
 import type { GlobalDaemonHello } from "../daemon/GlobalDaemonProtocol.js";
 import { backupHealthCheck } from "../dashboard/Backup.js";
@@ -1168,21 +1173,51 @@ export async function runSessionSyncNow(): Promise<void> {
  */
 export async function runRepairTranscripts(cwd: string, apply: boolean): Promise<void> {
 	const summaries = await listSummaries(Number.MAX_SAFE_INTEGER, cwd);
-	const candidates = summaries.filter(
-		(s) => s.transcriptsRepairedAt === undefined && getTranscriptIds(s).length === 0,
-	);
+	const candidates = summaries.filter(isTranscriptRepairCandidate);
 	if (candidates.length === 0) {
 		console.log("No summaries need transcript repair.");
 		return;
 	}
 
+	// Process oldest-upper-bound first and carry a PER-SESSION dedup floor forward:
+	// the per-owner lower bound is a constant (`firstSeenLine`), so without this
+	// every empty memory's window nests inside the next and the same turns are
+	// archived to all of them. Already-repaired siblings (from a PRIOR run) are
+	// folded into the same ordered walk — they archived their window from
+	// `firstSeenLine` too, so a candidate ordered after one must start past what
+	// that sibling actually archived, per session, or re-archive turns it already
+	// holds (the cross-run half of the dedup guarantee; a single run has no repaired
+	// siblings and so behaves exactly as before). The floor is per session, not one
+	// worktree-wide bound, precisely so a repaired sibling cannot suppress a session
+	// it never touched (P1). Only candidates are repaired; a repaired sibling just
+	// advances the floor. The ordering, the candidate predicate above, and the
+	// floor-advance helpers are the ONES shared with `transcriptRepairState`'s floor
+	// replay, so the UI's "repairable" wording cannot drift from what this run does.
+	const repairedSiblings = summaries.filter((s) => s.transcriptsRepairedAt !== undefined);
+	const ordered = orderTranscriptRepairCandidates([...candidates, ...repairedSiblings]);
+
 	let repaired = 0;
 	let errored = 0;
-	for (const candidate of candidates) {
-		const hash = candidate.commitHash.substring(0, 8);
+	// Per-session dedup floor carried forward. A repaired sibling whose stored
+	// transcript is unreadable contributes NOTHING (see `archivedSessionFloor`):
+	// an invisible copy is not a duplicate to guard a later memory's turns against.
+	const afterExclusiveBySession = new Map<string, number>();
+	for (const memory of ordered) {
+		// A prior-run repaired sibling only advances the floor — it is done. Fold in
+		// what it PROVABLY archived, per session; contribute nothing when its stored
+		// transcript is unreadable.
+		if (memory.transcriptsRepairedAt !== undefined) {
+			const archived = await archivedSessionFloor(memory, cwd);
+			if (archived.readable) mergeSessionFloor(afterExclusiveBySession, archived.bySession);
+			continue;
+		}
+		const hash = memory.commitHash.substring(0, 8);
 		let outcome: Awaited<ReturnType<typeof repairSummaryTranscripts>>;
 		try {
-			outcome = await repairSummaryTranscripts(candidate.commitHash, cwd, { apply });
+			outcome = await repairSummaryTranscripts(memory.commitHash, cwd, {
+				apply,
+				afterExclusiveBySession,
+			});
 		} catch (err) {
 			errored++;
 			console.log(`  ${hash}  error — ${errMsg(err)}`);
@@ -1190,6 +1225,11 @@ export async function runRepairTranscripts(cwd: string, apply: boolean): Promise
 		}
 		if (outcome.repaired) {
 			repaired++;
+			// Advance the dedup floor so the next (later-bounded) candidate keeps only
+			// turns past this one — per session, and only for the sessions this repair
+			// actually archived. Holds for dry runs too, so the reported "would repair
+			// — N entries" counts match what a real run would write.
+			if (outcome.archivedBySession) mergeSessionFloor(afterExclusiveBySession, outcome.archivedBySession);
 			console.log(`  ${hash}  ${apply ? "repaired" : "would repair"} — ${outcome.entries} entries`);
 		} else {
 			console.log(`  ${hash}  skipped — ${outcome.reason}`);
@@ -1337,7 +1377,12 @@ export function registerDoctorCommand(program: Command): void {
 					// the repair falls back to the frozen system-of-record and silently
 					// reads — or on --fix, tries to write — the wrong backend.
 					setActiveStorage(await createStorage(options.cwd, options.cwd));
-					await runRepairTranscripts(options.cwd, options.fix === true);
+					// `--dry-run` forces a report-only run even alongside `--fix`: a repair
+					// rewrites a stored memory and stamps its own idempotency key in the
+					// same write, so applying one under `--dry-run` would both contradict
+					// the flag and make the write non-re-attemptable. Every other doctor
+					// mode already treats `--dry-run` as "change nothing".
+					await runRepairTranscripts(options.cwd, options.fix === true && options.dryRun !== true);
 					return;
 				}
 				await runDoctor(

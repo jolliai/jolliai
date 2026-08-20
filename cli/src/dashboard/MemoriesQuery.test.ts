@@ -19,7 +19,8 @@ import {
 // The predicate reads the machine-global `claude-owners.json` and stats every
 // transcript it names, so a real call would answer differently on each developer's
 // machine. Its own cases live in `TranscriptRepair.test.ts`; what these pin is the
-// wiring around it.
+// wiring around it. The `storage` provider the wiring hands it is a LAZY thunk the
+// mocked predicate never resolves, so the real `createStorage` is never reached.
 vi.mock("../core/TranscriptRepair.js", () => ({
 	transcriptRepairState: vi.fn().mockResolvedValue("unrepairable"),
 }));
@@ -1488,6 +1489,16 @@ describe("MemoriesQuery", () => {
 			expect(transcriptRepairState).toHaveBeenCalledWith(
 				expect.objectContaining({ commitHash: HASH }),
 				"/w/acme-api",
+				// `siblingSummaries` and `storage` are both LAZY providers (the repo-wide
+				// sibling query and the per-worktree storage build both run only for a real
+				// candidate, not on every detail open); the mocked predicate never invokes
+				// them, so assert their shape rather than resolved values. `storage` being
+				// threaded is what stops the machine-global dashboard from reading a
+				// sibling's transcripts through the wrong repo's active storage.
+				expect.objectContaining({
+					siblingSummaries: expect.any(Function),
+					storage: expect.any(Function),
+				}),
 			);
 		});
 

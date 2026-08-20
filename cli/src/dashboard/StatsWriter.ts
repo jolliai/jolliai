@@ -837,6 +837,19 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 		if (prior.updated_at_ms > event.updatedAtMs) return;
 	}
 
+	// A session's OWN bucketing instant on the session-level axes is
+	// `updated_at_ms`, so when it moves to a new day the session's contribution
+	// moves with it — and the staleness scan only ever notices the DESTINATION
+	// day (the day the row now sits on, carrying the fresh write stamp). Left
+	// alone, the SOURCE day stays cached and overstated for good, because an old
+	// day gets no further writes to rebuild it. Forget the source day before the
+	// move. This is the session-level counterpart to the per-response day-forget
+	// below (which is Claude-only); every source is placed on the session axes by
+	// this instant, so this must not be gated on `usageEvents`.
+	if (prior !== undefined && prior.updated_at_ms !== event.updatedAtMs) {
+		forgetRollupDays(db, [prior.updated_at_ms]);
+	}
+
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const models = event.models ?? [];
 	// An event that carries NO usage information at all (no model split, no

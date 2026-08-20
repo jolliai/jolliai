@@ -249,10 +249,16 @@ export function readAvailableDays(
 	const oldestBuild = Math.min(...sentinels.values());
 	// And bounded again by the candidate days' own span, which is what keeps this
 	// scan from growing with the machine's history — see `readSourcesWrittenSince`.
-	// `dayKeyToMidnight` round-trips by construction here (every key came out of
-	// `localDayKey`), so the fallbacks are unreachable; they are the widest range
-	// rather than the narrowest so an impossible key degrades to the old
-	// over-reading behaviour instead of silently declaring stale days fresh.
+	// Every key here came out of `localDayKey`, and `localMidnight` resolves every
+	// real local day — including a spring-forward day whose 00:00 is skipped, which
+	// it maps to that day's first existing instant rather than rejecting (that
+	// rejection is what used to make these fallbacks reachable, and made a
+	// window spanning such a day hang the forward walk before it ever reached
+	// here). So `dayKeyToMidnight` round-trips by construction and the fallbacks
+	// are unreachable; they are kept as the WIDEST range rather than the narrowest
+	// so any residual impossible key degrades to over-reading (one extra scan)
+	// instead of silently declaring stale days fresh, or hanging the day step on a
+	// not-a-number bound.
 	const rangeFromMs = dayKeyToMidnight(first, timeZone) ?? 0;
 	const lastStartMs = dayKeyToMidnight(last, timeZone);
 	const rangeToMs = lastStartMs === undefined ? Number.MAX_SAFE_INTEGER : addLocalDays(lastStartMs, 1, timeZone);

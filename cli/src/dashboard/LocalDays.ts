@@ -72,22 +72,55 @@ export function localHour(ms: number, timeZone: string): number {
  *
  * `Intl` can only map epoch → wall clock; this inverts it by guessing the UTC
  * value of the wall-clock midnight and correcting by the observed error. Two
- * iterations settle every real zone including DST transitions: the first
- * correction lands within the zone's offset step, the second removes any
- * residue from a transition between guess and target. (On a "spring forward"
- * day where 00:00 does not exist, this lands on the earliest existing instant
- * of the day — exactly what a day boundary should be.)
+ * iterations settle every real zone including DST transitions whose 00:00
+ * exists: the first correction lands within the zone's offset step, the second
+ * removes any residue from a transition between guess and target, so the loop
+ * returns the moment `error` reaches zero.
+ *
+ * On a "spring forward" day whose 00:00 does NOT exist — the clocks jump over
+ * local midnight, as `Africa/Cairo` and `Asia/Beirut` do on their transition
+ * dates — no epoch maps to 00:00, so the correction never reaches zero and
+ * instead oscillates by the gap width. The earlier version returned that
+ * oscillating value, which landed an hour short **inside the previous local
+ * day**: `startOfLocalDay` then mapped it back to the previous day and the
+ * forward day-step became a fixed point, hanging the whole read path. We now
+ * fall through to {@link firstInstantOfLocalDay}, which returns the earliest
+ * instant that genuinely belongs to this day (the moment right after the gap) —
+ * a real day boundary, strictly inside the day, so stepping always advances.
  */
 function localMidnight(year: number, month: number, day: number, timeZone: string): number {
-	let guess = Date.UTC(year, month - 1, day);
+	const targetNaive = Date.UTC(year, month - 1, day);
+	let guess = targetNaive;
 	for (let i = 0; i < 3; i++) {
 		const seen = zonedParts(guess, timeZone);
-		const error =
-			Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute) - Date.UTC(year, month - 1, day);
-		if (error === 0) break;
+		const error = Date.UTC(seen.year, seen.month - 1, seen.day, seen.hour, seen.minute) - targetNaive;
+		if (error === 0) return guess;
 		guess -= error;
 	}
-	return guess;
+	return firstInstantOfLocalDay(year, month, day, timeZone);
+}
+
+/**
+ * The earliest epoch-ms belonging to local day `year-month-day`, for the
+ * spring-forward case where that day's 00:00 is skipped. The day is real (only
+ * its first minute-or-two is missing), so its boundary is the instant right
+ * after the gap. Found by bisecting, at minute resolution, the point where the
+ * local day key first reaches the target — monotonic in time, and the engine is
+ * minute-granular, so the answer is exact. The bracket (`-15 h` / `+14 h` around
+ * naive midnight) is wider than any real UTC offset, so the low end is always in
+ * an earlier local day and the high end is always at or past this day's start.
+ */
+function firstInstantOfLocalDay(year: number, month: number, day: number, timeZone: string): number {
+	const targetKey = `${year}-${String(month).padStart(2, "0")}-${String(day).padStart(2, "0")}`;
+	const naive = Date.UTC(year, month - 1, day);
+	let loMin = Math.floor((naive - 15 * 3_600_000) / 60_000);
+	let hiMin = Math.ceil((naive + 14 * 3_600_000) / 60_000);
+	while (hiMin - loMin > 1) {
+		const midMin = Math.floor((loMin + hiMin) / 2);
+		if (localDayKey(midMin * 60_000, timeZone) < targetKey) loMin = midMin;
+		else hiMin = midMin;
+	}
+	return hiMin * 60_000;
 }
 
 export function startOfLocalDay(ms: number, timeZone: string): number {

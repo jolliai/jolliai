@@ -361,6 +361,9 @@ vi.mock("../core/references/ReferenceStore.js", () => ({
 // `claude-owners.json` and stats every transcript path it names.
 vi.mock("../core/TranscriptRepair.js", () => ({
 	transcriptRepairState: vi.fn().mockResolvedValue("unrepairable"),
+	// The action filters `listSummaries` through this to build the sibling set it
+	// hands the predicate; a pass-through is enough (the list is stubbed empty).
+	isTranscriptRepairCandidate: vi.fn().mockReturnValue(true),
 }));
 
 vi.mock("../core/SummaryStore.js", () => ({
@@ -1446,18 +1449,30 @@ describe("runIdeBridgeAction — transcript-repair-state", () => {
 		vi.mocked(transcriptRepairState).mockResolvedValue("repairable");
 	});
 
-	it("answers the CLI predicate's state for a known commit", async () => {
+	it("answers the CLI predicate's state for a known commit, forwarding the repo's empty siblings", async () => {
 		// The action must FORWARD the predicate, not restate it: a Kotlin- or
 		// host-side restatement of "can this still be repaired?" is exactly the
 		// drift this bridge exists to prevent. Asserting the returned state comes
-		// from the predicate (and that the summary + cwd reach it) is what fails if
-		// someone hard-codes an answer here.
+		// from the predicate (and that the summary + cwd + sibling set reach it) is
+		// what fails if someone hard-codes an answer here. The siblings let the
+		// verdict reflect the batch dedup floor rather than the lone-repair window.
 		const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
+		const { listSummaries } = await import("../core/SummaryStore.js");
+		vi.mocked(listSummaries).mockResolvedValueOnce([{ commitHash: "sib" }] as never);
 
 		const result = await runIdeBridgeAction("transcript-repair-state", "/repo", { commitHash: "abc" });
 
 		expect(result).toEqual({ state: "repairable" });
-		expect(transcriptRepairState).toHaveBeenCalledWith({ commitHash: "abc" }, "/repo");
+		expect(transcriptRepairState).toHaveBeenCalledWith({ commitHash: "abc" }, "/repo", expect.any(Object));
+		// `siblingSummaries` is a LAZY provider (so the enumeration is paid only for a
+		// real candidate). Assert it resolves to the repo's list rather than that an
+		// eager array was passed — the mocked predicate never invokes it, so calling it
+		// here is what consumes the `mockResolvedValueOnce` and proves the wiring.
+		const opts = vi.mocked(transcriptRepairState).mock.calls[0][2] as {
+			siblingSummaries: () => Promise<unknown>;
+		};
+		expect(typeof opts.siblingSummaries).toBe("function");
+		await expect(opts.siblingSummaries()).resolves.toEqual([{ commitHash: "sib" }]);
 	});
 
 	it("passes every state through unchanged", async () => {

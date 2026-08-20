@@ -1922,11 +1922,25 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 			// direction to guess in: it invites the user to run a repair that has
 			// nothing to work from, and a memory nobody can look up is no evidence
 			// that local transcripts survive.
-			const { getSummary } = await import("../core/SummaryStore.js");
+			const { getSummary, listSummaries } = await import("../core/SummaryStore.js");
 			const summary = await getSummary(optionalString(request, "commitHash") ?? "", cwd);
 			if (!summary) return { state: "unrepairable" satisfies TranscriptRepairState };
 			const { transcriptRepairState } = await import("../core/TranscriptRepair.js");
-			return { state: await transcriptRepairState(summary, cwd) };
+			// Supply the repo's empty-or-repaired siblings so the verdict reflects the
+			// dedup floor a real `doctor --repair-transcripts` run would hand this memory
+			// — the only repair path a user can trigger — rather than the lone-repair
+			// window. Passed as a LAZY provider: `transcriptRepairState` short-circuits
+			// for the present/repaired majority before it needs siblings, so the
+			// `listSummaries(MAX)` enumeration (a read per memory) is paid only for an
+			// actual candidate, not on every state query. The engine owns the "which
+			// siblings count" filter (a repaired sibling still bounds the floor), so this
+			// passes the raw list. Safe here: this process reads local storage routed by
+			// `cwd`, the same way `getSummary` above does.
+			return {
+				state: await transcriptRepairState(summary, cwd, {
+					siblingSummaries: () => listSummaries(Number.MAX_SAFE_INTEGER, cwd),
+				}),
+			};
 		}
 		case "compile": {
 			const config = request.config as JolliMemoryConfig | undefined;

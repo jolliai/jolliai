@@ -6,6 +6,7 @@
  */
 
 import { randomUUID } from "node:crypto";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { rename, rm, writeFile } from "node:fs/promises";
 
 /**
@@ -43,6 +44,34 @@ export async function atomicWriteFile(filePath: string, content: string, mode?: 
 			// already has are the ones its owner chose.
 			await writeFile(filePath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
 			await rm(tmpPath, { force: true });
+		} else {
+			throw error;
+		}
+	}
+}
+
+/**
+ * Synchronous sibling of {@link atomicWriteFile}, for the sync-only state writers
+ * (e.g. the session-statistics channel's cursor file, written from hook and
+ * daemon paths that are not async). Same tmpfile + rename guarantee and the same
+ * Windows EPERM/EACCES fallback — a torn/partial write can never be observed even
+ * though this channel deliberately holds no lock and lets writers overlap, so the
+ * only residual is a last-writer-wins on the whole file, never a corrupt one.
+ */
+export function atomicWriteFileSync(filePath: string, content: string, mode?: number): void {
+	const tmpPath = `${filePath}.${process.pid}.${randomUUID()}.tmp`;
+	writeFileSync(tmpPath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
+	try {
+		renameSync(tmpPath, filePath);
+	} catch (error: unknown) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "EPERM" || code === "EACCES") {
+			// Windows fallback (mirrors {@link atomicWriteFile}): a direct overwrite cannot
+			// carry `mode` onto an existing target (node ignores it there), which is
+			// acceptable — this branch exists because the target is held open by another
+			// process, and the permissions it already has are the ones its owner chose.
+			writeFileSync(filePath, content, mode === undefined ? "utf-8" : { encoding: "utf-8", mode });
+			rmSync(tmpPath, { force: true });
 		} else {
 			throw error;
 		}

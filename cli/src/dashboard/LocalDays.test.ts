@@ -97,3 +97,83 @@ describe("local-day arithmetic", () => {
 		expect(localDayKey(midnight as number, LA)).toBe("2026-03-08");
 	});
 });
+
+/**
+ * Regression for the availability defect: two real zones spring forward AT local
+ * midnight, so that day's 00:00 does not exist. The inversion used to converge on
+ * an instant in the PREVIOUS local day, which made `addLocalDays` a fixed point —
+ * the forward window walk never advanced and the whole read path hung. These are
+ * the only two zones on that shape (measured across the platform's zones), each
+ * recurring annually 2027–2040.
+ *
+ * The skipped-midnight day is DETECTED at runtime, not pinned to a date. Egypt's
+ * DST in particular is a political decision (it was cancelled outright 2015–2023),
+ * so the exact transition date can move under an ICU/tzdata update — while the
+ * INVARIANT under test (the walk must advance and never repeat a day, and the
+ * skipped-midnight day resolves to its own earliest instant) does not depend on
+ * WHICH day it is. Binding the assertions to the detected day keeps the test
+ * meaningful without making it hostage to the zone database; if a future tzdata
+ * removes the transition from the window entirely, the case skips rather than
+ * failing on a date that is no longer special. A skipped-midnight day is found by
+ * its signature: its earliest existing instant is 01:00 local, so `localHour` of
+ * it is not 0.
+ */
+describe("local-day engine — zones whose local midnight is skipped", () => {
+	const zones = [
+		{ zone: "Africa/Cairo", from: "2027-04-25", to: "2027-05-05" },
+		{ zone: "Asia/Beirut", from: "2027-03-24", to: "2027-04-02" },
+	];
+
+	/** The first day in [from,to) whose local midnight does not exist, or undefined. */
+	function findSkippedMidnightDay(
+		zone: string,
+		from: string,
+		to: string,
+	): { key: string; midnight: number } | undefined {
+		const end = dayKeyToMidnight(to, zone) as number;
+		let cursor = dayKeyToMidnight(from, zone) as number;
+		let guard = 0;
+		while (cursor < end) {
+			if (localHour(cursor, zone) !== 0) return { key: localDayKey(cursor, zone), midnight: cursor };
+			cursor = addLocalDays(cursor, 1, zone);
+			if (++guard > 100) break;
+		}
+		return undefined;
+	}
+
+	for (const { zone, from, to } of zones) {
+		const gap = findSkippedMidnightDay(zone, from, to);
+
+		it.skipIf(!gap)(`${zone}: a forward day-walk across the transition terminates and never repeats a day`, () => {
+			const start = dayKeyToMidnight(from, zone) as number;
+			const end = dayKeyToMidnight(to, zone) as number;
+			expect(start).toBeDefined();
+			expect(end).toBeDefined();
+
+			const keys: string[] = [];
+			let cursor = start;
+			let guard = 0;
+			while (cursor < end) {
+				keys.push(localDayKey(cursor, zone));
+				const next = addLocalDays(cursor, 1, zone);
+				// The fixed point: on the unfixed engine `next === cursor` here, so the
+				// real walk (a plain `cursor < end` loop) span forever.
+				expect(next).toBeGreaterThan(cursor);
+				cursor = next;
+				if (++guard > 100) throw new Error(`${zone}: forward walk did not terminate`);
+			}
+
+			expect(keys).toContain((gap as { key: string }).key); // the skipped-midnight day is visited...
+			expect(new Set(keys).size).toBe(keys.length); // ...exactly once, and every day is distinct
+			for (let i = 1; i < keys.length; i++) expect(keys[i] > keys[i - 1]).toBe(true);
+		});
+
+		it.skipIf(!gap)(
+			`${zone}: the skipped-midnight day resolves to its own earliest instant, not the previous day`,
+			() => {
+				const { key, midnight } = gap as { key: string; midnight: number };
+				expect(localDayKey(midnight, zone)).toBe(key);
+			},
+		);
+	}
+});
