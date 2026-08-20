@@ -11,7 +11,9 @@ import {
 	AGENT_ENV_FAMILIES,
 	AGENT_ENV_MARKERS,
 	AMBIGUOUS_AGENT_ENV_KEYS,
+	CLIENTINFO_AGENTS,
 	detectAgentFromEnv,
+	resolveClientInfoAgent,
 	resolveTelemetryAgent,
 	TELEMETRY_AGENTS,
 	type TelemetryAgent,
@@ -195,5 +197,51 @@ describe("detectAgentFromEnv", () => {
 			const agent: TelemetryAgent | undefined = detectAgentFromEnv({ [key]: "1" });
 			expect(TELEMETRY_AGENTS).toContain(agent);
 		}
+	});
+});
+
+describe("resolveClientInfoAgent (MCP initialize handshake)", () => {
+	it("maps each measured clientInfo name to its host", () => {
+		// Both strings captured 2026-08-20 with a probe MCP server logging the raw
+		// initialize request — not taken from documentation or memory.
+		expect(resolveClientInfoAgent("claude-code")).toBe("claude");
+		expect(resolveClientInfoAgent("codex-mcp-client")).toBe("codex");
+	});
+
+	it("pins that the key space is the hosts' own spellings, not our vocabulary", () => {
+		// "codex" is the obvious guess for Codex's clientInfo name and is WRONG —
+		// the measured value is "codex-mcp-client". This test is what makes adding
+		// a guessed key a visible decision rather than a plausible-looking edit.
+		expect(resolveClientInfoAgent("codex")).toBeUndefined();
+		expect(resolveClientInfoAgent("claude")).toBeUndefined();
+	});
+
+	it("leaves cursor-agent's 'Cursor' unmapped until the IDE's own name is measured", () => {
+		// Measured: cursor-agent declares {"name":"Cursor","version":"1.0.0"} — a
+		// family name with a hardcoded version. If the IDE also says "Cursor",
+		// mapping it collapses cursor/cursor-cli, the split this vocabulary exists
+		// to keep. Same refusal as CURSOR_TRACE_ID. When the IDE's string is
+		// captured (the oninitialized log line), this decision gets revisited.
+		expect(resolveClientInfoAgent("Cursor")).toBeUndefined();
+	});
+
+	it("answers nothing for unknown or absent names, never a pass-through", () => {
+		expect(resolveClientInfoAgent(undefined)).toBeUndefined();
+		expect(resolveClientInfoAgent("")).toBeUndefined();
+		expect(resolveClientInfoAgent("some-future-host")).toBeUndefined();
+	});
+
+	it("only ever maps into the closed vocabulary", () => {
+		for (const agent of CLIENTINFO_AGENTS.values()) {
+			expect(TELEMETRY_AGENTS).toContain(agent);
+		}
+	});
+
+	it("is immune to prototype-shaped names", () => {
+		// The table is a plain object and the name is host-authored input; a lookup
+		// of "constructor"/"__proto__" must answer undefined, not a function.
+		expect(resolveClientInfoAgent("constructor")).toBeUndefined();
+		expect(resolveClientInfoAgent("__proto__")).toBeUndefined();
+		expect(resolveClientInfoAgent("hasOwnProperty")).toBeUndefined();
 	});
 });

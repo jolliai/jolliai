@@ -144,8 +144,10 @@ export async function serveMcpInProcess(dir: string): Promise<void> {
 		// Two other measurements from the same sweep, both narrowing what env can
 		// answer: an `mcp` proxy spawned by `cursor-agent` carried no `CURSOR_*` at
 		// all, and one spawned by Codex carried no `CODEX_THREAD_ID`. So of the
-		// hosts checked, only Claude passes its marker down to an MCP child — the
-		// MCP path is largely unattributed even where the CLI path is not.
+		// hosts checked, only Claude passes its marker down to an MCP child — which
+		// is why tool calls are attributed from the initialize handshake's
+		// clientInfo instead (CLIENTINFO_AGENTS); this env inference survives as
+		// the fallback for a mapped-marker host whose clientInfo is not mapped yet.
 		//
 		// The same sweep also caught the misattribution this dimension exists for,
 		// twice over: Claude Code serving from the CODEX plugin's dist, and Codex
@@ -291,8 +293,9 @@ if (!process.env.VITEST) {
 				//
 				// The right signal for a shared daemon is the MCP `initialize`
 				// handshake's `clientInfo`, which names the host per connection rather
-				// than per process. Not attempted here: mapping those strings onto the
-				// vocabulary needs its own capture, and absent is the honest interim.
+				// than per process — and that is what the CallTool handler now uses
+				// (CLIENTINFO_AGENTS in TelemetryAgent.ts), so keeping inference off
+				// here costs nothing the handshake does not give back better.
 				await bootstrapTelemetry({
 					cwd: resolveProjectDir(),
 					inferAgentFromEnv: !isDetachedDaemonInvocation(argv),

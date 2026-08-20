@@ -60,6 +60,12 @@
  *    walking: the QueueWorker loop passes `session.source` explicitly, which is
  *    how all thirteen hosts — Gemini included, fed by its AfterAgent hook rather
  *    than by a disk scan — can reach `ai_source_detected`.
+ *  - **Per-connection**, for MCP: the `initialize` handshake's `clientInfo.name`
+ *    through {@link resolveClientInfoAgent}. The only channel that works in the
+ *    shared `mcp-serve` daemon, where several hosts' sessions reach ONE process
+ *    and env inference is disabled — the handshake is per-connection, the env is
+ *    frozen at spawn from whichever proxy arrived first. It also beats env on
+ *    the single-session path: a declaration outranks an inherited marker.
  *
  * So the gap is a CLI command run from a host with no marker of its own: `kimi`,
  * `copilot`, `cline`, `devin` and `antigravity` are attributed at commit time
@@ -258,6 +264,58 @@ export const AGENT_ENV_FAMILIES: ReadonlyArray<AgentEnvFamily> = [
  * Listed rather than merely absent so each omission reads as a decision.
  */
 export const AMBIGUOUS_AGENT_ENV_KEYS: ReadonlyArray<string> = ["AI_AGENT", "CURSOR_TRACE_ID"];
+
+/**
+ * MCP `initialize` handshake `clientInfo.name` → agent, per CONNECTION.
+ *
+ * This is what attributes MCP tool calls, and it is the only signal that can:
+ * the env markers are structurally unavailable there (measured — of the hosts
+ * checked, only Claude passes a marker to an MCP child, and the shared
+ * `mcp-serve` daemon may not read its env at all, since one daemon serves
+ * several hosts' sessions and its env is frozen at spawn). `clientInfo` is the
+ * host DECLARING itself, once per connection, which is exactly the granularity
+ * a shared daemon needs.
+ *
+ * Keys are exact strings, each traceable to a probe capture (a minimal MCP
+ * server that logs the raw `initialize` request — the probe recipe lives with
+ * the design note). Guessing a key is worse than omitting it: `codex` here
+ * would have been the obvious guess and is WRONG — the measured value is
+ * `codex-mcp-client`. An unmapped name degrades to an absent property (unknown),
+ * never to a pass-through — `clientInfo.name` is an arbitrary host-authored
+ * string, and forwarding it verbatim would break the never-free-form rule. The
+ * `oninitialized` log line in `createMcpServer` records unmapped names locally,
+ * which is how the next host's exact string gets captured organically.
+ *
+ * Captured 2026-08-20 on macOS:
+ *   claude-code       claude  2.1.212, `claude -p … --strict-mcp-config`
+ *   codex-mcp-client  codex   0.147.0, `codex exec -c mcp_servers.probe…`
+ *
+ * One captured name is deliberately NOT mapped: `cursor-agent` declares
+ * `{"name":"Cursor","version":"1.0.0"}` — a family name with a hardcoded
+ * version, and the Cursor IDE's own clientInfo is unmeasured (the IDE spawns
+ * MCP from a shared process; no one-shot command reaches it, and its logs
+ * record only the server's info). If the IDE also says "Cursor", mapping it
+ * would collapse `cursor`/`cursor-cli` — the split this vocabulary exists to
+ * keep — so it waits, exactly like `CURSOR_TRACE_ID` did. The oninitialized
+ * log line captures the IDE's string the first time this dist serves one.
+ */
+export const CLIENTINFO_AGENTS: ReadonlyMap<string, TelemetryAgent> = new Map([
+	["claude-code", "claude"],
+	["codex-mcp-client", "codex"],
+]);
+
+/**
+ * Coerce an MCP client's self-declared name to a known agent token, or
+ * `undefined`. The clientInfo counterpart of {@link resolveTelemetryAgent}: same
+ * contract (closed set in, absent out), different key space — clientInfo names
+ * are the hosts' own spellings, not our vocabulary.
+ */
+export function resolveClientInfoAgent(name: string | undefined): TelemetryAgent | undefined {
+	// A Map, not a plain object: the name is host-authored input, and a bare
+	// object index would answer `Object` for "constructor" — a truthy Function
+	// leaking through a lookup typed as a token. Map.get has no prototype chain.
+	return name === undefined ? undefined : CLIENTINFO_AGENTS.get(name);
+}
 
 /** Same truthiness rule `CaptureProgress` applies to these markers. */
 function isTruthyEnv(v: string | undefined): boolean {

@@ -46,6 +46,10 @@ const connectMock = vi.fn().mockResolvedValue(undefined);
 // Capture the Server constructor's args so the test can assert name/version + capabilities.
 let serverInfo: { name: string; version: string } | undefined;
 let serverCapabilities: { tools?: unknown; prompts?: unknown } | undefined;
+// The per-connection clientInfo the SDK exposes after `initialize`; tests set
+// this to simulate what a host declared on this connection. Reset per test.
+let mockClientInfo: { name: string; version: string } | undefined;
+const capturedServers: Array<{ oninitialized?: () => void }> = [];
 
 // Find the handler registered for a given schema marker kind (e.g. "listPrompts").
 function handlerForKind(kind: string): RequestHandler | undefined {
@@ -55,9 +59,14 @@ function handlerForKind(kind: string): RequestHandler | undefined {
 
 vi.mock("@modelcontextprotocol/sdk/server/index.js", () => ({
 	Server: class {
+		oninitialized?: () => void;
+		getClientVersion() {
+			return mockClientInfo;
+		}
 		constructor(info: { name: string; version: string }, options?: { capabilities?: typeof serverCapabilities }) {
 			serverInfo = info;
 			serverCapabilities = options?.capabilities;
+			capturedServers.push(this);
 		}
 		setRequestHandler(schema: { kind: string }, handler: RequestHandler) {
 			capturedSchemas.push(schema);
@@ -221,6 +230,8 @@ describe("startMcpServer", () => {
 	beforeEach(() => {
 		capturedHandlers.length = 0;
 		capturedSchemas.length = 0;
+		capturedServers.length = 0;
+		mockClientInfo = undefined;
 		serverCapabilities = undefined;
 		connectMock.mockClear();
 		probeWorktreeMock.mockReset().mockResolvedValue("inside");
@@ -454,6 +465,64 @@ describe("startMcpServer", () => {
 		);
 		const props = vi.mocked(track).mock.calls[0][1] as Record<string, unknown>;
 		expect(JSON.stringify(props)).not.toContain("acme-secret-exfil-tool");
+	});
+
+	it("attributes a tool call to the connection's self-declared client (clientInfo → agent)", async () => {
+		// The only signal that survives the shared mcp-serve daemon, where several
+		// hosts' sessions reach ONE process and env inference is off: the
+		// initialize handshake is per-connection. `claude-code` is a measured
+		// clientInfo string (claude 2.1.212), not a guess.
+		mockClientInfo = { name: "claude-code", version: "2.1.212" };
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: { query: "x" } } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "search", ok: true, agent: "claude" }),
+		);
+	});
+
+	it("attributes the failure path too, with the same connection's agent", async () => {
+		mockClientInfo = { name: "codex-mcp-client", version: "0.147.0" };
+		vi.mocked(runSearch).mockRejectedValueOnce(new Error("boom"));
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: {} } });
+		expect(track).toHaveBeenCalledWith(
+			"command_invoked",
+			expect.objectContaining({ command: "mcp", tool: "search", ok: false, agent: "codex" }),
+		);
+	});
+
+	it("omits agent for an unmapped clientInfo name rather than passing it through", async () => {
+		// clientInfo.name is a host-authored arbitrary string; only measured,
+		// mapped names may reach the wire. "Cursor" is real (cursor-agent declares
+		// it) and deliberately unmapped — see CLIENTINFO_AGENTS.
+		mockClientInfo = { name: "Cursor", version: "1.0.0" };
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: {} } });
+		const props = vi.mocked(track).mock.calls[0][1] as Record<string, unknown>;
+		expect(props).not.toHaveProperty("agent");
+		expect(JSON.stringify(props)).not.toContain("Cursor");
+	});
+
+	it("omits agent when the client sent no clientInfo at all", async () => {
+		mockClientInfo = undefined;
+		await startMcpServer("/repo");
+		await capturedHandlers[1]({ params: { name: "search", arguments: {} } });
+		expect(vi.mocked(track).mock.calls[0][1]).not.toHaveProperty("agent");
+	});
+
+	it("logs each connection's clientInfo on initialize (the capture instrument)", async () => {
+		// The organic capture point for the NEXT host's exact string: hosts' own
+		// logs record only the server's info, never their own clientInfo, so this
+		// line is the only place an unmapped name surfaces. Must never throw —
+		// with or without clientInfo present.
+		await startMcpServer("/repo");
+		const server = capturedServers[0];
+		expect(server.oninitialized).toBeTypeOf("function");
+		mockClientInfo = { name: "some-future-host", version: "9.9.9" };
+		expect(() => server.oninitialized?.()).not.toThrow();
+		mockClientInfo = undefined;
+		expect(() => server.oninitialized?.()).not.toThrow();
 	});
 
 	it("CallTool handler does NOT flag a binding_required result as isError (it's a needs-input outcome)", async () => {

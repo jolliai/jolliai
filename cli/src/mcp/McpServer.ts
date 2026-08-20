@@ -39,6 +39,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { setActiveStorage } from "../core/SummaryStore.js";
 import { track } from "../core/Telemetry.js";
+import { resolveClientInfoAgent } from "../core/TelemetryAgent.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import type { JolliMemoryConfig } from "../Types.js";
 import {
@@ -663,11 +664,39 @@ export function createMcpServer(runtime: McpRuntime): Server {
 		{ capabilities: promptsEnabled ? { tools: {}, prompts: {} } : { tools: {} } },
 	);
 
+	// P0 instrument for the `agent` dimension: one line per connection recording
+	// the client's self-declared identity. This is how the NEXT host's exact
+	// clientInfo string gets captured — the mapping table only takes measured
+	// entries (see CLIENTINFO_AGENTS for why guessing is worse than omitting),
+	// and the hosts' own logs record the SERVER's info, never their own, so this
+	// line is the only organic capture point. debug.log only; the raw name is a
+	// host-authored string and never reaches telemetry.
+	server.oninitialized = () => {
+		const ci = server.getClientVersion();
+		const mapped = resolveClientInfoAgent(ci?.name);
+		log.info(
+			"MCP client connected: %s/%s%s",
+			ci?.name ?? "<no clientInfo>",
+			ci?.version ?? "?",
+			mapped ? ` (agent: ${mapped})` : " (unmapped — candidate for CLIENTINFO_AGENTS)",
+		);
+	};
+
 	server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: toolDefinitions }));
 
 	server.setRequestHandler(CallToolRequestSchema, async (req) => {
 		const { name, arguments: args } = req.params;
 		const start = Date.now();
+		// The `agent` dimension, resolved PER CONNECTION from the initialize
+		// handshake — the only signal that survives the shared daemon, where env
+		// inference is off because one process serves several hosts (see the
+		// daemon note in Cli.ts main()). Read per call rather than cached at
+		// oninitialized: getClientVersion() is a field read, and caching would
+		// add a second copy of per-connection state for no cost saved. Absent
+		// when the name is unmapped — the per-event property then simply isn't
+		// set, and the ambient context (env-inferred on the single-session stdio
+		// path, absent in the daemon) is the documented fallback.
+		const agent = resolveClientInfoAgent(server.getClientVersion()?.name);
 		try {
 			// Backstop for a client working from a cached `tools/list` (or one that
 			// ignores it). Throwing names the reason; the alternative is `dispatchTool`
@@ -741,6 +770,7 @@ export function createMcpServer(runtime: McpRuntime): Server {
 				tool: telemetryToolName(name),
 				duration_ms: Date.now() - start,
 				ok: !isError,
+				...(agent ? { agent } : {}),
 			});
 			return { content: [{ type: "text", text: JSON.stringify(result) }], ...(isError ? { isError: true } : {}) };
 		} catch (err) {
@@ -749,6 +779,7 @@ export function createMcpServer(runtime: McpRuntime): Server {
 				tool: telemetryToolName(name),
 				duration_ms: Date.now() - start,
 				ok: false,
+				...(agent ? { agent } : {}),
 			});
 			const message = err instanceof Error ? err.message : String(err);
 			log.warn("Tool %s failed: %s", name, message);
