@@ -24,7 +24,7 @@ security recipe and the dist resolver and will not produce valid output.
 Run:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" auth logout
+JOLLI_INVOKED_VIA=skill:logout "$HOME/.jolli/jollimemory/run-cli" auth logout
 ```
 
 Report the command output, then call the Jolli Memory `status` tool when

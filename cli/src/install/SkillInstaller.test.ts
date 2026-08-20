@@ -18,7 +18,8 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 /**
@@ -1475,8 +1476,8 @@ describe("skill revision is kept in lockstep with the body", () => {
 		search: { build: buildSearchSkillTemplate, revision: 3, fingerprint: "602cea610684" },
 		localRun: { build: buildLocalRunSkillTemplate, revision: 6, fingerprint: "d04d02ba2c73" },
 		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 5, fingerprint: "e3e5572715a3" },
-		menu: { build: buildJolliMenuSkillTemplate, revision: 8, fingerprint: "8db133d89c3b" },
-		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 9, fingerprint: "37225c630e7d" },
+		menu: { build: buildJolliMenuSkillTemplate, revision: 8, fingerprint: "5662a77934fb" },
+		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 9, fingerprint: "5f05bec43ad1" },
 	} as const;
 
 	for (const [name, want] of Object.entries(EXPECTED)) {
@@ -1499,16 +1500,50 @@ describe("skill revision is kept in lockstep with the body", () => {
 		{ name: "search", build: buildSearchSkillTemplate },
 		{ name: "local-run", build: buildLocalRunSkillTemplate },
 		{ name: "remote-run", build: buildRemoteRunSkillTemplate },
+		{ name: "jolli", build: buildJolliMenuSkillTemplate },
+		{ name: "jolli", build: buildPluginJolliMenuSkillTemplate },
 	] as const;
+	// An INVOCATION is a fenced command line starting with run-cli (optionally
+	// already prefixed) — deliberately narrower than "any line mentioning
+	// run-cli": the Step-0 `test -f …run-cli` presence checks never run a jolli
+	// command, so no command_invoked exists for them to annotate.
+	const INVOCATION = /^[ \t]*(?:JOLLI_INVOKED_VIA=\S+ )?"\$HOME\/\.jolli\/jollimemory\/run-cli" .*$/gm;
 	for (const { name, build } of VIA_SKILLS) {
-		it(`${name}: every run-cli invocation carries via skill:${name}`, () => {
+		it(`${name}: every run-cli invocation carries via skill:${name} (${build.name})`, () => {
 			const body = build();
-			const invocations = body.match(/^.*\/run-cli" .*$/gm) ?? [];
+			const invocations = body.match(INVOCATION) ?? [];
 			expect(invocations.length).toBeGreaterThan(0);
 			for (const line of invocations) {
 				expect(line.trimStart().startsWith(`JOLLI_INVOKED_VIA=skill:${name} `)).toBe(true);
 			}
 			expect(body).not.toContain("skill:jolli-");
+		});
+	}
+
+	// The Claude plugin's bundled recall/search are COMMITTED copies with no
+	// generator, so nothing regenerates them when the shared builders move —
+	// which is exactly how they shipped without the via prefix once. Pin the
+	// prefix on the files themselves.
+	for (const name of ["recall", "search"] as const) {
+		it(`claude bundle ${name}: its committed run-cli invocation carries via skill:${name}`, () => {
+			const file = join(
+				dirname(fileURLToPath(import.meta.url)),
+				"..",
+				"..",
+				"..",
+				"claude-plugin",
+				"plugins",
+				"jolli",
+				"skills",
+				name,
+				"SKILL.md",
+			);
+			const body = readFileSync(file, "utf-8");
+			const invocations = body.match(INVOCATION) ?? [];
+			expect(invocations.length).toBeGreaterThan(0);
+			for (const line of invocations) {
+				expect(line.trimStart().startsWith(`JOLLI_INVOKED_VIA=skill:${name} `)).toBe(true);
+			}
 		});
 	}
 

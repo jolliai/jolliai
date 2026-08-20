@@ -1577,7 +1577,7 @@ has no such action.
   id), then shell:
 
   \`\`\`bash
-  "$HOME/.jolli/jollimemory/run-cli" workflow runs <workflowId>
+  JOLLI_INVOKED_VIA=skill:jolli "$HOME/.jolli/jollimemory/run-cli" workflow runs <workflowId>
   \`\`\`
 
   It prints \`{ "type": "runs", "runs": [ ... ] }\` — one entry per run with its
@@ -1589,7 +1589,7 @@ has no such action.
   and stop. Offer to open any listed URL via the \`open-url\` helper:
 
   \`\`\`bash
-  "$HOME/.jolli/jollimemory/run-cli" open-url <url>
+  JOLLI_INVOKED_VIA=skill:jolli "$HOME/.jolli/jollimemory/run-cli" open-url <url>
   \`\`\`
 
   (\`{ "opened": true|false, "url": "..." }\`; \`opened: false\` on a headless host
@@ -1784,7 +1784,7 @@ run the bundled CLI through its stable dispatch script and read the same facts
 from its printed output:
 
 \`\`\`bash
-"$HOME/.jolli/jollimemory/run-cli" status
+JOLLI_INVOKED_VIA=skill:jolli "$HOME/.jolli/jollimemory/run-cli" status
 \`\`\`
 
 If neither the tool nor the CLI can be reached at all, skip the state-based

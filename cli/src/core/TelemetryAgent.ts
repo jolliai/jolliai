@@ -388,19 +388,35 @@ export const JOLLI_INVOKED_VIA_ENV = "JOLLI_INVOKED_VIA";
  * that bundle. Bare names also make the value host-neutral — all three plugin
  * bundles and the installed copies emit the same token.
  *
- * A hand-kept copy of the installed-skill registry, kept deliberately: this
+ * A hand-kept copy of the union of every skill name Jolli ships — the
+ * installed registry plus both plugin bundles' own skills — kept deliberately: this
  * module is a leaf that `Telemetry`, `TelemetryStartup` and the hooks all
  * import, and deriving the list live would drag `install/SkillInstaller` (the
  * whole install stack) into every one of them. The same trade
  * `ClientHeader.PLUGIN_BUNDLE_KINDS` makes, policed the same way:
- * `TelemetryAgent.test.ts` asserts it equals the names derived from
- * `SkillInstaller.INSTALLED_SKILL_NAMES`, so the copy cannot drift silently.
+ * `TelemetryAgent.test.ts` asserts it equals the bare-name union of
+ * `SkillInstaller.INSTALLED_SKILL_NAMES`, `CODEX_PLUGIN_SKILL_NAMES` and
+ * `CURSOR_PLUGIN_SKILL_NAMES`, so the copy cannot drift silently when a skill
+ * is added or retired in ANY of the three.
  *
- * Includes names whose recipes do not carry the prefix yet (`jolli`, the menu)
- * — the set answers "what could a legitimate via name be", so a recipe adopting
- * it later is a skill-template change only, never a core change.
+ * Every shipped run-cli recipe now carries its prefix (pinned per builder and
+ * per committed bundle file), so the set also includes names whose skills are
+ * currently MCP-only (`timeline`, `push`) — they emit nothing today, and being
+ * in the set means a future recipe there is a skill-template change only.
  */
-export const SKILL_VIA_NAMES: ReadonlyArray<string> = ["recall", "search", "local-run", "remote-run", "jolli"];
+export const SKILL_VIA_NAMES: ReadonlyArray<string> = [
+	"recall",
+	"search",
+	"local-run",
+	"remote-run",
+	"jolli",
+	"init",
+	"login",
+	"logout",
+	"status",
+	"timeline",
+	"push",
+];
 
 const SKILL_VIA_SET: ReadonlySet<string> = new Set(SKILL_VIA_NAMES);
 

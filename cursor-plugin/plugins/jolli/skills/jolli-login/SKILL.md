@@ -24,7 +24,7 @@ security recipe and the dist resolver and will not produce valid output.
 Run and wait for the interactive browser flow:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" auth login
+JOLLI_INVOKED_VIA=skill:login "$HOME/.jolli/jollimemory/run-cli" auth login
 ```
 
 Never ask the user for passwords, API keys, callback URLs, or browser tokens.

@@ -25,30 +25,26 @@ security recipe and the dist resolver and will not produce valid output.
 
 ## 1. Inspect state
 
-Call the Jolli Memory `status` tool. If unavailable, run `"$HOME/.jolli/jollimemory/run-cli" status`.
-
-If `$HOME/.jolli/jollimemory/run-cli` does not exist, the plugin's `sessionStart`
-hook has not run on this machine yet — that hook is what writes it. Ask the user to
-**quit Cursor completely (⌘Q) and reopen it, then start a new chat**, and retry. A
-freshly installed plugin's hooks are not registered until the app has been fully
-restarted, so **Developer: Reload Window** or another chat is not enough (measured).
+Call the Jolli Memory `status` tool. If unavailable, run `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" status`.
+If the dispatcher is missing, ask the user to run **Developer: Reload Window** and
+start a new chat so the Jolli `sessionStart` hook runs, then retry.
 
 ## 2. Enable local memory generation
 
 Run:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag cursor-plugin
+JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag cursor-plugin
 ```
 
 This explicit setup records `cursor-agent` as the local-agent tool only when none
 is configured yet — an agent tool and a paid provider already on disk are both left
-exactly as they are. What it writes is this repository's git hooks and this
-workspace's `.cursor/mcp.json`. It writes **no skills**: every Jolli skill ships
-with the plugin, so there is nothing here to place or repair — do not report
-skill files as an outcome of this step.
-
-Cursor notices `.cursor/mcp.json` within a second — no reload needed —
+exactly as they are. It also writes this workspace's
+`.cursor/mcp.json`, and places `/jolli-recall`, `/jolli-search`,
+`/jolli-local-run` and `/jolli-remote-run` into this repository — those four are
+not bundled with the plugin, so that they appear once in the menu rather than twice
+in a repository that also ran a full `jolli enable`. If they were already present
+this step changes nothing. Cursor notices that file within a second — no reload needed —
 but registers the server **disconnected**, so tell the user to open **Customize** in
 the sidebar and enable `jollimemory` to get the MCP tools. Everything below works
 without them either way. If the command reports that the repository is manually
@@ -64,7 +60,7 @@ If the user only wants local memory, skip to Step 5. Otherwise, when status show
 neither a Jolli sign-in nor a Jolli API key, run and wait for:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" auth login
+JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" auth login
 ```
 
 The command opens the browser and waits for a loopback callback. Never ask for a
@@ -77,14 +73,14 @@ Otherwise present the available Spaces and ask them to choose, offering the defa
 first when one exists. Call `bind_space` with the selected value. Treat
 `already_bound` as success.
 
-If the Space tools are unavailable, run `"$HOME/.jolli/jollimemory/run-cli" spaces --format json`,
+If the Space tools are unavailable, run `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" spaces --format json`,
 present only the returned Spaces, then bind the selected id or slug with
-`"$HOME/.jolli/jollimemory/run-cli" bind --space <id-or-slug> --format json`. Never put free-typed
+`JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" bind --space <id-or-slug> --format json`. Never put free-typed
 user text directly into this command.
 
 ## 5. Verify and report
 
-Call `status` again (or `"$HOME/.jolli/jollimemory/run-cli" status` when the tool is not registered yet).
+Call `status` again (or `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" status` when the tool is not registered yet).
 Report:
 
 - memory generation enabled or the exact remaining problem;

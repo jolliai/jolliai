@@ -226,7 +226,7 @@ read:
 **Fallback (CLI):** if the \`status\` tool is unavailable, read the same facts from
 
 \`\`\`bash
-${RUN_CLI} status
+JOLLI_INVOKED_VIA=skill:jolli ${RUN_CLI} status
 \`\`\`
 
 If neither can be reached, skip the state-based guidance and go straight to
@@ -387,7 +387,7 @@ ${SHELL_PREREQUISITE_BLOCK}
 
 ## 1. Inspect state
 
-Call the Jolli Memory \`status\` tool. If unavailable, run \`${RUN_CLI} status\`.
+Call the Jolli Memory \`status\` tool. If unavailable, run \`JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} status\`.
 
 ${CURSOR_DISPATCHER_MISSING_BLOCK}
 
@@ -396,7 +396,7 @@ ${CURSOR_DISPATCHER_MISSING_BLOCK}
 Run:
 
 \`\`\`bash
-${RUN_CLI} enable --repo-hooks-only --source-tag cursor-plugin
+JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} enable --repo-hooks-only --source-tag cursor-plugin
 \`\`\`
 
 This explicit setup records \`cursor-agent\` as the local-agent tool only when none
@@ -422,7 +422,7 @@ If the user only wants local memory, skip to Step 5. Otherwise, when status show
 neither a Jolli sign-in nor a Jolli API key, run and wait for:
 
 \`\`\`bash
-${RUN_CLI} auth login
+JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} auth login
 \`\`\`
 
 The command opens the browser and waits for a loopback callback. Never ask for a
@@ -435,14 +435,14 @@ Otherwise present the available Spaces and ask them to choose, offering the defa
 first when one exists. Call \`bind_space\` with the selected value. Treat
 \`already_bound\` as success.
 
-If the Space tools are unavailable, run \`${RUN_CLI} spaces --format json\`,
+If the Space tools are unavailable, run \`JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} spaces --format json\`,
 present only the returned Spaces, then bind the selected id or slug with
-\`${RUN_CLI} bind --space <id-or-slug> --format json\`. Never put free-typed
+\`JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} bind --space <id-or-slug> --format json\`. Never put free-typed
 user text directly into this command.
 
 ## 5. Verify and report
 
-Call \`status\` again (or \`${RUN_CLI} status\` when the tool is not registered yet).
+Call \`status\` again (or \`JOLLI_INVOKED_VIA=skill:init ${RUN_CLI} status\` when the tool is not registered yet).
 Report:
 
 - memory generation enabled or the exact remaining problem;
@@ -469,7 +469,7 @@ ${SHELL_PREREQUISITE_BLOCK}
 Run and wait for the interactive browser flow:
 
 \`\`\`bash
-${RUN_CLI} auth login
+JOLLI_INVOKED_VIA=skill:login ${RUN_CLI} auth login
 \`\`\`
 
 Never ask the user for passwords, API keys, callback URLs, or browser tokens.
@@ -497,7 +497,7 @@ ${SHELL_PREREQUISITE_BLOCK}
 Run:
 
 \`\`\`bash
-${RUN_CLI} auth logout
+JOLLI_INVOKED_VIA=skill:logout ${RUN_CLI} auth logout
 \`\`\`
 
 Report the command output, then call the Jolli Memory \`status\` tool when
@@ -535,7 +535,7 @@ description: Diagnose Jolli Memory installation, provider, account, hooks, queue
    - \`anthropic\`: requires an Anthropic API key.
    - unset: requires a usable provider credential.
 
-If \`status\` is unavailable, run \`${RUN_CLI} status\` and summarize it. Do not
+If \`status\` is unavailable, run \`JOLLI_INVOKED_VIA=skill:status ${RUN_CLI} status\` and summarize it. Do not
 list branch memories; route those requests to \`/jolli-recall\` or \`/jolli-search\`.
 
 ${SHELL_PREREQUISITE_BLOCK}

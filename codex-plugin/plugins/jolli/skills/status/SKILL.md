@@ -19,7 +19,7 @@ description: Diagnose Jolli Memory installation, provider, account, hooks, queue
    - `anthropic`: requires an Anthropic API key.
    - unset: requires a usable provider credential.
 
-If `status` is unavailable, run `"$HOME/.jolli/jollimemory/run-cli" status` and summarize it. Do not
+If `status` is unavailable, run `JOLLI_INVOKED_VIA=skill:status "$HOME/.jolli/jollimemory/run-cli" status` and summarize it. Do not
 list branch memories; route those requests to `jolli:recall` or `jolli:search`.
 
 ### Shell prerequisite

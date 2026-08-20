@@ -1,6 +1,6 @@
 import { readFile } from "node:fs/promises";
 import { describe, expect, it, vi } from "vitest";
-import { isBareMcpInvocation, isDetachedDaemonInvocation } from "./Cli.js";
+import { isAgentInferenceExempt, isBareMcpInvocation, isDetachedDaemonInvocation } from "./Cli.js";
 import { MCP_DAEMON_COMMAND, MCP_NO_DAEMON_ENV } from "./commands/McpCommand.js";
 import { GLOBAL_DAEMON_ENSURE_COMMAND } from "./daemon/EnsureGlobalDaemon.js";
 import { GLOBAL_DAEMON_COMMAND } from "./daemon/GlobalDaemonProtocol.js";
@@ -83,6 +83,30 @@ describe("isDetachedDaemonInvocation", () => {
 		// The per-session proxy is the counter-case: the host spawned it for one
 		// session, nothing else attaches to it, so its env does name its host.
 		expect(isDetachedDaemonInvocation(["mcp"])).toBe(false);
+	});
+});
+
+describe("isAgentInferenceExempt", () => {
+	it("exempts every detached daemon AND the ide-bridge server", () => {
+		// The bridge is the member the daemon predicate cannot cover: it is not
+		// detached (IntelliJ reads its stderr, so it must keep the telemetry
+		// notice behavior of an ordinary command), but its env belongs to whatever
+		// launched the IDE — an IntelliJ cold-started from a Claude shell would
+		// otherwise stamp agent:"claude" on the bridge's own lifecycle events.
+		for (const argv of [["mcp-serve"], ["global-daemon"], ["global-daemon-ensure"], ["ide-bridge-serve"]]) {
+			expect(isAgentInferenceExempt(argv)).toBe(true);
+		}
+	});
+
+	it("leaves ordinary short-lived commands inferring", () => {
+		for (const argv of [["recall"], ["status"], ["mcp"], ["enable"], []]) {
+			expect(isAgentInferenceExempt(argv)).toBe(false);
+		}
+	});
+
+	it("does not match a command that merely starts with the bridge's name", () => {
+		expect(isAgentInferenceExempt(["ide-bridge-serve-status"])).toBe(false);
+		expect(isAgentInferenceExempt(["ide-bridge"])).toBe(false);
 	});
 });
 

@@ -88,7 +88,7 @@ disk **before** they are sent.
 | `ai_provider_selected` | User chose jolli vs anthropic for LLM. Props: provider (discriminator). |
 | `memory_bank_migrated` | Migrate-to-Memory-Bank run. Props: outcome, repos, entries_bucket. |
 | `onboarding_progressed` | Per-install onboarding-funnel snapshot, emitted from a repo context and deduped by state tuple (+ daily heartbeat). Content-free — answers 'after install, where do people stall'. Props: in_git_repo, repo_enabled, capture_configured, capture_method (discriminator: local-agent/anthropic/jolli/none), memories_generated, memories_bucket. |
-| `command_invoked` | Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms; via (discriminator: skill:<name> from a closed skill-name set — present only when a Jolli skill's recipe invoked the command, omitted for a directly-typed one). MCP tool calls carry a `tool` property and are emitted per call (not per session); the session-level `command:"mcp"` event is suppressed. |
+| `command_invoked` | Any CLI command ran (auto-emitted). Props: command (discriminator), ok, duration_ms; via (discriminator: skill:<name> from a closed skill-name set — present when a Jolli skill's recipe invoked the command; absent means directly typed OR a pre-upgrade skill copy that predates the stamp, so absence is not proof of direct use). MCP tool calls carry a `tool` property and are emitted per call (not per session); the session-level `command:"mcp"` event is suppressed. |
 | `recall_performed` | A recall was run. Props: hit, result_count_bucket. |
 | `search_performed` | A search was run. Props: query_len_bucket, result_count_bucket. |
 | `memory_pushed` | Memories pushed to a Space. Props: kind, created, plans_bucket. |

@@ -25,6 +25,16 @@ vi.mock("../core/GitOps.js", () => ({
 	getCurrentBranch: vi.fn().mockResolvedValue(""),
 }));
 
+// Deterministic origin: the real resolver reads process.env / stdout.isTTY,
+// which differ between a dev machine (this suite may itself run inside an
+// agent session carrying CLAUDECODE) and CI. The resolver's own logic is unit
+// tested in TelemetryAgent.test.ts; what THESE tests pin is the threading —
+// that both enqueue paths stamp whatever the resolver answered.
+vi.mock("../core/TelemetryAgent.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/TelemetryAgent.js")>()),
+	resolveCommitOrigin: vi.fn(() => ({ trigger: "agent" as const, agent: "codex" as const })),
+}));
+
 vi.mock("../core/SessionTracker.js", () => ({
 	enqueueGitOperation: vi.fn(),
 }));
@@ -408,5 +418,49 @@ describe("PostRewriteHook", () => {
 			);
 			expect(launchWorker).toHaveBeenCalledWith("/test/project");
 		});
+	});
+});
+
+describe("commit-origin stamping (amend and rebase entries)", () => {
+	beforeEach(() => {
+		vi.mocked(enqueueGitOperation).mockResolvedValue(true);
+	});
+
+	it("stamps the resolved origin on an amend entry", async () => {
+		// Amend entries are built HERE, not in PostCommitHook — post-rewrite is the
+		// hook that receives the old→new mapping — so without this stamp every
+		// amend would drain as unattributed.
+		setStdinLines(["aaaa1111 bbbb2222"]);
+		await handlePostRewriteHook("amend", "/test/project");
+		expect(enqueueGitOperation).toHaveBeenCalledWith(
+			expect.objectContaining({ type: "amend", trigger: "agent", agent: "codex" }),
+			"/test/project",
+		);
+	});
+
+	it("stamps every rebase entry — pick and squash alike — with the one resolved origin", async () => {
+		// A rebase is one logical operation by one actor; the origin is resolved
+		// once at the hook entry and every group gets the same stamp.
+		setStdinLines(["aaaa1111 cccc3333", "bbbb2222 cccc3333", "dddd4444 eeee5555"]);
+		await handlePostRewriteHook("rebase", "/test/project");
+		const stamped = vi
+			.mocked(enqueueGitOperation)
+			.mock.calls.map(([op]) => op as { type: string; trigger?: string; agent?: string });
+		expect(stamped.length).toBeGreaterThanOrEqual(2);
+		for (const op of stamped) {
+			expect(["rebase-pick", "rebase-squash"]).toContain(op.type);
+			expect(op.trigger).toBe("agent");
+			expect(op.agent).toBe("codex");
+		}
+	});
+
+	it("threads the plugin marker into the resolver as fromPluginUi", async () => {
+		const { resolveCommitOrigin } = await import("../core/TelemetryAgent.js");
+		setStdinLines(["aaaa1111 bbbb2222"]);
+		await handlePostRewriteHook("amend", "/test/project");
+		// detectCommitSource found no marker in this harness, so the resolver must
+		// be asked with fromPluginUi:false — the marker consumed by commitSource
+		// and the one fed to origin resolution are the same read.
+		expect(vi.mocked(resolveCommitOrigin)).toHaveBeenCalledWith(expect.objectContaining({ fromPluginUi: false }));
 	});
 });

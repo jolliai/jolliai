@@ -2,6 +2,8 @@ import { readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { CODEX_PLUGIN_SKILL_NAMES } from "../install/CodexPluginSkills.js";
+import { CURSOR_PLUGIN_SKILL_NAMES } from "../install/CursorPluginSkills.js";
 import { compareSemver } from "../install/SemverCompare.js";
 import { INSTALLED_SKILL_NAMES } from "../install/SkillInstaller.js";
 import { LOCAL_AGENT_CHILD_ENV } from "./AgentReentry.js";
@@ -309,12 +311,17 @@ describe("resolveInvokedVia (the `via` dimension)", () => {
 		}
 	});
 
-	it("stays in lockstep with the installed-skill registry", () => {
+	it("stays in lockstep with every skill registry Jolli ships", () => {
 		// SKILL_VIA_NAMES is a deliberate hand-kept copy (this module is a leaf;
 		// deriving live would drag the install stack into every telemetry
-		// consumer). This assertion is what makes the copy safe: bare names here
-		// must equal SkillInstaller's registry with the `jolli-` prefix stripped.
-		const derived = INSTALLED_SKILL_NAMES.map((n) => (n.startsWith("jolli-") ? n.slice("jolli-".length) : n));
+		// consumer). This assertion is what makes the copy safe: it must equal the
+		// bare-name union of the installed registry and both plugin bundles'
+		// skill lists, so adding or retiring a skill anywhere breaks the pin
+		// rather than the vocabulary.
+		const bare = (n: string): string => (n.startsWith("jolli-") ? n.slice("jolli-".length) : n);
+		const derived = new Set(
+			[...INSTALLED_SKILL_NAMES, ...CODEX_PLUGIN_SKILL_NAMES, ...CURSOR_PLUGIN_SKILL_NAMES].map(bare),
+		);
 		expect([...SKILL_VIA_NAMES].sort()).toEqual([...derived].sort());
 	});
 

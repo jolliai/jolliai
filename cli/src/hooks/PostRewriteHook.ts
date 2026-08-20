@@ -29,6 +29,7 @@ import { getCurrentBranch } from "../core/GitOps.js";
 import { isWorkerLockHeld } from "../core/Locks.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { enqueueGitOperation } from "../core/SessionTracker.js";
+import { type CommitOrigin, resolveCommitOrigin } from "../core/TelemetryAgent.js";
 import { getCurrentTraceId, runWithTrace, traceIdFromEnv } from "../core/TraceContext.js";
 import { createLogger, getJolliMemoryDir, setLogDir } from "../Logger.js";
 import type { CommitSource, GitOperation } from "../Types.js";
@@ -65,6 +66,17 @@ export async function handlePostRewriteHook(command: string, cwd: string): Promi
 
 	// Detect commit source (plugin vs CLI)
 	const commitSource: CommitSource = detectCommitSource(cwd);
+	// Who set this rewrite in motion — same resolution, same reasons, and the
+	// same process-holds-the-truth argument as PostCommitHook's: amends and
+	// rebases are the entries the worker CANNOT re-derive an origin for, since
+	// post-commit never fires for a rebase pick and the drain may run in a
+	// chain-spawned worker carrying another commit's env. `fromPluginUi` reuses
+	// the plugin-source marker detectCommitSource just consumed (IntelliJ's
+	// Squash action writes it before driving a rewrite, same as Commit).
+	const origin = resolveCommitOrigin({
+		fromPluginUi: commitSource === "plugin",
+		isTTY: process.stdout.isTTY === true,
+	});
 
 	// Capture branch once for both subhandlers so the worker's tail cleanup
 	// can target the right `<branch>/` directory even if the user checks
@@ -79,9 +91,9 @@ export async function handlePostRewriteHook(command: string, cwd: string): Promi
 	}
 
 	if (command === "amend") {
-		await handleAmend(mappings, commitSource, cwd, branch);
+		await handleAmend(mappings, commitSource, origin, cwd, branch);
 	} else if (command === "rebase") {
-		await handleRebase(mappings, commitSource, cwd, branch);
+		await handleRebase(mappings, commitSource, origin, cwd, branch);
 	} else {
 		log.info("Unknown command '%s', skipping", command);
 	}
@@ -107,6 +119,7 @@ export async function handlePostRewriteHook(command: string, cwd: string): Promi
 async function handleAmend(
 	mappings: ReadonlyArray<HashMapping>,
 	commitSource: CommitSource,
+	origin: CommitOrigin,
 	cwd: string,
 	branch: string,
 ): Promise<void> {
@@ -120,6 +133,8 @@ async function handleAmend(
 		...(branch && { branch }),
 		sourceHashes: [oldHash],
 		commitSource,
+		trigger: origin.trigger,
+		...(origin.agent && { agent: origin.agent }),
 		createdAt: new Date().toISOString(),
 		...(traceId && { traceId }),
 	};
@@ -134,6 +149,7 @@ async function handleAmend(
 async function handleRebase(
 	mappings: ReadonlyArray<HashMapping>,
 	commitSource: CommitSource,
+	origin: CommitOrigin,
 	cwd: string,
 	branch: string,
 ): Promise<void> {
@@ -159,6 +175,8 @@ async function handleRebase(
 			...(branch && { branch }),
 			sourceHashes: oldHashes,
 			commitSource,
+			trigger: origin.trigger,
+			...(origin.agent && { agent: origin.agent }),
 			createdAt: new Date().toISOString(),
 			...(traceId && { traceId }),
 		};

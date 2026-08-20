@@ -25,7 +25,7 @@ security recipe and the dist resolver and will not produce valid output.
 
 ## 1. Inspect state
 
-Call the Jolli Memory `status` tool. If unavailable, run `"$HOME/.jolli/jollimemory/run-cli" status`.
+Call the Jolli Memory `status` tool. If unavailable, run `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" status`.
 If the dispatcher is missing, ask the user to start a new Codex session, open
 `/hooks`, trust the Jolli SessionStart hook, and retry.
 
@@ -34,7 +34,7 @@ If the dispatcher is missing, ask the user to start a new Codex session, open
 Run:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag codex-plugin
+JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" enable --repo-hooks-only --source-tag codex-plugin
 ```
 
 This explicit setup records `codex` as the local-agent tool only when none is
@@ -54,7 +54,7 @@ If the user only wants local memory, skip to Step 5. Otherwise, when status show
 neither a Jolli sign-in nor a Jolli API key, run and wait for:
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" auth login
+JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" auth login
 ```
 
 The command opens the browser and waits for a loopback callback. Never ask for a
@@ -67,14 +67,14 @@ Otherwise present the available Spaces and ask them to choose, offering the defa
 first when one exists. Call `bind_space` with the selected value. Treat
 `already_bound` as success.
 
-If the Space tools are unavailable, run `"$HOME/.jolli/jollimemory/run-cli" spaces --format json`,
+If the Space tools are unavailable, run `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" spaces --format json`,
 present only the returned Spaces, then bind the selected id or slug with
-`"$HOME/.jolli/jollimemory/run-cli" bind --space <id-or-slug> --format json`. Never put free-typed
+`JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" bind --space <id-or-slug> --format json`. Never put free-typed
 user text directly into this command.
 
 ## 5. Verify and report
 
-Call `status` again (or `"$HOME/.jolli/jollimemory/run-cli" status` when the tool is not registered yet).
+Call `status` again (or `JOLLI_INVOKED_VIA=skill:init "$HOME/.jolli/jollimemory/run-cli" status` when the tool is not registered yet).
 Report:
 
 - memory generation enabled or the exact remaining problem;

@@ -30,7 +30,7 @@ payload (a line that closes the here-doc early to smuggle shell) useless — do
 NOT hardcode a fixed delimiter.
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" search --arg-stdin <<'JOLLI_ARG_<DELIM>_END'
+JOLLI_INVOKED_VIA=skill:search "$HOME/.jolli/jollimemory/run-cli" search --arg-stdin <<'JOLLI_ARG_<DELIM>_END'
 <user-arg>
 JOLLI_ARG_<DELIM>_END
 ```

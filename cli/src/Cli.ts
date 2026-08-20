@@ -92,6 +92,26 @@ export function isDetachedDaemonInvocation(argv: ReadonlyArray<string>): boolean
 }
 
 /**
+ * Commands whose process must NOT infer its telemetry `agent` from the env
+ * markers: every detached daemon, plus `ide-bridge-serve`.
+ *
+ * A separate predicate rather than widening {@link isDetachedDaemonInvocation},
+ * because the two lists answer different questions and only coincide today.
+ * That one gates the one-time telemetry notice (its members' stderr goes to
+ * `/dev/null`, so printing there burns the flag on an audience of nobody);
+ * `ide-bridge-serve` does not belong on it — IntelliJ reads its stderr — but it
+ * shares the daemons' attribution problem exactly: it is a long-lived server
+ * whose env belongs to whatever launched the IDE, possibly days ago, and it
+ * emits for sessions it does not own. An IntelliJ cold-started from a Claude
+ * shell would otherwise stamp `agent: "claude"` on the bridge's own lifecycle
+ * events (the JVM UI events it forwards are already safe — the
+ * `telemetry-track` action re-bootstraps without inference before tracking).
+ */
+export function isAgentInferenceExempt(argv: ReadonlyArray<string>): boolean {
+	return isDetachedDaemonInvocation(argv) || argv[0] === "ide-bridge-serve";
+}
+
+/**
  * Runs the MCP proxy fast path — the per-session process, kept as small as this
  * file can make it.
  *
@@ -298,7 +318,7 @@ if (!process.env.VITEST) {
 				// here costs nothing the handshake does not give back better.
 				await bootstrapTelemetry({
 					cwd: resolveProjectDir(),
-					inferAgentFromEnv: !isDetachedDaemonInvocation(argv),
+					inferAgentFromEnv: !isAgentInferenceExempt(argv),
 				});
 				let failed = false;
 				try {
