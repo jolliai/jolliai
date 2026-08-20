@@ -1,4 +1,4 @@
-import { cpSync, existsSync, rmSync } from "node:fs";
+import { cpSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -22,6 +22,10 @@ import { fileURLToPath } from "node:url";
 //
 // base = <first non-flag arg> || $JOLLI_WEB_BASE || "E:\jolli". If <base>/frontend
 // does not exist, the web copy is skipped (not an error).
+//
+// A hand-maintained README.md in a destination is PRESERVED across the rm+copy
+// (src ships none): the web repo keeps a jolli-only doc describing the vendored
+// tree + the postMessage protocol, and it must survive every re-vendor.
 //
 // ORDER: the CLI must be built before this runs. If cli/dist/graph-assets is missing,
 // build the CLI first.
@@ -57,8 +61,15 @@ if (!vscodeOnly) {
 
 try {
 	for (const dest of dests) {
+		// Preserve a hand-maintained README.md across the rm+copy. `src` carries no
+		// README, so a bare rm+copy would delete the web repo's jolli-only doc (which
+		// explains the vendored tree + the postMessage protocol) on every re-vendor.
+		// vscode/assets/graph has none, so this is a no-op there.
+		const readmePath = join(dest, "README.md");
+		const preservedReadme = existsSync(readmePath) ? readFileSync(readmePath, "utf8") : null;
 		rmSync(dest, { recursive: true, force: true });
 		cpSync(src, dest, { recursive: true });
+		if (preservedReadme !== null) writeFileSync(readmePath, preservedReadme, "utf8");
 		console.log(`[copy-graph-assets] copied ${src} → ${dest}`);
 	}
 } catch (err) {
