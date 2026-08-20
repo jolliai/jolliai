@@ -663,6 +663,21 @@ describe("SessionTracker", () => {
 			expect(loaded?.lineNumber).toBe(0);
 		});
 
+		it("rewinds an archived Codex rollout cursor (archived_sessions is scanned too)", async () => {
+			const archived: TranscriptCursor = {
+				transcriptPath: "/Users/x/.codex/archived_sessions/rollout-archived.jsonl",
+				lineNumber: 42,
+				updatedAt: "2026-08-01T10:00:00Z",
+			};
+			await saveCursor(archived, tempDir);
+
+			const result = await rewindCodexCursors(tempDir);
+
+			expect(result).toEqual({ rewound: 1, paths: [archived.transcriptPath] });
+			const loaded = await loadCursorForTranscript(archived.transcriptPath, tempDir);
+			expect(loaded?.lineNumber).toBe(0);
+		});
+
 		it("returns {rewound: 0, paths: []} when there are no cursors at all", async () => {
 			const result = await rewindCodexCursors(tempDir);
 			expect(result).toEqual({ rewound: 0, paths: [] });

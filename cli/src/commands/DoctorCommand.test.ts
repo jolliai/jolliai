@@ -1656,4 +1656,79 @@ describe("DoctorCommand — --relink-codex", () => {
 		expect(joined).toContain("Rewound 0 Codex read-cursor(s)");
 		expect(joined).not.toContain("Future commits will re-capture");
 	});
+
+	it("warns which combined repairs it skipped, since it returns before them", async () => {
+		h.rewindCodexCursors.mockResolvedValue({ rewound: 1, paths: ["/home/x/.codex/sessions/2026/08/a.jsonl"] });
+
+		const out = await runDoctor(["--relink-codex", "--repair-transcripts"]);
+		const joined = out.join("\n");
+
+		expect(h.rewindCodexCursors).toHaveBeenCalledWith("/repo");
+		expect(joined).toContain("--relink-codex runs alone");
+		expect(joined).toContain("--repair-transcripts");
+	});
+
+	it("also warns about a skipped --schema-log (was missing from the list)", async () => {
+		h.rewindCodexCursors.mockResolvedValue({ rewound: 0, paths: [] });
+
+		const out = await runDoctor(["--relink-codex", "--schema-log"]);
+		const joined = out.join("\n");
+
+		expect(joined).toContain("--relink-codex runs alone");
+		expect(joined).toContain("--schema-log");
+	});
+});
+
+describe("DoctorCommand — otherRequestedRepairs", () => {
+	it("lists every other requested repair flag, excluding the running one", async () => {
+		const { otherRequestedRepairs } = await import("./DoctorCommand.js");
+		expect(
+			otherRequestedRepairs(
+				{ relinkCodex: true, schemaLog: true, markMigration: "x", syncSessions: true, repairTranscripts: true },
+				"--relink-codex",
+			),
+		).toEqual(["--schema-log", "--mark-migration", "--sync-sessions", "--repair-transcripts"]);
+	});
+
+	it("covers the --recover branch: recover excludes itself and names the rest", async () => {
+		const { otherRequestedRepairs } = await import("./DoctorCommand.js");
+		expect(otherRequestedRepairs({ recover: true, relinkCodex: true, schemaLog: true }, "--recover")).toEqual([
+			"--relink-codex",
+			"--schema-log",
+		]);
+	});
+
+	it("returns [] when nothing else was requested", async () => {
+		const { otherRequestedRepairs } = await import("./DoctorCommand.js");
+		expect(otherRequestedRepairs({ relinkCodex: true }, "--relink-codex")).toEqual([]);
+	});
+});
+
+describe("DoctorCommand — --recover with a combined repair", () => {
+	it("announces the skipped repair before running recover", async () => {
+		const { mkdtempSync, rmSync } = await import("node:fs");
+		const { tmpdir } = await import("node:os");
+		const { join } = await import("node:path");
+		const home = mkdtempSync(join(tmpdir(), "jolli-doctor-recover-combined-"));
+		const restoreHome = setIsolatedHome(home);
+		vi.clearAllMocks();
+		process.exitCode = undefined;
+		h.resolveProjectDir.mockReturnValue("/repo");
+		h.getGlobalConfigDir.mockReturnValue(join(home, ".jolli", "jollimemory"));
+		h.loadConfig.mockResolvedValue({});
+		try {
+			const out = await runDoctor(["--recover", "--relink-codex"]);
+			const joined = out.join("\n");
+			expect(joined).toContain("--recover runs alone");
+			expect(joined).toContain("--relink-codex");
+			// --recover still ran (it did not silently do nothing after the warning).
+			expect(joined).toContain("Snapshot candidates");
+			// The skipped repair truly did not run.
+			expect(h.rewindCodexCursors).not.toHaveBeenCalled();
+		} finally {
+			process.exitCode = 0;
+			restoreHome();
+			rmSync(home, { recursive: true, force: true });
+		}
+	});
 });

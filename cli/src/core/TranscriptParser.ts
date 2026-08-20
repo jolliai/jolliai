@@ -476,13 +476,19 @@ export class CodexTranscriptParser implements TranscriptParser {
 	}
 
 	/**
-	 * Counts consumed `response_item` rows whose `payload.type` this build does not
-	 * know (see {@link KNOWN_CODEX_RESPONSE_ITEM_TYPES}). A non-zero count on a slice
-	 * that yielded no conversation entries is the format-drift signal that keeps the
-	 * read cursor withheld — {@link parseToolUse} is computed independently of
-	 * {@link parseLine}, so without this a tool-heavy session whose message rows
-	 * changed shape would still report tool calls, advance the cursor, and strand
-	 * its unread conversation (the JOLLI-2240 failure mode, one shape further along).
+	 * Counts consumed `response_item` rows this build cannot read as conversation,
+	 * at BOTH drift levels: an unknown `payload.type` (see
+	 * {@link KNOWN_CODEX_RESPONSE_ITEM_TYPES}), and a `message` whose type is known
+	 * but whose inner role/content shape changed underneath ({@link
+	 * isDriftedCodexMessage}). A non-zero count on a slice that yielded no
+	 * conversation entries is the format-drift signal that keeps the read cursor
+	 * withheld — {@link parseToolUse} is computed independently of {@link parseLine},
+	 * so without this a tool-heavy session whose message rows changed shape (renamed
+	 * role, renamed text content type) would still report tool calls, advance the
+	 * cursor, and strand its unread conversation (the JOLLI-2240 failure mode, one
+	 * shape further along). Deliberately NOT counted: a message we understood and
+	 * dropped (injection/citation filtering) or an image-only turn — see
+	 * {@link isDriftedCodexMessage} for why each is drop-but-not-drift.
 	 */
 	parseUnrecognizedRows(lines: ReadonlyArray<string>): number {
 		let unknown = 0;
@@ -497,7 +503,20 @@ export class CodexTranscriptParser implements TranscriptParser {
 			const payload = (parsed as { payload?: unknown }).payload;
 			if (payload === null || typeof payload !== "object") continue;
 			const type = (payload as { type?: unknown }).type;
-			if (typeof type === "string" && !KNOWN_CODEX_RESPONSE_ITEM_TYPES.has(type)) unknown++;
+			if (typeof type !== "string") continue;
+			// Outer drift: a payload.type introduced after this build.
+			if (!KNOWN_CODEX_RESPONSE_ITEM_TYPES.has(type)) {
+				unknown++;
+				continue;
+			}
+			// Inner drift: a `message` whose payload.type we still know but whose role /
+			// content shape changed underneath — the same silent-strand failure one
+			// level deeper. Counted here so a tool-heavy slice whose message rows
+			// changed shape still withholds its cursor (parseToolUse is independent of
+			// parseLine, so it would otherwise report tools and advance past unread text).
+			if (type === "message" && isDriftedCodexMessage(payload as { role?: unknown; content?: unknown })) {
+				unknown++;
+			}
 		}
 		return unknown;
 	}
@@ -737,6 +756,37 @@ export function extractKimiText(value: unknown): string | null {
  * joined with newlines. Non-text items (images, etc.) are ignored. Returns null
  * when no text survives trimming.
  */
+/**
+ * True for a `response_item/message` payload whose INNER shape Codex changed in a
+ * way that costs conversation — the drift one level deeper than a renamed
+ * `payload.type`, which {@link CodexTranscriptParser.parseUnrecognizedRows} counts
+ * on its own. Two axes, each measured against a genuine drop that is NOT drift:
+ *
+ *   - `role` is a string Codex now emits that maps to neither speaker. A user or
+ *     assistant turn we understand-and-drop (injection/citation filtering) still
+ *     carries `user`/`assistant`, so this never fires on those; a missing role is
+ *     left uncounted deliberately (malformed, not a new encoding).
+ *   - a content item carries a string `text` under a `type` this build does not
+ *     read (e.g. `output_text` renamed). An image-only item carries no string
+ *     `text`, so an image-only turn — legitimately unrepresentable as text, and
+ *     dropped by {@link extractCodexMessageText} for that reason — is NOT drift and
+ *     must not withhold its slice's cursor forever.
+ */
+function isDriftedCodexMessage(payload: { role?: unknown; content?: unknown }): boolean {
+	const role = payload.role;
+	if (typeof role === "string" && role !== "user" && role !== "assistant") return true;
+	const content = payload.content;
+	if (Array.isArray(content)) {
+		for (const item of content) {
+			if (!item || typeof item !== "object") continue;
+			const type = (item as { type?: unknown }).type;
+			const text = (item as { text?: unknown }).text;
+			if (typeof text === "string" && type !== "input_text" && type !== "output_text") return true;
+		}
+	}
+	return false;
+}
+
 function extractCodexMessageText(content: unknown): string | null {
 	if (!Array.isArray(content)) return null;
 	const parts: string[] = [];
@@ -796,9 +846,14 @@ function isCodexInjectedUserText(text: string): boolean {
 	for (const tag of CODEX_INJECTED_WRAPPED_TAGS) {
 		if (t.startsWith(`<${tag}>`) && text.includes(`</${tag}>`)) return true;
 	}
+	// Companion is a fully-CLOSED injected block, not a bare mention: the real
+	// injection always carries one, while a genuine turn that opens with the header
+	// and merely quotes `<environment_context>`/`<INSTRUCTIONS>` in prose does not —
+	// so a bare `includes` here would drop that real submission.
 	if (
 		t.startsWith("# AGENTS.md instructions") &&
-		(text.includes("<INSTRUCTIONS>") || text.includes("<environment_context>"))
+		(/<INSTRUCTIONS>[\s\S]*<\/INSTRUCTIONS>/.test(text) ||
+			/<environment_context>[\s\S]*<\/environment_context>/.test(text))
 	) {
 		return true;
 	}
@@ -817,11 +872,15 @@ function isCodexInjectedUserText(text: string): boolean {
  * It is injected metadata — the citations Codex resolved for its own memory tool,
  * not part of what the user or the model said — so unlike the injected user turns
  * above it must NOT drop the whole turn (that would delete the entire assistant
- * response); the trailer is stripped and the content before it is kept. The regex
- * is greedy + `$`-anchored so it removes one or more trailing blocks in a single
- * pass and never touches a block that has real content after it.
+ * response); the trailer is stripped and the content before it is kept. Each block
+ * body is TEMPERED (`(?!</oai-mem-citation>)`) so one block cannot span across an
+ * intermediate close tag, and the group repeats over a `$`-anchored run — so a run
+ * of trailing blocks is removed in one pass while genuine text that happens to sit
+ * BETWEEN two citation blocks (which a single greedy `[\s\S]*`, or even a lazy
+ * `[\s\S]*?` backtracking to reach `$`, would have swallowed) is kept.
  */
-const CODEX_MEM_CITATION_TRAILER = /\s*<oai-mem-citation>[\s\S]*<\/oai-mem-citation>\s*$/;
+const CODEX_MEM_CITATION_TRAILER =
+	/(?:\s*<oai-mem-citation>(?:(?!<\/oai-mem-citation>)[\s\S])*<\/oai-mem-citation>)+\s*$/;
 function stripCodexMemCitation(text: string): string {
 	return text.replace(CODEX_MEM_CITATION_TRAILER, "").trimEnd();
 }

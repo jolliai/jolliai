@@ -328,6 +328,31 @@ describe("CodexTranscriptParser response_item", () => {
 		expect(entry?.content).not.toContain("oai-mem-citation");
 	});
 
+	it("keeps genuine text that sits BETWEEN two trailing citation blocks", () => {
+		// Guards against a single greedy `[\s\S]*` swallowing everything from the first
+		// open tag to the last close tag — which would delete the real 'answer B'.
+		const entry = parser.parseLine(
+			line({
+				type: "response_item",
+				payload: {
+					type: "message",
+					role: "assistant",
+					content: [
+						{
+							type: "output_text",
+							text: "answer A\n\n<oai-mem-citation>c1</oai-mem-citation>\n\nanswer B\n\n<oai-mem-citation>c2</oai-mem-citation>",
+						},
+					],
+				},
+			}),
+			0,
+		);
+		expect(entry?.role).toBe("assistant");
+		expect(entry?.content).toContain("answer B");
+		// The trailing run of blocks is still stripped.
+		expect(entry?.content).not.toContain("c2");
+	});
+
 	it("drops a turn that is nothing but an <oai-mem-citation> block", () => {
 		expect(
 			parser.parseLine(
@@ -410,6 +435,30 @@ describe("CodexTranscriptParser response_item", () => {
 		);
 		expect(entry?.role).toBe("human");
 		expect(entry?.content).toContain("can you rewrite the context7 section");
+	});
+
+	it("keeps a genuine '# AGENTS.md instructions' turn that only MENTIONS a tag, with no closed block", () => {
+		// The companion signal is a fully-closed injected block, not a bare mention:
+		// a real question that opens with the header and merely names <environment_context>
+		// (or <INSTRUCTIONS>) in prose must survive.
+		const entry = parser.parseLine(
+			line({
+				type: "response_item",
+				payload: {
+					type: "message",
+					role: "user",
+					content: [
+						{
+							type: "input_text",
+							text: "# AGENTS.md instructions — why does Codex prepend an <environment_context> block? Should I keep <INSTRUCTIONS> too?",
+						},
+					],
+				},
+			}),
+			0,
+		);
+		expect(entry?.role).toBe("human");
+		expect(entry?.content).toContain("why does Codex prepend");
 	});
 
 	it("keeps the '# Context from my IDE setup:' wrapper — it carries a real '## My request'", () => {
@@ -536,6 +585,53 @@ describe("CodexTranscriptParser response_item", () => {
 				"{not json",
 				line({ type: "response_item", payload: { type: 42 } }),
 				line({ type: "response_item", payload: null }),
+			];
+			expect(parser.parseUnrecognizedRows(rows)).toBe(0);
+		});
+
+		it("counts a known-type message whose role Codex changed (inner drift)", () => {
+			const drift = line({
+				type: "response_item",
+				payload: { type: "message", role: "tool", content: [{ type: "input_text", text: "x" }] },
+			});
+			expect(parser.parseUnrecognizedRows([drift])).toBe(1);
+		});
+
+		it("counts a message whose text content type was renamed (inner drift)", () => {
+			const drift = line({
+				type: "response_item",
+				payload: { type: "message", role: "assistant", content: [{ type: "output_content", text: "hi" }] },
+			});
+			expect(parser.parseUnrecognizedRows([drift])).toBe(1);
+		});
+
+		it("counts a message with both role and content drift only once", () => {
+			const drift = line({
+				type: "response_item",
+				payload: { type: "message", role: "tool", content: [{ type: "output_content", text: "hi" }] },
+			});
+			expect(parser.parseUnrecognizedRows([drift])).toBe(1);
+		});
+
+		it("does NOT count an image-only message (unrepresentable, not drift)", () => {
+			const imageOnly = line({
+				type: "response_item",
+				payload: { type: "message", role: "user", content: [{ type: "input_image", image_url: "…" }] },
+			});
+			expect(parser.parseUnrecognizedRows([imageOnly])).toBe(0);
+		});
+
+		it("does NOT count a normal message, an empty-content message, or a missing role", () => {
+			const rows = [
+				line({
+					type: "response_item",
+					payload: { type: "message", role: "user", content: [{ type: "input_text", text: "hi" }] },
+				}),
+				line({ type: "response_item", payload: { type: "message", role: "assistant", content: [] } }),
+				line({
+					type: "response_item",
+					payload: { type: "message", content: [{ type: "input_text", text: "hi" }] },
+				}),
 			];
 			expect(parser.parseUnrecognizedRows(rows)).toBe(0);
 		});

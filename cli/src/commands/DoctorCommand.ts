@@ -1203,6 +1203,44 @@ export async function runRepairTranscripts(cwd: string, apply: boolean): Promise
 	);
 }
 
+/**
+ * The other flag-driven repair modes a user requested alongside the one now
+ * running. Each repair branch in the action `return`s, so a combined invocation
+ * silently does one thing — this is what the branches announce so nothing is
+ * dropped without a word. Single source of truth so the two callers cannot drift
+ * (the earlier per-branch list omitted `--schema-log` and had no `--recover`
+ * counterpart at all).
+ */
+export function otherRequestedRepairs(
+	options: {
+		recover?: boolean;
+		relinkCodex?: boolean;
+		schemaLog?: boolean;
+		markMigration?: string;
+		syncSessions?: boolean;
+		repairTranscripts?: boolean;
+	},
+	runningFlag: string,
+): string[] {
+	const requested: Array<[boolean, string]> = [
+		[options.recover === true, "--recover"],
+		[options.relinkCodex === true, "--relink-codex"],
+		[options.schemaLog === true, "--schema-log"],
+		[typeof options.markMigration === "string", "--mark-migration"],
+		[options.syncSessions === true, "--sync-sessions"],
+		[options.repairTranscripts === true, "--repair-transcripts"],
+	];
+	return requested.filter(([on, flag]) => on && flag !== runningFlag).map(([, flag]) => flag);
+}
+
+/** Announces the co-requested repairs a returning branch is about to skip. */
+function warnOtherRepairsSkipped(runningFlag: string, others: string[]): void {
+	if (others.length === 0) return;
+	console.log(
+		`Note: ${runningFlag} runs alone; ${others.join(", ")} ${others.length === 1 ? "was" : "were"} not run. Re-run separately.`,
+	);
+}
+
 /** Registers the `doctor` sub-command on the given Commander program. */
 export function registerDoctorCommand(program: Command): void {
 	program
@@ -1248,10 +1286,17 @@ export function registerDoctorCommand(program: Command): void {
 				setLogDir(options.cwd);
 				log.info("Running 'doctor' command");
 				if (options.recover === true) {
+					// Runs first and returns, so any other requested repair is silently
+					// skipped — announce them (this branch had no such notice at all).
+					warnOtherRepairsSkipped("--recover", otherRequestedRepairs(options, "--recover"));
 					await runRecover(options.from, options.fix === true);
 					return;
 				}
 				if (options.relinkCodex === true) {
+					// This branch returns before the other repairs run, so a combined
+					// invocation would silently skip them. Say what is being ignored rather
+					// than doing one of the two things the user asked for without a word.
+					warnOtherRepairsSkipped("--relink-codex", otherRequestedRepairs(options, "--relink-codex"));
 					const { rewound, paths } = await rewindCodexCursors(options.cwd);
 					console.log(
 						`Rewound ${rewound} Codex read-cursor(s). The rollout files on disk are now unconsumed.`,

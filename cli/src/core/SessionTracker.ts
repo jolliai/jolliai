@@ -268,11 +268,15 @@ export async function saveCursor(cursor: TranscriptCursor, cwd?: string): Promis
 }
 
 /**
- * Matches a Codex rollout transcript path, keyed under `.codex/sessions/` on
- * either separator style. Windows-safe: `[\\/]` accepts both `\` and `/`
+ * Matches a Codex rollout transcript path, keyed under `.codex/sessions/` OR
+ * `.codex/archived_sessions/`. Both are scanned by
+ * {@link scanCodexSessionsOnDisk} (active tree + flat archive), so both can carry
+ * a read cursor the JOLLI-2240 parser bug stranded — a Codex conversation the user
+ * archived before running recovery keys under the archive path and would be missed
+ * by a `sessions/`-only match. Windows-safe: `[\\/]` accepts both `\` and `/`
  * rather than assuming the POSIX form every other cursor key happens to use.
  */
-const CODEX_ROLLOUT_PATH = /[\\/]\.codex[\\/]sessions[\\/]/;
+const CODEX_ROLLOUT_PATH = /[\\/]\.codex[\\/](?:archived_)?sessions[\\/]/;
 
 /**
  * Recovery lever for JOLLI-2240: before this PR's response-item parser fix,

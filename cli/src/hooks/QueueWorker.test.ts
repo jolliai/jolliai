@@ -5628,6 +5628,49 @@ describe("QueueWorker", () => {
 			}
 		});
 
+		it("does NOT count a WITHHELD drift slice's tokens or tools (no re-count on re-read)", async () => {
+			const cwd = mkdtempSync(join(tmpdir(), "jolli-c5drift-"));
+			try {
+				vi.mocked(loadAllSessions).mockResolvedValue([
+					{
+						sessionId: "claude-drift",
+						transcriptPath: "/tmp/claude-drift.jsonl",
+						updatedAt: "2026-04-01T12:00:00.000Z",
+						source: "claude" as const,
+					},
+				]);
+				vi.mocked(loadCursorForTranscript).mockResolvedValue(null);
+				vi.mocked(saveCursor).mockResolvedValue(undefined);
+				// Zero entries + tokens/tools present + an unrecognized shape = format drift.
+				// The cursor is withheld so a fixed build re-reads the slice; its tokens and
+				// tool calls must NOT be accumulated, or the same usage would be re-attributed
+				// to every commit until the cursor finally advances.
+				vi.mocked(readTranscript).mockResolvedValue({
+					entries: [],
+					newCursor: {
+						transcriptPath: "/tmp/claude-drift.jsonl",
+						lineNumber: 9,
+						updatedAt: "2026-04-01T12:00:00.000Z",
+					},
+					totalLinesRead: 9,
+					usageTokens: 555,
+					usageBreakdown: { input: 400, output: 155, cached: 0 },
+					toolUse: [{ name: "Bash", kind: "builtin" as const, calls: 3 }],
+					unrecognizedRows: 2,
+				});
+
+				const result = await __test__.loadSessionTranscripts(cwd, {});
+
+				// Withheld → nothing from this slice reaches the commit: no tokens, no carrier.
+				expect(result.conversationTokens).toBe(0);
+				expect(result.sessionTranscripts).toHaveLength(0);
+				// And the cursor was not queued to advance.
+				expect(saveCursor).not.toHaveBeenCalled();
+			} finally {
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
+
 		// End-to-end contract for the fix: token accumulation is deliberately
 		// decoupled from the `entries.length > 0` gate, but the only carrier a
 		// per-session split has to reach disk is a SessionTranscript — and that object

@@ -4507,6 +4507,63 @@ async function readAllTranscripts(
 		}
 		const endLine = result.newCursor.lineNumber;
 
+		const consumedLines = (result.totalLinesRead ?? 0) > 0;
+		const zeroEntries = result.entries.length === 0;
+		// "Recognized as nothing at all" — no entries, no usage, no tools. Deliberately
+		// broad: it also catches a purely-injected / metadata-only slice (message rows we
+		// understood and dropped), which is withheld on the same self-correcting tradeoff
+		// as a genuinely unreadable one — a fixed build re-reads it, real content advances
+		// it. See the withhold comment below.
+		const recognizedNothing = zeroEntries && (result.usageTokens ?? 0) === 0 && (result.toolUse?.length ?? 0) === 0;
+		// Format-drift canary (JOLLI-2240): the slice carried rows whose conversation
+		// shape this build cannot read. Because toolUse/usage are parsed INDEPENDENTLY of
+		// conversation text, a tool-heavy session whose message rows changed shape reports
+		// tools and tokens while producing zero entries — so `recognizedNothing` misses it.
+		// This does not: unrecognizedRows > 0 is the signal, and it is false for a
+		// legitimate tool-only turn (every row recognized) and for an injected/metadata
+		// slice (rows recognized, deliberately dropped).
+		const sawUnrecognizedShape = (result.unrecognizedRows ?? 0) > 0;
+
+		// A discovered session we actually read content from but produced no conversation
+		// entries is the loud signal a future upstream format change would otherwise hide
+		// (JOLLI-2240 shipped silent for weeks). Name the source and path — this fires
+		// whether the cursor advances (a usage/tool-only turn) or is withheld below.
+		if (consumedLines && zeroEntries) {
+			log.warn(
+				"Transcript source read to zero conversation entries: source=%s path=%s lines=%d→%d unrecognizedRows=%d",
+				session.source,
+				session.transcriptPath,
+				startLine,
+				endLine,
+				result.unrecognizedRows ?? 0,
+			);
+		}
+
+		// Withhold the cursor AND skip this slice entirely when a consumed, zero-entry
+		// slice either was recognized as nothing at all OR carried an unrecognized
+		// conversation shape — both mean a fixed build should re-read it. Skipping is
+		// load-bearing, not just the cursor: usage/tools are accumulated below, so
+		// counting a withheld slice's tokens/tool calls would re-attribute the SAME usage
+		// to every commit until the cursor finally advances (the drift branch can carry
+		// tools>0). A slice with tokens/tools but text we fully recognized is a legitimate
+		// tool-only turn (entries==0, sawUnrecognizedShape==false, usage/tools>0 →
+		// recognizedNothing==false): it is NOT withheld, and must advance or it re-reads
+		// forever. Re-warning each commit on a withheld slice is intentional and bounded
+		// (small head slice); it self-corrects when real content lands or the format is
+		// understood.
+		if (consumedLines && zeroEntries && (recognizedNothing || sawUnrecognizedShape)) {
+			log.warn(
+				"Not advancing read cursor: %s in consumed lines: source=%s path=%s lines=%d→%d unrecognizedRows=%d",
+				sawUnrecognizedShape ? "unrecognized conversation shape" : "source recognized nothing",
+				session.source,
+				session.transcriptPath,
+				startLine,
+				endLine,
+				result.unrecognizedRows ?? 0,
+			);
+			continue;
+		}
+
 		// Count usage tokens regardless of whether this slice produced any *merged*
 		// conversation entries. A slice can legitimately carry usage lines (assistant
 		// turns with a `usage` block) while yielding zero merged entries — e.g. the
@@ -4596,57 +4653,8 @@ async function readAllTranscripts(
 		// summary write lands (or at a deliberate skip). Saving here — before
 		// storeSummary — made a crash or LLM failure between this point and the
 		// store silently lose every entry the cursor had already walked past.
-		const consumedLines = (result.totalLinesRead ?? 0) > 0;
-		const recognizedNothing =
-			result.entries.length === 0 && (result.usageTokens ?? 0) === 0 && (result.toolUse?.length ?? 0) === 0;
-		// Format-drift canary (JOLLI-2240): the slice carried rows whose conversation
-		// shape this build cannot read. Because toolUse/usage are parsed INDEPENDENTLY
-		// of conversation text, a tool-heavy session whose message rows changed shape
-		// reports tools and tokens while producing zero entries — so `recognizedNothing`
-		// misses it. This does not, and it does not fire for a legitimate tool-only turn
-		// (every row recognized) or a purely-injected slice (message rows recognized,
-		// deliberately dropped).
-		const sawUnrecognizedShape = (result.unrecognizedRows ?? 0) > 0;
-
-		// A discovered session we actually read content from but produced no conversation
-		// entries is the loud signal a future upstream format change would otherwise hide
-		// (JOLLI-2240 shipped silent for weeks). Name the source and path.
-		if (consumedLines && result.entries.length === 0) {
-			log.warn(
-				"Transcript source read to zero conversation entries: source=%s path=%s lines=%d→%d unrecognizedRows=%d",
-				session.source,
-				session.transcriptPath,
-				startLine,
-				endLine,
-				result.unrecognizedRows ?? 0,
-			);
-		}
-
-		// Withhold the cursor when a consumed, zero-entry slice EITHER was recognized as
-		// nothing at all (no entries, no usage, no tools — "the format wrote lines we
-		// understood in no way") OR carried an unrecognized conversation shape (message
-		// text may be hiding in it). Both mean a fixed build should re-read this slice.
-		// A slice with tokens/tools but text we fully recognized is a legitimate tool-only
-		// turn and must still advance, or it re-reads and re-counts every commit forever;
-		// that case has entries==0 but sawUnrecognizedShape==false, so it is not withheld.
-		// The gate requires entries==0: a slice that produced SOME entries advances even
-		// with a drift canary, since withholding it would re-capture the entries forever.
-		// Re-warning on every commit here is intentional, not a bug to silence: such a
-		// session is re-read and re-warns each commit until real content lands or the
-		// format is understood — bounded (small head slice) and self-correcting.
-		if (consumedLines && result.entries.length === 0 && (recognizedNothing || sawUnrecognizedShape)) {
-			log.warn(
-				"Not advancing read cursor: %s in consumed lines: source=%s path=%s lines=%d→%d unrecognizedRows=%d",
-				sawUnrecognizedShape ? "unrecognized conversation shape" : "source recognized nothing",
-				session.source,
-				session.transcriptPath,
-				startLine,
-				endLine,
-				result.unrecognizedRows ?? 0,
-			);
-		} else {
-			pendingCursors.push(result.newCursor);
-		}
+		// Slices that had to be withheld already `continue`d above and never reach here.
+		pendingCursors.push(result.newCursor);
 	}
 
 	// Give every conversation that spent tokens a persistence carrier, including the
