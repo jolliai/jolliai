@@ -92,6 +92,7 @@ import {
 	DASHBOARD_SCRIPT_FILES,
 	hasForeignOrigin,
 	isAllowedHost,
+	type ModelRequest,
 	resolveDashboardAssetsDir,
 	startDashboardServer,
 } from "./DashboardServer.js";
@@ -430,6 +431,26 @@ describe("routes", () => {
 		expect(res.status).toBe(200);
 		expect(((await res.json()) as DashboardModel).view).toBe("standup");
 		expect(scopes).toEqual([{ kind: "repo", repoIdentities: ["r1"] }]);
+	});
+
+	it("threads the standup whole-week paging offset from ?offset=, rejecting non-integer and negative", async () => {
+		const reqs: ModelRequest[] = [];
+		const port = await listen(
+			testServer({
+				buildModel: async (req) => {
+					reqs.push(req);
+					return model(req.view);
+				},
+			}),
+		);
+		await get(port, "/api/model?view=standup&offset=2");
+		await get(port, "/api/model?view=standup");
+		await get(port, "/api/model?view=standup&offset=-1");
+		await get(port, "/api/model?view=standup&offset=abc");
+		// Deep-linkable, so an out-of-range magnitude is clamped to the furthest page
+		// (STANDUP_MAX_OFFSET = 52) rather than dropped or forwarded to addLocalDays' loop.
+		await get(port, "/api/model?view=standup&offset=99999999");
+		expect(reqs.map((r) => r.standupOffset)).toEqual([2, undefined, undefined, undefined, 52]);
 	});
 
 	it("reads a multi-repo scope from REPEATED repo params", async () => {
@@ -1665,10 +1686,10 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(graph.graph?.repos[0]?.graphAvailable).toBe(true);
 	});
 
-	// Memories is the one view that reads git before querying: a rebase leaves
-	// rewritten commits in `memories` forever, so the list is filtered against
-	// what is still reachable. Only this view pays that cost, and only for
-	// repos that are still enabled.
+	// The Memories view reads git before querying: a rebase leaves rewritten
+	// commits in `memories` forever, so the list is filtered against what is still
+	// reachable. Stats and Standup pay the same cost (see REACHABILITY_VIEWS); the
+	// views outside that set skip it, and it is only paid for still-enabled repos.
 	it("reads reachable commits for the Memories view, and prunes rows that no branch reaches", async () => {
 		const dbPath = join(dir, "memories-reach.db");
 		const configDir = join(dir, "config");
@@ -2375,7 +2396,7 @@ describe("Decisions card gist (Stats view only)", () => {
 		expect(body.standup?.authoredBy).toBe("me@example.com");
 		// The seeded commit carries no author, so the filter excludes it — the proof
 		// the identity reached the query rather than being resolved and dropped.
-		expect(body.standup?.todayCommits).toEqual([]);
+		expect((body.standup?.days ?? []).flatMap((d) => d.commits)).toEqual([]);
 	});
 
 	it("never reads the git identity for views other than Standup", async () => {

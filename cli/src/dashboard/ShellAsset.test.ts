@@ -1150,3 +1150,124 @@ describe("JD.renderShell — optional nav rows", () => {
 		expect(navViews(h)).not.toContain("settings");
 	});
 });
+
+/**
+ * The standup week pager (topbar), which replaces the range control on the standup
+ * board. Two halves: `JD.query` carries the `offset` across a scope change or a
+ * reload and drops it on the way out, and `renderShell` wires the three controls'
+ * disabled state and destinations. The board itself had asset coverage before this;
+ * the pager did not, which is how a `›` left enabled at the furthest window (a dead
+ * button) could ship — see the STANDUP_MAX_OFFSET guard in DashboardQuery.ts.
+ */
+const standupModel = (standupOver: Record<string, unknown> = {}, modelOver: Record<string, unknown> = {}): unknown =>
+	model({
+		view: "standup",
+		// No ranged payload on standup — the board carries its own week window.
+		stats: undefined,
+		standup: {
+			windowFrom: "2026-07-24",
+			windowTo: "2026-07-30",
+			offset: 0,
+			hasNewer: false,
+			hasOlder: true,
+			days: [],
+			workspaces: [],
+			...standupOver,
+		},
+		...modelOver,
+	});
+
+describe("JD.query — standup offset", () => {
+	it("carries the offset from the model's own echo, so a reload preserves the window", () => {
+		const { JD } = loadJD();
+		expect(JD.query(standupModel({ offset: 3 }))).toBe("?offset=3");
+	});
+
+	it("keeps the offset when only the repo scope changes", () => {
+		const { JD } = loadJD();
+		const query = JD.query(standupModel({ offset: 2 }, { scope: scoped(JOLLIAI) }), { repo: [SITE] });
+		expect(query).toContain("offset=2");
+		expect(query).toContain("repo=site");
+	});
+
+	it("omits offset 0 — the current week is the bare URL", () => {
+		const { JD } = loadJD();
+		expect(JD.query(standupModel({ offset: 0 }))).toBe("");
+	});
+
+	it("drops the offset when it is explicitly cleared, as navigating away does", () => {
+		const { JD } = loadJD();
+		expect(JD.query(standupModel({ offset: 4 }), { offset: undefined })).toBe("");
+	});
+
+	it("never emits offset off the standup view, even with one in the model", () => {
+		const { JD } = loadJD();
+		// A stats model still carries stats, so this also proves the emit is gated on
+		// the view and not on the absence of a standup payload.
+		expect(JD.query(model(), { offset: 5 })).not.toContain("offset");
+	});
+});
+
+describe("the standup week pager", () => {
+	it("is hidden on a non-standup view", () => {
+		const h = loadJD();
+		h.JD.renderShell(model());
+		expect(h.element("standupPager").hidden).toBe(true);
+	});
+
+	it("shows the window range as its label", () => {
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ windowFrom: "2026-07-24", windowTo: "2026-07-30" }));
+		expect(h.element("standupPager").hidden).toBe(false);
+		expect(h.element("standupPagerLabel").textContent).toBe("Jul 24 – 30");
+	});
+
+	it("on the current week disables ‹ and Today, and enables › when older data exists", () => {
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ offset: 0, hasNewer: false, hasOlder: true }));
+		expect(h.element("standupNewer").disabled).toBe(true);
+		expect(h.element("standupToday").disabled).toBe(true);
+		expect(h.element("standupOlder").disabled).toBe(false);
+	});
+
+	it("at the furthest window disables › and enables ‹ / Today", () => {
+		// The server sets hasOlder:false at the STANDUP_MAX_OFFSET ceiling (a further
+		// click clamps back onto this window); the client must honour it. This is the
+		// asset-side half of the dead-button fix.
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ offset: 52, hasNewer: true, hasOlder: false }));
+		expect(h.element("standupOlder").disabled).toBe(true);
+		expect(h.element("standupNewer").disabled).toBe(false);
+		expect(h.element("standupToday").disabled).toBe(false);
+	});
+
+	it("‹ pages one week newer, › one older, Today jumps to the current week", () => {
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ offset: 3, hasNewer: true, hasOlder: true }));
+		h.element("standupNewer").onclick?.();
+		expect(h.href()).toBe("/dashboard/standup?offset=2");
+		h.element("standupOlder").onclick?.();
+		expect(h.href()).toBe("/dashboard/standup?offset=4");
+		h.element("standupToday").onclick?.();
+		// offset 0 is left out of the URL, so Today lands on the bare current-week path.
+		expect(h.href()).toBe("/dashboard/standup");
+	});
+
+	it("preserves the repo scope in a pager destination", () => {
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ offset: 1, hasNewer: true, hasOlder: true }, { scope: scoped(JOLLIAI) }));
+		h.element("standupOlder").onclick?.();
+		expect(h.href()).toContain("/dashboard/standup?");
+		expect(h.href()).toContain("repo=jolliai");
+		expect(h.href()).toContain("offset=2");
+	});
+
+	it("a disabled control navigates nowhere", () => {
+		const h = loadJD();
+		h.JD.renderShell(standupModel({ offset: 0, hasNewer: false, hasOlder: false }));
+		h.element("standupNewer").onclick?.();
+		h.element("standupOlder").onclick?.();
+		h.element("standupToday").onclick?.();
+		expect(h.href()).toBe("");
+	});
+});

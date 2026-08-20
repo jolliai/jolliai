@@ -69,6 +69,20 @@
 				<button type="button" data-range="3m">90d</button>
 				<button type="button" data-range="custom" aria-expanded="false" aria-controls="rangeCustom">Custom</button>
 			</div>
+			<!-- Standup week pager. Shown only on the standup board (shell.js toggles
+			     it against the preset range control above): the board pages a whole
+			     seven-day window at a time rather than picking a preset. The label
+			     states the window; `‹` moves to more recent days, `›` to older — the
+			     direction of travel across the Today-on-the-left columns. `Today`
+			     jumps straight back to the current week (offset 0), so a reader many
+			     weeks back does not have to click `‹` repeatedly; disabled once the
+			     window already ends today. -->
+			<div class="standup-pager" id="standupPager" role="group" aria-label="Standup week" hidden>
+				<span class="standup-pager-label" id="standupPagerLabel"></span>
+				<button type="button" class="standup-pager-nav" id="standupNewer" aria-label="More recent days">‹</button>
+				<button type="button" class="standup-pager-nav" id="standupOlder" aria-label="Older days">›</button>
+				<button type="button" class="standup-pager-today" id="standupToday" aria-label="Jump to the current week">Today</button>
+			</div>
 			<!-- The form keeps Apply keyboard-submittable while the calendar provides
 			     an explicit, visible start-to-end selection. Future days are disabled
 			     from the model's own zone, rather than being silently clamped later. -->

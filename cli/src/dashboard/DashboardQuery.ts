@@ -27,7 +27,6 @@ import { ACTIVITY_BUCKET_MS } from "./ActivityBuckets.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import type {
 	AdoptionTier,
-	CommitInsightKind,
 	ConcurrencyModel,
 	CoverageNote,
 	DashboardMenus,
@@ -52,7 +51,7 @@ import type {
 	SkillDayPoint,
 	SkillDetail,
 	StandupCommit,
-	StandupInsight,
+	StandupDay,
 	StandupModel,
 	StandupWorkspace,
 	StatsModel,
@@ -267,6 +266,12 @@ export interface QueryOptions {
 	 * unfiltered; see {@link authorFilter} for why that fail-open matters.
 	 */
 	readonly authorIdentity?: AuthorIdentity;
+	/**
+	 * Standup view: whole-week paging offset. 0 (or absent) shows the window
+	 * ending today; each increment pages back another seven days. See
+	 * {@link StandupModel} for the window it selects.
+	 */
+	readonly standupOffset?: number;
 	/** Knowledge view: the async-read Memory Bank `_wiki` file lists. Absent renders an empty list. */
 	readonly knowledgeModel?: KnowledgeModel;
 	/** Graph view: the async-read Memory Bank repo list. Absent renders an empty list. */
@@ -777,10 +782,9 @@ function buildDecisionsCard(
 			   -- under the pre-rewrite hash, reachable only through the alias.
 			   JOIN topic_insights i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
 			  WHERE i.kind = 'decision' AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
-			  -- i.ord for the same reason buildStandupInsights carries it: one commit
-			  -- contributes several decision rows sharing its timestamp, so the date
-			  -- alone does not pick a first row — and rows[0] here IS the card (its
-			  -- one line and its one deep link).
+			  -- i.ord because one commit contributes several decision rows sharing its
+			  -- timestamp, so the date alone does not pick a first row — and rows[0]
+			  -- here IS the card (its one line and its one deep link).
 			  ORDER BY c.committed_at_ms DESC, i.ord`,
 		)
 		.all(fromMs, toMs, ...filter.params) as ReadonlyArray<{
@@ -1013,65 +1017,74 @@ function toRecentSession(s: SessionRow, nowMs: number): RecentSession {
 
 // ── Standup page ────────────────────────────────────────────────────────────
 
-/**
- * Render order for standup insights: risks first, notes last.
- *
- * The first three entries never match anything — {@link TOPIC_INSIGHTS_CTE} emits
- * only `decision` and `todo` — so today this sorts TODOs ahead of decisions and
- * nothing else. Kept whole rather than trimmed to the producible pair: the order
- * is the answer to "where would a risk go", which is a question the list should
- * still answer if the summarizer learns to record one. See `CommitInsightKind`.
- */
-const INSIGHT_ORDER: ReadonlyArray<CommitInsightKind> = ["blocker", "question", "gotcha", "todo", "decision"];
+/** Days in a single standup window, and the paging step between adjacent windows. */
+const STANDUP_WINDOW_DAYS = 7;
 
-/** Insights mined from the standup window's commit memories. */
-function buildStandupInsights(
+/**
+ * The furthest back `›` can page — one year of whole weeks. An upper bound is
+ * load-bearing, not cosmetic: `offset` is deep-linkable and reload-safe, so a
+ * crafted or mistyped `?offset=99999999` reaches `addLocalDays`, whose loop
+ * steps one local day at a time and would spin ~700M Intl-backed iterations,
+ * blocking the single-threaded dashboard for every tab. Clamped here (the query
+ * layer every caller passes through) and again at the URL parse boundary.
+ */
+export const STANDUP_MAX_OFFSET = 52;
+
+/**
+ * How many newest-first rows {@link hasCommitsBefore} pulls while looking for a
+ * reachable one. A generous ceiling, not a correctness knob: unreachable rows are
+ * only rebase/squash residue, so the first reachable commit is in practice the
+ * very newest older row, and a run of this many CONSECUTIVE residue rows sitting
+ * ahead of a real older commit does not occur. The bound is what keeps a
+ * per-render / per-30s-poll query off a full materialise-and-sort of `commits`,
+ * which is machine-global and grows without bound (DbBackfill imports whole
+ * histories) and has no single-column `committed_at_ms` index. Were the bound ever
+ * exceeded the only cost is `›` disabling one window early — never wrong data.
+ */
+const HAS_OLDER_SCAN_LIMIT = 256;
+
+/**
+ * Is there a REACHABLE, author-filtered commit strictly before `beforeMs` in
+ * scope? Drives `hasOlder`.
+ *
+ * Reachability is a JS-side set (git, not the DB — see {@link ReachableCommits}),
+ * so this cannot be a bare SQL `EXISTS`: a rebased or squashed-away commit keeps
+ * its `commits` row forever, and counting it would enable `›` onto a window whose
+ * only commits no longer exist in git. Rows are read newest-first, bounded to the
+ * first {@link HAS_OLDER_SCAN_LIMIT}; `.some` then returns at the first reachable
+ * one — in practice the very newest older commit, since unreachable rows are only
+ * rebase/squash residue. The `LIMIT` is load-bearing, not decorative: without it
+ * this materialises and sorts the whole `commits` table (no `committed_at_ms`
+ * index) on every render and poll, for a single boolean (see that constant for why
+ * the bound cannot lose a real answer). When `reachable` is absent (fail-open)
+ * `isReachable` accepts the first row, so this collapses back to the old existence
+ * check.
+ *
+ * This answers "is there ANY older commit", NOT "is the next window non-empty":
+ * paging steps a fixed seven-day calendar week, so a gap in history still lets
+ * the reader page through intermediate empty weeks before reaching older data —
+ * intended for a weekly board, where an empty week is truthful. What it guards is
+ * the TERMINAL case: `›` never runs off the end into a window with nothing beyond.
+ */
+function hasCommitsBefore(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
-	fromMs: number,
-	toMs: number,
+	beforeMs: number,
 	identity: AuthorIdentity | undefined,
-): StandupInsight[] {
+	reachable: ReachableCommits | undefined,
+): boolean {
 	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
-	// Same filter as the commit columns, and for a stronger reason: the Risks
-	// column is a list of things the reader is expected to answer for. A
-	// teammate's blocker rendered here is work silently reassigned to whoever
-	// reads the board.
 	const author = authorFilter(identity, "c");
 	const rows = db
 		.prepare(
-			`${TOPIC_INSIGHTS_CTE}
-			 SELECT i.kind, i.text, i.addressed_to, c.hash, c.committed_at_ms, r.repo_name
-			   FROM commits c
-			   JOIN repos r ON r.id = c.repo_id
-			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
-			   -- See commitsInRange / buildDecisionsCard: a rewritten commit's insights
-			   -- are still filed under the pre-rewrite hash, reachable only through the
-			   -- alias. Without this join an amended commit's blockers and questions
-			   -- vanish from Standup while its decisions still render on the Decisions
-			   -- card, which reads the same table through the alias.
-			   JOIN topic_insights i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
-			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}${author.sql}
-			  ORDER BY c.committed_at_ms DESC, i.ord`,
+			`SELECT c.hash, r.repo_identity
+			   FROM commits c JOIN repos r ON r.id = c.repo_id
+			  WHERE c.committed_at_ms < ?${filter.sql}${author.sql}
+			  ORDER BY c.committed_at_ms DESC
+			  LIMIT ${HAS_OLDER_SCAN_LIMIT}`,
 		)
-		.all(fromMs, toMs, ...filter.params, ...author.params) as ReadonlyArray<{
-		kind: string;
-		text: string;
-		addressed_to: string | null;
-		hash: string;
-		committed_at_ms: number;
-		repo_name: string;
-	}>;
-	return rows
-		.map((row) => ({
-			kind: row.kind as CommitInsightKind,
-			text: row.text,
-			commitHash: row.hash,
-			repoName: row.repo_name,
-			committedAtMs: row.committed_at_ms,
-			...(row.addressed_to ? { addressedTo: row.addressed_to } : {}),
-		}))
-		.sort((a, b) => INSIGHT_ORDER.indexOf(a.kind) - INSIGHT_ORDER.indexOf(b.kind));
+		.all(beforeMs, ...filter.params, ...author.params) as ReadonlyArray<{ hash: string; repo_identity: string }>;
+	return rows.some((row) => isReachable(reachable, row.repo_identity, row.hash));
 }
 
 function buildStandup(
@@ -1081,10 +1094,19 @@ function buildStandup(
 	nowMs: number,
 	tier: AdoptionTier,
 	identity: AuthorIdentity | undefined,
+	/** Whole-week paging offset: 0 = window ending today, 1 = the previous seven days, … */
+	offset: number,
+	/** Reachable commit sets, keyed by `repo_identity` — see {@link ReachableCommits}. */
+	reachable: ReachableCommits | undefined,
 ): StandupModel {
-	const todayStart = startOfLocalDay(nowMs, timeZone);
-	const tomorrowStart = addLocalDays(nowMs, 1, timeZone);
-	const yesterdayStart = addLocalDays(nowMs, -1, timeZone);
+	/* The anchor is the newest day shown. offset pages a whole week at a time, so
+	   the window is always the seven local days ending on the anchor. Clamped to
+	   [0, STANDUP_MAX_OFFSET]: negatives and non-integers fall to today's window,
+	   and an out-of-range magnitude is capped rather than left to spin addLocalDays. */
+	const safeOffset = Number.isInteger(offset) ? Math.min(Math.max(offset, 0), STANDUP_MAX_OFFSET) : 0;
+	const anchorStart = addLocalDays(nowMs, -STANDUP_WINDOW_DAYS * safeOffset, timeZone);
+	const windowStart = addLocalDays(anchorStart, -(STANDUP_WINDOW_DAYS - 1), timeZone);
+	const windowEnd = addLocalDays(anchorStart, 1, timeZone);
 
 	/* What the header states the board is filtered to. Derived from the SAME
 	   identity the queries were given (and by the same emptiness rule), so the
@@ -1145,21 +1167,64 @@ function buildStandup(
 		deletions: w.deletions ?? 0,
 	}));
 
+	/* One query over the whole window, then bucketed by local day. commitsInRange
+	   orders newest-first; a day column reads oldest-first (the mockup's order), so
+	   each bucket accumulates newest-first with push and is reversed ONCE when the
+	   day is emitted below — not `unshift`ed per row, which is O(n²) in a busy day's
+	   commit count. Rewritten-away commits are dropped, not shown: a rebase/squash
+	   leaves their `commits` row behind, and the board is a first-person "what I did"
+	   feed, so a commit that no longer exists in git is a false claim rather than
+	   noise — see ReachableCommits. */
+	const byDay = new Map<string, StandupCommit[]>();
+	for (const row of commitsInRange(db, scope, windowStart, windowEnd, identity)) {
+		if (!isReachable(reachable, row.repo_identity, row.hash)) continue;
+		const key = localDayKey(row.committed_at_ms, timeZone);
+		const bucket = byDay.get(key);
+		if (bucket) bucket.push(toStandupCommit(row));
+		else byDay.set(key, [toStandupCommit(row)]);
+	}
+
+	/* Seven columns, newest first — every day present so the grid is stable, quiet
+	   days rendered as an empty column. Each bucket was filled newest-first, so it is
+	   reversed here (in place, once) to the oldest-first order a column reads in. */
+	const days: StandupDay[] = [];
+	for (let d = 0; d < STANDUP_WINDOW_DAYS; d++) {
+		const key = localDayKey(addLocalDays(anchorStart, -d, timeZone), timeZone);
+		const bucket = byDay.get(key);
+		if (bucket) bucket.reverse();
+		days.push({ day: key, commits: bucket ?? [] });
+	}
+
 	return {
 		today: localDayKey(nowMs, timeZone),
-		yesterday: localDayKey(yesterdayStart, timeZone),
-		/* Sessions and workspaces carry no author filter, and need none: an agent
-		   session and an uncommitted diff are this machine's own working state, so
-		   they are already first-person. Only `commits` can hold a teammate's row. */
-		yesterdaySessions: sessionsInRange(db, scope, yesterdayStart, todayStart).map((s) => toRecentSession(s, nowMs)),
-		yesterdayCommits: commitsInRange(db, scope, yesterdayStart, todayStart, identity).map(toStandupCommit),
-		todaySessions: sessionsInRange(db, scope, todayStart, tomorrowStart).map((s) => toRecentSession(s, nowMs)),
-		todayCommits: commitsInRange(db, scope, todayStart, tomorrowStart, identity).map(toStandupCommit),
+		yesterday: localDayKey(addLocalDays(nowMs, -1, timeZone), timeZone),
+		windowFrom: localDayKey(windowStart, timeZone),
+		windowTo: localDayKey(anchorStart, timeZone),
+		offset: safeOffset,
+		days,
+		/* `‹` (newer) exists whenever the anchor is before today; `›` (older) whenever
+		   there is a REACHABLE, author-filtered commit anywhere before the window AND
+		   the window is not already the furthest one paging can reach. Paging steps a
+		   fixed calendar week, so on a history with gaps the reader can still land on
+		   intermediate empty weeks before reaching older data — that is intended for a
+		   weekly board. What `hasOlder` guarantees is the terminal case: `›` never
+		   enables a window with nothing beyond it — and the STANDUP_MAX_OFFSET ceiling
+		   is exactly such a nothing-beyond, because `safeOffset` clamps a further click
+		   straight back onto this same window, so an enabled `›` there is a dead button
+		   (the invariant the containment query was added to hold). The `&&` also skips
+		   that query at the ceiling, where its answer cannot change the result. */
+		hasNewer: safeOffset > 0,
+		hasOlder: safeOffset < STANDUP_MAX_OFFSET && hasCommitsBefore(db, scope, windowStart, identity, reachable),
 		workspaces,
 		...(authoredBy ? { authoredBy } : {}),
-		...(tier !== "installed"
-			? { insights: buildStandupInsights(db, scope, yesterdayStart, tomorrowStart, identity) }
-			: {}),
+		/* `insights` survives ONLY as the memory-tier flag its PRESENCE carries — the
+		   board renders no insight text (JOLLI-2200/2201: the column could never fill,
+		   and `renderStandup` reads only `!!standup.insights`). So it is an empty array
+		   at the tier and absent below it, and the content is deliberately not fetched:
+		   a per-window query whose every row the client discards was ~40 KB re-sent on
+		   each 30 s poll for a boolean. If a real insight column ever returns, this is
+		   where its query goes back. */
+		...(tier !== "installed" ? { insights: [] } : {}),
 	};
 }
 
@@ -2939,7 +3004,18 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 					),
 				};
 			case "standup":
-				return { standup: buildStandup(db, options.scope, timeZone, nowMs, tier, options.authorIdentity) };
+				return {
+					standup: buildStandup(
+						db,
+						options.scope,
+						timeZone,
+						nowMs,
+						tier,
+						options.authorIdentity,
+						options.standupOffset ?? 0,
+						options.reachableCommits,
+					),
+				};
 			case "knowledge":
 				// Read off disk (Memory Bank `_wiki`), pre-built in the model builder
 				// like settings — there is no DB query for it here.

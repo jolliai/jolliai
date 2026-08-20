@@ -17,6 +17,8 @@ import type {
 	DashboardScope,
 	McpServerRow,
 	SessionUpsertedEvent,
+	StandupCommit,
+	StandupModel,
 	StatsEventEnvelope,
 	StatsModel,
 	ToolUsageRow,
@@ -26,9 +28,30 @@ import { MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 /** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
 const SH = "Asia/Shanghai";
 
-import { buildDashboardModel, buildSkillDetail, buildToolUsagePage, type QueryOptions } from "./DashboardQuery.js";
+import {
+	buildDashboardModel,
+	buildSkillDetail,
+	buildToolUsagePage,
+	type QueryOptions,
+	STANDUP_MAX_OFFSET,
+} from "./DashboardQuery.js";
 import { volumeReachable } from "./RepoForget.js";
 import { applyStatsEvents } from "./StatsWriter.js";
+
+/** Every commit across a standup window's day columns, flattened newest-day-first. */
+function standupCommits(standup: StandupModel | undefined): ReadonlyArray<StandupCommit> {
+	return (standup?.days ?? []).flatMap((d) => d.commits);
+}
+
+/** The single commit with `hash` anywhere in the window, or undefined. */
+function commitByHash(standup: StandupModel | undefined, hash: string): StandupCommit | undefined {
+	return standupCommits(standup).find((c) => c.hash === hash);
+}
+
+/** The local day key of the column that holds `hash`, or undefined. */
+function commitDayKey(standup: StandupModel | undefined, hash: string): string | undefined {
+	return (standup?.days ?? []).find((d) => d.commits.some((c) => c.hash === hash))?.day;
+}
 
 /**
  * Seeds one memories row plus its `memory_topics` rows — the source the
@@ -605,41 +628,317 @@ describe("buildDashboardModel", () => {
 		if (!standup) throw new Error("standup missing");
 		expect(standup.today).toBe("2026-07-30");
 		expect(standup.yesterday).toBe("2026-07-29");
-		expect(standup.yesterdaySessions.map((s) => s.sessionId)).toEqual(["yesterday-1"]);
-		expect(standup.yesterdayCommits).toEqual([
+		expect(standup.windowFrom).toBe("2026-07-24");
+		expect(standup.windowTo).toBe("2026-07-30");
+		// abc1234 landed yesterday (Jul 29); it sits in that column, and today is empty.
+		expect(commitDayKey(standup, "abc1234")).toBe("2026-07-29");
+		expect(commitByHash(standup, "abc1234")).toEqual(
 			expect.objectContaining({
 				hash: "abc1234",
 				message: "feat: yesterday's commit",
 				branch: "main",
 				repoName: "jolli",
 			}),
-		]);
-		expect(standup.todaySessions.map((s) => s.sessionId)).toEqual(["today-1"]);
-		expect(standup.todayCommits).toEqual([]);
+		);
+		expect(standup.days.find((d) => d.day === "2026-07-30")?.commits ?? []).toEqual([]);
 		expect(standup.workspaces).toEqual([
 			{ repoName: "jolli", branch: "main", filesChanged: 6, insertions: 184, deletions: 22 },
 		]);
 	});
 
-	it("moves a 23:30 UTC session into the next local day under Asia/Shanghai", async () => {
+	/** A `commit.created` event on a given ISO instant, in `repo-1`. */
+	const commitAt = (iso: string, hash: string, message: string): StatsEventEnvelope => ({
+		producerKind: "cli",
+		event: {
+			type: "commit.created",
+			repoIdentity: "repo-1",
+			hash,
+			committedAtMs: Date.parse(iso),
+			message,
+			branch: "main",
+			branches: ["main"],
+			insertions: 1,
+			deletions: 0,
+		},
+	});
+
+	/** `repo.enabled` for `repo-1`, the prerequisite before any commit event. */
+	const repoEnabled: StatsEventEnvelope = {
+		producerKind: "cli",
+		event: { type: "repo.enabled", repoIdentity: "repo-1", repoName: "jolli", worktreeRoot: "/w", enabledAt: "t" },
+	};
+
+	it("windows the standup board to seven days, newest-first, ending today at offset 0", async () => {
 		await applySummaryEvents(
-			[session({ sessionId: "boundary", updatedAtMs: Date.parse("2026-07-29T23:30:00Z") })],
-			{
-				producerKind: "cli",
-				dbPath,
-			},
+			[
+				repoEnabled,
+				commitAt("2026-07-30T09:00:00Z", "c-today", "today commit"),
+				commitAt("2026-07-29T09:00:00Z", "c-yest", "yesterday commit"),
+				commitAt("2026-07-26T09:00:00Z", "c-sat", "saturday commit"),
+				commitAt("2026-07-24T09:00:00Z", "c-edge", "window edge commit"),
+				commitAt("2026-07-23T09:00:00Z", "c-older", "just before the window"),
+			],
+			{ producerKind: "cli", dbPath },
 		);
-		// In UTC that session is "yesterday"; in Shanghai it is "today".
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 0,
+				}),
+			{ dbPath },
+		);
+		const standup = model.standup;
+		if (!standup) throw new Error("standup missing");
+		expect(standup.today).toBe("2026-07-30");
+		expect(standup.yesterday).toBe("2026-07-29");
+		expect(standup.windowFrom).toBe("2026-07-24");
+		expect(standup.windowTo).toBe("2026-07-30");
+		// Seven columns, newest first — the mockup's Today-on-the-left order.
+		expect(standup.days.map((d) => d.day)).toEqual([
+			"2026-07-30",
+			"2026-07-29",
+			"2026-07-28",
+			"2026-07-27",
+			"2026-07-26",
+			"2026-07-25",
+			"2026-07-24",
+		]);
+		const byDay = Object.fromEntries(standup.days.map((d) => [d.day, d.commits.map((c) => c.hash)]));
+		expect(byDay["2026-07-30"]).toEqual(["c-today"]);
+		expect(byDay["2026-07-29"]).toEqual(["c-yest"]);
+		expect(byDay["2026-07-26"]).toEqual(["c-sat"]);
+		expect(byDay["2026-07-24"]).toEqual(["c-edge"]);
+		expect(byDay["2026-07-25"]).toEqual([]);
+		// A commit the day before the window is excluded, not folded into the edge column.
+		const allHashes = standup.days.flatMap((d) => d.commits.map((c) => c.hash));
+		expect(allHashes).not.toContain("c-older");
+	});
+
+	it("reports no newer window and no older data when offset 0 holds the earliest commit", async () => {
+		await applySummaryEvents(
+			[
+				repoEnabled,
+				commitAt("2026-07-30T09:00:00Z", "c-today", "today commit"),
+				commitAt("2026-07-24T09:00:00Z", "c-edge", "window edge commit"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 0,
+				}),
+			{ dbPath },
+		);
+		expect(model.standup?.hasNewer).toBe(false);
+		expect(model.standup?.hasOlder).toBe(false);
+	});
+
+	it("pages back a whole week at offset 1 and reports a newer window", async () => {
+		await applySummaryEvents(
+			[
+				repoEnabled,
+				commitAt("2026-07-30T09:00:00Z", "c-today", "today commit"),
+				commitAt("2026-07-20T09:00:00Z", "c-lastweek", "last week commit"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 1,
+				}),
+			{ dbPath },
+		);
+		const standup = model.standup;
+		if (!standup) throw new Error("standup missing");
+		// The seven days ending Jul 23 — the week before the one ending today.
+		expect(standup.offset).toBe(1);
+		expect(standup.windowFrom).toBe("2026-07-17");
+		expect(standup.windowTo).toBe("2026-07-23");
+		expect(standup.days.map((d) => d.day)).toEqual([
+			"2026-07-23",
+			"2026-07-22",
+			"2026-07-21",
+			"2026-07-20",
+			"2026-07-19",
+			"2026-07-18",
+			"2026-07-17",
+		]);
+		const byDay = Object.fromEntries(standup.days.map((d) => [d.day, d.commits.map((c) => c.hash)]));
+		expect(byDay["2026-07-20"]).toEqual(["c-lastweek"]);
+		// Today's commit is newer than this window and must not leak into it.
+		expect(standup.days.flatMap((d) => d.commits.map((c) => c.hash))).not.toContain("c-today");
+		expect(standup.hasNewer).toBe(true);
+		expect(standup.hasOlder).toBe(false);
+	});
+
+	it("clamps a non-integer or negative offset to the window ending today", async () => {
+		await applySummaryEvents([repoEnabled, commitAt("2026-07-30T09:00:00Z", "c-today", "today commit")], {
+			producerKind: "cli",
+			dbPath,
+		});
+		for (const bad of [1.5, -3]) {
+			const model = await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "standup",
+						scope: { kind: "all" },
+						timeZone: "UTC",
+						nowMs,
+						standupOffset: bad,
+					}),
+				{ dbPath },
+			);
+			expect(model.standup?.offset).toBe(0);
+			expect(model.standup?.windowTo).toBe("2026-07-30");
+			expect(model.standup?.hasNewer).toBe(false);
+		}
+	});
+
+	it("clamps an out-of-range offset to STANDUP_MAX_OFFSET rather than spinning addLocalDays", async () => {
+		// `offset` is deep-linkable, so a crafted magnitude must not reach addLocalDays'
+		// per-day loop unbounded. The clamp lands on the furthest window, one year back.
+		await applySummaryEvents([repoEnabled, commitAt("2026-07-30T09:00:00Z", "c-today", "today commit")], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 99_999_999,
+				}),
+			{ dbPath },
+		);
+		expect(model.standup?.offset).toBe(STANDUP_MAX_OFFSET);
+		// The window is the seven days ending 52 weeks (364 days) before today.
+		expect(model.standup?.windowTo).toBe("2025-07-31");
+		expect(model.standup?.windowFrom).toBe("2025-07-25");
+	});
+
+	it("drops a rewritten-away commit from its day column and from hasOlder", async () => {
+		// A rebase/squash leaves the pre-rewrite commit's row in `commits` forever;
+		// standup is a first-person feed, so an unreachable hash is a false claim.
+		await applySummaryEvents(
+			[
+				repoEnabled,
+				commitAt("2026-07-29T09:00:00Z", "c-live", "reachable commit"),
+				commitAt("2026-07-28T09:00:00Z", "c-dead", "squashed-away commit"),
+				commitAt("2026-07-10T09:00:00Z", "c-old-dead", "older squashed-away commit"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 0,
+					// Only c-live remains reachable from a ref; the other two were rewritten away.
+					reachableCommits: new Map([["repo-1", new Set(["c-live"])]]),
+				}),
+			{ dbPath },
+		);
+		const standup = model.standup;
+		if (!standup) throw new Error("standup missing");
+		const allHashes = standup.days.flatMap((d) => d.commits.map((c) => c.hash));
+		expect(allHashes).toContain("c-live");
+		expect(allHashes).not.toContain("c-dead");
+		// The only older commit (c-old-dead) is unreachable, so `›` stays disabled.
+		expect(standup.hasOlder).toBe(false);
+	});
+
+	it("keeps hasOlder true when a reachable commit precedes the window", async () => {
+		await applySummaryEvents(
+			[
+				repoEnabled,
+				commitAt("2026-07-30T09:00:00Z", "c-today", "today commit"),
+				commitAt("2026-07-10T09:00:00Z", "c-old-live", "older reachable commit"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: 0,
+					reachableCommits: new Map([["repo-1", new Set(["c-today", "c-old-live"])]]),
+				}),
+			{ dbPath },
+		);
+		expect(model.standup?.hasOlder).toBe(true);
+	});
+
+	it("disables `›` at STANDUP_MAX_OFFSET even when reachable older commits precede that window", async () => {
+		// The furthest window paging can reach ends 52 weeks back; a further click is
+		// clamped straight back onto it, so `›` there is a dead button. `hasOlder` must
+		// respect the ceiling even though older reachable commits DO exist before the
+		// window — the containment query alone would enable the arrow onto a window the
+		// clamp never lets you leave. Without the `safeOffset < STANDUP_MAX_OFFSET`
+		// guard this fixture reports `hasOlder: true`.
+		await applySummaryEvents(
+			[
+				repoEnabled,
+				commitAt("2026-07-30T09:00:00Z", "c-today", "today commit"),
+				commitAt("2025-07-28T09:00:00Z", "c-furthest", "inside the furthest window"),
+				commitAt("2025-07-01T09:00:00Z", "c-beyond", "older than the furthest window"),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "standup",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					standupOffset: STANDUP_MAX_OFFSET,
+					// All reachable: the older commit is real, so only the ceiling can disable `›`.
+					reachableCommits: new Map([["repo-1", new Set(["c-today", "c-furthest", "c-beyond"])]]),
+				}),
+			{ dbPath },
+		);
+		expect(model.standup?.offset).toBe(STANDUP_MAX_OFFSET);
+		expect(model.standup?.hasOlder).toBe(false);
+	});
+
+	it("buckets a 23:30 UTC commit into the next local day column under Asia/Shanghai", async () => {
+		await applySummaryEvents([repoEnabled, commitAt("2026-07-29T23:30:00Z", "boundary", "edge commit")], {
+			producerKind: "cli",
+			dbPath,
+		});
+		// In UTC that commit is on Jul 29; in Shanghai (+08:00 → 07:30) it is Jul 30.
 		const utc = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "standup", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 			{ dbPath },
 		);
-		expect(utc.standup?.yesterdaySessions.map((s) => s.sessionId)).toEqual(["boundary"]);
+		expect(commitDayKey(utc.standup, "boundary")).toBe("2026-07-29");
 		const shanghai = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "standup", scope: { kind: "all" }, timeZone: SH, nowMs }),
 			{ dbPath },
 		);
-		expect(shanghai.standup?.todaySessions.map((s) => s.sessionId)).toEqual(["boundary"]);
+		expect(commitDayKey(shanghai.standup, "boundary")).toBe("2026-07-30");
 	});
 
 	/** A second and third repo, each with one session, alongside `seed()`'s. */
@@ -817,8 +1116,8 @@ describe("buildDashboardModel", () => {
 		);
 		const standup = model.standup;
 		if (!standup) throw new Error("standup missing");
-		expect(standup.todaySessions[0].title).toBe("claude session");
-		const commit = standup.todayCommits[0];
+		const commit = commitByHash(standup, "bare1");
+		if (!commit) throw new Error("bare1 commit missing");
 		expect(commit.message).toBe("");
 		expect(commit).not.toHaveProperty("branch");
 		expect(commit).not.toHaveProperty("insertions");
@@ -3374,22 +3673,17 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(model.stats?.seriesKeys).toEqual(["codex"]);
 	});
 
-	it("surfaces standup insights ordered risks-first from the window's commits", async () => {
+	it("marks the memory tier with a present-but-empty insights flag, fetching no content", async () => {
+		// `insights` is a tier flag carried by PRESENCE, not a payload: the board
+		// renders no insight text (JOLLI-2200/2201), so it is an empty array at the
+		// memory tier and the server no longer runs a query to fill it. The seeded
+		// memories carry decisions/todo the old code would have surfaced here.
 		await seedMemory();
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "standup", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 			{ dbPath },
 		);
-		const insights = model.standup?.insights;
-		if (!insights) throw new Error("insights missing at memory tier");
-		// Derivation reality: summaries carry decisions/todo per topic, nothing
-		// else — todo ranks ahead of decision in the risk ordering.
-		expect(insights.map((i) => i.kind)).toEqual(["todo", "todo", "decision"]);
-		expect(insights[0]).toMatchObject({
-			text: "CI flaky",
-			commitHash: "mem1",
-			repoName: "jolli",
-		});
+		expect(model.standup?.insights).toEqual([]);
 	});
 
 	it("omits standup insights entirely below the memory tier", async () => {
@@ -3413,13 +3707,15 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		await seedMemory();
 		const standup = await standupOf();
 		// mem1 landed today and names a ticket; mem2 landed yesterday and does not.
-		expect(standup?.todayCommits[0]).toMatchObject({
+		expect(commitDayKey(standup, "mem1")).toBe(standup?.today);
+		expect(commitByHash(standup, "mem1")).toMatchObject({
 			hash: "mem1",
 			turns: 10,
 			estCostUsd: 3,
 			ticketId: "JOLLI-2069",
 		});
-		const yesterday = standup?.yesterdayCommits[0];
+		expect(commitDayKey(standup, "mem2")).toBe(standup?.yesterday);
+		const yesterday = commitByHash(standup, "mem2");
 		expect(yesterday).toMatchObject({ hash: "mem2", turns: 4, estCostUsd: 1 });
 		// Absent, not zero or empty: the row has to be able to omit what it does not
 		// know rather than render "$0.00 est" as if that were measured.
@@ -3456,7 +3752,7 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		);
 		// Mode: two feature topics outvote one ux topic.
 		await seedTopicRows(dbPath, "cat1", ["feature", "ux", "feature"]);
-		expect((await standupOf())?.todayCommits[0]).toMatchObject({ hash: "cat1", workCategory: "feature" });
+		expect(commitByHash(await standupOf(), "cat1")).toMatchObject({ hash: "cat1", workCategory: "feature" });
 	});
 
 	it("breaks label ties toward the first-appearing category — the stored copy's exact rule", async () => {
@@ -3492,7 +3788,7 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		);
 		// bugfix and ux both count 2; bugfix's first topic sits at pos 0.
 		await seedTopicRows(dbPath, "tie1", ["bugfix", "ux", "ux", "bugfix"]);
-		expect((await standupOf())?.todayCommits[0]).toMatchObject({ hash: "tie1", workCategory: "bugfix" });
+		expect(commitByHash(await standupOf(), "tie1")).toMatchObject({ hash: "tie1", workCategory: "bugfix" });
 	});
 
 	it("leaves the memory-tier columns off a commit only git reported", async () => {
@@ -3521,20 +3817,11 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 			],
 			{ producerKind: "cli", dbPath },
 		);
-		const commit = (await standupOf())?.todayCommits[0];
+		const commit = commitByHash(await standupOf(), "raw1");
 		expect(commit).toMatchObject({ hash: "raw1" });
 		expect(commit).not.toHaveProperty("turns");
 		expect(commit).not.toHaveProperty("estCostUsd");
 		expect(commit).not.toHaveProperty("ticketId");
-	});
-
-	it("dates every standup insight by the commit that raised it", async () => {
-		await seedMemory();
-		const insights = (await standupOf())?.insights ?? [];
-		expect(insights.length).toBeGreaterThan(0);
-		expect(insights.every((insight) => typeof insight.committedAtMs === "number")).toBe(true);
-		// "CI flaky" came out of mem1, which landed three hours before now.
-		expect(insights.find((insight) => insight.text === "CI flaky")?.committedAtMs).toBe(nowMs - 3 * 3_600_000);
 	});
 });
 
@@ -4164,20 +4451,17 @@ describe("standup author filter", () => {
 	it("keeps only the local identity's commits, matching email case-insensitively or name", async () => {
 		await seedSharedBranch();
 		const standup = await standupOf(MINE);
-		expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2"]);
+		expect(
+			standupCommits(standup)
+				.map((c) => c.hash)
+				.sort(),
+		).toEqual(["mine1", "mine2"]);
 		expect(standup?.authoredBy).toBe("Me@Example.com");
 	});
 
-	it("drops a teammate's TODO out of the Risks column", async () => {
-		await seedSharedBranch();
-		const insights = (await standupOf(MINE))?.insights ?? [];
-		expect(insights.map((i) => i.text)).toEqual(["my own TODO"]);
-	});
-
-	it("leaves sessions and the dirty worktree unfiltered — they are this machine's own state", async () => {
+	it("leaves the dirty worktree unfiltered — it is this machine's own state", async () => {
 		await seedSharedBranch();
 		const standup = await standupOf(MINE);
-		expect(standup?.todaySessions.map((s) => s.sessionId)).toEqual(["s1"]);
 		expect(standup?.workspaces).toHaveLength(1);
 	});
 
@@ -4185,9 +4469,12 @@ describe("standup author filter", () => {
 		await seedSharedBranch();
 		for (const identity of [undefined, { emails: [], names: [] }, { emails: ["  "], names: [" "] }]) {
 			const standup = await standupOf(identity);
-			expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2", "theirs1"]);
+			expect(
+				standupCommits(standup)
+					.map((c) => c.hash)
+					.sort(),
+			).toEqual(["mine1", "mine2", "theirs1"]);
 			expect(standup).not.toHaveProperty("authoredBy");
-			expect((standup?.insights ?? []).length).toBe(2);
 		}
 	});
 
@@ -4195,7 +4482,11 @@ describe("standup author filter", () => {
 		await seedSharedBranch();
 		const standup = await standupOf({ emails: [], names: ["Me"] });
 		expect(standup?.authoredBy).toBe("Me");
-		expect(standup?.todayCommits.map((c) => c.hash).sort()).toEqual(["mine1", "mine2"]);
+		expect(
+			standupCommits(standup)
+				.map((c) => c.hash)
+				.sort(),
+		).toEqual(["mine1", "mine2"]);
 	});
 
 	it("never filters the stats page — repo activity is not a first-person question", async () => {

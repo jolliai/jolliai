@@ -128,6 +128,7 @@ import {
 	buildToolUsagePage,
 	clearWorktreeExistenceCache,
 	type QueryOptions,
+	STANDUP_MAX_OFFSET,
 } from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
 import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
@@ -534,17 +535,23 @@ export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs">;
 export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
 
 /**
- * Views whose payload counts or renders per-MEMORY rows, and therefore pay for
- * one `git rev-list --branches` per repo. Deliberately not `standup`: its
- * commit lists — like the stats heatmap and KPI row — report activity, and a
- * commit that has since been squashed away still happened. Only the
- * memory-facing rows are filtered, because a rewritten commit's `memories` row
- * is a DUPLICATE of the surviving one, not a record of separate work.
+ * Views that filter rewritten-away commits, and therefore pay for one
+ * `git rev-list --branches` per repo.
+ *
+ * `stats` and `memories` join because their per-MEMORY rows are duplicates of the
+ * surviving one once a commit is rewritten, not a record of separate work.
+ * `standup` joins for a DIFFERENT reason: it is a FIRST-PERSON "what I did" feed
+ * whose columns the user pastes as their own standup, so a discrete line naming a
+ * commit hash that no longer exists in git is a false claim, and a squashed-away
+ * commit keeping `›` enabled onto an empty older window is the same defect one
+ * level up. This is the one place standup diverges from the stats heatmap and KPI
+ * row, which stay AGGREGATE activity counts — squashed work still happened, so it
+ * still counts there.
  *
  * `repositories` used to be here too, for its per-repo memory badge; it went
  * with that page.
  */
-const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories"]);
+const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "standup"]);
 
 /**
  * How long one worktree's git identity is trusted. Minutes, not hours: the value
@@ -1027,6 +1034,25 @@ function parseRange(url: URL): DashboardRange | undefined {
 }
 
 /**
+ * `offset=N` — the standup board's whole-week paging step. A non-negative
+ * integer, else absent (buildStandup then defaults to the window ending today).
+ * Validated here rather than forwarded verbatim like `from`/`to` because it
+ * reaches `addLocalDays`, which loops one local day at a time: a non-integer
+ * throws there, and an unbounded magnitude (this param is deep-linkable) would
+ * spin the single-threaded server for minutes. A too-large value is CLAMPED to
+ * the furthest page rather than dropped, so a stale deep link lands on the oldest
+ * window instead of silently snapping to today; `buildStandup` re-clamps for any
+ * caller that does not pass through here.
+ */
+function parseStandupOffset(url: URL): number | undefined {
+	const raw = url.searchParams.get("offset");
+	if (raw === null) return undefined;
+	const n = Number(raw);
+	if (!Number.isInteger(n) || n < 0) return undefined;
+	return Math.min(n, STANDUP_MAX_OFFSET);
+}
+
+/**
  * The query params that select a window and an axis.
  *
  * `from`/`to` are forwarded verbatim: validating them here as well as in
@@ -1052,6 +1078,7 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 	// parameters, and an unresolvable value means the detail falls back to the
 	// page scope rather than erroring.
 	const detailRepo = url.searchParams.get("detailRepo") ?? undefined;
+	const standupOffset = parseStandupOffset(url);
 	return {
 		...(dimension ? { dimension } : {}),
 		...(range ? { range } : {}),
@@ -1059,6 +1086,7 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 		...(customTo ? { customTo } : {}),
 		...(hash ? { hash } : {}),
 		...(detailRepo ? { detailRepoIdentity: detailRepo } : {}),
+		...(standupOffset !== undefined ? { standupOffset } : {}),
 	};
 }
 

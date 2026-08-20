@@ -723,21 +723,57 @@ body {
 
   /* ---------- standup view ---------- */
   .ctx { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-bottom: 16px; }
-  .ctx .date { font-size: 15px; font-weight: 650; }
   .sprint-chips { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .schip { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-2); border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; }
   /* No `.st` status rule: the mockup's `● on track` chip needed plan-step
      progress, which does not exist locally, so `sprintChips` emits tickets only
      and nothing ever carried the class. */
   .cols { display: grid; grid-template-columns: 1fr; gap: 16px; }
-  /* Two columns — Yesterday and Today. The third (Risks · Blockers · Questions)
-     was removed because the insight kinds it filtered for are never produced; see
-     the note at the top of standup.js. */
   @media (min-width: 980px) { .cols { grid-template-columns: 1fr 1fr; } }
   .cols > .card { grid-column: auto; }
   .col h2 { display: flex; align-items: baseline; gap: 8px; }
   .col h2 .cnt { font-size: 11px; color: var(--muted); font-weight: 500; }
   .col-list { display: grid; gap: 8px; margin-top: 12px; }
+  .day-title { font-weight: 650; }
+
+  /* The standup board's seven day columns: one card per day, newest (Today)
+     leftmost, laid out as fixed-width columns that scroll horizontally rather
+     than wrapping — so the week reads as one strip and a quiet day is a visible
+     empty column rather than a gap. Overrides the two-column `.cols` grid above.
+     The third Risks · Blockers · Questions column stays gone — the insight kinds
+     it filtered for are never produced; see the note at the top of standup.js. */
+  .main:has(.standup-days) { overflow-x: hidden; }
+  .cols.standup-days {
+    grid-template-columns: none;
+    grid-auto-flow: column;
+    grid-auto-columns: minmax(260px, 1fr);
+    align-items: start;
+    overflow-x: auto;
+    max-width: 100%;
+    padding-bottom: 8px;
+    scroll-snap-type: x proximity;
+  }
+  .cols.standup-days > .card { min-width: 0; scroll-snap-align: start; }
+  .standup-days .col h2 { min-width: 0; }
+  .standup-days .item .r1, .standup-days .item .t { min-width: 0; }
+  .standup-days .item .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .standup-days .empty-note { min-height: 28px; display: flex; align-items: center; margin-top: 12px; }
+  @media (max-width: 700px) { .cols.standup-days { grid-auto-columns: minmax(238px, 82vw); } }
+
+  /* The standup week pager, sitting where the preset range control sits on other
+     views. A pill matching `.seg`'s treatment: a static label flanked by two nav
+     arrows; a disabled arrow is the window's edge (today, or the earliest data). */
+  .standup-pager { display: inline-flex; align-items: center; gap: 2px; border: 1px solid var(--border); border-radius: 9px; padding: 2px; background: var(--surface); }
+  .standup-pager[hidden] { display: none; }
+  .standup-pager-label { font-size: 12px; font-weight: 600; color: var(--ink); padding: 5px 10px; white-space: nowrap; }
+  .standup-pager-nav { display: inline-flex; align-items: center; justify-content: center; width: 26px; height: 26px; border: 0; border-radius: 7px; background: transparent; color: var(--ink-2); font-size: 15px; line-height: 1; cursor: pointer; }
+  .standup-pager-nav:hover:not(:disabled) { color: var(--ink); background: var(--lock-bg); }
+  .standup-pager-nav:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .standup-pager-nav:disabled { opacity: .35; cursor: default; }
+  .standup-pager-today { display: inline-flex; align-items: center; height: 26px; margin-left: 2px; padding: 0 10px; border: 0; border-radius: 7px; background: transparent; color: var(--ink-2); font-size: 12px; font-weight: 600; line-height: 1; cursor: pointer; }
+  .standup-pager-today:hover:not(:disabled) { color: var(--ink); background: var(--lock-bg); }
+  .standup-pager-today:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  .standup-pager-today:disabled { opacity: .35; cursor: default; }
 
   /* No `.ghead` group header: both day columns are flat. Memory Activity's
      grouping IS the day, and here the day is already the column, so a second

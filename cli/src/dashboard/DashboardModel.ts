@@ -1476,29 +1476,59 @@ export interface StandupInsight {
 	readonly committedAtMs: number;
 }
 
-/** The Standup page payload. */
+/** One day column on the Standup board — a local day and the commits that landed on it. */
+export interface StandupDay {
+	/** Local `YYYY-MM-DD`. */
+	readonly day: string;
+	/** Commits completed on {@link day}, oldest-first within the day. Empty for a quiet day. */
+	readonly commits: ReadonlyArray<StandupCommit>;
+}
+
+/**
+ * The Standup page payload — a seven-day window of commit activity.
+ *
+ * The board is a rolling 7-day window ending on an anchor day, paged a whole
+ * week at a time (the `offset` request param: 0 = window ending today). The
+ * columns are COMMITS ONLY (JOLLI-2200 / 2201): a column states what was
+ * COMPLETED that day, matching the rows the stats page's Memory Activity card
+ * lists for the same day, and a session or an uncommitted worktree is work in
+ * flight rather than a completed row.
+ */
 export interface StandupModel {
-	/** Local `YYYY-MM-DD` the board was built for. */
+	/** The real local `YYYY-MM-DD` today, for the "Today"/"Yesterday" column titles. */
 	readonly today: string;
 	readonly yesterday: string;
+	/** Oldest and newest local `YYYY-MM-DD` of the shown window (newest = the anchor). */
+	readonly windowFrom: string;
+	readonly windowTo: string;
 	/**
-	 * NOT RENDERED, and absence from the page is not an oversight. Both day columns
-	 * are commits only: Today states what was COMPLETED today (JOLLI-2201), and the
-	 * columns are required to list the same rows the stats page's Memory Activity
-	 * card lists for the same day — which is commits and nothing else. A session is
-	 * not a commit, and a live session or an uncommitted worktree is work in flight
-	 * besides.
-	 *
-	 * All three are still queried: they are the only local record of "in progress",
-	 * and the column that wants them has not been designed yet. But a renderer
-	 * putting any of them back into a day column re-opens the ticket.
+	 * The resolved whole-week paging offset this window is at (0 = ending today).
+	 * Echoed so the client can preserve it across a repo-scope change or a poll
+	 * without re-reading the URL — see `JD.query` in `shell.js`.
 	 */
-	readonly yesterdaySessions: ReadonlyArray<RecentSession>;
-	readonly yesterdayCommits: ReadonlyArray<StandupCommit>;
-	/** Not rendered — see {@link StandupModel.yesterdaySessions}. */
-	readonly todaySessions: ReadonlyArray<RecentSession>;
-	readonly todayCommits: ReadonlyArray<StandupCommit>;
-	/** Uncommitted work. Not rendered — see {@link StandupModel.yesterdaySessions}. */
+	readonly offset: number;
+	/**
+	 * The seven day columns, NEWEST FIRST — the anchor day leftmost, going back a
+	 * week. Every day in the window is present, including quiet ones (empty
+	 * `commits`), so the grid has a stable seven columns.
+	 */
+	readonly days: ReadonlyArray<StandupDay>;
+	/**
+	 * A newer window exists to page forward to (i.e. the anchor is before today).
+	 * Drives the `‹` arrow, which moves toward more recent days — see the standup
+	 * pager in `shell.js`. False on the current window: there is no future to show.
+	 */
+	readonly hasNewer: boolean;
+	/**
+	 * An author-filtered commit exists strictly before this window, so paging back
+	 * lands on data rather than empty weeks. Drives the `›` arrow (older days).
+	 */
+	readonly hasOlder: boolean;
+	/**
+	 * Uncommitted work across the registered repos. NOT RENDERED in a day column —
+	 * it is work in flight, not a completed row — but carried for a future
+	 * in-progress surface and because it is window-independent (current state).
+	 */
 	readonly workspaces: ReadonlyArray<StandupWorkspace>;
 	/**
 	 * The git identity the commit columns were filtered to (an email, or a name
@@ -1509,15 +1539,17 @@ export interface StandupModel {
 	 */
 	readonly authoredBy?: string;
 	/**
-	 * Risks/blockers/questions/TODOs mined from the window's commit memories.
-	 * Present (possibly empty) from the memory tier onwards.
+	 * The memory-tier flag, carried by PRESENCE alone: an EMPTY array from the
+	 * memory tier onwards, absent below it. `renderStandup` reads only
+	 * `!!standup.insights` — how many fields a commit row may show — never the
+	 * contents.
 	 *
-	 * NOT RENDERED either, and now for two reasons at once. `todo` is unrouted for
-	 * the reason above and `decision` belongs to the Decisions card; the other
-	 * three had a column of their own until it was removed, because nothing can
-	 * produce them (see {@link CommitInsightKind}). What the field still does is
-	 * carry the memory tier: its mere PRESENCE is what `renderStandup` reads to
-	 * decide how many fields a commit row may show.
+	 * It is typed as an insight array, and stays so, for one reason: the standup
+	 * board once rendered a Risks/Blockers/Questions column from it. That column was
+	 * removed (JOLLI-2200/2201 — nothing produces those kinds, see
+	 * {@link CommitInsightKind}), and with it the server stopped populating this: the
+	 * per-window query re-sent ~40 KB the client discarded on every 30 s poll. The
+	 * shape is kept so a real insight column can return here without a wire change.
 	 */
 	readonly insights?: ReadonlyArray<StandupInsight>;
 }

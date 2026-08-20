@@ -21,6 +21,7 @@ import { describe, expect, it } from "vitest";
 
 interface JDNamespace {
 	renderStandup: (model: unknown) => void;
+	standupPagerLabel: (fromKey: string, toKey: string) => string;
 }
 
 interface FakeElement {
@@ -79,6 +80,26 @@ function loadJD(): { JD: JDNamespace; element: (id: string) => FakeElement } {
 
 const nowMs = Date.parse("2026-07-30T12:00:00Z");
 
+/** The seven local day keys of the default window, newest first (as the server emits them). */
+const WINDOW_DAYS = ["2026-07-30", "2026-07-29", "2026-07-28", "2026-07-27", "2026-07-26", "2026-07-25", "2026-07-24"];
+
+/** A full seven-day `days` array, with only the named days carrying commits. */
+function days(byDay: Record<string, unknown[]> = {}): unknown[] {
+	return WINDOW_DAYS.map((day) => ({ day, commits: byDay[day] ?? [] }));
+}
+
+/** One commit row, defaulted so a test names only the fields it cares about. */
+function commit(over: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		hash: "abc1234def",
+		message: "feat: my work",
+		committedAtMs: nowMs - 26 * 3_600_000,
+		repoName: "jolliai",
+		branch: "main",
+		...over,
+	};
+}
+
 function model(standupOver: Record<string, unknown> = {}): unknown {
 	return {
 		schemaVersion: 1,
@@ -92,24 +113,35 @@ function model(standupOver: Record<string, unknown> = {}): unknown {
 		standup: {
 			today: "2026-07-30",
 			yesterday: "2026-07-29",
-			yesterdaySessions: [],
-			yesterdayCommits: [
-				{
-					hash: "abc1234def",
-					message: "feat: my work",
-					committedAtMs: nowMs - 26 * 3_600_000,
-					repoName: "jolliai",
-					branch: "main",
-				},
-			],
-			todaySessions: [],
-			todayCommits: [],
+			windowFrom: "2026-07-24",
+			windowTo: "2026-07-30",
+			offset: 0,
+			days: days({ "2026-07-29": [commit()] }),
+			hasNewer: false,
+			hasOlder: false,
 			workspaces: [],
 			insights: [],
 			...standupOver,
 		},
 	};
 }
+
+describe("standup pager label", () => {
+	it("collapses a same-month window to a single month name", () => {
+		const { JD } = loadJD();
+		expect(JD.standupPagerLabel("2026-07-24", "2026-07-30")).toBe("Jul 24 – 30");
+	});
+
+	it("names both months across a month boundary", () => {
+		const { JD } = loadJD();
+		expect(JD.standupPagerLabel("2026-07-28", "2026-08-03")).toBe("Jul 28 – Aug 3");
+	});
+
+	it("includes the year on both ends across a year boundary", () => {
+		const { JD } = loadJD();
+		expect(JD.standupPagerLabel("2025-12-29", "2026-01-04")).toBe("Dec 29, 2025 – Jan 4, 2026");
+	});
+});
 
 describe("standup author disclosure", () => {
 	it("names the identity the board was filtered to", () => {
@@ -140,76 +172,66 @@ describe("standup column shape", () => {
 		expect(html).not.toContain("Copy as standup");
 	});
 
-	// JOLLI-2201. A TODO is work that has NOT happened; the column states what
-	// landed today, so an unfinished item in it is a claim the board cannot make.
-	it("keeps TODOs out of Today and counts today's commits instead", () => {
+	// One column per day in the window, in the server's newest-first order. The
+	// column's stable, locale-independent handle is `data-day` (an ISO date); the
+	// aria-label carries the HUMAN-READABLE title instead — a region landmark named
+	// by a bare ISO string reads badly to a screen reader. Today and Yesterday get
+	// their named titles.
+	it("renders one column per window day, newest first, with Today/Yesterday titles", () => {
 		const { JD, element } = loadJD();
-		JD.renderStandup(
-			model({
-				todayCommits: [
-					{
-						hash: "0f0f0f0abc",
-						message: "fix: today's landing",
-						committedAtMs: nowMs - 3_600_000,
-						repoName: "jolliai",
-						branch: "main",
-					},
-				],
-				insights: [
-					{
-						kind: "todo",
-						text: "wire the retry path",
-						commitHash: "abc1234def",
-						repoName: "jolliai",
-						committedAtMs: nowMs - 26 * 3_600_000,
-					},
-				],
-			}),
-		);
+		JD.renderStandup(model({ authoredBy: "me@example.com" }));
 		const html = element("app").innerHTML;
-		expect(html).toContain("fix: today&#39;s landing");
-		expect(html).not.toContain("wire the retry path");
-		expect(html).not.toContain("TODO");
+		for (const day of WINDOW_DAYS) expect(html).toContain(`data-day="${day}"`);
+		// The accessible name is the readable title, never the raw ISO date.
+		expect(html).toContain('aria-label="Today"');
+		expect(html).not.toContain('aria-label="Standup for');
+		// Newest first: Today's column markup precedes the oldest day's.
+		expect(html.indexOf('data-day="2026-07-30"')).toBeLessThan(html.indexOf('data-day="2026-07-24"'));
+		expect(html).toContain(">Today<");
+		expect(html).toContain(">Yesterday<");
+		// Dated columns read in English (en-US pinned), matching the Today/Yesterday titles.
+		expect(html).toContain("Jul 24");
 	});
 
-	// Yesterday is commits-only too, at BOTH tiers. Below the memory tier it used
-	// to carry the raw session trail; Memory Activity never lists a session, and
-	// the two are required to agree.
-	it("keeps session rows out of Yesterday at the raw tier", () => {
+	// A quiet day is still a column — the grid stays a stable seven wide rather
+	// than collapsing — and it says so rather than rendering blank.
+	it("renders a quiet day as an empty column", () => {
+		const { JD, element } = loadJD();
+		JD.renderStandup(model());
+		const html = element("app").innerHTML;
+		expect(html).toContain("No commits.");
+		// The day that does carry a commit shows it, and its count.
+		expect(html).toContain("feat: my work");
+		expect(html).toContain("· 1 commit");
+	});
+
+	// A commit lands in the column for its own day, not another.
+	it("buckets a commit into its own day column", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(
 			model({
-				insights: undefined,
-				yesterdaySessions: [
-					{
-						title: "an agent run",
-						source: "claude",
-						messageCount: 40,
-						updatedAtMs: nowMs - 26 * 3_600_000,
-						repoName: "jolliai",
-						isLive: false,
-					},
-				],
+				days: days({
+					"2026-07-30": [commit({ hash: "todayc", message: "fix: today's landing" })],
+					"2026-07-26": [commit({ hash: "satc", message: "chore: saturday" })],
+				}),
 			}),
 		);
 		const html = element("app").innerHTML;
-		expect(html).toContain("feat: my work");
-		expect(html).not.toContain("an agent run");
-		expect(html).toContain("· 1 commit");
+		// Today's column (first) holds today's commit; it precedes Saturday's.
+		expect(html.indexOf("fix: today&#39;s landing")).toBeLessThan(html.indexOf("chore: saturday"));
 	});
 
 	// Memory Activity's grouping IS the day; here the day is already the column, so
 	// a second axis inside one makes two identical lists read as different ones.
-	it("renders both day columns flat, with no group headers", () => {
+	it("renders the day columns flat, with no group headers", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(model({ authoredBy: "me@example.com" }));
 		expect(element("app").innerHTML).not.toContain("ghead");
 	});
 
 	// The heading and its count already say what the column holds. An EMPTY `.sub`
-	// is not the same as none — it carries a bottom margin, so it would hold the
-	// caption's gap open.
-	it("gives the day columns no caption, and no empty caption element", () => {
+	// is not the same as none — it carries a bottom margin, so it would hold a gap open.
+	it("gives the day columns no caption element", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(model({ authoredBy: "me@example.com" }));
 		const html = element("app").innerHTML;
@@ -222,20 +244,11 @@ describe("standup column shape", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(
 			model({
-				yesterdayCommits: [
-					{
-						hash: "abc1234def",
-						message: "feat: my work",
-						committedAtMs: nowMs - 26 * 3_600_000,
-						repoName: "jolliai",
-						branch: "main",
-						turns: 12,
-						workCategory: "bugfix",
-						estCostUsd: 2.29,
-						insertions: 58,
-						deletions: 11,
-					},
-				],
+				days: days({
+					"2026-07-29": [
+						commit({ turns: 12, workCategory: "bugfix", estCostUsd: 2.29, insertions: 58, deletions: 11 }),
+					],
+				}),
 			}),
 		);
 		const html = element("app").innerHTML;
@@ -251,32 +264,9 @@ describe("standup column shape", () => {
 		expect(html).not.toContain("+58");
 	});
 
-	// Same rule for the two other non-completed sources the column used to carry.
-	it("keeps live sessions and uncommitted work out of Today", () => {
-		const { JD, element } = loadJD();
-		JD.renderStandup(
-			model({
-				todaySessions: [
-					{
-						title: "still going",
-						source: "claude",
-						messageCount: 12,
-						updatedAtMs: nowMs - 60_000,
-						repoName: "jolliai",
-						isLive: true,
-					},
-				],
-				workspaces: [{ repoName: "jolliai", branch: "main", filesChanged: 3, insertions: 40, deletions: 2 }],
-			}),
-		);
-		const html = element("app").innerHTML;
-		expect(html).not.toContain("still going");
-		expect(html).not.toContain("Uncommitted on");
-		expect(html).toContain("Nothing yet.");
-	});
-
-	// JOLLI-2200. Titles only — the decision text belongs to the Decisions card.
-	it("renders Yesterday outcomes without their decision detail", () => {
+	// JOLLI-2200. Titles only — the decision text belongs to the Decisions card,
+	// and a TODO is not work that landed (JOLLI-2201). No insight kind reaches a column.
+	it("renders commit rows only, never an insight's text", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(
 			model({
@@ -286,14 +276,15 @@ describe("standup column shape", () => {
 						text: "chose the lock-free path",
 						commitHash: "abc1234def",
 						repoName: "jolliai",
-						committedAtMs: nowMs - 26 * 3_600_000,
 					},
+					{ kind: "todo", text: "wire the retry path", commitHash: "abc1234def", repoName: "jolliai" },
 				],
 			}),
 		);
 		const html = element("app").innerHTML;
 		expect(html).toContain("feat: my work");
 		expect(html).not.toContain("chose the lock-free path");
+		expect(html).not.toContain("wire the retry path");
 		expect(html).not.toContain("<b>Decision:</b>");
 	});
 });
@@ -339,12 +330,11 @@ describe("standup columns", () => {
 		},
 	];
 
-	it("renders exactly Yesterday and Today", () => {
+	it("renders the seven day columns and no Risks/Blockers column", () => {
 		const { JD, element } = loadJD();
 		JD.renderStandup(model({ insights: everyKind }));
 		const html = element("app").innerHTML;
-		expect(html).toContain('aria-label="Yesterday"');
-		expect(html).toContain('aria-label="Today"');
+		for (const day of WINDOW_DAYS) expect(html).toContain(`data-day="${day}"`);
 		expect(html).not.toContain("Risks");
 		expect(html).not.toContain("Blockers");
 	});

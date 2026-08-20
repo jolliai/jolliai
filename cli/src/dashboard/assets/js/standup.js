@@ -110,15 +110,17 @@ window.JD = window.JD || {};
 				"read from your commits</span>"
 			);
 		}
-		/* Prototype-less: ticket ids come from commit messages. */
+		/* Prototype-less: ticket ids come from commit messages, across the whole window. */
 		var counts = Object.create(null);
-		standup.yesterdayCommits.concat(standup.todayCommits).forEach((commit) => {
-			if (commit.ticketId) counts[commit.ticketId] = (counts[commit.ticketId] || 0) + 1;
+		(standup.days || []).forEach((entry) => {
+			(entry.commits || []).forEach((commit) => {
+				if (commit.ticketId) counts[commit.ticketId] = (counts[commit.ticketId] || 0) + 1;
+			});
 		});
 		var tickets = Object.keys(counts).sort((a, b) => counts[b] - counts[a] || a.localeCompare(b));
 		if (tickets.length === 0) {
 			return (
-				'<span class="schip" style="border-style:dashed">no ticket on the last two days of commits — ' +
+				'<span class="schip" style="border-style:dashed">no ticket in this window — ' +
 				"chips appear when a commit names one</span>"
 			);
 		}
@@ -152,75 +154,75 @@ window.JD = window.JD || {};
 
 	/* ---- columns ----------------------------------------------------------- */
 
-	/* `sub` is optional. The two day columns pass none — their heading and count
-	   already say what they hold, and the sentence under them was restating it. An
-	   empty string must not render an empty `.sub`: it carries a bottom margin, so
-	   the blank div would leave the gap the caption used to occupy. */
-	function column(title, count, sub, bodyHtml) {
+	var plural = (n, word) => n + " " + word + (n === 1 ? "" : "s");
+
+	/* Column title. Today and Yesterday keep their named titles; every other day is
+	   its own short weekday date. The key is a bare local `YYYY-MM-DD` the server
+	   already computed in the model's zone, so it is formatted in UTC — reading it
+	   back through the local zone could shift the calendar day. Locale is pinned to
+	   en-US so the whole board reads in one language (the Today/Yesterday titles are
+	   English), rather than mixing them with a viewer's localized month names. */
+	var dayTitleFormat = new Intl.DateTimeFormat("en-US", {
+		weekday: "short",
+		month: "short",
+		day: "numeric",
+		timeZone: "UTC",
+	});
+	function dayTitle(dayKey, standup) {
+		if (dayKey === standup.today) return "Today";
+		if (dayKey === standup.yesterday) return "Yesterday";
+		return dayTitleFormat.format(new Date(dayKey + "T00:00:00Z"));
+	}
+
+	/* One day's column. COMMITS ONLY, flat, and identical in shape to the stats
+	   page's Memory Activity rows for the same day — only how many FIELDS a row can
+	   show varies with tier, which is the row's own business (see commitRow). No
+	   `.sub` caption: the heading and count already say what the column holds, and
+	   an empty one would hold its bottom margin open. A quiet day is still a column,
+	   so the grid stays a stable seven wide.
+
+	   A named `<section>` is a region landmark, so its aria-label is what a screen
+	   reader announces and lists this column by — it must be the human-readable
+	   title ("Today", "Yesterday", "Wed, Jul 30"), not a bare ISO date. The ISO day
+	   rides on `data-day` instead: a stable, locale-independent handle for the asset
+	   test that never reaches the accessibility tree. The title format is en-US
+	   pinned (see dayTitle), so the aria-label stays locale-independent too. */
+	function dayCard(entry, standup, model, memory) {
+		var commits = entry.commits || [];
+		var body = commits.length ? dayColumn(commits, model, memory) : '<div class="empty-note">No commits.</div>';
 		return (
-			'<section class="card col" aria-label="' +
-			JD.esc(title) +
-			'"><h2>' +
-			JD.esc(title) +
-			'<span class="cnt">' +
-			JD.esc(count) +
+			'<section class="card col" data-day="' +
+			JD.esc(entry.day) +
+			'" aria-label="' +
+			JD.esc(dayTitle(entry.day, standup)) +
+			'"><h2><span class="day-title">' +
+			JD.esc(dayTitle(entry.day, standup)) +
+			'</span><span class="cnt">· ' +
+			JD.esc(plural(commits.length, "commit")) +
 			"</span></h2>" +
-			(sub ? '<div class="sub">' + JD.esc(sub) + "</div>" : "") +
 			'<div class="col-list">' +
-			bodyHtml +
+			body +
 			"</div></section>"
 		);
 	}
 
-	var plural = (n, word) => n + " " + word + (n === 1 ? "" : "s");
-
 	JD.renderStandup = (model) => {
-		var esc = JD.esc;
 		var standup = model.standup;
 		var memory = !!standup.insights;
 
-		/* Context strip: date and sprint chips. The Copy-as-standup button and its
-		   "posts nowhere" caption used to close this row (JOLLI-2198); the board is
-		   now read directly, so there is nothing to right-align against and the
-		   spacer went with them. */
+		/* Context strip: the author disclosure and sprint chips. The window's date
+		   range is stated by the pager in the topbar (see shell.js), not here. */
 		var html =
-			'<div class="ctx"><span class="date">' +
-			esc(JD.weekdayDate(model.generatedAtMs, model.timeZone)) +
-			'</span><span class="sprint-chips">' +
-			authorChip(standup) +
-			sprintChips(standup, model) +
-			"</span></div>";
+			'<div class="ctx"><span class="sprint-chips">' + authorChip(standup) + sprintChips(standup, model) + "</span></div>";
 
-		/* The two day columns. Both are COMMITS ONLY, flat, and identical in shape:
-		   what was completed that day, which is what Memory Activity lists for the
-		   same day on the stats page.
-
-		   Three things used to make them disagree with that card, all removed. Today
-		   carried open TODOs, live sessions and uncommitted worktree rows — work in
-		   flight under a heading everyone reads as "done" (JOLLI-2201). Yesterday
-		   carried session rows below the memory tier, which are not commits at all.
-		   And Yesterday grouped its rows under `TICKET · category` / `repo · branch`
-		   headers, which Memory Activity has no counterpart for: its grouping IS the
-		   day, and here the day is already the column. A group header inside one is a
-		   second axis the other page does not have, so two identical lists read as
-		   different ones.
-
-		   Neither column splits by tier any more. A commit is a commit without
-		   memory; only how many FIELDS a row can show varies, and that is the row's
-		   own business (see commitRow). */
-		var yBody = dayColumn(standup.yesterdayCommits, model, memory);
-		if (!yBody) yBody = '<div class="empty-note">Nothing recorded.</div>';
-		var yCount = "· " + plural(standup.yesterdayCommits.length, "commit");
-
-		var tBody = dayColumn(standup.todayCommits, model, memory);
-		if (!tBody) tBody = '<div class="empty-note">Nothing yet.</div>';
-		var tCount = "· " + plural(standup.todayCommits.length, "commit");
-
-		/* Two columns. The third — Risks · Blockers · Questions — is gone; see the
-		   note at the top of this file for why it could never fill. */
-		html += '<div class="cols">';
-		html += column("Yesterday", yCount, "", yBody);
-		html += column("Today", tCount, "", tBody);
+		/* One column per day, in the server's newest-first order — Today leftmost,
+		   the week trailing off to the right, horizontally scrollable. The third
+		   Risks · Blockers · Questions column is gone; see the note at the top of
+		   this file for why it could never fill. */
+		html += '<div class="cols standup-days">';
+		(standup.days || []).forEach((entry) => {
+			html += dayCard(entry, standup, model, memory);
+		});
 		html += "</div>";
 
 		document.getElementById("app").innerHTML = html;

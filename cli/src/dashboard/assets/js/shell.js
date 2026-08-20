@@ -44,13 +44,38 @@ window.JD = window.JD || {};
 			parts.push("to=" + encodeURIComponent(to));
 		}
 		if (dimension) parts.push("dimension=" + encodeURIComponent(dimension));
+		/* Standup pages a whole week at a time via `offset`, preserved across a
+		   scope change or reload from the model's own echo. 0 is the default and is
+		   left out of the URL. Only the standup view carries it; navigating away
+		   passes `{ offset: undefined }` so it is dropped. */
+		var offset =
+			"offset" in o ? o.offset : model.view === "standup" && model.standup ? model.standup.offset : undefined;
+		if (model.view === "standup" && offset) parts.push("offset=" + encodeURIComponent(offset));
 		return parts.length > 0 ? "?" + parts.join("&") : "";
 	};
 
 	/* The view payload that carries a time window, whichever page this is. The
-	   standup board is a fixed yesterday/today pair and deliberately has none,
-	   which is what hides the range control there. */
+	   standup board carries its own whole-week window and pages it with the topbar
+	   pager (see renderShell), so the preset range control stays hidden there. */
 	JD.ranged = (model) => model.stats || null;
+
+	/* The standup pager's window label — a date range like "Jul 24 – 30". The keys
+	   are bare local YYYY-MM-DD, formatted in UTC so reading them back through the
+	   local zone cannot shift the calendar day. Locale is pinned to en-US to match
+	   the English day-column titles rather than a viewer's localized month names.
+	   The month name repeats only across a month boundary, and the year appears
+	   only when the window straddles one. */
+	JD.standupPagerLabel = (fromKey, toKey) => {
+		var from = new Date(fromKey + "T00:00:00Z");
+		var to = new Date(toKey + "T00:00:00Z");
+		var sameYear = from.getUTCFullYear() === to.getUTCFullYear();
+		var md = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", timeZone: "UTC" });
+		var mdy = new Intl.DateTimeFormat("en-US", { month: "short", day: "numeric", year: "numeric", timeZone: "UTC" });
+		var dayOnly = new Intl.DateTimeFormat("en-US", { day: "numeric", timeZone: "UTC" });
+		if (!sameYear) return mdy.format(from) + " – " + mdy.format(to);
+		if (from.getUTCMonth() === to.getUTCMonth()) return md.format(from) + " – " + dayOnly.format(to);
+		return md.format(from) + " – " + md.format(to);
+	};
 
 	/* One page-level tooltip (#tip in index.html), positioned above-left of the
 	   pointer and clamped to the viewport — ported from the mockup's showTip so a
@@ -814,6 +839,48 @@ window.JD = window.JD || {};
 			if (calendarPending) renderCalendar();
 		}
 
+		/* Topbar — standup week pager. Replaces the preset range control on the
+		   standup board, which pages a whole seven-day window at a time. The label
+		   states the window; `‹` reveals more recent days (disabled on the window
+		   ending today) and `›` older days (disabled once no reachable author-filtered
+		   commit precedes the window), matching the Today-on-the-left column order.
+		   `Today` jumps back to the current week in one click. Each control is a real
+		   navigation, like the range control above. */
+		var pager = document.getElementById("standupPager");
+		if (pager) {
+			var standup = model.view === "standup" ? model.standup : null;
+			pager.hidden = !standup;
+			if (standup) {
+				document.getElementById("standupPagerLabel").textContent = JD.standupPagerLabel(
+					standup.windowFrom,
+					standup.windowTo,
+				);
+				var newer = document.getElementById("standupNewer");
+				var older = document.getElementById("standupOlder");
+				var today = document.getElementById("standupToday");
+				newer.disabled = !standup.hasNewer;
+				older.disabled = !standup.hasOlder;
+				/* `Today` shares its enabled condition with `‹`: both are meaningful only
+				   when the window is not already the one ending today (hasNewer ⟺ offset > 0). */
+				today.disabled = !standup.hasNewer;
+				newer.onclick = () => {
+					if (!standup.hasNewer) return;
+					window.location.href =
+						JD.viewPath("standup") + JD.query(model, { offset: Math.max(0, standup.offset - 1) });
+				};
+				older.onclick = () => {
+					if (!standup.hasOlder) return;
+					window.location.href = JD.viewPath("standup") + JD.query(model, { offset: standup.offset + 1 });
+				};
+				today.onclick = () => {
+					if (!standup.hasNewer) return;
+					/* offset 0 is left out of the URL by JD.query, so this lands on the
+					   current-week window with no `offset=` param. */
+					window.location.href = JD.viewPath("standup") + JD.query(model, { offset: 0 });
+				};
+			}
+		}
+
 		/* Navigation. Real links (not client-side swaps) so a view is deep-linkable
 		   and reload-safe; the server renders each page with its data inlined.
 
@@ -836,7 +903,9 @@ window.JD = window.JD || {};
 					return;
 				}
 				if (navView && navView !== model.view) JD.track("dashboard_view_switched", { view: navView });
-				window.location.href = path + JD.query(model, { range: undefined });
+				// Range and the standup pager offset are both per-page window state, dropped
+				// on the way out; the repo scope survives (see above).
+				window.location.href = path + JD.query(model, { range: undefined, offset: undefined });
 			};
 		});
 		document.getElementById("machinesChip").hidden = model.tier !== "space";
@@ -928,12 +997,12 @@ window.JD = window.JD || {};
 	   Down to one key, by one rule applied twice. `blocker`/`question`/`gotcha`
 	   went with the standup's Risks column — those insight kinds are never
 	   produced (see the note at the top of standup.js). `session`/`workspace`/
-	   `todo`/`decision` went with the rows that drew them: both day columns are
-	   commits only now (JOLLI-2200 / 2201), and nothing else ever asked for a
-	   mark. Sessions, workspaces and TODOs are all still QUERIED — see
-	   `StandupModel.yesterdaySessions` — so re-add a key here when the column
-	   that wants them is designed, rather than treating this list as the record
-	   of what the model carries. */
+	   `todo`/`decision` went with the rows that drew them: the standup board's day
+	   columns are commits only now (JOLLI-2200 / 2201), and nothing else ever asked
+	   for a mark. Uncommitted worktrees are still QUERIED — see
+	   `StandupModel.workspaces` — so re-add a key here when the column that wants
+	   them is designed, rather than treating this list as the record of what the
+	   model carries. */
 	JD.glyph = {
 		commit: '<span class="glyph commit">◆</span>',
 	};
