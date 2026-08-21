@@ -57,7 +57,7 @@ window.JD = window.JD || {};
 	/* The view payload that carries a time window, whichever page this is. The
 	   standup board carries its own whole-week window and pages it with the topbar
 	   pager (see renderShell), so the preset range control stays hidden there. */
-	JD.ranged = (model) => model.stats || null;
+	JD.ranged = (model) => model.stats || model.coaching || null;
 
 	/* The standup pager's window label — a date range like "Jul 24 – 30". The keys
 	   are bare local YYYY-MM-DD, formatted in UTC so reading them back through the
@@ -110,14 +110,25 @@ window.JD = window.JD || {};
 	};
 
 	/* Append page-specific params to a `JD.query` result, picking `?` or `&` by
-	   whether that result is already non-empty. One helper because getting the
-	   separator wrong produces a URL that silently loses the page scope. */
+	   whether one is already present. One helper because getting the separator
+	   wrong produces a URL that silently loses the page scope.
+
+	   The separator is chosen by looking for a `?`, NOT by whether the argument
+	   is non-empty. Callers pass two different shapes — a bare query string
+	   (`JD.query(...)`, possibly "") and a path with that string already appended
+	   (`"/api/tool-usage" + JD.query(...)`) — and the truthiness test was right
+	   for only the first. A path whose query came back EMPTY is still truthy, so
+	   it took the `&` branch and produced `/api/journey&repo=…`: a pathname no
+	   route matches, answered 404 by the catch-all with the handler never
+	   reached. That is exactly what shipped on the journeys view, which is the
+	   one page carrying no range and no scope params, hence the only one where
+	   `JD.query` returns "". Testing for `?` is correct for both shapes. */
 	JD.withParams = (query, params) => {
 		var parts = Object.keys(params)
 			.filter((key) => params[key] !== undefined && params[key] !== null && params[key] !== "")
 			.map((key) => key + "=" + encodeURIComponent(params[key]));
 		if (parts.length === 0) return query;
-		return (query ? query + "&" : "?") + parts.join("&");
+		return query + (query.indexOf("?") >= 0 ? "&" : "?") + parts.join("&");
 	};
 
 	/* The scope's repo identities, always an array — empty means every repo.
@@ -141,6 +152,7 @@ window.JD = window.JD || {};
 		{ view: "stats", label: "My Dashboard", sub: "individual · local" },
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
 		{ view: "skills", label: "Skills", sub: "usage · per-skill" },
+		{ view: "journeys", label: "Coaching", sub: "enablement · against your own earlier line", beta: true },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
 		{ view: "knowledge", label: "Knowledge", sub: "wiki · per-repo" },
 		{ view: "graph", label: "Graph", sub: "knowledge graph · per-repo" },
@@ -155,6 +167,7 @@ window.JD = window.JD || {};
 		stats: "/dashboard",
 		standup: "/dashboard/standup",
 		skills: "/skills",
+		journeys: "/dashboard/journeys",
 		memories: "/memories",
 		knowledge: "/knowledge",
 		graph: "/graph",
@@ -205,6 +218,7 @@ window.JD = window.JD || {};
 		   Skills card is a summary of the same data, and this page answers a
 		   different question (one skill's whole history) at a different grain. */
 		{ view: "skills", path: "/skills", label: "Skills" },
+		{ view: "journeys", path: "/dashboard/journeys", label: "Coaching", beta: true },
 		{ view: "memories", path: "/memories", label: "Memories" },
 		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
 		   from the enabled dashboard repos — they carry their own empty state. */
@@ -247,6 +261,11 @@ window.JD = window.JD || {};
 		book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
 		network:
 			'<rect x="9" y="2" width="6" height="6" rx="1"/><rect x="2" y="16" width="6" height="6" rx="1"/><rect x="16" y="16" width="6" height="6" rx="1"/><path d="M12 8v4"/><path d="M5 16v-2h14v2"/>',
+		/* Lucide `compass` — Coaching points a run against the reader's own earlier
+		   line, so a direction mark rather than a chart or a person. The circle plus
+		   the inner needle reads as bearing/enablement, not as one more graph. */
+		compass:
+			'<path d="m16.24 7.76-1.804 5.411a2 2 0 0 1-1.265 1.265L7.76 16.24l1.804-5.411a2 2 0 0 1 1.265-1.265z"/><circle cx="12" cy="12" r="10"/>',
 		settings:
 			'<path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/>',
 	};
@@ -261,6 +280,7 @@ window.JD = window.JD || {};
 			stats: "dashboard",
 			standup: "calendar",
 			skills: "puzzle",
+			journeys: "compass",
 			memories: "database",
 			knowledge: "book",
 			graph: "network",
@@ -302,7 +322,7 @@ window.JD = window.JD || {};
 	   removed. Kept as a table rather than collapsed to `true` so a future view
 	   that ignores the scope hides the control instead of lying about it; the
 	   picker hides rather than disables, same as the range control on standup. */
-	var SCOPED_VIEWS = { stats: true, standup: true, skills: true, memories: true };
+	var SCOPED_VIEWS = { stats: true, standup: true, skills: true, memories: true, journeys: true };
 
 	/* Button label for a selection: the repo's name at one, a count past that.
 	   Names past one would either truncate or push the range control off the row,
@@ -674,7 +694,16 @@ window.JD = window.JD || {};
 
 		document.title = "jolli — " + current.label;
 		document.getElementById("jdRoot").setAttribute("data-tier", String(TIER_INDEX[model.tier] || 0));
-		document.getElementById("pageTitle").textContent = current.label;
+		var pageTitleEl = document.getElementById("pageTitle");
+		pageTitleEl.textContent = current.label;
+		// A Beta page (Coaching) carries the same badge the nav row does — appended
+		// as an element so the label stays plain text (no innerHTML injection).
+		if (current.beta) {
+			var pageBeta = document.createElement("span");
+			pageBeta.className = "sb-beta pt-beta";
+			pageBeta.textContent = "Beta";
+			pageTitleEl.appendChild(pageBeta);
+		}
 		document.getElementById("pageSub").textContent = current.sub;
 
 		/* Sidebar — the nav list (plus an empty pinned bottom slot). Nothing is
@@ -694,7 +723,9 @@ window.JD = window.JD || {};
 			navIcon(navIconFor(item.view)) +
 			'<span class="name">' +
 			esc(item.label) +
-			"</span></button>";
+			"</span>" +
+			(item.beta ? '<span class="sb-beta">Beta</span>' : "") +
+			"</button>";
 		var nav = "";
 		NAV_MIDDLE.forEach((item) => {
 			if (!navRowVisible(item, model)) return;

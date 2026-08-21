@@ -31,6 +31,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
+import { inflateSync } from "node:zlib";
 import type { AlreadyCurrent } from "../core/DiskSessionScan.js";
 import { execGit, getHeadHash, resolveWorktreeRoots } from "../core/GitOps.js";
 import { GitRefStorage, resolveCommittish } from "../core/GitRefStorage.js";
@@ -42,7 +43,8 @@ import type { SessionSourceDefinition } from "../core/sessions/SessionSourceDefi
 import { DAEMON_RESCAN_SOURCES, SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { skillOutcomeConfidence } from "../core/skills/SkillOutcomeConfidence.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
-import type { ToolCallCount, TranscriptSource } from "../Types.js";
+import type { StoredTranscript, ToolCallCount, TranscriptSource } from "../Types.js";
+import { bucketsFrom } from "./ActivityBuckets.js";
 import {
 	collectCommitEvents,
 	// collectRepoGraph,  // parked with `repo_graphs` — see SotSchema
@@ -2656,6 +2658,18 @@ export async function dbBackfillRepos(
 			results.push({ mode: "skipped", eventsApplied: 0, repoName: repo.repoName, error: errMsg(err) });
 		}
 	}
+	// Route A: backfill `session_activity` from the persisted transcripts, whole
+	// DB once — after every repo has been imported, so the rows reference sessions
+	// the loop above just wrote. Idempotent (0 once converged); a failure is a
+	// warning, never a failed import.
+	try {
+		const covered = await withDashboardDb((db) => backfillStoredActivity(db), {
+			...(rest.dbPath ? { dbPath: rest.dbPath } : {}),
+		});
+		if (covered > 0) log.info("backfilled activity for %d stored sessions", covered);
+	} catch (err) {
+		log.warn("activity backfill failed: %s", errMsg(err));
+	}
 	// Appended, not prepended: a caller reading the list in order should see the
 	// repos that were worked on first, and these carry no per-repo detail to
 	// interleave with them.
@@ -3279,4 +3293,72 @@ export async function dbRescanSessions(opts: SessionRescanOptions): Promise<Sess
 		}, dbOpts);
 
 	return { ...totals, eventsApplied };
+}
+
+/**
+ * Backfills `session_activity` for sessions that have a stored transcript but
+ * no activity buckets — Route A from the coverage measurement. This reads the
+ * SUMMARY PIPELINE's persisted `transcripts.sessions_blob`, NOT the live 7-day
+ * discovery window, so it reaches the historical sessions the concurrency
+ * feature's "no repair path" note deliberately left untouched (§4.3 duration).
+ *
+ * Idempotent: `session_activity` is insert-only and the writer projects it
+ * with `INSERT OR IGNORE`, so re-running converges and a session the live
+ * writer later touches is never double-written. `bucketsFrom` is the SOLE
+ * definition of a bucket — no private copy — so backfilled rows cannot drift
+ * from the live writer's. A session whose entries carry no timestamp gets NO
+ * rows (the same presence-gate as the live writer's absent `activityBuckets`).
+ *
+ * @returns how many sessions this run wrote buckets for (0 once converged).
+ */
+export function backfillStoredActivity(db: DashboardDbHandle, now: () => number = Date.now): number {
+	const uncovered = new Set<string>(
+		(
+			db
+				.prepare(
+					`SELECT s.event_id AS event_id
+					   FROM sessions s
+					  WHERE NOT EXISTS (SELECT 1 FROM session_activity a WHERE a.session_event_id = s.event_id)`,
+				)
+				.all() as ReadonlyArray<{ event_id: string }>
+		).map((row) => row.event_id),
+	);
+	if (uncovered.size === 0) return 0;
+
+	const blobs = db
+		.prepare(
+			`SELECT DISTINCT r.repo_identity AS repo_identity, t.sessions_blob AS sessions_blob
+			   FROM transcripts t
+			   JOIN repos r ON r.id = t.repo_id
+			   JOIN transcript_sessions ts ON ts.repo_id = t.repo_id AND ts.transcript_id = t.transcript_id
+			   JOIN sessions s ON s.repo_id = ts.repo_id AND s.source = ts.source AND s.session_id = ts.session_id
+			  WHERE NOT EXISTS (SELECT 1 FROM session_activity a WHERE a.session_event_id = s.event_id)`,
+		)
+		.all() as ReadonlyArray<{ repo_identity: string; sessions_blob: Uint8Array }>;
+
+	let written = 0;
+	const recordedAtMs = now();
+	const insertBucket = db.prepare(
+		"INSERT OR IGNORE INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+	);
+	for (const row of blobs) {
+		let stored: StoredTranscript;
+		try {
+			stored = JSON.parse(inflateSync(Buffer.from(row.sessions_blob)).toString("utf8")) as StoredTranscript;
+		} catch {
+			// One unreadable blob is one unbackfilled session, never a failed run.
+			log.warn("activity backfill: unreadable transcript for repo %s", row.repo_identity);
+			continue;
+		}
+		for (const session of stored.sessions ?? []) {
+			if (!session.source) continue;
+			const eventId = sessionEventId(row.repo_identity, session.source, session.sessionId);
+			if (!uncovered.has(eventId)) continue;
+			const buckets = bucketsFrom(session.entries);
+			if (buckets.length === 0) continue;
+			for (const bucket of buckets) insertBucket.run(eventId, bucket, recordedAtMs);
+			written += 1;
+		}
+	}
+	return written;
 }

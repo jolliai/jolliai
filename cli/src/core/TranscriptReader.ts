@@ -213,9 +213,10 @@ export function parseTranscriptContent(
 	beforeTimestamp?: string,
 ): TranscriptReadResult {
 	const startLine = cursor?.lineNumber ?? 0;
-	// Typed as the interface (not the concrete fallback) so the optional
-	// parser methods — parseUsageByModel/parseToolUse/parseUnrecognizedRows — are
-	// reachable through `?.` regardless of which parser was supplied.
+	// Typed as the interface (not the concrete fallback) so the optional parser
+	// methods — parseUsageByModel/parseToolUse/parseUnrecognizedRows/
+	// parseCompactions/parseTurnAborts — are reachable through `?.` regardless of
+	// which parser was supplied.
 	const activeParser: TranscriptParser = parser ?? new ClaudeTranscriptParser();
 	const parseFn = (line: string, num: number) => activeParser.parseLine(line, num);
 
@@ -351,6 +352,12 @@ export function parseTranscriptContent(
 	// text may be hiding in a shape we can no longer read (JOLLI-2240). The cursor
 	// gate in QueueWorker uses it to withhold such a slice for a fixed build to reread.
 	const unrecognizedRows = activeParser.parseUnrecognizedRows?.(consumedLines) ?? 0;
+	// Compaction / turn-abort events over the same consumed lines. Absent for a
+	// source whose parser cannot see them — the same absence-vs-empty rule as
+	// `toolUse` above.
+	const compactions = activeParser.parseCompactions?.(consumedLines);
+	const turnAborts = activeParser.parseTurnAborts?.(consumedLines);
+	const testRuns = activeParser.parseTestRuns?.(consumedLines);
 
 	// When beforeTimestamp is set, advance cursor only to the last consumed line.
 	// Without beforeTimestamp (legacy/CLI path), advance to EOF for backward compatibility.
@@ -380,6 +387,10 @@ export function parseTranscriptContent(
 		// Omitted when zero so the field's presence means "this build saw a shape it
 		// did not recognize" — a signal, not routine bookkeeping.
 		...(unrecognizedRows > 0 && { unrecognizedRows }),
+		// Same rule: an empty array means "no compactions/aborts in this slice".
+		...(compactions && { compactions }),
+		...(turnAborts && { turnAborts }),
+		...(testRuns && { testRuns }),
 	};
 }
 
@@ -554,6 +565,18 @@ export interface SessionTranscript {
 	 *  {@link usage} and persisted as {@link StoredSession.toolUse}. Absent for
 	 *  sources whose parser cannot report tool calls. */
 	readonly toolUse?: ReadonlyArray<ToolCallCount>;
+	/** Context-compaction instants across this commit's slices, attached alongside
+	 *  {@link usage} and persisted as {@link StoredSession.compactions}. Absent for
+	 *  sources whose parser cannot report them. */
+	readonly compactions?: ReadonlyArray<number>;
+	/** Turn-abort instants across this commit's slices, persisted as
+	 *  {@link StoredSession.turnAborts}. Absent for sources whose parser cannot
+	 *  report them. */
+	readonly turnAborts?: ReadonlyArray<number>;
+	/** Test-run instants across this commit's slices, persisted as
+	 *  {@link StoredSession.testRuns}. Absent for sources whose parser cannot
+	 *  report them (or carries no exec tool). */
+	readonly testRuns?: ReadonlyArray<number>;
 }
 
 /**

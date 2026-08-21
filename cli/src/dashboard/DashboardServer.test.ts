@@ -2,6 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, 
 import type { Server } from "node:http";
 import { hostname, tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The write-surface POST handlers call these directly (no injectable seam,
@@ -96,6 +97,7 @@ import {
 	resolveDashboardAssetsDir,
 	startDashboardServer,
 } from "./DashboardServer.js";
+import { buildJourneys } from "./JourneysQuery.js";
 import * as repoForget from "./RepoForget.js";
 import * as repoRegistry from "./RepoRegistry.js";
 import { applyStatsEvents } from "./StatsWriter.js";
@@ -113,21 +115,12 @@ function writeTestAssets(base: string): string {
 		'<html><head><link rel="stylesheet" href="styles/main.css" /></head><body><!-- scripts:start --><!-- scripts:end --></body></html>',
 	);
 	writeFileSync(join(assets, "styles", "main.css"), "body{color:red}");
-	for (const f of [
-		"format.js",
-		"charts.js",
-		"shell.js",
-		"stats.js",
-		"skills.js",
-		"standup.js",
-		"graph.js",
-		"memories.js",
-		"knowledge.js",
-		"settings.js",
-		"main.js",
-	]) {
-		writeFileSync(join(assets, "js", f), `/* ${f} */`);
-	}
+	// Derived, never restated: `resolveDashboardAssetsDir` rejects a tree missing
+	// any of these, so a hand-kept copy that fell behind the constant would fail
+	// every test using this fixture for a reason having nothing to do with the
+	// test. (It had already drifted in order, harmlessly, which is exactly how the
+	// membership drift that follows goes unnoticed.)
+	for (const f of DASHBOARD_SCRIPT_FILES) writeFileSync(join(assets, "js", f), `/* ${f} */`);
 	return assets;
 }
 
@@ -206,6 +199,11 @@ function get(port: number, path: string, headers: Record<string, string> = {}): 
 }
 
 beforeEach(() => {
+	// Module-level `vi.fn()` mocks keep their call history across tests unless it
+	// is cleared explicitly. Several assertions in this file care about "never"
+	// or "exactly once" for the CURRENT request only, so each test needs a clean
+	// slate while preserving the default mock implementations above.
+	vi.clearAllMocks();
 	dir = mkdtempSync(join(tmpdir(), "jolli-dsrv-"));
 	assetsDir = writeTestAssets(dir);
 });
@@ -802,6 +800,365 @@ describe("routes", () => {
 		// Still alive afterwards.
 		expect((await get(port, "/memories")).status).toBe(200);
 	});
+
+	it("serves the journeys page and its model token", async () => {
+		const port = await listen(
+			testServer({
+				buildModel: async (req) => ({
+					...model(req.view),
+					repos: [{ repoIdentity: "r1", repoName: "r1", worktreeRoot: "/r1", sessionsThisWeek: 0 }],
+					...(req.view === "journeys"
+						? {
+								coaching: {
+									roster: {
+										label: "You",
+										planFirst: { availability: "unavailable" },
+										skills: { availability: "unavailable" },
+										cost: { availability: "unavailable" },
+										recall: { availability: "unavailable" },
+										turnaround: { availability: "unavailable" },
+										friction: { availability: "unavailable" },
+									},
+									adoptNext: [],
+									queue: [],
+									patterns: { established: [], emerging: [] },
+									hero: [],
+									featured: { smoothest: null, hardest: null },
+									journeyCount: 0,
+									indexedCommits: 0,
+									windowStartMs: 0,
+									windowEndMs: 0,
+								},
+							}
+						: {}),
+				}),
+			}),
+		);
+		const page = await get(port, "/dashboard/journeys");
+		expect(page.status).toBe(200);
+		const res = await get(port, "/api/model?view=journeys");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { view: string; coaching?: unknown };
+		expect(body.view).toBe("journeys");
+		expect(body.coaching).toBeDefined();
+	});
+
+	it("rejects an /api/journey call with no id", async () => {
+		const port = await listen(testServer());
+		const response = await get(port, "/api/journey?repo=repo-a");
+		expect(response.status).toBe(400);
+	});
+
+	it("404s an /api/journey id no window contains", async () => {
+		const dbPath = join(dir, "journey-detail.db");
+		const configDir = join(dir, "config-journey");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ dbPath, configDir }));
+		const response = await get(port, "/api/journey?repo=repo-a&id=T%00repo-a%00NOPE-1");
+		expect(response.status).toBe(404);
+	});
+
+	// `id` is namespaced by repo identity already (JourneyKey.ts's SEP-joined
+	// key), so `repo=` is an optional scope narrowing, never a requirement —
+	// unlike `/api/memories`' bare commit hash, an id lookup under an "all
+	// repos" scope cannot collide across repos.
+	it("resolves an /api/journey call by id alone, with no repo param", async () => {
+		const dbPath = join(dir, "journey-no-repo.db");
+		const configDir = join(dir, "config-journey-no-repo");
+		const nowMs = Date.now();
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-a",
+						repoName: "repo-a",
+						worktreeRoot: "/w/repo-a",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const journeyId = await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-a") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'reachable-hash', NULL, NULL, 'reachable-hash', 0, ?, 1, 1, ?)`,
+				).run(id, JSON.stringify({ commitHash: "reachable-hash", branch: "solo", topics: [] }), nowMs);
+				return buildJourneys(db, { kind: "all" }, nowMs - 86_400_000, nowMs + 86_400_000).journeys[0]?.id ?? "";
+			},
+			{ dbPath },
+		);
+		expect(journeyId).not.toBe("");
+
+		const port = await listen(testServer({ dbPath, configDir }));
+		const response = await get(
+			port,
+			`/api/journey?id=${encodeURIComponent(journeyId)}&fromMs=${nowMs - 86_400_000}&toMs=${nowMs + 86_400_000}`,
+		);
+		expect(response.status).toBe(200);
+	});
+
+	// Regression test for the midnight bug, expressed without needing a clock:
+	// a journey id is only meaningful within the window that grouped it, so a
+	// caller must be able to hand that exact window back rather than the route
+	// re-resolving one of its own (which — with a REAL clock — could straddle a
+	// local-midnight boundary and disagree with the feed about what "30d" means).
+	it("resolves a journey via explicit fromMs/toMs even when the current relative window would exclude it", async () => {
+		const dbPath = join(dir, "journey-explicit-window.db");
+		const configDir = join(dir, "config-journey-explicit-window");
+		const nowMs = Date.now();
+		// Well outside the default 30-day relative window `resolveWindow` falls
+		// back to when no range/from/to is given.
+		const oldCommitMs = nowMs - 200 * 86_400_000;
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-a",
+						repoName: "repo-a",
+						worktreeRoot: "/w/repo-a",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const journeyId = await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-a") as {
+					id: number;
+				};
+				// `listReachableCommits` is stubbed to return "reachable-hash" only
+				// (see the module-level `vi.mock` above), so the commit hash matters.
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'reachable-hash', NULL, NULL, 'reachable-hash', 0, ?, 1, 1, ?)`,
+				).run(id, JSON.stringify({ commitHash: "reachable-hash", branch: "solo", topics: [] }), oldCommitMs);
+				// A wide window sees the commit — this is the id the feed would have
+				// shown it under, had the feed itself been asked over that window.
+				return buildJourneys(db, { kind: "all" }, oldCommitMs - 1000, nowMs + 1000).journeys[0]?.id ?? "";
+			},
+			{ dbPath },
+		);
+		expect(journeyId).not.toBe("");
+
+		const port = await listen(testServer({ dbPath, configDir }));
+
+		// Without explicit bounds, the route falls back to the default relative
+		// window, which genuinely does not reach a 200-day-old commit.
+		const relative = await get(port, `/api/journey?repo=repo-a&id=${encodeURIComponent(journeyId)}`);
+		expect(relative.status).toBe(404);
+
+		// The feed's own bounds, echoed back by the caller, resolve the SAME
+		// journey — this is the fix: the route must not re-derive a window.
+		const explicit = await get(
+			port,
+			`/api/journey?repo=repo-a&id=${encodeURIComponent(journeyId)}&fromMs=${oldCommitMs - 1000}&toMs=${nowMs + 1000}`,
+		);
+		expect(explicit.status).toBe(200);
+	});
+
+	// Both-or-neither: a half-supplied pair must not mix one echoed bound with
+	// one freshly-resolved one, which would silently widen or narrow the query
+	// in a way nobody asked for.
+	it("falls back to the resolved window when only one of fromMs/toMs is supplied, rather than mixing", async () => {
+		const dbPath = join(dir, "journey-half-bound.db");
+		const configDir = join(dir, "config-journey-half-bound");
+		const nowMs = Date.now();
+		const oldCommitMs = nowMs - 200 * 86_400_000;
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-a",
+						repoName: "repo-a",
+						worktreeRoot: "/w/repo-a",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const journeyId = await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-a") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'reachable-hash', NULL, NULL, 'reachable-hash', 0, ?, 1, 1, ?)`,
+				).run(id, JSON.stringify({ commitHash: "reachable-hash", branch: "solo", topics: [] }), oldCommitMs);
+				return buildJourneys(db, { kind: "all" }, oldCommitMs - 1000, nowMs + 1000).journeys[0]?.id ?? "";
+			},
+			{ dbPath },
+		);
+		expect(journeyId).not.toBe("");
+
+		const port = await listen(testServer({ dbPath, configDir }));
+
+		// `fromMs` alone reaches back far enough to include the old commit — if it
+		// were mixed with a freshly-resolved `toMs` (today) this would 200. The
+		// both-or-neither rule instead falls all the way back to the resolved
+		// 30-day window, which excludes it.
+		const halfBound = await get(
+			port,
+			`/api/journey?repo=repo-a&id=${encodeURIComponent(journeyId)}&fromMs=${oldCommitMs - 1000}`,
+		);
+		expect(halfBound.status).toBe(404);
+
+		// `Number.parseInt` accepts a trailing garbage suffix ("123abc" -> 123);
+		// a malformed bound must fall back to the resolved window exactly like a
+		// missing one, not silently parse a prefix of it.
+		const malformed = await get(
+			port,
+			`/api/journey?repo=repo-a&id=${encodeURIComponent(journeyId)}&fromMs=${oldCommitMs - 1000}abc&toMs=${nowMs + 1000}`,
+		);
+		expect(malformed.status).toBe(404);
+
+		// A reversed pair parses fine as two integers but describes no real
+		// window; it must fall back rather than be honoured backwards.
+		const reversed = await get(
+			port,
+			`/api/journey?repo=repo-a&id=${encodeURIComponent(journeyId)}&fromMs=${nowMs + 1000}&toMs=${oldCommitMs - 1000}`,
+		);
+		expect(reversed.status).toBe(404);
+	});
+
+	it("serves the whole journeys model from /api/journeys", async () => {
+		const dbPath = join(dir, "journeys-feed.db");
+		const configDir = join(dir, "config-journeys-feed");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ dbPath, configDir }));
+		const res = await get(port, "/api/journeys?range=30d");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { journeys: unknown[]; windowStartMs: number; windowEndMs: number };
+		expect(Array.isArray(body.journeys)).toBe(true);
+		expect(body.windowStartMs).toBeLessThan(body.windowEndMs);
+	});
+
+	it("honours explicit fromMs/toMs bounds", async () => {
+		const dbPath = join(dir, "journeys-explicit.db");
+		const configDir = join(dir, "config-journeys-explicit");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ dbPath, configDir }));
+		const from = 1_700_000_000_000;
+		const to = from + 86_400_000;
+		const res = await get(port, `/api/journeys?fromMs=${from}&toMs=${to}`);
+		const body = (await res.json()) as { windowStartMs: number; windowEndMs: number };
+		// Echoed back verbatim — the grouping is window-dependent, so a route that
+		// re-resolved would answer about a different set than the caller asked for.
+		expect(body.windowStartMs).toBe(from);
+		expect(body.windowEndMs).toBe(to);
+	});
+
+	it("falls back to the range when only one bound is supplied", async () => {
+		const dbPath = join(dir, "journeys-half-bound.db");
+		const configDir = join(dir, "config-journeys-half-bound");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ dbPath, configDir }));
+		const res = await get(port, "/api/journeys?range=30d&fromMs=1700000000000");
+		const body = (await res.json()) as { windowStartMs: number };
+		// One bound alone is a window nobody computed; mixing it with a freshly
+		// derived one would silently produce a third window.
+		expect(body.windowStartMs).not.toBe(1_700_000_000_000);
+	});
+
+	it("clamps an explicit window wider than the scan ceiling", async () => {
+		const dbPath = join(dir, "journeys-clamp.db");
+		const configDir = join(dir, "config-journeys-clamp");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ dbPath, configDir }));
+		// A hostile span from the epoch to the far future must not reach the
+		// read path at full width — the echo-back reports the clamped window
+		// instead of the requested one.
+		const res = await get(port, "/api/journeys?fromMs=0&toMs=9007199254740991");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { windowStartMs: number; windowEndMs: number };
+		expect(body.windowEndMs - body.windowStartMs).toBeLessThanOrEqual(366 * 86_400_000);
+	});
+
+	it("carries the test-first signal on feed journeys, so the Patterns 'test-first' filter can match", async () => {
+		// The Patterns page counts test-first journeys over the SAME window with
+		// `withTests`, and clicking that pattern filters the FEED to them. If the
+		// feed route omits `withTests`, every feed journey's `tested` is absent, the
+		// filter matches nothing, and a pattern reporting N journeys opens an empty
+		// list ("No journeys match this filter."). The feed must build the same
+		// signal the pattern counted.
+		const dbPath = join(dir, "journeys-testfirst.db");
+		const configDir = join(dir, "config-journeys-testfirst");
+		const at = 1_754_000_000_000;
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					"INSERT INTO repos (id, repo_identity, repo_name, worktree_root, enabled_at, bootstrap_state) VALUES (1, 'repo-a', 'repo-a', '/tmp/repo-a', ?, 'done')",
+				).run(new Date(at).toISOString());
+				// `listReachableCommits` is mocked to `["reachable-hash"]`, and the feed
+				// route drops any commit not still carried by a branch — so the seeded
+				// commit must be that hash or the journey is filtered out before its
+				// `tested` signal is ever read.
+				const summary = {
+					commitHash: "reachable-hash",
+					commitMessage: "do the thing",
+					commitDate: new Date(at).toISOString(),
+					branch: "feature/reachable",
+				};
+				db.prepare(
+					"INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, summary_json, first_seen_ms, written_at_ms, commit_date_ms) VALUES (1, 'reachable-hash', NULL, NULL, 'reachable-hash', ?, ?, ?, ?)",
+				).run(JSON.stringify(summary), at, at, at);
+				const stored = {
+					sessions: [{ sessionId: "s-t1", source: "codex", entries: [], testRuns: [at - 60_000] }],
+				};
+				db.prepare(
+					"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (1, 't1', ?, ?)",
+				).run(deflateSync(Buffer.from(JSON.stringify(stored), "utf8")), at);
+				db.prepare(
+					"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (1, 'reachable-hash', 't1')",
+				).run();
+			},
+			{ dbPath },
+		);
+		const port = await listen(testServer({ dbPath, configDir }));
+		const res = await get(port, `/api/journeys?fromMs=${at - 86_400_000}&toMs=${at + 86_400_000}`);
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as {
+			journeys: ReadonlyArray<{ tested?: { availability: string; testFirst?: boolean } }>;
+		};
+		expect(body.journeys[0]?.tested).toEqual({ availability: "measured", testFirst: true });
+	});
+
+	it("500s /api/journeys with a generic message when the read fails", async () => {
+		// A database the service cannot open — the route's try/catch must turn
+		// it into the same generic 500 as any other read failure, never surface
+		// the underlying path or error text.
+		const port = await listen(testServer({ dbPath: join(dir, "no-such-dir", "missing.db") }));
+		const res = await get(port, "/api/journeys?range=30d");
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as { error: string };
+		expect(body.error).toBe("could not read journeys");
+		expect(body.error).not.toContain("no-such-dir");
+	});
+
+	it("500s /api/journey with a generic message when the read fails", async () => {
+		const port = await listen(testServer({ dbPath: join(dir, "no-such-dir", "missing.db") }));
+		const res = await get(port, "/api/journey?range=30d&id=T%00repo-a%00X");
+		expect(res.status).toBe(500);
+		const body = (await res.json()) as { error: string };
+		expect(body.error).toBe("could not read that journey");
+		expect(body.error).not.toContain("no-such-dir");
+	});
 });
 
 describe("assembleDashboardHtml", () => {
@@ -858,6 +1215,36 @@ describe("assembleDashboardHtml", () => {
 			`window.__JOLLI_SOURCE_META__ = ${JSON.stringify({ meta: SOURCE_META, neutral: NEUTRAL_SOURCE_COLOR })}`,
 		);
 		expect(html.indexOf("__JOLLI_SOURCE_META__")).toBeLessThan(html.indexOf("/* main.js */"));
+	});
+});
+
+describe("DASHBOARD_SCRIPT_FILES tracks the page template", () => {
+	/**
+	 * The one direction nothing else could see, and it shipped: `journeys.js` was
+	 * added to `index.html` and to neither this constant nor the plugin publish
+	 * libs, so the assembled page carried `main.js`'s call to
+	 * `window.JD.renderJourneys` with no file defining it — a TypeError on every
+	 * visit to `/dashboard/journeys`.
+	 *
+	 * `assembleDashboardHtml` REPLACES the whole `scripts:start/end` block, so the
+	 * `<script src>` tags never load anything at runtime; they are the template's
+	 * own record of what the page needs. That makes them worth nothing as a
+	 * mechanism and everything as an assertion — and it is why the omission is
+	 * invisible everywhere else: `resolveDashboardAssetsDir` probes only files the
+	 * constant already names, and `PluginDashboardAssets.test.ts` compares the
+	 * publish libs against that same constant. Both agree with each other while
+	 * both are missing the file.
+	 *
+	 * Order is asserted, not just membership: the list is a load order (shared
+	 * helpers, then page modules, then `main.js` boots), so a page that loads
+	 * `main.js` first is as broken as one missing a file.
+	 */
+	it("lists exactly the scripts index.html declares, in the same order", () => {
+		const html = readFileSync(join(resolveDashboardAssetsDir(), "index.html"), "utf8");
+		const block = /<!-- scripts:start -->([\s\S]*?)<!-- scripts:end -->/u.exec(html)?.[1] ?? "";
+		const declared = [...block.matchAll(/<script src="js\/([^"]+)"><\/script>/gu)].map((m) => m[1]);
+
+		expect(declared).toEqual([...DASHBOARD_SCRIPT_FILES]);
 	});
 });
 
@@ -1666,6 +2053,25 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(enabled.status).toBe(200);
 
 		expect((await repoOptions(port))[0].missing).toBeUndefined();
+	});
+
+	// The journeys view now inlines a `coaching` payload and moves the feed
+	// behind `/api/journeys` — the model injected into the page must carry the
+	// former and never the latter, or every page load pays ~107 KB for rows the
+	// reader usually never opens.
+	it("does not inline the journey feed into the journeys page", async () => {
+		const dbPath = join(dir, "journeys-inline.db");
+		const configDir = join(dir, "config-journeys-inline");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const html = await (await get(port, "/dashboard/journeys")).text();
+		// The model is injected as `window.__JOLLI_DASHBOARD__ = <json>;` by
+		// `assembleDashboardHtml`.
+		const json = /window\.__JOLLI_DASHBOARD__ = (.*?);<\/script>/s.exec(html)?.[1] ?? "";
+		const body = JSON.parse(json) as { coaching?: unknown; journeys?: unknown };
+		expect(body.coaching).toBeTruthy();
+		// The feed is behind a modal; inlining it would pay for it on every load.
+		expect(body.journeys).toBeUndefined();
 	});
 
 	it("reads knowledge and graph models off the Memory Bank folder", async () => {

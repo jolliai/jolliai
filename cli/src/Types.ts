@@ -362,6 +362,16 @@ export interface TranscriptReadResult {
 	 *  so presence is itself the signal. The cursor gate withholds a zero-entry
 	 *  slice with a non-zero count so a fixed build re-reads it. */
 	readonly unrecognizedRows?: number;
+	/** Epoch-ms instants of context compactions over the slice, de-duplicated and
+	 *  sorted. Absent when the source's parser cannot see them. */
+	readonly compactions?: ReadonlyArray<number>;
+	/** Epoch-ms instants of aborted turns over the slice, de-duplicated and
+	 *  sorted. Absent when the source's parser cannot see them. */
+	readonly turnAborts?: ReadonlyArray<number>;
+	/** Epoch-ms instants the agent invoked a test runner over the slice,
+	 *  de-duplicated and sorted. Absent when the source's parser cannot see them
+	 *  (or carries no exec tool); an EMPTY array means "ran no tests". */
+	readonly testRuns?: ReadonlyArray<number>;
 }
 
 // ─── Stored transcript types (orphan branch persistence) ─────────────────────
@@ -425,6 +435,28 @@ export interface StoredSession {
 	 * carries.
 	 */
 	readonly toolUse?: ReadonlyArray<ToolCallCount>;
+	/**
+	 * Epoch-ms instants the agent compacted its context (`isCompactSummary` for
+	 * Claude, `compacted`/`context_compacted` for Codex). Forward-only: absent on
+	 * memories written before this field, and absent for sources whose transcript
+	 * carries no compaction event. An EMPTY array means "no compactions in this
+	 * slice" — the positive fact, distinct from absence ("not recorded").
+	 */
+	readonly compactions?: ReadonlyArray<number>;
+	/**
+	 * Epoch-ms instants a turn was aborted (`turn_aborted` — Codex only). The
+	 * friction signal for the red-zone chip. Forward-only, same absence rule as
+	 * {@link compactions}.
+	 */
+	readonly turnAborts?: ReadonlyArray<number>;
+	/**
+	 * Epoch-ms instants the agent invoked a test runner (`npx vitest`, `npm test`,
+	 * …). Forward-only: absent on memories written before this field, and absent
+	 * for sources whose transcript carries no exec tool. An EMPTY array means
+	 * "ran no tests in this slice" — the positive fact, distinct from absence
+	 * ("not recorded").
+	 */
+	readonly testRuns?: ReadonlyArray<number>;
 }
 
 /** Structured transcript data for a commit, stored as `transcripts/{commitHash}.json` in the orphan branch */

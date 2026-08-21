@@ -25,6 +25,7 @@ import type {
 	ToolCallKind,
 	TranscriptSource,
 } from "../Types.js";
+import type { JourneyShape } from "./JourneyMetrics.js";
 
 /**
  * Version stamped on every event written to `events_raw`. Bump when an event's
@@ -402,7 +403,15 @@ export type AdoptionTier = "installed" | "memory" | "space";
  * (`jolli disable` still pauses a repository — the dashboard just no longer
  * offers a control for it).
  */
-export type DashboardView = "stats" | "standup" | "skills" | "memories" | "knowledge" | "graph" | "settings";
+export type DashboardView =
+	| "stats"
+	| "standup"
+	| "skills"
+	| "journeys"
+	| "memories"
+	| "knowledge"
+	| "graph"
+	| "settings";
 
 /** One browsable `_wiki` markdown file (a topic page or the `_index.md`). */
 export interface KnowledgeFile {
@@ -2250,6 +2259,306 @@ export interface DashboardMenus {
 	readonly graph: boolean;
 }
 
+/**
+ * How a journey's commits were grouped. Rendered as a distinct badge on every
+ * rung: a branch journey must never present itself as a ticket journey. Same
+ * rule as "unmeasured is not zero", one level up — an INFERRED grouping must
+ * not render as a STATED one.
+ */
+export type JourneyGroupedBy = "ticket" | "branch" | "commit";
+
+/** Whether a signal was measured for this journey. Ported from the cloud. */
+export type FieldAvailability = "measured" | "partial" | "unavailable";
+
+/**
+ * Which signals this journey could be measured on.
+ *
+ * `frictionSignals`, `waitTiming` and `reviewTiming` are pinned `"unavailable"`
+ * locally and are NOT dropped: keeping the field means a future signal is a
+ * population rather than a redesign, and every mark is gated on this object —
+ * an unmeasured signal draws nothing rather than drawing a zero.
+ */
+export interface JourneyAvailability {
+	readonly duration: FieldAvailability;
+	readonly turns: FieldAvailability;
+	readonly cost: FieldAvailability;
+	readonly frictionSignals: FieldAvailability;
+	readonly waitTiming: FieldAvailability;
+	readonly reviewTiming: FieldAvailability;
+}
+
+export interface JourneyDecision {
+	readonly text: string;
+	readonly commitHash: string;
+}
+
+export interface LocalJourneyCommit {
+	readonly commitHash: string;
+	readonly message: string;
+	readonly committedAtMs: number;
+	readonly repoIdentity: string;
+	readonly repoName: string;
+}
+
+/** One stretch where the agent finished and waited for the human. */
+export interface WaitPeriod {
+	/** The agent's last turn — when it stopped and waited. */
+	readonly startedAtMs: number;
+	/** The human's next turn — when the wait ended. */
+	readonly endedAtMs: number;
+	readonly durationMinutes: number;
+}
+
+/** The journey's recorded turns, split by speaker. */
+export interface TurnAttribution {
+	readonly humanTurns: number;
+	readonly agentTurns: number;
+}
+
+/**
+ * One journey. Mirrors the cloud's `CoachingJourney` except for the delta the
+ * spec's §2.3 fixes: `subjectId` and `waitingOn` are gone (single-subject), and
+ * `groupedBy` plus `turns` are added.
+ *
+ * `turns` is an ADDITION, not a repurposing of `durationMinutes`: they are
+ * different quantities, and writing turns into a field named for minutes is the
+ * lie the whole availability model exists to prevent.
+ *
+ * `landed` does NOT appear here. It was carried as "this commit survived the
+ * reachability filter" — which every commit that reaches the accumulator does
+ * by construction, since unreachable rows are dropped before folding starts —
+ * so it was a boolean that could only ever be `true` (see I1(b) of the review
+ * that removed it). Rendering a constant as a fact is the same class of bug
+ * this model exists to prevent one level down (an unmeasured signal must never
+ * render as a zero); a structurally-always-true field is the same lie in the
+ * other direction. A future `landed` distinguishing "reached the default
+ * branch" from "reachable from some branch" needs a second git walk this repo
+ * does not do today — see the review note in `JourneysQuery.ts`'s history
+ * before reintroducing it.
+ */
+export interface LocalJourney {
+	readonly id: string;
+	readonly groupedBy: JourneyGroupedBy;
+	readonly ticket: string | null;
+	readonly branch: string | null;
+	readonly title: string;
+	readonly repoIdentity: string;
+	readonly repoName: string;
+	readonly startedAtMs: number;
+	readonly endedAtMs: number;
+	readonly commitCount: number;
+	readonly sessionCount: number;
+	readonly turns: number | null;
+	readonly durationMinutes: number | null;
+	readonly costUsd: number | null;
+	readonly planFirst: boolean;
+	readonly shape: JourneyShape;
+	/** Capped for the feed — `decisionCount` is the true total. Never a silent cut. */
+	readonly decisions: ReadonlyArray<JourneyDecision>;
+	readonly decisionCount: number;
+	readonly availability: JourneyAvailability;
+	/**
+	 * Per-journey turn-abort friction, absent unless the producer opted in
+	 * (`buildJourneys(..., { withFriction: true })`). Not the roster's
+	 * window-aggregate cell — this is one journey's own abort count, gating the
+	 * feed's `flagged` chip. Absent means "not requested", never "no friction".
+	 */
+	readonly friction?: RosterCell;
+	/**
+	 * Per-journey test-first verdict, absent unless the producer opted in
+	 * (`buildJourneys(..., { withTests: true })`). A test run before the
+	 * journey's first commit is the §5 step-5 signal the test-first pattern
+	 * counts. Absent means "not requested", never "no tests".
+	 */
+	readonly tested?: JourneyTested;
+	/**
+	 * Longest single "waiting on you" stretch in minutes, absent unless the
+	 * producer opted in (`buildJourneys(..., { withWaits: true })`). Derived from
+	 * turn timestamps (no DB column), so it rides the same transcript walk as
+	 * `friction`/`tested`. Absent means "not requested", never "no wait".
+	 */
+	readonly longestWaitMinutes?: number;
+}
+
+/**
+ * Whether a journey ran a test before its first commit, availability-gated.
+ *
+ * `testRuns` is forward-only and source-gated, so a journey with no reporting
+ * session is `unavailable` (no verdict) rather than "not test-first". A
+ * `partial` journey's `testFirst: true` is still positive evidence — a
+ * pre-commit run was seen — while `false` means only "no positive evidence".
+ */
+export interface JourneyTested {
+	readonly availability: RosterAvailability;
+	/** Present unless `availability === "unavailable"`. */
+	readonly testFirst?: boolean;
+}
+
+export interface JourneysModel {
+	readonly journeys: ReadonlyArray<LocalJourney>;
+	/** Memories that fell in the window, before grouping — the feed's denominator. */
+	readonly indexedCommits: number;
+	readonly smoothestId: string | null;
+	readonly hardestId: string | null;
+	/**
+	 * The exact bounds this payload's grouping was computed under — the same
+	 * `fromMs`/`toMs` `buildJourneys` was called with, echoed back rather than
+	 * left for a caller to re-derive.
+	 *
+	 * A journey id is only meaningful within the window that grouped it: two
+	 * independent `resolveWindow` calls (one for the feed, a later one for a
+	 * clicked row) can straddle a local-midnight boundary and disagree about
+	 * what "30d" means, so a journey the feed just rendered can 404 from the
+	 * detail route. Opening a journey must send THESE bounds back
+	 * (`/api/journey?...&fromMs=&toMs=`) rather than letting the route resolve
+	 * a fresh window from a second clock read.
+	 */
+	readonly windowStartMs: number;
+	readonly windowEndMs: number;
+}
+
+/**
+ * How much of a roster cell's underlying signal the window actually measured.
+ *
+ * `partial` is the load-bearing one: a window that opens before a signal began
+ * being captured produces a real but unrepresentative number, and rendering it
+ * as a plain value is indistinguishable from "this person does not do that".
+ * Tool-use capture began part-way through this database's history, so every
+ * cell reading `session_tool_use` can be in this state for a wide-enough window.
+ */
+export type RosterAvailability = "measured" | "partial" | "unavailable";
+
+/** One roster cell: a number, how well it was measured, and its own trend. */
+export interface RosterCell {
+	readonly availability: RosterAvailability;
+	/** Absent unless `availability === "measured"`. */
+	readonly value?: number;
+	/**
+	 * Percent change against the immediately preceding window of equal length.
+	 * Absent when the prior window has nothing to divide by — never rendered as
+	 * `+0%`, which claims a measurement that was not made.
+	 */
+	readonly trendPct?: number;
+}
+
+/** The skills cell additionally names the top skill, which has no numeric form. */
+export interface RosterSkillsCell extends RosterCell {
+	readonly topName?: string;
+	readonly distinctCount?: number;
+}
+
+export interface CoachingRoster {
+	/** Label for the single subject — this machine's user. */
+	readonly label: string;
+	/** Share of the window's journeys that began with a plan, 0-100. */
+	readonly planFirst: RosterCell;
+	readonly skills: RosterSkillsCell;
+	/** Cost over the window, in USD, trended against the same population. */
+	readonly cost: RosterCell;
+	/** Recall tool calls over the window, across every server-name spelling. */
+	readonly recall: RosterCell;
+	/**
+	 * Median activity minutes per journey — how quickly work turns around. Thin
+	 * until duration coverage is raised (§4.3): the cell is `unavailable` when no
+	 * journey in the window has measured duration, and the median only ever
+	 * divides by the measured set.
+	 */
+	readonly turnaround: RosterCell;
+	/**
+	 * The red-zone chip (§3.3): turn-abort friction events across the window's
+	 * sessions. Codex-only (`turn_aborted`), so `unavailable` when no session
+	 * could report it and `partial` when some Codex sessions predate the capture
+	 * field — never a `0` for an unmeasured signal.
+	 */
+	readonly friction: RosterCell;
+}
+
+/** One practice the ADOPT NEXT card recommends, with how far along it already is. */
+export interface AdoptItem {
+	readonly key: string;
+	readonly title: string;
+	/** Template-assembled sentence — never an LLM pass (§3.5). */
+	readonly detail: string;
+	/** Journeys of the last `window` that already do it. */
+	readonly adopted: number;
+	/** Denominator — the last N journeys the share is measured over. */
+	readonly window: number;
+}
+
+/** One self-directed action item, drawn from a specific journey (the evidence link). */
+export interface QueueItem {
+	readonly key: string;
+	readonly title: string;
+	readonly detail: string;
+	readonly journeyId: string;
+	readonly journeyTitle: string;
+	/** The originating journey's ticket, shown as the evidence label. Null when the
+	 *  journey is branch/commit-grouped (no ticket) — the surface falls back to the
+	 *  journey title then. */
+	readonly journeyTicket: string | null;
+	readonly repoIdentity: string;
+}
+
+/** One behaviour pattern across the window's journeys. */
+export interface Pattern {
+	readonly key: string;
+	readonly label: string;
+	readonly count: number;
+	/** Distinct ISO weeks the matching journeys span. */
+	readonly weeks: number;
+	/** Below the evidence bar (≥4 journeys over ≥3 weeks). */
+	readonly emerging: boolean;
+}
+
+export interface PatternsModel {
+	readonly established: ReadonlyArray<Pattern>;
+	readonly emerging: ReadonlyArray<Pattern>;
+}
+
+/**
+ * The journeys view's inline payload.
+ *
+ * `JourneysModel` deliberately does NOT ride here any more: the feed is behind a
+ * modal, so inlining its rows would pay ~107 KB on every page load for content
+ * most loads never open. The featured pair are whole journeys rather than ids
+ * because they render on load, inside the roster's open expansion.
+ */
+export interface CoachingModel {
+	readonly roster: CoachingRoster;
+	/** The ADOPT NEXT card's recommendations, in display order. */
+	readonly adoptNext: ReadonlyArray<AdoptItem>;
+	/** Self-directed action items, each linked to the journey it came from. */
+	readonly queue: ReadonlyArray<QueueItem>;
+	readonly patterns: PatternsModel;
+	/** Per-day cost/turn points for the expansion's hero trend. */
+	readonly hero: ReadonlyArray<{ readonly date: string; readonly costUsd: number; readonly turns: number }>;
+	readonly featured: {
+		readonly smoothest: LocalJourney | null;
+		readonly hardest: LocalJourney | null;
+	};
+	/** How many journeys the feed modal will show — the button's own count. */
+	readonly journeyCount: number;
+	/** Journeys in the window carrying a measured turn-abort. Absent when no
+	 *  journey's friction is measurable (e.g. an all-Claude window). */
+	readonly flaggedCount?: number;
+	/** Journeys that stalled waiting on the human (longest wait ≥ the stall
+	 *  threshold). Absent when no journey's wait was measured — in practice
+	 *  today that means an empty window (zero journeys), since `buildCoaching`
+	 *  always requests waits, so every journey in a non-empty window carries a
+	 *  (possibly zero) `longestWaitMinutes`. Not a per-journey availability
+	 *  gate the way `flaggedCount`'s friction denominator is. */
+	readonly awaitingCount?: number;
+	readonly indexedCommits: number;
+	readonly windowStartMs: number;
+	readonly windowEndMs: number;
+	/** The window echoed back for the topbar range control (mirrors StatsModel).
+	 *  Filled at the payload layer from the resolved window, not by `buildCoaching`
+	 *  itself, so the query and its direct tests stay unaware of the preset name. */
+	readonly range?: DashboardRange;
+	readonly rangeFrom?: string;
+	readonly rangeTo?: string;
+}
+
 /** Everything one page render needs. Injected inline, then refreshed over HTTP. */
 export interface DashboardModel {
 	readonly schemaVersion: number;
@@ -2273,4 +2582,6 @@ export interface DashboardModel {
 	readonly graph?: GraphModel;
 	/** Present on the settings view only. */
 	readonly settings?: SettingsPageModel;
+	/** Present on the journeys view only. The feed itself arrives over `/api/journeys`. */
+	readonly coaching?: CoachingModel;
 }

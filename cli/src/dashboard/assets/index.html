@@ -165,6 +165,40 @@
 		</div>
 	</div>
 	<!--
+	  The Journeys page's trace sheet. Same layer rules as the Context viewer
+	  above (inside `.jd` for the colour tokens, outside `.main` so it is not
+	  clipped), and the same `.overlay`/`.overlay.open` show/hide convention —
+	  see `openContextDialog` / `wireContextRows` in memories.js.
+	-->
+	<div class="overlay" id="ovJourney" role="dialog" aria-modal="true" aria-labelledby="jtraceTitle">
+		<div class="sheet">
+			<h3 id="jtraceTitle">Journey</h3>
+			<div class="sub" id="jtraceSub"></div>
+			<div id="jtraceBody" class="jtrace-body"></div>
+			<div class="row">
+				<div class="spacer"></div>
+				<button class="cta ghost" type="button" id="jtraceClose">Close</button>
+			</div>
+		</div>
+	</div>
+	<!--
+	  The Journeys page's feed modal. Same layer rules and `.overlay`/`.sheet`
+	  convention as the trace sheet above; its body is filled by `JD.openFeedModal`
+	  → `JD.renderFeedInto`, fetching the whole feed from `/api/journeys` only when
+	  the roster's "Open the N journeys" button is clicked.
+	-->
+	<div class="overlay" id="ovFeed" role="dialog" aria-modal="true" aria-labelledby="jfeedTitle">
+		<div class="sheet">
+			<h3 id="jfeedTitle">Journeys</h3>
+			<div class="sub" id="jfeedSub"></div>
+			<div id="jfeedBody" class="jtrace-body"></div>
+			<div class="row">
+				<div class="spacer"></div>
+				<button class="cta ghost" type="button" id="jfeedClose">Close</button>
+			</div>
+		</div>
+	</div>
+	<!--
 	  The Settings modal. Opened over any page from the pinned bottom nav row
 	  (JD.openSettings), which fetches /api/model?view=settings and fills the body.
 	  Same layer rules as the sheets above: fixed, inside `.jd` for token scoping.
@@ -180,8 +214,10 @@
 <script src="js/charts.js"></script>
 <script src="js/shell.js"></script>
 <script src="js/stats.js"></script>
+<script src="js/skills.js"></script>
 <script src="js/standup.js"></script>
 <script src="js/memories.js"></script>
+<script src="js/journeys.js"></script>
 <script src="js/knowledge.js"></script>
 <script src="js/graph.js"></script>
 <script src="js/settings.js"></script>

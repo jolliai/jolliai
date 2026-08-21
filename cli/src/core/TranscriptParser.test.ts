@@ -91,6 +91,78 @@ describe("CodexTranscriptParser", () => {
 			expect(entry).toEqual({ role: "human", content: "hello", timestamp: undefined });
 		});
 	});
+
+	describe("compactions and turn aborts", () => {
+		it("extracts context_compacted and compacted timestamps", () => {
+			const lines = [
+				JSON.stringify({
+					timestamp: "2026-03-22T02:00:00Z",
+					type: "event_msg",
+					payload: { type: "context_compacted" },
+				}),
+				JSON.stringify({
+					timestamp: "2026-03-22T03:00:00Z",
+					type: "event_msg",
+					payload: { type: "compacted" },
+				}),
+			];
+			expect(parser.parseCompactions?.(lines)).toEqual([
+				Date.parse("2026-03-22T02:00:00Z"),
+				Date.parse("2026-03-22T03:00:00Z"),
+			]);
+		});
+
+		it("extracts turn_aborted timestamps only", () => {
+			const lines = [
+				JSON.stringify({
+					timestamp: "2026-03-22T02:00:00Z",
+					type: "event_msg",
+					payload: { type: "turn_aborted" },
+				}),
+				JSON.stringify({
+					timestamp: "2026-03-22T03:00:00Z",
+					type: "event_msg",
+					payload: { type: "user_message", message: "hi" },
+				}),
+			];
+			expect(parser.parseTurnAborts?.(lines)).toEqual([Date.parse("2026-03-22T02:00:00Z")]);
+		});
+
+		it("omits an event with no timestamp", () => {
+			const line = JSON.stringify({ type: "event_msg", payload: { type: "turn_aborted" } });
+			expect(parser.parseTurnAborts?.([line])).toEqual([]);
+		});
+	});
+
+	describe("test runs", () => {
+		it("extracts the instant of a real exec_command running npx vitest", () => {
+			const line = JSON.stringify({
+				timestamp: "2026-04-29T15:48:40Z",
+				type: "response_item",
+				payload: {
+					type: "function_call",
+					name: "exec_command",
+					arguments:
+						'{"cmd":"npx vitest run cli/src/core/SummaryFormat.test.ts cli/src/core/SummaryTree.test.ts"}',
+					call_id: "call_test",
+				},
+			});
+			expect(parser.parseTestRuns?.([line])).toEqual([Date.parse("2026-04-29T15:48:40Z")]);
+		});
+
+		it("ignores a non-test exec_command and a missing timestamp", () => {
+			const notATest = JSON.stringify({
+				timestamp: "2026-04-29T15:48:40Z",
+				type: "response_item",
+				payload: { type: "function_call", name: "exec_command", arguments: '{"cmd":"pwd && rg --files"}' },
+			});
+			const noTime = JSON.stringify({
+				type: "response_item",
+				payload: { type: "function_call", name: "exec_command", arguments: '{"cmd":"npx vitest run"}' },
+			});
+			expect(parser.parseTestRuns?.([notATest, noTime])).toEqual([]);
+		});
+	});
 });
 
 describe("CodexTranscriptParser response_item", () => {
@@ -1219,6 +1291,69 @@ describe("ClaudeTranscriptParser", () => {
 			expect(parser.parseUsageByModel([turn("<synthetic>", { input_tokens: 5, output_tokens: 2 })])).toEqual([
 				{ model: "", provider: "anthropic", input: 5, output: 2, cached: 0 },
 			]);
+		});
+	});
+
+	describe("parseCompactions", () => {
+		it("extracts isCompactSummary timestamps", () => {
+			const lines = [
+				JSON.stringify({ isCompactSummary: true, timestamp: "2026-06-14T18:03:11.482Z" }),
+				JSON.stringify({ isCompactSummary: true, timestamp: "2026-06-14T18:20:00.000Z" }),
+			];
+			expect(parser.parseCompactions?.(lines)).toEqual([
+				Date.parse("2026-06-14T18:03:11.482Z"),
+				Date.parse("2026-06-14T18:20:00.000Z"),
+			]);
+		});
+
+		it("ignores non-compaction lines and missing timestamps", () => {
+			const lines = [
+				JSON.stringify({ isCompactSummary: false, timestamp: "2026-06-14T18:03:11.482Z" }),
+				JSON.stringify({ isCompactSummary: true }),
+			];
+			expect(parser.parseCompactions?.(lines)).toEqual([]);
+		});
+	});
+
+	describe("parseTestRuns", () => {
+		it("extracts the instant of a real Bash command running npx vitest", () => {
+			const line = JSON.stringify({
+				timestamp: "2026-06-14T18:03:11.482Z",
+				message: {
+					role: "assistant",
+					content: [
+						{
+							type: "tool_use",
+							name: "Bash",
+							input: {
+								command: "cd /…/cli && npx vitest run src/core/KBPathResolver.test.ts 2>&1 | tail -35",
+							},
+						},
+					],
+				},
+			});
+			expect(parser.parseTestRuns?.([line])).toEqual([Date.parse("2026-06-14T18:03:11.482Z")]);
+		});
+
+		it("ignores a non-test Bash command, a non-Bash tool, and a missing timestamp", () => {
+			const notATest = JSON.stringify({
+				timestamp: "2026-06-14T18:03:11.482Z",
+				message: {
+					role: "assistant",
+					content: [{ type: "tool_use", name: "Bash", input: { command: "gh pr view 448" } }],
+				},
+			});
+			const readTool = JSON.stringify({
+				timestamp: "2026-06-14T18:03:11.482Z",
+				message: { role: "assistant", content: [{ type: "tool_use", name: "Read", input: { file: "x" } }] },
+			});
+			const noTime = JSON.stringify({
+				message: {
+					role: "assistant",
+					content: [{ type: "tool_use", name: "Bash", input: { command: "npx vitest run" } }],
+				},
+			});
+			expect(parser.parseTestRuns?.([notATest, readTool, noTime])).toEqual([]);
 		});
 	});
 });

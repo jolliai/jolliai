@@ -12,6 +12,7 @@
 
 import { createLogger } from "../Logger.js";
 import type { ModelTokenUsage, ParsedTurnUsage, ToolCallCount, TranscriptEntry } from "../Types.js";
+import { isTestCommand } from "./TestCommandDetect.js";
 import {
 	builtinTool,
 	classifyCodexToolName,
@@ -108,6 +109,18 @@ export interface TranscriptParser {
 	 *  where a legitimately empty tool-only slice (all rows recognized) must advance.
 	 *  Absent method = the source has no schema this parser tracks drift against (0). */
 	parseUnrecognizedRows?(lines: ReadonlyArray<string>): number;
+	/** Epoch-ms instants of context compactions over a whole consumed slice,
+	 *  de-duplicated and sorted. Absent method = the source's transcripts carry no
+	 *  compaction event. */
+	parseCompactions?(lines: ReadonlyArray<string>): number[];
+	/** Epoch-ms instants of aborted turns over a whole consumed slice,
+	 *  de-duplicated and sorted. Absent method = the source's transcripts carry no
+	 *  turn-abort event. */
+	parseTurnAborts?(lines: ReadonlyArray<string>): number[];
+	/** Epoch-ms instants the agent invoked a test runner over a whole consumed
+	 *  slice, de-duplicated and sorted. Absent method = the source's transcripts
+	 *  carry no exec tool (or cannot be read), so "ran no tests" is never claimed. */
+	parseTestRuns?(lines: ReadonlyArray<string>): number[];
 }
 
 /**
@@ -312,6 +325,68 @@ export class ClaudeTranscriptParser implements TranscriptParser {
 			return undefined;
 		}
 	}
+
+	parseCompactions(lines: ReadonlyArray<string>): number[] {
+		const times = new Set<number>();
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			if ((parsed as { isCompactSummary?: unknown }).isCompactSummary !== true) continue;
+			const atMs = parseIsoMs(this.parseTimestamp(line));
+			if (atMs !== undefined) times.add(atMs);
+		}
+		return [...times].sort((a, b) => a - b);
+	}
+
+	parseTestRuns(lines: ReadonlyArray<string>): number[] {
+		const times = new Set<number>();
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const content = (parsed as { message?: { content?: unknown } }).message?.content;
+			if (!Array.isArray(content)) continue;
+			for (const block of content) {
+				const b = block as { type?: unknown; name?: unknown; input?: { command?: unknown } };
+				if (b.type !== "tool_use" || b.name !== "Bash") continue;
+				if (typeof b.input?.command !== "string" || !isTestCommand(b.input.command)) continue;
+				const atMs = parseIsoMs(this.parseTimestamp(line));
+				if (atMs !== undefined) times.add(atMs);
+			}
+		}
+		return [...times].sort((a, b) => a - b);
+	}
+}
+
+/** Codex `payload.type` values that mark a context compaction. */
+const CODEX_COMPACTION_EVENT_TYPES: ReadonlySet<string> = new Set(["compacted", "context_compacted"]);
+
+/** Epoch-ms instants of Codex events whose `payload.type` is in `types`. */
+function codexEventInstants(lines: ReadonlyArray<string>, types: ReadonlySet<string>): number[] {
+	const times = new Set<number>();
+	for (const line of lines) {
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const payload = (parsed as { payload?: unknown })?.payload;
+		if (payload === null || typeof payload !== "object") continue;
+		const type = (payload as { type?: unknown }).type;
+		if (typeof type !== "string" || !types.has(type)) continue;
+		const rawAt = (parsed as { timestamp?: unknown }).timestamp;
+		const atMs = parseIsoMs(typeof rawAt === "string" ? rawAt : undefined);
+		if (atMs !== undefined) times.add(atMs);
+	}
+	return [...times].sort((a, b) => a - b);
 }
 
 /**
@@ -519,6 +594,42 @@ export class CodexTranscriptParser implements TranscriptParser {
 			}
 		}
 		return unknown;
+	}
+
+	parseCompactions(lines: ReadonlyArray<string>): number[] {
+		return codexEventInstants(lines, CODEX_COMPACTION_EVENT_TYPES);
+	}
+
+	parseTurnAborts(lines: ReadonlyArray<string>): number[] {
+		return codexEventInstants(lines, new Set(["turn_aborted"]));
+	}
+
+	parseTestRuns(lines: ReadonlyArray<string>): number[] {
+		const times = new Set<number>();
+		for (const line of lines) {
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(line);
+			} catch {
+				continue;
+			}
+			const payload = (parsed as { payload?: unknown })?.payload;
+			if (payload === null || typeof payload !== "object") continue;
+			const p = payload as { type?: unknown; name?: unknown; arguments?: unknown };
+			if (p.type !== "function_call" || p.name !== "exec_command") continue;
+			let cmd: unknown;
+			try {
+				const args = typeof p.arguments === "string" ? (JSON.parse(p.arguments) as { cmd?: unknown }) : {};
+				cmd = args.cmd;
+			} catch {
+				continue;
+			}
+			if (typeof cmd !== "string" || !isTestCommand(cmd)) continue;
+			const rawAt = (parsed as { timestamp?: unknown }).timestamp;
+			const atMs = parseIsoMs(typeof rawAt === "string" ? rawAt : undefined);
+			if (atMs !== undefined) times.add(atMs);
+		}
+		return [...times].sort((a, b) => a - b);
 	}
 }
 

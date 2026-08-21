@@ -62,6 +62,21 @@ export function localDayKey(ms: number, timeZone: string): string {
 	return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
 }
 
+/**
+ * The local ISO week's Monday as `YYYY-MM-DD` — a stable key for "how many
+ * DISTINCT weeks do these instants span". Two instants in the same ISO week
+ * always share the same Monday, so this key is what a `Set` counts. The
+ * day-of-week is computed from the UTC-projected calendar date (`getUTCDay`)
+ * so the arithmetic never depends on the machine's own zone.
+ */
+export function localWeekKey(ms: number, timeZone: string): string {
+	const p = zonedParts(ms, timeZone);
+	const utc = Date.UTC(p.year, p.month - 1, p.day);
+	const dow = new Date(utc).getUTCDay(); // 0 Sun .. 6 Sat
+	const monday = new Date(utc - ((dow + 6) % 7) * 86_400_000);
+	return monday.toISOString().slice(0, 10);
+}
+
 /** Local hour (0–23) of `ms`. */
 export function localHour(ms: number, timeZone: string): number {
 	return zonedParts(ms, timeZone).hour;

@@ -4231,6 +4231,16 @@ export interface SessionTokenBucket {
 	 * nothing. A source whose parser omits `parseToolUse` never creates it.
 	 */
 	byTool?: Map<string, ToolCallCount>;
+	/**
+	 * Compaction instants seen across this conversation's slices, de-duplicated by
+	 * the set. Undefined while no slice has REPORTED compactions, so "this source
+	 * cannot see them" survives to disk — same rule as `byTool`.
+	 */
+	compactions?: Set<number>;
+	/** Turn-abort instants, same rule as {@link compactions}. */
+	turnAborts?: Set<number>;
+	/** Test-run instants, same rule as {@link compactions}. */
+	testRuns?: Set<number>;
 }
 
 /**
@@ -4372,6 +4382,9 @@ function attachPerSessionUsage(
 			// entries were pruned had its slices excluded from the summary, so its
 			// tool calls are not this commit's either.
 			...(bucket.byTool && { toolUse: [...bucket.byTool.values()] }),
+			...(bucket.compactions && { compactions: [...bucket.compactions].sort((a, b) => a - b) }),
+			...(bucket.turnAborts && { turnAborts: [...bucket.turnAborts].sort((a, b) => a - b) }),
+			...(bucket.testRuns && { testRuns: [...bucket.testRuns].sort((a, b) => a - b) }),
 		};
 	});
 }
@@ -4771,6 +4784,24 @@ async function readAllTranscripts(
 			pluginClaimsByConversation.set(convKey, pluginClaims);
 			bucket.byTool = byTool;
 		}
+		// Merge this slice's compaction / turn-abort instants. Gated on presence,
+		// not length, for the same reason as `toolUse`: a slice that genuinely had
+		// none must still be told apart from a source that cannot report them.
+		if (result.compactions) {
+			const compactions = bucket.compactions ?? new Set<number>();
+			for (const atMs of result.compactions) compactions.add(atMs);
+			bucket.compactions = compactions;
+		}
+		if (result.turnAborts) {
+			const turnAborts = bucket.turnAborts ?? new Set<number>();
+			for (const atMs of result.turnAborts) turnAborts.add(atMs);
+			bucket.turnAborts = turnAborts;
+		}
+		if (result.testRuns) {
+			const testRuns = bucket.testRuns ?? new Set<number>();
+			for (const atMs of result.testRuns) testRuns.add(atMs);
+			bucket.testRuns = testRuns;
+		}
 		perSessionTokens.set(convKey, bucket);
 
 		if (result.entries.length > 0) {
@@ -4893,8 +4924,21 @@ async function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTr
 	// serialize step below gates the `usage` field on, so a carrier that survives
 	// here always keeps its usage on disk (and a present-but-all-zero usage is
 	// treated as no usage, exactly as it is there).
+	//
+	// A compaction-, turn-abort- or test-run-only carrier survives for the same
+	// reason: those instants are dashboard signal the summary body cannot
+	// re-derive, and a conversation that emitted one in a slice with no datable
+	// usage would otherwise lose them to the shell filter. This EXTENDS the
+	// zero-turn drop (JOLLI-2236) rather than reverting it — a session carrying
+	// none of entries, usage, or event signal is still the pure-noise shell that
+	// rule removes.
 	const kept = sessionTranscripts.filter(
-		(st) => st.entries.length > 0 || (st.usage != null && st.usage.input + st.usage.output + st.usage.cached > 0),
+		(st) =>
+			st.entries.length > 0 ||
+			(st.usage != null && st.usage.input + st.usage.output + st.usage.cached > 0) ||
+			(st.compactions != null && st.compactions.length > 0) ||
+			(st.turnAborts != null && st.turnAborts.length > 0) ||
+			(st.testRuns != null && st.testRuns.length > 0),
 	);
 	// Titles are resolved HERE rather than attached upstream like `usage` and
 	// `toolUse`, even though that is the established pattern for this array: there
@@ -4921,6 +4965,11 @@ async function buildStoredTranscript(sessionTranscripts: ReadonlyArray<SessionTr
 			// "this session called no tools", which a reader must be able to tell
 			// apart from a source that cannot report them (see StoredSession.toolUse).
 			...(st.toolUse && { toolUse: st.toolUse }),
+			// Same presence-gate: `[]` means "no compactions/aborts", absence means
+			// "this source cannot report them".
+			...(st.compactions && { compactions: st.compactions }),
+			...(st.turnAborts && { turnAborts: st.turnAborts }),
+			...(st.testRuns && { testRuns: st.testRuns }),
 		})),
 	};
 }

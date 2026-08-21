@@ -1446,6 +1446,54 @@ describe("buildDashboardModel", () => {
 			expect((await model()).stats?.concurrency).toBeUndefined();
 		});
 	});
+
+	it("builds only the coaching payload for the journeys view", async () => {
+		await withDashboardDb(() => {}, { dbPath });
+		const journeysModel = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "journeys", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(journeysModel.coaching).toBeDefined();
+		// The feed is behind a modal served by /api/journeys; the page model no
+		// longer carries the whole `JourneysModel` inline — the field is gone
+		// from the type entirely, not merely left unset.
+		expect("journeys" in journeysModel).toBe(false);
+		expect(journeysModel.stats).toBeUndefined();
+		expect(journeysModel.memories).toBeUndefined();
+	});
+
+	it("defaults the coaching window to the last 7 days, not the global month default", async () => {
+		await withDashboardDb(() => {}, { dbPath });
+		// No `range` supplied: Coaching diverges from the shared `DEFAULT_RANGE`
+		// ("month") and opens on a 7-day window. `nowMs` is 2026-07-30, so a
+		// week counting today spans 07-24 → 07-30.
+		const journeysModel = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "journeys", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		expect(journeysModel.coaching?.range).toBe("week");
+		expect(journeysModel.coaching?.rangeFrom).toBe("2026-07-24");
+		expect(journeysModel.coaching?.rangeTo).toBe("2026-07-30");
+	});
+
+	it("lets an explicit range override the coaching 7-day default", async () => {
+		await withDashboardDb(() => {}, { dbPath });
+		// The divergence is a DEFAULT, not a lock: picking another preset in the
+		// topbar still resolves to that preset's window.
+		const journeysModel = await withDashboardDb(
+			(db) =>
+				buildDashboardModel(db, {
+					view: "journeys",
+					scope: { kind: "all" },
+					timeZone: "UTC",
+					nowMs,
+					range: "month",
+				}),
+			{ dbPath },
+		);
+		expect(journeysModel.coaching?.range).toBe("month");
+		expect(journeysModel.coaching?.rangeFrom).toBe("2026-07-01");
+	});
 });
 
 describe("buildDashboardModel — tool usage", () => {

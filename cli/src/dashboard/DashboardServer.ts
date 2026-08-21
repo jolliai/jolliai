@@ -127,11 +127,15 @@ import {
 	buildSkillDetail,
 	buildToolUsagePage,
 	clearWorktreeExistenceCache,
+	JOURNEYS_DEFAULT_RANGE,
+	MAX_CUSTOM_DAYS,
 	type QueryOptions,
+	resolveWindow,
 	STANDUP_MAX_OFFSET,
 } from "./DashboardQuery.js";
 import { projectRepoRegistryState } from "./DbBackfill.js";
 import { buildGraphViewerDocument } from "./GraphViewerDocument.js";
+import { buildJourneyDetail, buildJourneys } from "./JourneysQuery.js";
 import {
 	buildGraphModel,
 	buildKnowledgeModel,
@@ -141,6 +145,7 @@ import {
 	resolveKbRoot,
 	WIKI_FILE_PATTERN,
 } from "./KnowledgeQuery.js";
+import { machineTimeZone } from "./LocalDays.js";
 import {
 	buildMemoriesPage,
 	type ReachableCommits,
@@ -188,19 +193,19 @@ export const DASHBOARD_HEALTH_SERVICE = "jolli-dashboard";
 // ── Asset assembly ──────────────────────────────────────────────────────────
 
 /**
- * App scripts, in load order (shared helpers first, page modules, then boot).
+ * Every script `assembleDashboardHtml` inlines, in load order (shared helpers
+ * first, page modules, then `main.js` boots). Exported because three gates
+ * depend on the list being one thing: `resolveDashboardAssetsDir` probes for
+ * each file, the plugin publish scripts assert each is staged
+ * (`PluginDashboardAssets.test.ts`), and `assets/index.html`'s
+ * `<!-- scripts:start/end -->` block must declare exactly these, in this order
+ * (`DashboardServer.test.ts`).
  *
- * This list is duplicated in three other places that must move together:
- * `assets/index.html`'s `<!-- scripts:start/end -->` block, the test fixture
- * in `DashboardServer.test.ts` (`writeTestAssets`), and the loader in
- * `FeedCardAsset.test.ts`. A file added here and missed in one of those three
- * only fails at runtime (a 404'd `<script src>` in the shipped page) or in
- * that one test file, never at compile time.
- */
-/**
- * Every script `assembleDashboardHtml` inlines, in load order. Exported because
- * two gates depend on the list being one thing: `resolveDashboardAssetsDir`
- * probes for each file, and the plugin publish scripts assert each is staged.
+ * That last gate exists because the template's `<script src>` tags are the one
+ * copy of this list that CANNOT fail loudly: the assembler replaces the whole
+ * block, so those tags never load anything — a file declared there and omitted
+ * here is simply absent from the page, and the first symptom is a TypeError in
+ * the browser when `main.js` calls into it. `journeys.js` shipped that way.
  */
 export const DASHBOARD_SCRIPT_FILES = [
 	"format.js",
@@ -213,6 +218,7 @@ export const DASHBOARD_SCRIPT_FILES = [
 	"skills.js",
 	"standup.js",
 	"memories.js",
+	"journeys.js",
 	"knowledge.js",
 	"graph.js",
 	"settings.js",
@@ -551,7 +557,16 @@ export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
  * `repositories` used to be here too, for its per-repo memory badge; it went
  * with that page.
  */
-const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>(["stats", "memories", "standup"]);
+const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>([
+	"stats",
+	"memories",
+	"standup",
+	// Whether a branch still carries a commit is a question only git can answer.
+	// Without this set, a rewritten-away commit assembles into a journey that
+	// reports work no branch has — `assemble()`'s `isReachable` filter is what
+	// drops it, and it runs entirely on this reachability set.
+	"journeys",
+]);
 
 /**
  * How long one worktree's git identity is trusted. Minutes, not hours: the value
@@ -1091,6 +1106,36 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 }
 
 /**
+ * Parses the `fromMs`/`toMs` echo-back pair the two journeys routes share —
+ * the SAME window the feed resolved, sent back by the client rather than left
+ * for the route to re-derive (see the `/api/journey` handler's comment for why
+ * a second resolve is the bug). Returns `undefined` when the pair is unusable
+ * and the caller should fall back to a fresh `resolveWindow`.
+ *
+ * `Number` plus `Number.isSafeInteger` rejects a trailing-garbage suffix that
+ * `parseInt` would accept, and `from < to` rejects a reversed or degenerate
+ * pair that parsed fine but describes no real window. Both or neither: one
+ * bound alone is a window nobody computed.
+ *
+ * The span is clamped to the same scan ceiling the range picker's custom
+ * window gets ({@link MAX_CUSTOM_DAYS}): a hostile or stale request cannot ask
+ * the read path to walk wider than the preset/custom limit allows. Only the
+ * WIDTH is clamped, never the position — a bounded window in the past (the
+ * page's own presets, a bookmarked custom range) is echoed back exactly, which
+ * is the contract a caller's trace request depends on.
+ */
+function parseExplicitWindowMs(url: URL): { readonly startMs: number; readonly endMs: number } | undefined {
+	const rawFromMs = url.searchParams.get("fromMs");
+	const rawToMs = url.searchParams.get("toMs");
+	const fromMs = rawFromMs === null ? Number.NaN : Number(rawFromMs);
+	const toMs = rawToMs === null ? Number.NaN : Number(rawToMs);
+	if (!Number.isSafeInteger(fromMs) || !Number.isSafeInteger(toMs) || fromMs >= toMs) return undefined;
+	const maxSpanMs = MAX_CUSTOM_DAYS * 86_400_000;
+	const startMs = toMs - fromMs > maxSpanMs ? toMs - maxSpanMs : fromMs;
+	return { startMs, endMs: toMs };
+}
+
+/**
  * Path → view.
  *
  * `/dashboard` and `/dashboard/standup` are the current nav's two Dashboard
@@ -1127,6 +1172,7 @@ const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 	"/dashboard": "stats",
 	"/dashboard/standup": "standup",
 	"/skills": "skills",
+	"/dashboard/journeys": "journeys",
 	"/memories": "memories",
 	"/knowledge": "knowledge",
 	"/graph": "graph",
@@ -1145,6 +1191,7 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 	"standup",
 	"skills",
 	"memories",
+	"journeys",
 	"knowledge",
 	"graph",
 	"settings",
@@ -1735,6 +1782,146 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("skill detail read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that skill's detail" });
+			}
+			return;
+		}
+
+		// One journey's full record, for the trace modal. Deliberately NOT folded
+		// into the page model: the feed caps each row's decisions at 8 and carries
+		// no per-commit rows, and shipping every journey's full trace would
+		// multiply the page's size for content the reader usually never opens.
+		// A read like every other GET here — no token.
+		if (url.pathname === "/api/journey") {
+			// `id` alone identifies a journey. Every `JourneyKey.key` is namespaced
+			// by repo identity (a ticket key carries `T\x00<repoIdentity>\x00<ticket>`,
+			// a branch key `B\x00<repoIdentity>\x00<branch>`, a lone commit
+			// `C\x00<repoIdentity>\x00<hash>`), so a lookup by id under an "all
+			// repos" scope cannot collide across repos the way `/api/memories`'
+			// bare commit hash can. `repo=` is still accepted below (via
+			// `parseScope`) as an optional scope narrowing, mirroring every other
+			// page — it is simply not REQUIRED for correctness.
+			const id = url.searchParams.get("id") ?? "";
+			if (!id) {
+				sendJson(res, 400, { error: "id is required" });
+				return;
+			}
+			const scope = parseScope(url);
+			const win = parseWindow(url);
+			// The feed already resolved a window when it rendered these journeys —
+			// `fromMs`/`toMs` are that SAME window, echoed back by the client rather
+			// than left for this route to re-derive. Two independent `resolveWindow`
+			// calls (one when the feed rendered, one here) can straddle a
+			// local-midnight boundary and disagree about what "30d" means, so a
+			// journey the feed just rendered could otherwise 404 from this route —
+			// the id is only meaningful within the window that grouped it. Both or
+			// neither: one bound alone is a window nobody computed, so a
+			// half-supplied pair falls back to a fresh resolve rather than mixing
+			// one echoed bound with one freshly-derived one. Parse and clamp live in
+			// `parseExplicitWindowMs` — the SAME helper `/api/journeys` uses, so the
+			// two routes can never disagree about what a pair means.
+			const explicitWindow = parseExplicitWindowMs(url);
+			try {
+				const detail = await withReadonlyDashboardDb(
+					async (db) => {
+						const reachable = await readReachableCommitsByRepo(
+							db
+								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
+								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
+						);
+						const resolved =
+							explicitWindow ??
+							// Match the Coaching page's own default: with no explicit
+							// bounds AND no `?range=`, the feed opens on
+							// `JOURNEYS_DEFAULT_RANGE` (week), not the global month, so a
+							// window-dependent journey id stays resolvable.
+							resolveWindow(
+								win.range ?? JOURNEYS_DEFAULT_RANGE,
+								win.customFrom,
+								win.customTo,
+								Date.now(),
+								machineTimeZone(),
+							);
+						return buildJourneyDetail(db, scope, resolved, id, reachable);
+					},
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				if (!detail) {
+					sendJson(res, 404, { error: "not found" });
+					return;
+				}
+				sendJson(res, 200, detail);
+			} catch (err) {
+				// Same rule as the other read routes: log the detail, tell the
+				// client only that the read failed.
+				log.warn("journey detail read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that journey" });
+			}
+			return;
+		}
+
+		// The whole journey feed, fetched when the feed modal opens.
+		//
+		// Deliberately NOT cursor-paged, unlike `/api/memories`. Two of the feed's
+		// client functions are defined over the COMPLETE set and would silently
+		// degrade against a page: `JD.journeyFilters` derives which filter chips
+		// exist from the journeys present, and `JD.shouldGroupByDay` decides on the
+		// header count across the whole set against `DAY_HEADER_CAP`. Paging would
+		// make both answer from whatever happened to have loaded, with no error
+		// anywhere. The payload is only paid when the modal opens, which is the
+		// win this route exists for; paging can be added later behind the same URL
+		// once those two functions take an explicit total.
+		if (url.pathname === "/api/journeys") {
+			const scope = parseScope(url);
+			const win = parseWindow(url);
+			// Explicit bounds arrive as `fromMs`/`toMs`, NOT as `from`/`to` —
+			// `parseWindow` already claims the latter pair for the range picker's
+			// `customFrom`/`customTo`, where they are date strings. Sending epoch
+			// milliseconds under those names is silently misread. Same parse and
+			// same clamp as `/api/journey` above — `parseExplicitWindowMs` is the
+			// ONE definition of what a pair means, so the feed and its trace can
+			// never resolve different windows for the same bounds.
+			const explicitWindow = parseExplicitWindowMs(url);
+			try {
+				const model = await withReadonlyDashboardDb(
+					async (db) => {
+						const reachable = await readReachableCommitsByRepo(
+							db
+								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
+								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
+						);
+						const resolved =
+							explicitWindow ??
+							// Match the Coaching page's own default: with no explicit
+							// bounds AND no `?range=`, the feed opens on
+							// `JOURNEYS_DEFAULT_RANGE` (week), not the global month, so a
+							// window-dependent journey id stays resolvable.
+							resolveWindow(
+								win.range ?? JOURNEYS_DEFAULT_RANGE,
+								win.customFrom,
+								win.customTo,
+								Date.now(),
+								machineTimeZone(),
+							);
+						// The feed renders the `flagged` chip (turn-abort friction)
+						// and the `test-first` chip, and the Patterns page filters
+						// the feed to its own test-first count — so the feed must
+						// carry the same `tested` signal that count was measured
+						// with, or clicking the pattern opens an empty list. Both
+						// signals ride the one per-journey transcript walk this
+						// surface pays; the roster's page load does not.
+						return buildJourneys(db, scope, resolved.startMs, resolved.endMs, reachable, {
+							withFriction: true,
+							withTests: true,
+						});
+					},
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				sendJson(res, 200, model);
+			} catch (err) {
+				// Same rule as the other read routes: log the detail, tell the
+				// client something generic.
+				log.warn("journeys read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read journeys" });
 			}
 			return;
 		}

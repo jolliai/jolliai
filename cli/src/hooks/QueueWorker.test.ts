@@ -3186,6 +3186,39 @@ describe("QueueWorker", () => {
 
 			expect(stored.sessions.map((s) => s.sessionId)).toEqual(["real", "carrier"]);
 		});
+
+		it("persists compaction, turn-abort and test-run instants so the dashboard can read them later", async () => {
+			const stored = await __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/claude/s1.jsonl",
+					source: "claude",
+					entries: [],
+					compactions: [1_700_000_000_000, 1_700_000_100_000],
+					turnAborts: [1_700_000_200_000],
+					testRuns: [1_700_000_300_000, 1_700_000_400_000],
+				},
+			]);
+
+			expect(stored.sessions[0].compactions).toEqual([1_700_000_000_000, 1_700_000_100_000]);
+			expect(stored.sessions[0].turnAborts).toEqual([1_700_000_200_000]);
+			expect(stored.sessions[0].testRuns).toEqual([1_700_000_300_000, 1_700_000_400_000]);
+		});
+
+		it("omits compactions, turnAborts and testRuns for a source that cannot report them", async () => {
+			const stored = await __test__.buildStoredTranscript([
+				{
+					sessionId: "s1",
+					transcriptPath: "/gemini/s1.json",
+					source: "gemini",
+					entries: [{ role: "human", content: "hi", timestamp: "2026-08-19T10:00:00Z" }],
+				},
+			]);
+
+			expect(stored.sessions[0]).not.toHaveProperty("compactions");
+			expect(stored.sessions[0]).not.toHaveProperty("turnAborts");
+			expect(stored.sessions[0]).not.toHaveProperty("testRuns");
+		});
 	});
 
 	describe("mergeToolCallSlice", () => {

@@ -357,6 +357,16 @@ body {
   .sb-icon { width: 16px; height: 16px; display: inline-flex; flex: none; }
   .sb-icon svg { width: 100%; height: 100%; fill: none; stroke: currentColor; stroke-width: 1.8; stroke-linecap: round; stroke-linejoin: round; }
   .sb-item .name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  /* Beta tag rides right after the label (not pushed to the far edge like `.meta`),
+     so it reads as part of the row's identity rather than as a trailing metric. */
+  .sb-beta {
+    flex: none; margin-left: 6px; padding: 1px 6px; border-radius: 999px;
+    font-size: 10px; font-weight: 600; line-height: 1.4; letter-spacing: .02em;
+    text-transform: uppercase; color: var(--accent); background: var(--accent-soft);
+  }
+  /* Same badge next to the page-title <b> (Coaching) — nudged to sit on the title's
+     baseline rather than the big font's cap height. */
+  .pt-beta { display: inline-block; vertical-align: middle; position: relative; top: -1px; }
   .sb-item .meta { margin-left: auto; font-size: 11px; color: var(--muted); flex: none; }
   .sb-item .jmark { margin-left: auto; }
   @media (max-width: 899px) { .sidebar { display: none; } }
@@ -1347,6 +1357,12 @@ body {
      whatever the agent named the file, so it is long far more often than not. */
   .sheet h3 { margin: 0 0 2px; padding-right: 34px; font-size: 14px; }
   .sheet .sub { font-size: 12px; color: var(--muted); margin: 2px 0 10px; padding-right: 34px; }
+  .sheet-wide { width: min(1280px, 100%); }
+  .ctx-body {
+    flex: 0 1 auto; min-height: 0; overflow: auto; margin: 0; white-space: pre-wrap; word-break: break-word;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 12px; line-height: 1.6;
+    color: var(--ink-2); background: var(--page); border: 1px solid var(--grid); border-radius: 8px; padding: 12px;
+  }
   /* Corner ✕, matching the Settings modal's `.set-modal-close` (same box, hue and
      hover plate) so both dialog families dismiss the same way. The footer's
      "Close" button stays: this is the affordance a reader looks for after
@@ -2442,4 +2458,350 @@ body {
 	   WIDTH, which the frame had to borrow; width is unconstrained at every breakpoint now,
 	   so height is all that is left to hand back.) */
 	.jd .sk-band { --sk-band-plot-h: 180px; }
+}
+
+/* ── Journeys ─────────────────────────────────────────────────────────────
+   Colours come from the shell's tokens, so the page follows the theme without
+   the renderer branching on it. */
+
+/* The coaching page follows the artifact's panel grid rather than a plain
+   vertical stack: reports, patterns, adoption, queue, and a compact practice
+   summary each sit in their own card. */
+.coach-page { display: grid; gap: 14px; }
+/* Header tiles: Journeys / Flagged journeys / Awaiting an answer. A tile whose
+   count is unmeasured shows `—` in the same slot a number would occupy, never
+   a bare 0 — `.coach-tile-warn` only ever applies to a measured positive count. */
+.coach-tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 12px; }
+.coach-tile {
+	display: grid; gap: 4px; padding: 14px 16px;
+	border: 1px solid var(--border); border-radius: 12px;
+	background: var(--surface); box-shadow: var(--shadow-sm);
+}
+.coach-tile-value { font-size: 28px; font-weight: 650; letter-spacing: -.02em; color: var(--ink); font-variant-numeric: tabular-nums; }
+.coach-tile-label { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+.coach-tile-delta { font-size: 12px; color: var(--muted); }
+.coach-tile-value.coach-tile-warn { color: var(--warn); }
+.coach-panel,
+.jadopt, .jqueue {
+	border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px;
+	background: var(--surface); box-shadow: var(--shadow-sm);
+}
+/* `.jpatterns` sits INSIDE `.coach-panel.coach-patterns`, which already draws the
+   border/background — so it carries none of its own (no double border). */
+.coach-panel-head, .jpatterns-head {
+	display: flex; align-items: center; justify-content: space-between; gap: 12px;
+	margin-bottom: 10px;
+}
+/* Patterns & Reports: the question sits immediately to the RIGHT of the title
+   (left-aligned as one unit), not pushed to the far edge by space-between. */
+.jpatterns-head, .coach-panel-head { justify-content: flex-start; }
+.coach-panel-head h3,
+.jadopt h3, .jqueue h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+/* Reports (coach-panel-head) is a full section title like Patterns/Queue — a
+   proper-case heading, not the small uppercase label the shared rule above sets. */
+.coach-panel-head h3 { font-size: 18px; text-transform: none; letter-spacing: -.01em; color: var(--ink); }
+/* The per-panel question line, shared across the Reports/Patterns/Queue heads
+   (each head lays out differently — flex row for coach-panel-head/jpatterns-head,
+   plain block for jqueue-head — so this only normalizes the paragraph itself). */
+.coach-panel-q { margin: 0; font-size: 13px; color: var(--ink-2); }
+/* The observational-not-causal / medians-not-means disclosure under the
+   Patterns head — small print, same treatment as `.jqueue-foot`. */
+.coach-panel-method { margin: 4px 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+.coach-patterns { padding: 20px 24px; }
+.jpatterns { display: grid; gap: 22px; }
+.jpatterns-head { margin-bottom: 0; }
+.jpatterns-title-wrap { display: flex; align-items: center; gap: 12px; }
+.jpatterns h3 {
+	margin: 0; font-size: 18px; letter-spacing: -.01em; color: var(--ink);
+	text-transform: none;
+}
+/* Single-column list (the two-column layout with the left compare visual was
+   retired — mockup is a plain list). */
+.jpatterns-list { display: grid; gap: 20px; min-width: 0; }
+.jpatterns-group-title, .jpatterns-group-name, .jpatterns-group-meta, .jpatterns-adopt-kicker {
+	margin: 0;
+}
+.jpatterns-group + .jpatterns-group { margin-top: 16px; }
+.jpatterns-group-title {
+	padding-bottom: 8px; font-size: 12px; font-weight: 700; letter-spacing: .08em;
+	color: var(--muted); border-bottom: 1px solid var(--grid);
+}
+.jpatterns-group-action {
+	display: block; width: 100%; padding: 0; border: 0; background: transparent; text-align: left; cursor: pointer;
+}
+.jpatterns-group-action:focus-visible {
+	outline: 2px solid var(--accent); outline-offset: 4px; border-radius: 10px;
+}
+.jpatterns-group-row {
+	display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: center;
+	padding: 12px 0; border-bottom: 1px solid var(--grid);
+}
+.jpatterns-group-action:hover .jpatterns-group-row .jpatterns-group-name,
+.jpatterns-group-action:hover .jpatterns-group-row .jpatterns-group-outcome { color: var(--accent); }
+.jpatterns-group-name { font-size: 15px; font-weight: 600; color: var(--ink); }
+.jpatterns-group-meta { margin-top: 2px; font-size: 12px; color: var(--muted); }
+.jpatterns-group-outcome { font-size: 13px; font-weight: 600; white-space: nowrap; }
+.jpatterns-group-row[data-pattern-tone="working"] .jpatterns-group-outcome { color: var(--good); }
+.jpatterns-group-row[data-pattern-tone="dragging"] .jpatterns-group-outcome { color: var(--warn); }
+.jpatterns-group-row[data-pattern-tone="emerging"] .jpatterns-group-outcome { color: var(--muted); }
+.jpatterns-adopt { display: grid; gap: 10px; padding-top: 12px; border-top: 1px solid var(--grid); }
+.jpatterns-adopt-kicker { font-size: 12px; font-weight: 700; letter-spacing: .08em; color: var(--muted); text-transform: uppercase; }
+/* Plain text list — a bold recommendation followed by its evidence detail. No
+   card/widget chrome. */
+.jpatterns-adopt-rows { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.jpatterns-adopt-item { font-size: 14px; line-height: 1.5; }
+.jpatterns-adopt-item-title { font-weight: 600; color: var(--ink); }
+.jpatterns-adopt-item-detail { color: var(--muted); }
+/* Trace legend — a wrapping row of mark + label pairs explaining the journey
+   strip vocabulary. */
+/* Shared trace legend — used by both Patterns and Reports. */
+.jtrace-legend {
+	display: flex; flex-wrap: wrap; gap: 8px 18px; padding-top: 14px; border-top: 1px solid var(--grid);
+	font-size: 12px; color: var(--muted);
+}
+.jlegend-item { display: inline-flex; align-items: center; gap: 6px; }
+.jlegend-mark { display: inline-flex; flex: none; width: 22px; height: 10px; align-items: center; justify-content: center; }
+.jlegend-solid { border-top: 3px solid var(--accent); }
+.jlegend-dashed { border-top: 3px dashed var(--accent); }
+.jlegend-break { width: 2px; height: 12px; background: var(--border); }
+.jlegend-decision { width: 8px; height: 8px; background: var(--accent); transform: rotate(45deg); border-radius: 1px; }
+.jlegend-friction { width: 3px; height: 12px; background: var(--warn); border-radius: 999px; }
+.jlegend-degraded { border-top: 3px solid var(--crit); }
+.jlegend-landed { width: 8px; height: 8px; background: var(--good); border-radius: 999px; }
+.jlegend-nocommit { width: 8px; height: 8px; border: 1.5px solid var(--muted); border-radius: 999px; }
+/* Patterns footer — chips + the two controls, then the expandable method note. */
+.jpatterns-foot {
+	display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding-top: 12px;
+	font-size: 12px;
+}
+.jpatterns-foot-chip {
+	padding: 2px 9px; border-radius: 999px; background: var(--lock-bg); color: var(--muted);
+}
+.jpatterns-measured-btn, .jreports-measured-btn {
+	appearance: none; border: 0; background: transparent; font: inherit; font-size: 12px;
+	color: var(--accent); cursor: pointer; padding: 0;
+}
+/* "how this is measured" — an info glyph plus its label, on all three panels. */
+.jmeasure-btn { display: inline-flex; align-items: center; gap: 5px; }
+.jmeasure-icon { width: 14px; height: 14px; flex: none; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+/* "Browse the record" — a link (to Memories), pushed to the row's right edge. */
+.jbrowse-record { margin-left: auto; font-size: 12px; font-weight: 600; color: var(--accent); text-decoration: none; cursor: pointer; }
+.jbrowse-record:hover { text-decoration: underline; }
+.jpatterns-measured-btn:hover, .jreports-measured-btn:hover { text-decoration: underline; }
+.jpatterns-method, .jreports-method { margin: 10px 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+.jadopt-list, .jqueue-list { list-style: none; margin: 0; padding: 0; }
+.jadopt-item { display: flex; flex-direction: column; gap: 2px; padding: 8px 0; border-top: 1px solid var(--grid); }
+.jadopt-item:first-child { border-top: 0; }
+.jadopt-title { font-weight: 500; }
+.jadopt-detail { font-size: 12px; color: var(--muted); }
+.jadopt-share { font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.jqueue { display: grid; gap: 18px; padding: 18px 20px; }
+/* Title and question on one line, question immediately to the right of the title
+   — same treatment as `.jpatterns-head`. */
+.jqueue-head { display: flex; align-items: center; gap: 12px; margin-bottom: -2px; }
+.jqueue-title-wrap { display: flex; align-items: center; gap: 14px; }
+.jqueue h3 {
+	margin: 0; font-size: 18px; letter-spacing: -.01em; color: var(--ink);
+	text-transform: none;
+}
+.jqueue-list { display: grid; gap: 14px; }
+/* Single-column card — no per-person avatar column (single-subject). */
+.jqueue-card {
+	display: block; min-width: 0;
+	padding: 20px 22px; border: 1px solid var(--border); border-radius: 18px; background: var(--surface);
+}
+/* The status tag borrows the mockup's blocker/ramp/trend colour semantics:
+   `scope` (blocked-work) reads warning, `practice` (a positive habit) reads
+   positive, the neutral `note` fallback reads muted. Real theme tokens only. */
+.jqueue-card[data-queue-tone="practice"] .jqueue-tag { color: var(--good); }
+.jqueue-card[data-queue-tone="scope"] .jqueue-tag { color: var(--warn); }
+.jqueue-copy { display: grid; gap: 10px; min-width: 0; }
+.jqueue-row-top {
+	display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 16px; align-items: start;
+}
+.jqueue-title {
+	font-size: 17px; line-height: 1.35; font-weight: 650; color: var(--ink);
+}
+.jqueue-tag {
+	font-size: 11px; letter-spacing: .14em; text-transform: uppercase; color: var(--muted);
+	white-space: nowrap;
+}
+.jqueue-detail {
+	font-size: 14px; line-height: 1.55; color: var(--ink-2);
+}
+.jqueue-evidence-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+.jqueue-evidence {
+	font-size: 12px; color: var(--muted);
+}
+.jqueue-link {
+	appearance: none; border: 0; background: transparent; padding: 0;
+	color: var(--accent); font: inherit; font-size: 13px; font-weight: 600; cursor: pointer; text-align: left;
+}
+.jqueue-link:hover { text-decoration: underline; }
+/* Footer — chips + the measured toggle, then the expandable note. Mirrors the
+   patterns footer. */
+.jqueue-foot {
+	display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; margin: 0; font-size: 12px;
+}
+.jqueue-foot-chip { padding: 2px 9px; border-radius: 999px; background: var(--lock-bg); color: var(--muted); }
+.jqueue-measured-btn {
+	appearance: none; border: 0; background: transparent; font: inherit; font-size: 12px;
+	color: var(--accent); cursor: pointer; padding: 0;
+}
+.jqueue-measured-btn:hover { text-decoration: underline; }
+.jqueue-method { margin: 10px 0 0; font-size: 12px; line-height: 1.55; color: var(--muted); }
+
+/* The collapsed single-subject report row (§B, part 1) — the collapsed head of
+   the Reports panel, rendered by `JD.reportRow` and composed into `renderCoaching`. */
+.report-row { display: flex; align-items: center; gap: 14px; padding: 12px 14px; border: 1px solid var(--border); border-radius: 10px; margin-bottom: 16px; background: var(--page); cursor: pointer; transition: box-shadow .12s ease; }
+.report-row:hover { box-shadow: var(--shadow-sm); }
+.report-avatar {
+	display: flex; align-items: center; justify-content: center; flex-shrink: 0;
+	width: 32px; height: 32px; border-radius: 999px; background: var(--lock-bg); color: var(--accent);
+	font-size: 12px; font-weight: 600; letter-spacing: .02em;
+}
+.report-name { font-weight: 500; white-space: nowrap; }
+.report-count { color: var(--muted); font-size: 13px; white-space: nowrap; }
+.report-strip { display: inline-flex; align-items: center; gap: 4px; }
+.report-strip-more { font-size: 12px; color: var(--muted); }
+.report-facets { display: flex; align-items: center; gap: 16px; margin-left: auto; }
+.report-facet { display: inline-flex; align-items: baseline; gap: 4px; font-variant-numeric: tabular-nums; }
+.report-facet-arrow { font-size: 12px; color: var(--muted); }
+.report-facet-value { font-weight: 500; }
+.report-facet-label { font-size: 11px; color: var(--muted); }
+.report-flagged { padding: 3px 10px; border-radius: 999px; background: color-mix(in srgb, var(--warn) 14%, var(--surface)); color: var(--warn); font-size: 12px; font-weight: 600; white-space: nowrap; }
+
+/* The always-open expansion body (§B, part 2): a self-trend summary bar above
+   the two highlight cards, rendered by `JD.reportExpansion`. */
+.report-expansion { margin-bottom: 16px; }
+.report-summary {
+	display: flex; align-items: center; gap: 10px; padding: 10px 14px;
+	border: 1px solid var(--border); border-radius: 10px; margin-bottom: 12px; background: var(--page);
+}
+.report-summary-measure { font-weight: 500; white-space: nowrap; }
+.report-summary-against { color: var(--muted); font-size: 12px; white-space: nowrap; margin-right: auto; }
+.report-cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+                gap: 12px; margin-bottom: 0; }
+/* Positive vs warning framing for the two highlight cards — the only colour
+   distinction between them. */
+.jcard[data-kind="worth-sharing"] { border-color: color-mix(in srgb, var(--good) 40%, var(--border)); }
+.jcard[data-kind="worth-sharing"] h3 { color: var(--good-text); }
+.jcard[data-kind="needs-help"] { border-color: color-mix(in srgb, var(--warn) 40%, var(--border)); }
+.jcard[data-kind="needs-help"] h3 { color: var(--warn); }
+
+.jfeed-btn { display: inline-block; padding: 8px 16px; border: 1px solid var(--accent); border-radius: 999px; background: transparent; color: var(--accent); cursor: pointer; font-size: 13px; white-space: nowrap; }
+.jfeed-btn:hover { background: var(--lock-bg); }
+
+.jfeed { display: flex; flex-direction: column; gap: 2px; }
+.jrow { display: grid; grid-template-columns: 1fr auto 170px auto auto; gap: 12px;
+        align-items: center; padding: 10px 12px; background: none; border: 0;
+        border-radius: 6px; text-align: left; cursor: pointer; color: inherit; }
+.jrow:hover { background: var(--lock-bg); }
+.jfchips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 4px; }
+.jfchip { padding: 3px 10px; border: 1px solid var(--border); border-radius: 12px; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer; }
+.jfchip:hover { background: var(--lock-bg); }
+.jfchip.on { border-color: var(--accent); color: var(--accent); }
+.jfday { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; padding: 10px 0 3px; }
+.jrow-title { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jrow-shape, .jrow-meta { color: var(--muted); font-size: 12px; }
+.jbadge { font-size: 11px; padding: 1px 6px; border-radius: 10px; border: 1px solid var(--border); }
+.jbadge[data-grouped-by="ticket"] { color: var(--accent); border-color: var(--accent); }
+.jbadge[data-grouped-by="branch"] { color: var(--muted); }
+.jbadge[data-grouped-by="commit"] { color: var(--muted); opacity: 0.7; }
+.jglyph .glyph-bar { fill: var(--accent); }
+/* The unmeasured bar is neutral AND translucent, so it cannot be misread as a
+   short measured one. */
+.jglyph .glyph-bar[data-unmeasured="true"] { fill: var(--muted); opacity: 0.45; }
+.jglyph .glyph-sep { stroke: var(--border); stroke-width: 1; }
+.jglyph .glyph-decision { fill: var(--accent); stroke: var(--accent); stroke-width: 1; }
+.jempty { padding: 32px; text-align: center; color: var(--muted); }
+.jcard { padding: 14px; border: 1px solid var(--border); border-radius: 10px; background: var(--page); }
+/* A highlight card opens its journey trace on click (see journeys.js) — signal
+   it the way a feed row does, without disturbing the non-clickable base card. */
+.jcard-clickable { cursor: pointer; transition: box-shadow .12s ease, transform .12s ease; }
+.jcard-clickable:hover { box-shadow: var(--shadow-sm); transform: translateY(-1px); }
+.jcard-clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.jcard h3 { margin: 0 0 4px; font-size: 12px; text-transform: uppercase; color: var(--muted); }
+/* States the basis for "Smoothest"/"Hardest" so neither reads as a verdict
+   with no stated grounds. */
+.jcard-rankedby { margin: 0 0 6px; font-size: 11px; color: var(--muted); }
+.jcard-title { margin: 0 0 8px; font-weight: 500; }
+.jcard-figures { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; margin: 8px 0 0; font-size: 12px; }
+.jcard-figures dt { color: var(--muted); }
+.jcard-figures dd { margin: 0; }
+
+/* The trace sheet. `#ovJourney` shares `.overlay`/`.sheet` with the Context
+   viewer, so only the body's own layout lives here. */
+/* The trace opens FROM the feed modal (a row click) and must stack above it:
+   both are `.overlay` at z-index 80, and `#ovFeed` sits later in the DOM, so
+   it would otherwise paint over the sheet the reader just asked to see —
+   clicking a journey silently opens the detail underneath the modal it was
+   clicked from. */
+#ovJourney { z-index: 90; }
+.jtrace-body { max-height: 60vh; overflow-y: auto; }
+.jtrace-visual { padding-bottom: 8px; border-bottom: 1px solid var(--grid); }
+.jtrace-badge { display: inline-block; padding: 1px 7px; border: 1px solid var(--border); border-radius: 10px; font-size: 11px; color: var(--muted); }
+/* Mirrors `.jbadge[data-grouped-by=...]` above so the trace sheet's badge and
+   the feed's badge cannot present a branch journey as a ticket one (or vice
+   versa) via colour alone — same attribute, same treatment. */
+.jtrace-badge[data-grouped-by="ticket"] { color: var(--accent); border-color: var(--accent); }
+.jtrace-badge[data-grouped-by="branch"] { color: var(--muted); }
+.jtrace-badge[data-grouped-by="commit"] { color: var(--muted); opacity: 0.7; }
+.jtrace-shape { margin-left: 8px; font-size: 12px; color: var(--ink-2); }
+.jtrace-meta { margin-left: 10px; font-size: 12px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.jtrace-section { padding: 12px 0; border-bottom: 1px solid var(--grid); }
+.jtrace-section h4 { margin: 0 0 8px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.jtrace-section p { margin: 0; line-height: 1.5; }
+.jtrace-empty-copy { color: var(--muted); }
+.jtrace-bands { list-style: none; margin: 0; padding: 0; }
+.jtrace-band { display: grid; grid-template-columns: 24px 1fr auto; gap: 8px;
+               align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border); }
+.jtrace-ord { color: var(--muted); font-size: 12px; text-align: right; }
+.jtrace-hash { color: var(--muted); font-size: 12px; }
+.jtrace-decisions { margin: 4px 0 0; padding-left: 18px; }
+.jtrace-decision { margin: 2px 0; }
+.jwait-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.jwait { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; border-top: 1px solid var(--grid); }
+.jwait:first-child { border-top: 0; }
+.jwait-duration { font-weight: 500; font-variant-numeric: tabular-nums; }
+.jwait-time { font-size: 12px; color: var(--muted); }
+.jtrace-attribution { margin: 0 0 10px; font-size: 12px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+.jtrace-svg { display: block; width: 100%; height: auto; margin: 6px 0 14px; }
+.jtrace-stage { fill: var(--lock-bg); stroke: var(--border); stroke-width: 1; }
+.jtrace-stage-label { font-size: 11px; fill: var(--muted); }
+.jtrace-axis { stroke: var(--border); stroke-width: 1; }
+.jtrace-commit { fill: var(--accent); }
+.jtrace-decision-mark { fill: var(--accent); }
+.jtrace-compaction { fill: var(--crit); }
+.jcompaction-list { list-style: none; margin: 4px 0 0; padding: 0; }
+.jcompaction { display: flex; gap: 10px; align-items: baseline; padding: 4px 0; border-top: 1px solid var(--grid); }
+.jcompaction:first-child { border-top: 0; }
+.jcompaction-time { font-size: 12px; color: var(--muted); }
+.jtrace-receipts { display: flex; flex-wrap: wrap; gap: 12px; font-size: 12px; color: var(--ink-2); }
+.jtrace-receipt code { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+
+/* The sub-line's one asserted status. Amber, pill-shaped — a state to notice, not
+   an error, and only shown when a wait actually stalled (see `renderJourneyMeta`). */
+.jtrace-status { margin-left: 10px; padding: 1px 8px; border: 1px solid var(--warn); border-radius: 10px; font-size: 11px; color: var(--warn); }
+
+/* The measurable stats, two-up. `activity`/`est cost`/`sessions`/`waiting` only —
+   the mockup's per-phase "where the time went" split and degraded-context share
+   have no local signal yet and are deliberately absent. */
+.jtrace-stats { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px 24px; margin: 0; padding: 12px 0; border-bottom: 1px solid var(--grid); }
+.jtrace-stats dt { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
+.jtrace-stats dd { margin: 2px 0 0; font-size: 15px; color: var(--ink); font-variant-numeric: tabular-nums; }
+
+/* The trace sheet's own legend — marks match the SVG glyphs `traceSvg` draws
+   (stage band, commit dot, decision diamond, compaction dot) and nothing else. */
+.jtrace-sheet-legend { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 10px; font-size: 11px; color: var(--muted); }
+.jsheet-legend-item { display: inline-flex; align-items: center; gap: 6px; }
+.jsheet-legend-mark { display: inline-flex; flex: none; width: 18px; height: 10px; align-items: center; justify-content: center; }
+.jsheet-legend-band { height: 8px; background: var(--lock-bg); border: 1px solid var(--border); border-radius: 2px; }
+.jsheet-legend-commit { width: 8px; height: 8px; background: var(--accent); border-radius: 999px; }
+.jsheet-legend-decision { width: 8px; height: 8px; background: var(--accent); transform: rotate(45deg); border-radius: 1px; }
+.jsheet-legend-compaction { width: 8px; height: 8px; background: var(--crit); border-radius: 999px; }
+
+@media (max-width: 760px) {
+	.coach-patterns { padding: 16px; }
+	.jpatterns-group-outcome { white-space: normal; }
 }

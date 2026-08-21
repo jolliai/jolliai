@@ -8,6 +8,7 @@
 		/* Page mode, not the card grid: the list is one full-height column, the same
 		   shape the browser pages below use. */
 		skills: { render: (model) => window.JD.renderSkills(model), grid: false },
+		journeys: { render: (model) => window.JD.renderCoaching(model), grid: false },
 		memories: { render: (model) => window.JD.renderMemories(model), grid: false },
 		knowledge: { render: (model) => window.JD.renderKnowledge(model), grid: false },
 		graph: { render: (model) => window.JD.renderGraph(model), grid: false },

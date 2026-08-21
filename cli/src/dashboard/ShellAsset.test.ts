@@ -1073,19 +1073,19 @@ describe("JD.renderShell — optional nav rows", () => {
 	it("hides Knowledge and Graph when both flags are off", () => {
 		const h = loadJD();
 		h.JD.renderShell(model({ menus: menus(false, false) }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories"]);
 	});
 
 	it("shows each row only when its own flag is on, keeping NAV_MIDDLE's order", () => {
 		const h = loadJD();
 		h.JD.renderShell(model({ menus: menus(true, false) }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories", "knowledge"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories", "knowledge"]);
 
 		h.JD.renderShell(model({ menus: menus(false, true) }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories", "graph"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories", "graph"]);
 
 		h.JD.renderShell(model({ menus: menus(true, true) }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories", "knowledge", "graph"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories", "knowledge", "graph"]);
 	});
 
 	// The rows carry their icon and path from the same tables the always-on rows
@@ -1102,7 +1102,15 @@ describe("JD.renderShell — optional nav rows", () => {
 		// one that grew a second. `stats` and `standup` are the two that used to draw
 		// none — they were indented children under a group label that wore the mark
 		// belonging to My Dashboard.
-		expect(iconsPerRow(h)).toEqual({ stats: 1, standup: 1, skills: 1, memories: 1, knowledge: 1, graph: 1 });
+		expect(iconsPerRow(h)).toEqual({
+			stats: 1,
+			standup: 1,
+			skills: 1,
+			journeys: 1,
+			memories: 1,
+			knowledge: 1,
+			graph: 1,
+		});
 	});
 
 	// A payload with no `menus` at all is what a tab left open across an upgrade
@@ -1112,7 +1120,7 @@ describe("JD.renderShell — optional nav rows", () => {
 	it("treats an absent menus slice as both rows hidden", () => {
 		const h = loadJD();
 		h.JD.renderShell(model());
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories"]);
 	});
 
 	// A slice naming only one row, or holding a non-boolean, must degrade the same
@@ -1121,10 +1129,10 @@ describe("JD.renderShell — optional nav rows", () => {
 	it("treats a partial or non-boolean menus slice as hidden", () => {
 		const h = loadJD();
 		h.JD.renderShell(model({ menus: { knowledge: true } }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories", "knowledge"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories", "knowledge"]);
 
 		h.JD.renderShell(model({ menus: { knowledge: "yes", graph: 1 } }));
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories"]);
 	});
 
 	// Only the ROW is gated. Landing on /graph with the flag off still renders the
@@ -1135,7 +1143,7 @@ describe("JD.renderShell — optional nav rows", () => {
 		const h = loadJD();
 		h.JD.renderShell(model({ view: "graph", menus: menus(false, false) }));
 		expect(h.element("pageTitle").textContent).toBe("Graph");
-		expect(navViews(h)).toEqual(["stats", "standup", "skills", "memories"]);
+		expect(navViews(h)).toEqual(["stats", "standup", "skills", "journeys", "memories"]);
 	});
 
 	// Settings is built from NAV_BOTTOM, outside the filtered loop, so no change to

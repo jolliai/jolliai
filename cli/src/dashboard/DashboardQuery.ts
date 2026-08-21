@@ -6,12 +6,12 @@
  *
  * Every local-time decision in the dashboard — "today"'s boundaries, heatmap
  * day buckets, the hour histogram, streaks — goes through the JS/IANA helpers
- * in this file, driven by one `timeZone` string. SQLite's `localtime` is never
- * used: it answers with the process's zone at query time, drifts on Windows,
- * and cannot agree with the boundaries computed here. The database itself
- * stores only UTC epoch-ms; SQL filters rows by `*_ms` range (index-friendly)
- * and the bucketing happens in JS with `Intl`, which is DST-aware and
- * identical across platforms.
+ * in `TimeZone.ts`, driven by one `timeZone` string. SQLite's `localtime` is
+ * never used: it answers with the process's zone at query time, drifts on
+ * Windows, and cannot agree with the boundaries computed here. The database
+ * itself stores only UTC epoch-ms; SQL filters rows by `*_ms` range
+ * (index-friendly) and the bucketing happens in JS with `Intl`, which is
+ * DST-aware and identical across platforms.
  *
  * Everything here opens the database read-only. There is deliberately no way
  * to reach a write from a query.
@@ -24,6 +24,7 @@ import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { CommitSummary, SkillEntryPath } from "../Types.js";
 import { ACTIVITY_BUCKET_MS } from "./ActivityBuckets.js";
+import { buildCoaching } from "./CoachingQuery.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import type {
 	AdoptionTier,
@@ -115,6 +116,15 @@ const RANGE_DAYS: Readonly<Record<PresetRange, number>> = { today: 1, week: 7, "
 const DEFAULT_RANGE: PresetRange = "month";
 
 /**
+ * Coaching (the `journeys` view) opens on a tighter default than the rest of the
+ * dashboard: a 7-day window rather than the shared `DEFAULT_RANGE` month. It is a
+ * DEFAULT, not a lock — an explicit `?range=` from the topbar still wins — so the
+ * divergence lives only where no range was asked for. Named (not inlined) so the
+ * one page that departs from the global default is greppable.
+ */
+export const JOURNEYS_DEFAULT_RANGE: PresetRange = "week";
+
+/**
  * How far back a custom range may reach, in local days.
  *
  * Not a data-retention statement — it is a scan bound. A custom window is the
@@ -123,7 +133,7 @@ const DEFAULT_RANGE: PresetRange = "month";
  * ceiling. Asking for more is clamped (never rejected): the reader still gets
  * the most recent year, and `rangeFrom` reports the window they actually got.
  */
-const MAX_CUSTOM_DAYS = 366;
+export const MAX_CUSTOM_DAYS = 366;
 
 /** A session updated within this window renders as "live". */
 const LIVE_WINDOW_MS = 10 * 60 * 1000;
@@ -133,7 +143,7 @@ const NIGHT_OWL_HOUR = 21;
 // ── Range resolution ────────────────────────────────────────────────────────
 
 /** A range request resolved into concrete bounds and day keys. */
-interface ResolvedWindow {
+export interface ResolvedWindow {
 	/** What the page ended up showing — `custom` only if the request survived. */
 	readonly range: DashboardRange;
 	/** Inclusive lower bound, epoch-ms. */
@@ -185,8 +195,15 @@ function resolveCustomWindow(
 	};
 }
 
-/** Turns the requested range into the one window every figure is computed over. */
-function resolveWindow(
+/**
+ * Turns the requested range into the one window every figure is computed over.
+ *
+ * Exported so the Journeys builder computes the SAME window the topbar control
+ * means. A second definition would let the range chip and the feed disagree
+ * about what "30d" is, and the journey grouping is window-dependent — see the
+ * spec's §2.2 — so a drifting window silently changes what a journey IS.
+ */
+export function resolveWindow(
 	range: DashboardRange | undefined,
 	customFrom: string | undefined,
 	customTo: string | undefined,
@@ -492,15 +509,30 @@ const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_t
  * commit carrying turns/tokens or a mined insight. Space stays future work.
  */
 export function detectTier(db: DashboardDbHandle): AdoptionTier {
-	const row = db
+	// Two probes instead of one additive expression, so the cheap one runs
+	// alone in the common case. Enrichment is monotonic — the tier only ever
+	// moves installed -> memory, nothing removes it — so a memory tier is
+	// proven by the first probe (turns/tokens/ticket_id are generated columns
+	// off summary_json), and the expensive json_each expansion over every
+	// memory's summary_json never runs on a database that is already memory
+	// tier. Only an installed-tier database — where the first probe found
+	// nothing — pays the second scan, and that is the same cost the old
+	// single additive query paid on every request.
+	const enriched = db
 		.prepare(
-			`SELECT EXISTS (SELECT 1 FROM memories WHERE turns IS NOT NULL OR tokens IS NOT NULL OR ticket_id IS NOT NULL)
-			      + EXISTS (SELECT 1 FROM memories, json_each(memories.summary_json, '$.topics') t
+			`SELECT EXISTS (SELECT 1 FROM memories
+			                 WHERE turns IS NOT NULL OR tokens IS NOT NULL OR ticket_id IS NOT NULL) AS n`,
+		)
+		.get() as { n: number };
+	if (enriched.n > 0) return "memory";
+	const insight = db
+		.prepare(
+			`SELECT EXISTS (SELECT 1 FROM memories, json_each(memories.summary_json, '$.topics') t
 			                 WHERE TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
 			                    OR TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> '') AS n`,
 		)
-		.get() as { n: number } | undefined;
-	return (row?.n ?? 0) > 0 ? "memory" : "installed";
+		.get() as { n: number };
+	return insight.n > 0 ? "memory" : "installed";
 }
 
 interface SeriesResult {
@@ -2976,7 +3008,10 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 	const window = () => resolveWindow(options.range, options.customFrom, options.customTo, nowMs, timeZone);
 	// Exactly one view payload is built per request — the other two would be
 	// wasted queries, and the page only ever reads its own.
-	const payload = (): Pick<DashboardModel, "stats" | "standup" | "memories" | "knowledge" | "graph" | "settings"> => {
+	const payload = (): Pick<
+		DashboardModel,
+		"stats" | "standup" | "memories" | "knowledge" | "graph" | "settings" | "coaching"
+	> => {
 		switch (options.view) {
 			// Skills reads `stats.toolUsage` and nothing else, so it shares this payload
 			// rather than declaring one of its own — which is also what lets its list and
@@ -3042,6 +3077,34 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 				// builder (no DB read), so there is nothing to query here — just pass
 				// the pre-built snapshot through. Absent only if the builder omitted it.
 				return { settings: options.settingsModel };
+			case "journeys": {
+				// Coaching's own default (see JOURNEYS_DEFAULT_RANGE) — only when no
+				// range was asked for; an explicit preset or `custom` still wins.
+				const resolved = resolveWindow(
+					options.range ?? JOURNEYS_DEFAULT_RANGE,
+					options.customFrom,
+					options.customTo,
+					nowMs,
+					timeZone,
+				);
+				return {
+					coaching: {
+						...buildCoaching(
+							db,
+							options.scope,
+							resolved.startMs,
+							resolved.endMs,
+							timeZone,
+							options.reachableCommits,
+						),
+						// Echoed for the topbar range control, exactly as the stats
+						// payload does it (see `range`/`rangeFrom`/`rangeTo` above).
+						range: resolved.range,
+						rangeFrom: resolved.from,
+						rangeTo: resolved.to,
+					},
+				};
+			}
 		}
 	};
 
