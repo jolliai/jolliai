@@ -1517,7 +1517,7 @@ name: jolli
 description: The Jolli action menu — a single front door that lists the Jolli skills available in this session (recall, search, run a workflow local or remote, workflow history, plus any setup and account skills a Jolli plugin adds) and the Jolli MCP tools, then routes your choice to the right one. Use when the user types /jolli or asks for the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 8
+  revision: 9
   vendor: "jolli.ai"
 ---
 
@@ -1699,7 +1699,7 @@ name: jolli
 description: The Jolli front door — checks how Jolli is set up in this repo, guides first-time setup through /jolli:init when something's missing, reminds you to sign in when memories can't sync yet, and otherwise shows a status snapshot and routes you to the right Jolli skill or MCP tool. Use when the user types /jolli or asks for Jolli / the Jolli menu.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 9
+  revision: 10
   vendor: "jolli.ai"
 ---
 

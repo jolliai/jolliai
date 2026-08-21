@@ -225,7 +225,7 @@ server prints once it is listening:
 \`\`\`bash
 LOG=$(mktemp "\${TMPDIR:-/tmp}/jolli-dashboard.XXXXXX")
 echo "LOG $LOG"
-nohup "$HOME/.jolli/jollimemory/run-cli" dashboard >"$LOG" 2>&1 &
+JOLLI_INVOKED_VIA=skill:dashboard nohup "$HOME/.jolli/jollimemory/run-cli" dashboard >"$LOG" 2>&1 &
 echo "PID $!"
 for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
 	URL=$(grep -o 'http://127\\.0\\.0\\.1:[0-9]*/dashboard' "$LOG" | head -1)

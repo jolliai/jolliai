@@ -95,7 +95,7 @@ read:
 **Fallback (CLI):** if the `status` tool is unavailable, read the same facts from
 
 ```bash
-"$HOME/.jolli/jollimemory/run-cli" status
+JOLLI_INVOKED_VIA=skill:jolli "$HOME/.jolli/jollimemory/run-cli" status
 ```
 
 If neither can be reached, skip the state-based guidance and go straight to

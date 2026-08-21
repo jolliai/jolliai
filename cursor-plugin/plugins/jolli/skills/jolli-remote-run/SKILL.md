@@ -1,10 +1,6 @@
 ---
 name: jolli-remote-run
 description: Run a Jolli workflow remotely — the Jolli backend executes the workflow server-side; this recipe triggers the run, monitors it to completion, reports the outcome (failed / cancelled / succeeded) with its article, PR, and workflow links, and offers to open any in your browser. Use when the user wants to run a Jolli workflow remotely (on the Jolli backend).
-metadata:
-  version: "dev"
-  revision: 5
-  vendor: "jolli.ai"
 ---
 
 # Jolli Remote Run
@@ -164,3 +160,15 @@ While a remote run is still in progress, the user can stop it: call
 `mcp__jollimemory__cancel_remote_workflow`) with the workflow's numeric id —
 `{ "id": <workflow id> }`. After cancelling, re-run `workflow run-status <runId>`
 to report the cancelled outcome (who/when + workflow URL).
+
+## If the Jolli CLI dispatcher is missing (Cursor)
+
+`$HOME/.jolli/jollimemory/run-cli` is written by this plugin's `sessionStart` hook,
+and a freshly installed plugin's hooks are not registered until Cursor has been fully
+restarted — a window reload or another chat is not enough (measured). So when that file
+does not exist, the fix is to **quit Cursor completely (⌘Q) and reopen it, then start
+a new chat**, and retry.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+`@jolli.ai/cli` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.

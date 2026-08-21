@@ -1476,8 +1476,13 @@ describe("skill revision is kept in lockstep with the body", () => {
 		search: { build: buildSearchSkillTemplate, revision: 3, fingerprint: "602cea610684" },
 		localRun: { build: buildLocalRunSkillTemplate, revision: 6, fingerprint: "d04d02ba2c73" },
 		remoteRun: { build: buildRemoteRunSkillTemplate, revision: 5, fingerprint: "e3e5572715a3" },
-		menu: { build: buildJolliMenuSkillTemplate, revision: 8, fingerprint: "5662a77934fb" },
-		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 9, fingerprint: "5f05bec43ad1" },
+		// 9/10 rather than 8/9: main and this branch each changed the menu bodies
+		// under 8/9 independently (dashboard routing there, via prefixes here), so
+		// the merged bodies differ from BOTH already-dogfooded 8/9s under the same
+		// numbers — and an equal revision never overwrites (the lockstep contract),
+		// so without this bump no existing install would ever receive the merge.
+		menu: { build: buildJolliMenuSkillTemplate, revision: 9, fingerprint: "29b528112102" },
+		pluginMenu: { build: buildPluginJolliMenuSkillTemplate, revision: 10, fingerprint: "be1e140af79a" },
 	} as const;
 
 	for (const [name, want] of Object.entries(EXPECTED)) {
@@ -1507,7 +1512,9 @@ describe("skill revision is kept in lockstep with the body", () => {
 	// already prefixed) — deliberately narrower than "any line mentioning
 	// run-cli": the Step-0 `test -f …run-cli` presence checks never run a jolli
 	// command, so no command_invoked exists for them to annotate.
-	const INVOCATION = /^[ \t]*(?:JOLLI_INVOKED_VIA=\S+ )?"\$HOME\/\.jolli\/jollimemory\/run-cli" .*$/gm;
+	// `nohup` is a legal shape between the prefix and the command (the dashboard
+	// skill backgrounds its server); the env assignment must still come FIRST.
+	const INVOCATION = /^[ \t]*(?:JOLLI_INVOKED_VIA=\S+ )?(?:nohup )?"\$HOME\/\.jolli\/jollimemory\/run-cli" .*$/gm;
 	for (const { name, build } of VIA_SKILLS) {
 		it(`${name}: every run-cli invocation carries via skill:${name} (${build.name})`, () => {
 			const body = build();
@@ -1524,7 +1531,7 @@ describe("skill revision is kept in lockstep with the body", () => {
 	// generator, so nothing regenerates them when the shared builders move —
 	// which is exactly how they shipped without the via prefix once. Pin the
 	// prefix on the files themselves.
-	for (const name of ["recall", "search"] as const) {
+	for (const name of ["recall", "search", "dashboard"] as const) {
 		it(`claude bundle ${name}: its committed run-cli invocation carries via skill:${name}`, () => {
 			const file = join(
 				dirname(fileURLToPath(import.meta.url)),

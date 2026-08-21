@@ -416,6 +416,7 @@ export const SKILL_VIA_NAMES: ReadonlyArray<string> = [
 	"status",
 	"timeline",
 	"push",
+	"dashboard",
 ];
 
 const SKILL_VIA_SET: ReadonlySet<string> = new Set(SKILL_VIA_NAMES);
