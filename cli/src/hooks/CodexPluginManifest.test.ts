@@ -50,6 +50,61 @@ describe("Codex plugin manifest", () => {
 	});
 });
 
+// The branding fields are paths into the installed plugin package, and every way they
+// can be wrong is silent. Codex draws its own generated placeholder tile for a plugin
+// whose logo resolves to nothing, so a typo, a renamed file and an asset that was
+// never committed all look identical to a plugin that declared no branding at all —
+// the install stays healthy and only the icon is missing.
+//
+// Nothing else in this tree reads these paths, so this is the only thing tying them to
+// the publish gate, which is where existence is actually asserted: every
+// PUBLISH_REQUIRED_CONFIG entry is checked present-and-non-empty here AND staged in
+// the mirror, the pair that already caught a global gitignore eating a committed
+// SKILL.md. The list is DERIVED from the manifest rather than restated, so a dark logo
+// or a screenshot added later cannot ship without picking up that check.
+describe("Codex plugin branding assets", () => {
+	const readInterface = () =>
+		readJson(pluginRoot, ".codex-plugin", "plugin.json").interface as Record<string, unknown>;
+
+	const declaredAssets = (): string[] => {
+		const iface = readInterface();
+		const screenshots = Array.isArray(iface.screenshots) ? (iface.screenshots as unknown[]) : [];
+		return [iface.composerIcon, iface.logo, iface.logoDark, ...screenshots].filter(
+			(entry): entry is string => typeof entry === "string" && entry.length > 0,
+		);
+	};
+
+	it("declares a composer icon, a logo and a brand color", () => {
+		const iface = readInterface();
+		expect(iface.composerIcon).toBe("./assets/app-icon.png");
+		expect(iface.logo).toBe("./assets/logo.png");
+		// A malformed color is not rejected, it is ignored — the card renders untinted,
+		// which reads as a design choice rather than as a broken field.
+		expect(iface.brandColor).toMatch(/^#[0-9a-f]{6}$/iu);
+	});
+
+	it("keeps every asset a relative ./assets/ path inside the package", () => {
+		const assets = declaredAssets();
+		expect(assets.length).toBeGreaterThan(0);
+		for (const asset of assets) {
+			expect(asset, "paths must be relative and begin with ./").toMatch(/^\.\/assets\/[\w.-]+$/u);
+		}
+	});
+
+	it("lists every declared asset in PUBLISH_REQUIRED_CONFIG", () => {
+		const libText = readFileSync(join(repoRoot, "codex-plugin", "scripts", "_publish-lib.sh"), "utf-8");
+		const block = libText.split("PUBLISH_REQUIRED_CONFIG=(")[1]?.split(")")[0] ?? "";
+		const required = block.split(/\s+/u).filter((entry) => entry.length > 0);
+
+		expect(required.length).toBeGreaterThan(0);
+		for (const asset of declaredAssets()) {
+			expect(required, `${asset} is declared but never checked at publish`).toContain(
+				`plugins/jolli/${asset.slice(2)}`,
+			);
+		}
+	});
+});
+
 describe("Codex plugin MCP config", () => {
 	/*
 	 * The load-bearing one, and it asserts an ABSENCE.

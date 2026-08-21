@@ -18,7 +18,8 @@
 #   CURSOR_LOCAL_PLUGIN=/tmp/jolli bash cursor-plugin/scripts/publish-local.sh
 #
 # Alternatively, symlink the plugin directory instead of copying — Cursor follows it,
-# so a rebuild is picked up with a window reload and no re-run of this script:
+# so a rebuild is picked up with a window reload and no re-run of this script (the
+# first install still needs a full quit-and-reopen for the hooks to register):
 #   ln -s "$PWD/cursor-plugin/plugins/jolli" ~/.cursor/plugins/local/jolli
 # The trade-off is that a symlink exposes `scripts/` too, so it does not prove the
 # plugin works from what a consumer actually receives.
@@ -60,9 +61,12 @@ VERSION="$(publish_version)"
 echo ""
 echo "Local plugin installed at: $DEST  (jolli v$VERSION)"
 echo "Load it in Cursor:"
-echo "  1. Developer: Reload Window"
+echo "  1. QUIT Cursor completely and reopen it. A window reload loads the skills but"
+echo "     NOT a newly installed plugin's hooks (measured), so on a first install the"
+echo "     sessionStart hook below never runs and no dispatcher is written."
 echo "  2. Open Customize in the sidebar and confirm 'Jolli Memory' is listed"
 echo "  3. Start a new chat — the sessionStart hook installs this repo's git hooks"
 echo "     and writes .cursor/mcp.json"
 echo ""
-echo "Re-run this script after any change to cli/src or the skills, then reload again."
+echo "Re-run this script after any change to cli/src or the skills. A reload picks up"
+echo "changed skills and dist; quit and reopen if the hook itself needs to re-register."

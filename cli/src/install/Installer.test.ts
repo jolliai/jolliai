@@ -1,4 +1,4 @@
-import { lstatSync, mkdtempSync, readlinkSync, rmSync, symlinkSync } from "node:fs";
+import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,7 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
  * Only the shape claim is gated. That the mirror is PLACED, and that a vanished bundle
  * gets it cleaned up, hold under both placements and stay asserted everywhere.
  */
-const canSymlink = ((): boolean => {
+const _canSymlink = ((): boolean => {
 	const probe = mkdtempSync(join(tmpdir(), "jolli-symlink-probe-"));
 	try {
 		symlinkSync(join(probe, "target"), join(probe, "link"), "dir");
@@ -322,8 +322,10 @@ vi.mock("./ClaudeHookInstaller.js", async (importOriginal) => {
 
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { installSessionStartHook } from "./ClaudeHookInstaller.js";
+import { addGitExcludePaths } from "./GitExclude.js";
 import { renderInstructionsBlock } from "./GlobalInstructionsInstaller.js";
 import { getStatus, install, isGeminiHookInstalled, uninstall } from "./Installer.js";
+import { CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS } from "./SkillInstaller.js";
 
 describe("Installer", () => {
 	let tempDir: string;
@@ -1680,86 +1682,23 @@ describe("Installer", () => {
 		});
 
 		/*
-		 * What it DOES own is the Cursor-only mirror. Cursor reads `.agents/skills/` and
-		 * the plugin bundle into one flat pool and collapses neither, so the four
-		 * host-neutral skills are not bundled — they are placed per repo here, and only
-		 * when `.agents/` has not already supplied them. `.cursor/skills/` is read by no
-		 * other host, which is what makes writing and removing it safe.
-		 */
-		it("mirrors the host-neutral skills into .cursor/skills/ when .agents/ has none", async () => {
-			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
-
-			for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
-				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(true);
-			}
-			// The `/jolli` umbrella is NOT among them: it is machine-global, because the
-			// chat-first window that most needs a front door never names a workspace.
-			expect(await exists(join(tempDir, ".cursor", "skills", "jolli", "SKILL.md"))).toBe(false);
-		});
-
-		// The PLACEMENT above holds on every machine; its shape does not. Split out rather
-		// than asserted conditionally inside that test, so a skipped capability shows up as
-		// a skipped test instead of a passing one that quietly checked less.
-		it.skipIf(!canSymlink)("plants that mirror as symlinks into the bundle", async () => {
-			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
-
-			// A symlink is what makes the entry vanish when the plugin is uninstalled. What
-			// the target CONTAINS is the bundle's business and is asserted in
-			// SkillInstaller.test.ts against the real builders.
-			const recall = join(tempDir, ".cursor", "skills", "jolli-recall");
-			expect(lstatSync(recall).isSymbolicLink()).toBe(true);
-			expect(readlinkSync(recall)).toBe(join(fakeBundleDir, "mirror", "jolli-recall"));
-		});
-
-		/*
-		 * The convergence that makes removal-through-the-UI survivable. Once the Cursor
-		 * plugin is uninstalled its own bootstrap never runs again, so if the reconcile
-		 * lived only in the cursor branch nothing could ever clean up the mirror. Every
-		 * other host's bootstrap keeps running — and Cursor itself executes the imported
-		 * Claude plugin's hooks — so the reconcile runs from all of them.
-		 */
-		it("cleans up the Cursor mirror from ANOTHER host's bootstrap", async () => {
-			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
-			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
-
-			// The plugin is gone, exactly as Cursor's plugin manager leaves it: the bundle
-			// directory itself no longer exists, so every planted symlink now dangles. The
-			// recorded root under `~/.jolli/` survives — an uninstall never touches it —
-			// so only verifying that `mirror/` still exists can notice.
-			await rm(fakeBundleDir, { recursive: true, force: true });
-			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
-
-			for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
-				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(false);
-			}
-
-			// No restore needed: beforeEach rebuilds the bundle and re-points the mock.
-		});
-
-		/*
-		 * The same convergence in the WRITE direction, which is the half that was
-		 * untested — and the half that made the git-exclude registration wrong.
+		 * What it DOES own is sweeping away the RETIRED per-repo mirror.
 		 *
-		 * The reconcile is host-neutral, so with the Cursor plugin present on the machine
-		 * it plants `.cursor/skills/` symlinks during a CLAUDE or CODEX bootstrap too:
-		 * repo-hooks-only writes no `.agents/skills/`, so nothing else supplies these
-		 * names. While the exclude paths were registered inside the `pluginHost ===
-		 * "cursor"` branch, exactly that combination got the symlinks with no exclude
-		 * lines and left `?? .cursor/` in `git status`. Registration now sits beside this
-		 * call instead, outside the host branch.
+		 * Earlier versions did not bundle the four host-neutral skills — Cursor reads
+		 * `.agents/skills/` and a plugin bundle into one flat pool and collapses neither, so
+		 * bundling them doubled each entry in a repo that had run `jolli enable`. They were
+		 * planted per repo instead, into `.cursor/skills/`. The bundle ships them directly
+		 * now, so a leftover is a second entry for a name the bundle already supplies — and
+		 * after an upgrade moved the version-stamped bundle, a DANGLING one.
+		 *
+		 * The sweep is host-neutral for the reason the retired reconcile was: the Cursor
+		 * bootstrap's own opt-in gate means an un-opted-in repo never reaches it, and a user
+		 * who removes the plugin through Cursor's UI runs no Jolli code at that moment.
 		 */
-		it("mirrors into .cursor/skills/ from ANOTHER host's bootstrap too", async () => {
-			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
-
-			for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
-				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(true);
-			}
-		});
-
-		it("mirrors nothing when .agents/skills/ already provides the skill", async () => {
-			await mkdir(join(tempDir, ".agents", "skills", "jolli-recall"), { recursive: true });
+		it("sweeps a leftover mirror copy on a cursor-plugin bootstrap", async () => {
+			await mkdir(join(tempDir, ".cursor", "skills", "jolli-recall"), { recursive: true });
 			await writeFile(
-				join(tempDir, ".agents", "skills", "jolli-recall", "SKILL.md"),
+				join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"),
 				'---\nname: jolli-recall\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n',
 				"utf-8",
 			);
@@ -1767,20 +1706,76 @@ describe("Installer", () => {
 			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
 
 			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
-			// The others still get mirrored — the decision is per skill, not per repo.
-			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-search", "SKILL.md"))).toBe(true);
 		});
 
-		// The exclude paths themselves are asserted in SkillInstaller.test.ts
-		// (`CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS`); this fixture's temp dir is not a real
-		// git checkout, so `addGitExcludePaths` no-ops here and there is nothing to read
-		// back. Verifying the one-line hand-off would mean standing up a real repo in
-		// the fast tier, which is not worth it.
-		//
-		// What IS covered functionally is the precondition that made the registration's
-		// placement matter — that the mirror is planted from a non-Cursor bootstrap (see
-		// the test above). The registration is now unconditional and adjacent to that
-		// call, so the two cannot drift apart the way a branch-gated one did.
+		it("sweeps it from ANOTHER host's bootstrap too", async () => {
+			await mkdir(join(tempDir, ".cursor", "skills", "jolli-search"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".cursor", "skills", "jolli-search", "SKILL.md"),
+				'---\nname: jolli-search\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n',
+				"utf-8",
+			);
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "claude-plugin" });
+
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-search", "SKILL.md"))).toBe(false);
+		});
+
+		// Nothing is WRITTEN there any more, in either direction. A bootstrap that plants a
+		// `.cursor/skills/` entry has reintroduced the retired mirror.
+		it("writes nothing into .cursor/skills/", async () => {
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+				expect(await exists(join(tempDir, ".cursor", "skills", name, "SKILL.md"))).toBe(false);
+			}
+		});
+
+		// A user's own skill at that path is not ours to remove, in either caller.
+		it("spares a .cursor/skills/ entry the user wrote themselves", async () => {
+			await mkdir(join(tempDir, ".cursor", "skills", "jolli-recall"), { recursive: true });
+			await writeFile(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"), "mine\n", "utf-8");
+
+			await install(tempDir, { repoHooksOnly: true, sourceTag: "cursor-plugin" });
+
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(true);
+		});
+
+		// The retired exclude paths are asserted in SkillInstaller.test.ts
+		// (`CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS`); this fixture's temp dir is not a real
+		// git checkout, so `removeGitExcludePaths` no-ops here and there is nothing to read
+		// back for the INSTALL paths — a one-line hand-off sitting adjacent to the sweep it
+		// belongs to. The uninstall path below is the one case worth a real repo: it is only
+		// reachable on a machine that upgraded THROUGH a version which planted the mirror,
+		// so no install-path assertion covers it, and the failure is silent and lasting.
+		it("drops the retired mirror's exclude lines on uninstall, not just its files", async () => {
+			const { promisify } = await import("node:util");
+			const { execFile } = await import("node:child_process");
+			await promisify(execFile)("git", ["init"], { cwd: tempDir });
+
+			// The state a pre-bundle version left behind: the planted mirror, plus the
+			// excludes that hid it. `addGitExcludePaths` writes the same managed block the
+			// old install path did.
+			await mkdir(join(tempDir, ".cursor", "skills", "jolli-recall"), { recursive: true });
+			await writeFile(
+				join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"),
+				'---\nname: jolli-recall\nmetadata:\n  vendor: "jolli.ai"\n---\nbody\n',
+				"utf-8",
+			);
+			await addGitExcludePaths(tempDir, [...CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS]);
+			const excludePath = join(tempDir, ".git", "info", "exclude");
+			expect(await readFile(excludePath, "utf-8")).toContain("/.cursor/skills/");
+
+			await uninstall(tempDir);
+
+			// Both halves, or the user's OWN future `.cursor/skills/` entries stay hidden by
+			// an exclude for a directory nothing writes any more — git reports an untracked
+			// directory as one `?? .cursor/` line, which is why the bare directory entry is
+			// in the list beside the per-skill ones and has to go too.
+			expect(await exists(join(tempDir, ".cursor", "skills", "jolli-recall", "SKILL.md"))).toBe(false);
+			const after = await readFile(excludePath, "utf-8");
+			for (const path of CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS) expect(after).not.toContain(path);
+		});
 	});
 
 	describe("multi-host MCP registration", () => {

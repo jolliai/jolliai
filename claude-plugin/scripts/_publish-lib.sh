@@ -56,7 +56,7 @@ PUBLISH_REQUIRED_DIST=(
 
 # Skills the plugin ships (must match plugins/jolli/skills/ exactly). Used for
 # the exact-count staging assertion so a partial skill loss is caught.
-PUBLISH_EXPECTED_SKILLS=(push recall search)
+PUBLISH_EXPECTED_SKILLS=(dashboard push recall search)
 
 # Commands the plugin ships (same exact-count pattern as skills — a repo-local
 # .gitignore silently dropping one file leaves the count >0 but wrong; the exact

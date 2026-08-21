@@ -1,5 +1,5 @@
 {
-	"name": "jolli-cursor-marketplace",
+	"name": "jolli-cursor",
 	"owner": { "name": "jolli.ai", "email": "hello@jolli.ai" },
 	"metadata": {
 		"description": "Jolli Memory tools for Cursor — recall prior context, search decisions, author memory-rich PRs."

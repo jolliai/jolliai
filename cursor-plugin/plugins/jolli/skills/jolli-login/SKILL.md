@@ -33,6 +33,10 @@ On success, say that Jolli credentials were saved and offer `/jolli-init` to bin
 the repository to a Space. Clarify that local memory generation still uses the
 configured local agent unless the user explicitly changes providers. On failure,
 surface the command's reason and suggest retrying; if the browser did not open,
-point out the login URL printed by the command. If the dispatcher does not exist,
-ask the user to run **Developer: Reload Window**, start a new chat so the Jolli
-`sessionStart` hook runs, and retry.
+point out the login URL printed by the command.
+
+If `$HOME/.jolli/jollimemory/run-cli` does not exist, the plugin's `sessionStart`
+hook has not run on this machine yet — that hook is what writes it. Ask the user to
+**quit Cursor completely (⌘Q) and reopen it, then start a new chat**, and retry. A
+freshly installed plugin's hooks are not registered until the app has been fully
+restarted, so **Developer: Reload Window** or another chat is not enough (measured).

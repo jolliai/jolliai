@@ -8,19 +8,25 @@
  * after a template edit rather than the copies quietly going stale.
  */
 
-import { readdirSync, readFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import type { LocalAgentToolId } from "../Types.js";
 import { CODEX_PLUGIN_SKILL_NAMES } from "./CodexPluginSkills.js";
 import {
+	appendCursorDispatcherRecovery,
 	buildCursorJolliSkillTemplate,
 	buildCursorLogoutSkillTemplate,
+	CURSOR_DISPATCHER_MISSING_BLOCK,
+	CURSOR_DISPATCHER_RECOVERY_SECTION,
 	CURSOR_PLUGIN_SKILL_NAMES,
 	CURSOR_PLUGIN_SKILLS,
+	CURSOR_RESTART_PHRASE,
 	type CursorPluginSkill,
+	removeCursorGlobalMenu,
 	renderCursorPluginSkill,
 } from "./CursorPluginSkills.js";
 import { SHELL_PREREQUISITE_BLOCK } from "./PluginSkillText.js";
@@ -71,6 +77,112 @@ describe("every Cursor skill that shells run-cli carries the Windows shell prere
 	it("is the same text the installed skills carry, not a second copy", () => {
 		expect(buildLocalRunSkillTemplate()).toContain(SHELL_PREREQUISITE_BLOCK);
 	});
+});
+
+/*
+ * The first-install window this bundle inherited by shipping the four host-neutral
+ * skills: their bodies are `.agents/skills/` text, where "Jolli not installed — install
+ * `@jolli.ai/cli` globally or the VS Code extension" is the right answer. Inside a
+ * plugin it is not: Jolli IS installed, and the dispatcher those bodies test for is
+ * written by a `sessionStart` hook that has not run yet.
+ *
+ * Asserted on the RENDERED text, since the transform is the renderer's — a builder
+ * assertion would pass while the committed SKILL.md carries none of it.
+ */
+describe("the Cursor render appends a dispatcher recovery note where the body has none", () => {
+	for (const skill of CURSOR_PLUGIN_SKILLS) {
+		const body = skill.build();
+		const shellsRunCli = body.includes(".jolli/jollimemory/run-cli");
+		const alreadyHandled = body.includes(CURSOR_RESTART_PHRASE);
+		const wants = shellsRunCli && !alreadyHandled;
+
+		it(`${skill.name}: ${wants ? "gets the note" : "already answers for this host"}`, () => {
+			const rendered = renderCursorPluginSkill(skill);
+			expect(rendered.includes(CURSOR_DISPATCHER_RECOVERY_SECTION)).toBe(wants);
+			// Either way the rendered copy must name the one remedy that works here —
+			// that is the whole point, and it is what a bare append could get wrong by
+			// landing on a body that never mentions the dispatcher.
+			if (shellsRunCli) expect(rendered).toContain(CURSOR_RESTART_PHRASE);
+		});
+	}
+
+	// The four host-neutral bodies are the reason this exists. Pin that they really do
+	// carry the advice being overridden, so the override cannot quietly become dead text
+	// if a shared builder is reworded.
+	for (const name of ["jolli-recall", "jolli-search"]) {
+		it(`${name}: the note overrides advice that is actually present`, () => {
+			const skill = CURSOR_PLUGIN_SKILLS.find((s) => s.name === name);
+			expect(skill).toBeDefined();
+			expect(skill?.build()).toContain("install the Jolli VS Code extension");
+			expect(renderCursorPluginSkill(skill as CursorPluginSkill)).toContain(CURSOR_DISPATCHER_RECOVERY_SECTION);
+		});
+	}
+
+	// The predicate is a shared phrase, not three spellings. A body that answers for this
+	// host in its own words must use it, or it silently collects a duplicate section.
+	it("the shared remedy block uses the same phrase the predicate looks for", () => {
+		expect(CURSOR_DISPATCHER_MISSING_BLOCK).toContain(CURSOR_RESTART_PHRASE);
+		expect(buildCursorJolliSkillTemplate()).toContain(CURSOR_RESTART_PHRASE);
+	});
+
+	// The section carries the marker it is selected by, which makes the append
+	// idempotent: re-rendering an already-noted body adds nothing.
+	it("is idempotent, because the section carries its own marker", () => {
+		expect(CURSOR_DISPATCHER_RECOVERY_SECTION).toContain(CURSOR_RESTART_PHRASE);
+		const recall = CURSOR_PLUGIN_SKILLS.find((skill) => skill.name === "jolli-recall") as CursorPluginSkill;
+		const once = renderCursorPluginSkill(recall);
+		expect(appendCursorDispatcherRecovery(once)).toBe(once);
+	});
+
+	// The remedy is the HOST's. Codex gates its hook on trust rather than on a restart,
+	// so borrowing that sentence here would send a Cursor user to a panel Cursor has not
+	// got.
+	it("gives Cursor's remedy and never Codex's", () => {
+		expect(CURSOR_DISPATCHER_RECOVERY_SECTION).not.toContain("/hooks");
+	});
+});
+
+/*
+ * A freshly installed plugin's hooks are not registered until Cursor has been quit and
+ * reopened — measured on 3.16.29, where a window reload plus a new chat both left the
+ * `sessionStart` hook unrun and `~/.jolli/jollimemory/` untouched. The dispatcher is
+ * what that hook writes, so on a first install "Developer: Reload Window" is not a
+ * weaker fix, it is not a fix: the user retries it, sees the same failure, and never
+ * gets past setup. Three skills shipped that advice.
+ *
+ * Derived from the bodies rather than from a list of skill names, so a skill that grows
+ * a dispatcher-missing branch later cannot slip past — and asserted as a NEGATIVE per
+ * paragraph, because the reload wording is legitimate elsewhere (the umbrella's
+ * dispatcher-PRESENT branch, where a reload really does re-run the hook of a plugin
+ * that is already registered).
+ */
+describe("no Cursor skill offers a window reload as the remedy for a missing dispatcher", () => {
+	const bodies: ReadonlyArray<readonly [string, string]> = [
+		["jolli", buildCursorJolliSkillTemplate()],
+		...CURSOR_PLUGIN_SKILLS.map((skill) => [skill.name, skill.build()] as const),
+	];
+
+	for (const [name, body] of bodies) {
+		it(`${name}: never pairs an absent dispatcher with a reload`, () => {
+			// The shared remedy is exempt by construction, not by wording: it NAMES the
+			// reload in order to rule it out. Removing it first is what keeps this a test
+			// about stray advice rather than about how the good paragraph is phrased.
+			const offenders = body
+				.split(CURSOR_DISPATCHER_MISSING_BLOCK)
+				.join("\n\n")
+				.split(/\n\s*\n/u)
+				.filter((para) => /Reload Window/u.test(para))
+				.filter((para) => /does not exist|is missing|has not run|not been written/u.test(para));
+			expect(offenders).toEqual([]);
+		});
+
+		// The positive half: a skill that DOES tell the user the dispatcher may be absent
+		// carries the one shared sentence, so the remedy cannot drift per skill.
+		const claimsAbsence = body.includes("does not exist, the plugin's `sessionStart`");
+		it(`${name}: ${claimsAbsence ? "carries the shared remedy" : "has no dispatcher-absent branch"}`, () => {
+			expect(body.includes(CURSOR_DISPATCHER_MISSING_BLOCK)).toBe(claimsAbsence);
+		});
+	}
 });
 
 // The bare front door now exists four times — CLI `runGuidedFrontDoor`, the Claude
@@ -256,41 +368,52 @@ describe("Cursor plugin skill inventory", () => {
 	 * fix and is WRONG here: `install(..., { repoHooksOnly: true })` returns before
 	 * `updateSkillIfNeeded`, so a plugin bootstrap never writes `.agents/skills/` at all
 	 * — a plugin-only user would lose recall and search permanently, not until the next
-	 * session. A cosmetic duplicate beats a functional hole. See
+	 * session. A cosmetic duplicate beats a functional hole.
+	 *
+	 * It was tried anyway, as a per-repo mirror into `.cursor/skills/` written only when
+	 * no other root supplied the name, and it failed for precisely that reason: the
+	 * mirror was planted by the sessionStart bootstrap, whose opt-in gate is false in a
+	 * repo that has not been set up, so a Cursor-only user got no recall and no search
+	 * at all — absent from the store page and absent from the menu. See
 	 * cursor-plugin/DEVELOPMENT.md.
 	 */
-	// This bundle is the Codex one MINUS the four host-neutral skills, which Cursor
-	// gets per-repo from `.agents/skills/` or `.cursor/skills/` instead. Asserting the
-	// exact difference (rather than equality, which is what this used to assert) keeps
-	// both halves honest: adding a Cursor-specific skill without a Codex counterpart
-	// fails here, and so does quietly re-bundling a shared one.
-	it("is the Codex capability set minus everything written on demand", () => {
+	// This bundle is the Codex one MINUS the `jolli` umbrella alone. Asserting the exact
+	// difference (rather than plain equality) keeps both halves honest in both
+	// directions: adding a Cursor-specific skill without a Codex counterpart fails here,
+	// and so does dropping a shared one back out of the bundle.
+	// Now an exact match, umbrella included — the two bundles ship the same capability
+	// set, differing only in how each host names the directories.
+	it("is the Codex capability set exactly", () => {
 		const bare = (names: ReadonlyArray<string>) => [...names].map((name) => name.replace(/^jolli-/u, "")).sort();
-		// Written on demand rather than shipped — but at TWO different scopes, which is
-		// why this is not "the per-repo mirror": the four host-neutral skills go per-repo
-		// into `<repo>/.cursor/skills/` (`reconcileCursorRepoSkills`), while `jolli` goes
-		// MACHINE-GLOBAL into `~/.cursor/skills/` (`ensureCursorGlobalMenu`), because the
-		// chat-first window that most needs a front door never names a workspace.
-		const writtenOnDemand = ["jolli", "local-run", "recall", "remote-run", "search"];
-		expect(bare(CURSOR_PLUGIN_SKILL_NAMES)).toEqual(
-			bare(CODEX_PLUGIN_SKILL_NAMES).filter((n) => !writtenOnDemand.includes(n)),
-		);
+		expect(bare(CURSOR_PLUGIN_SKILL_NAMES)).toEqual(bare(CODEX_PLUGIN_SKILL_NAMES));
 	});
 
-	// Named individually so a re-bundle fails with the reason attached rather than as
-	// an opaque set mismatch. Cursor reads `.agents/skills/` and this bundle into ONE
-	// flat pool and its de-duplicator collapses neither, so a bundled copy shows up as
-	// a second, identically-named slash-menu entry in every repo that ran a full
-	// `jolli enable`. The four host-neutral names are placed per-repo by
-	// `reconcileCursorRepoSkills`; `jolli` is placed machine-global by
-	// `ensureCursorGlobalMenu` — not by the mirror, which filters it out.
-	it("does NOT bundle anything written on demand", () => {
-		for (const name of ["jolli", "jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
-			expect(
-				CURSOR_PLUGIN_SKILL_NAMES,
-				"bundling this duplicates the .agents/skills/ copy in Cursor's flat pool",
-			).not.toContain(name);
+	// The decided trade-off above, asserted per name so a re-prune fails with the reason
+	// attached rather than as an opaque set mismatch. A Cursor-only user reaches these
+	// four ONLY through the bundle: `install(..., { repoHooksOnly: true })` returns
+	// before `updateSkillIfNeeded`, so no plugin bootstrap ever writes `.agents/skills/`,
+	// and the retired per-repo mirror was planted by a bootstrap gated on the repo being
+	// set up already. Dropping one to tidy a multi-host user's picker takes recall or
+	// search away from the audience this bundle exists for.
+	it("bundles every shared skill a Cursor-only user needs", () => {
+		for (const name of ["jolli-recall", "jolli-search", "jolli-local-run", "jolli-remote-run"]) {
+			expect(CURSOR_PLUGIN_SKILL_NAMES, "a Cursor-only user has no other source for this skill").toContain(name);
 		}
+	});
+
+	/*
+	 * The umbrella is bundled, and this is the assertion that keeps it that way.
+	 *
+	 * It was machine-global (`~/.cursor/skills/jolli/`, written by the bootstrap) on the
+	 * theory that Cursor's chat-first Agents Window could not load a bundled skill.
+	 * Measured on 3.16.29 against Cursor's own slash-menu cache: every bundled skill
+	 * appears in both no-repository contexts, and the install is recorded under a
+	 * `no-workspace` key. The machine-global copy also could not survive its own first
+	 * install — a fresh plugin's hooks are not registered until Cursor fully restarts, so
+	 * the write never happened and the user had every skill except the front door.
+	 */
+	it("bundles the umbrella, so it exists the instant the plugin does", () => {
+		expect(CURSOR_PLUGIN_SKILL_NAMES).toContain("jolli");
 	});
 
 	/*
@@ -360,4 +483,54 @@ describe("the logout skill accounts for every local-agent tool", () => {
 			expect(tpl).toContain(localAgentToolLabel(id));
 		});
 	}
+});
+
+// ─── Retiring the machine-global `/jolli` umbrella ──────────────────────────
+//
+// The umbrella ships in the bundle now. What is left at `~/.cursor/skills/jolli/` is a
+// leftover from an earlier version, and the bootstrap sweeps it so the flat menu does not
+// show the same document twice.
+
+describe("removeCursorGlobalMenu", () => {
+	let home: string;
+	const menu = () => join(home, ".cursor", "skills", "jolli", "SKILL.md");
+	const plant = (body: string) => {
+		mkdirSync(join(home, ".cursor", "skills", "jolli"), { recursive: true });
+		writeFileSync(menu(), body, "utf-8");
+	};
+
+	beforeEach(() => {
+		home = mkdtempSync(join(tmpdir(), "jolli-cursor-home-"));
+	});
+	afterEach(() => {
+		rmSync(home, { recursive: true, force: true });
+	});
+
+	// The old copy is recognisable by the `vendor` marker in the metadata block that
+	// `buildCursorJolliSkillTemplate` still carries — which is exactly why that block is
+	// kept even though the bundled render strips it.
+	it("removes a copy an earlier version wrote", async () => {
+		plant(buildCursorJolliSkillTemplate());
+		await removeCursorGlobalMenu(home);
+		expect(existsSync(menu())).toBe(false);
+	});
+
+	it("spares a skill the user wrote themselves", async () => {
+		plant("---\nname: jolli\n---\nmine\n");
+		await removeCursorGlobalMenu(home);
+		expect(existsSync(menu())).toBe(true);
+	});
+
+	it("is a no-op when there is nothing there", async () => {
+		await expect(removeCursorGlobalMenu(home)).resolves.toBeUndefined();
+	});
+
+	// The bundled copy is the same document, minus the block the renderer strips — so the
+	// sweep cannot leave the user worse off than before it ran.
+	it("the bundled copy carries the same body the leftover did", () => {
+		const bundled = renderCursorPluginSkill({ name: "jolli", build: buildCursorJolliSkillTemplate });
+		expect(bundled).toContain("# Jolli Memory");
+		expect(bundled).not.toMatch(/^metadata:$/mu);
+		expect(bundled).toMatch(/^name: jolli$/mu);
+	});
 });

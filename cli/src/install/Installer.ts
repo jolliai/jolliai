@@ -111,11 +111,10 @@ import {
 	removeRepoMcpHosts,
 } from "./mcp/HostRegistrars.js";
 import {
-	CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS,
+	CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS,
 	installPluginJolliMenu,
 	JOLLI_MENU_GIT_EXCLUDE_PATHS,
 	PLUGIN_JOLLI_MENU_GIT_EXCLUDE_PATHS,
-	reconcileCursorRepoSkills,
 	removeClaudeLegacySkills,
 	removeCursorRepoSkills,
 	removePluginJolliMenu,
@@ -635,44 +634,27 @@ export async function install(
 				}
 
 				/*
-				 * Converge the Cursor mirror on EVERY plugin bootstrap, not just Cursor's.
+				 * Sweep the RETIRED Cursor per-repo mirror on EVERY plugin bootstrap, not just
+				 * Cursor's — and drop the git-excludes that served it.
 				 *
-				 * The case this exists for is the one no code can react to as it happens: the
-				 * user removes the Cursor plugin through Cursor's own UI. From that moment the
-				 * Cursor bootstrap never runs again, so a reconcile that only lived there could
-				 * never clean up after itself — the mirrored skills would stay in the slash menu
-				 * of a repo whose plugin is gone.
+				 * The bundle ships all four host-neutral skills directly now, so a leftover
+				 * `.cursor/skills/jolli-recall` symlink is a second menu entry for a name the
+				 * bundle already supplies, and after a marketplace upgrade it is a dangling
+				 * one. The exclude lines have to go with it: nothing writes that directory any
+				 * more, so an exclude for it would hide skills the USER puts there.
 				 *
-				 * Every other host's bootstrap, however, keeps running, and Cursor executes the
-				 * imported Claude plugin's hooks itself. Those fire per SESSION, which is far
-				 * sooner than the next commit — the only other automatic signal available, and
-				 * one that may never arrive in a repo the user has stopped committing to.
+				 * Host-neutral placement is what the retired reconcile got right, and the
+				 * reason carries over unchanged: a user who removes the Cursor plugin through
+				 * Cursor's own UI runs no Jolli code at that moment, and the Cursor bootstrap's
+				 * own opt-in gate means an un-opted-in repo never reaches it either. Every
+				 * other host's bootstrap keeps running, per SESSION — far sooner than the next
+				 * commit, which may never come in a repo the user has stopped committing to.
 				 *
-				 * Cheap and idempotent: a handful of stats, and on a machine that never had
-				 * the Cursor plugin the bundle lookup comes back empty and this resolves to a
-				 * no-op against a repo that has nothing to remove.
+				 * Cheap and idempotent both ways: four stats against a repo that has nothing to
+				 * remove, and `removeGitExcludePaths` rewrites only when a line actually goes.
 				 */
-				await reconcileCursorRepoSkills(wt);
-				/*
-				 * The mirror's git-excludes belong HERE, beside the reconcile — not in the
-				 * `pluginHost === "cursor"` branch above, where they used to live.
-				 *
-				 * The reconcile is deliberately host-neutral (see the block above), so it
-				 * plants `.cursor/skills/` symlinks on a CLAUDE or CODEX bootstrap too, as
-				 * long as this machine has the Cursor plugin. With the registration gated on
-				 * the Cursor branch, exactly that combination — both plugins installed, the
-				 * repository opted in from the other host — got the symlinks with no exclude
-				 * lines, leaving `?? .cursor/` in `git status`: the pollution these paths
-				 * exist to prevent, in the one case the gate could not see.
-				 *
-				 * Unconditional rather than conditioned on "did it plant anything", for the
-				 * reason the constant's own docstring gives: the set is union-merged and an
-				 * exclude line for an absent path is inert, so covering both states keeps
-				 * this idempotent instead of making the block flap. A return value the
-				 * caller must remember to honour would also be the same shape of bug as the
-				 * one being fixed.
-				 */
-				await addGitExcludePaths(wt, [...CURSOR_REPO_SKILL_GIT_EXCLUDE_PATHS]);
+				await removeCursorRepoSkills(wt);
+				await removeGitExcludePaths(wt, [...CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS]);
 				// Neither non-Claude bootstrap owns any SKILL assets — the Cursor branch above
 				// writes MCP config and nothing else. Both hosts load their skills from the
 				// plugin bundle (Codex namespaces them `jolli:<name>`; the Cursor bundle keeps
@@ -1212,22 +1194,35 @@ export async function uninstall(
 			// the `jolli-*` siblings stay per the conservative policy noted below.
 			if (!options?.preserveMenu) await removePluginJolliMenu(wt);
 
-			// The Cursor mirror, for the same reason and with one extra twist. These FOUR
-			// host-neutral skills live in this repo's `.cursor/skills/` because Cursor pools
-			// every skill root into one flat menu, so bundling them would double each entry
-			// — see reconcileCursorRepoSkills. Being repo-level is what makes them survive a
+			// The RETIRED Cursor per-repo mirror. Earlier versions planted four
+			// host-neutral skills into this repo's `.cursor/skills/`; the bundle ships them
+			// directly now, so this is a sweep of what those versions left behind — see
+			// CURSOR_RETIRED_MIRROR_SKILLS. Being repo-level is what made them survive a
 			// plugin-manager uninstall, and a code-driven uninstall is the only thing that
 			// can reach them. (The `/jolli` umbrella is NOT among them: it is machine-global,
-			// shared by every repo, so only a plugin-level teardown may remove it — see
-			// removeCursorGlobalMenu.)
+			// shared by every repo, so no per-repo teardown may take it — `jolli uninstall`
+			// reaches it through UninstallScan's machine-global surface instead.)
 			//
 			// NOT gated on `preserveMenu`: that flag exists so one host's teardown cannot
 			// delete ANOTHER host's assets, and `.cursor/skills/` is written by nothing
-			// else. A Cursor session tearing down a disabled repo should still take its own
-			// mirror with it, exactly as it would its own MCP entry.
+			// else. A Cursor session tearing down a disabled repo should still take the
+			// leftovers with it, exactly as it would its own MCP entry.
 			//
 			// Ownership-guarded, so a user's own `.cursor/skills/jolli-recall` survives.
+			//
+			// The exclude lines go WITH the files, unlike the `jolli-*` entries dropped
+			// below: those are kept precisely because their SKILL.md files are kept, and
+			// here the files are being deleted. Nothing writes `.cursor/skills/` any more,
+			// so a surviving exclude for it hides skills the USER later puts there — and
+			// git reports an untracked DIRECTORY as one `?? .cursor/` line rather than
+			// descending, which is why CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS carries both
+			// `/.cursor/skills/` and the four per-skill paths. Reached only by an uninstall
+			// on a machine that upgraded THROUGH a version which planted the mirror; the
+			// install paths sweep the same pair (see the bootstrap above and
+			// `updateSkillIfNeeded`), so a repo that never had it has nothing to remove and
+			// `removeGitExcludePaths` rewrites only when a line actually goes.
 			await removeCursorRepoSkills(wt);
+			await removeGitExcludePaths(wt, [...CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS]);
 		}
 
 		// Git hooks are shared — remove once from the common hooks directory

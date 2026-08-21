@@ -1,0 +1,29 @@
+<svg width="256" height="256" viewBox="0 0 75 75" xmlns="http://www.w3.org/2000/svg">
+  <!-- The Jolli graph mark. Same geometry and node fills as vscode/assets/icon.svg,
+       with the paler #D9D5F8 edge from the light variant (intellij/.../jollimemory.svg)
+       — a combination that lives only in the plugin assets, so this file is their
+       vector record: re-export the sibling PNGs from HERE, not from icon.svg.
+       That master has a 61x56 viewBox; hosts render a plugin logo in a square, so
+       the mark is translated to sit centred in a square canvas with ~10% margin.
+       Self-contained on purpose: no external references, no <script>. -->
+  <g transform="translate(7.005 9.830)">
+    <g stroke="#D9D5F8" stroke-width="2.4" stroke-linecap="round" fill="none" opacity="0.95">
+      <line x1="29.25" y1="6.88" x2="5.5" y2="25.67"/>
+      <line x1="29.25" y1="6.88" x2="50.05" y2="18.21"/>
+      <line x1="5.5" y1="25.67" x2="11.65" y2="49.42"/>
+      <line x1="11.65" y1="49.42" x2="53.7" y2="40.68"/>
+      <line x1="53.7" y1="40.68" x2="50.05" y2="18.21"/>
+      <line x1="29.05" y1="30.48" x2="29.25" y2="6.88"/>
+      <line x1="29.05" y1="30.48" x2="5.5" y2="25.67"/>
+      <line x1="29.05" y1="30.48" x2="50.05" y2="18.21"/>
+      <line x1="29.05" y1="30.48" x2="11.65" y2="49.42"/>
+      <line x1="29.05" y1="30.48" x2="53.7" y2="40.68"/>
+    </g>
+    <circle cx="29.25" cy="6.88" r="6.98" fill="#4C8CFF"/>
+    <circle cx="50.05" cy="18.21" r="5.53" fill="#20D4E8"/>
+    <circle cx="5.5" cy="25.67" r="5.17" fill="#6FB3FF"/>
+    <circle cx="53.7" cy="40.68" r="6.96" fill="#7B7BFF"/>
+    <circle cx="11.65" cy="49.42" r="6.02" fill="#C3A6FF"/>
+    <circle cx="29.05" cy="30.48" r="7.82" fill="#9B5CFF"/>
+  </g>
+</svg>

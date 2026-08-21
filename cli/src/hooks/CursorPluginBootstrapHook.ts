@@ -65,9 +65,9 @@ import { withRepoHooksLock } from "../core/Locks.js";
 import { isPluginBundleCwd } from "../core/PluginBundlePaths.js";
 import { readManualDisableFlag } from "../core/RepoProfile.js";
 import { loadConfig } from "../core/SessionTracker.js";
+import { removeCursorGlobalMenu } from "../install/CursorPluginSkills.js";
 import { isGitHookInstalled } from "../install/GitHookInstaller.js";
 import { install, reconcileRuntimeRegistry, uninstall } from "../install/Installer.js";
-import { ensureCursorGlobalMenu, recordCursorPluginRoot } from "../install/SkillInstaller.js";
 import { createLogger, setLogDir } from "../Logger.js";
 import { readStdin } from "./HookUtils.js";
 import { buildSessionStartContext, ensurePluginDefaultProvider } from "./SessionStartHook.js";
@@ -152,9 +152,24 @@ export function resolveCursorProjectDir(input: { workspace_roots?: unknown }, en
 }
 
 export async function runCursorPluginBootstrap(projectDir: string): Promise<CursorBootstrapOutput | null> {
-	if (!(await isInsideGitRepo(projectDir))) return null;
+	// Both "not a repository" exits are LOGGED, and that is not noise.
+	//
+	// `setLogDir` has not run yet at this point, so these land in the machine-global
+	// `~/.jolli/jollimemory/debug.log` — deliberately, since there is no repository to
+	// write into. Without them, "the hook ran and decided to do nothing" is
+	// indistinguishable in the log from "the hook never ran", and the two have opposite
+	// fixes: the first is a cwd that names no repository, the second is Cursor not
+	// registering the plugin's hooks until it is fully restarted. Diagnosing exactly that
+	// pair took several rounds against a silent log.
+	if (!(await isInsideGitRepo(projectDir))) {
+		log.info("Cursor plugin bootstrap: %s is not inside a git repository — nothing to do", projectDir);
+		return null;
+	}
 	const topLevel = await execGit(["rev-parse", "--show-toplevel"], projectDir);
-	if (topLevel.exitCode !== 0 || !topLevel.stdout.trim()) return null;
+	if (topLevel.exitCode !== 0 || !topLevel.stdout.trim()) {
+		log.info("Cursor plugin bootstrap: could not resolve a worktree root from %s — nothing to do", projectDir);
+		return null;
+	}
 	const worktreeRoot = topLevel.stdout.trim();
 
 	// THE CONSENT GATE, and it has to be the FIRST thing that happens to this path.
@@ -283,24 +298,18 @@ export async function main(): Promise<void> {
 		// marketplace cache. `runCursorPluginBootstrap` re-points this to the worktree
 		// once it has one.
 		setLogDir(homedir());
-		// FIRST, and independent of any repository: the front door. Cursor's chat-first
-		// Agents Window never names a workspace, so this is the only thing the bootstrap
-		// can do there — and the only thing it must always do. Ordered ahead of the
-		// repository branch so a repo-side failure cannot cost the user their menu.
-		await ensureCursorGlobalMenu();
-		// Then leave a trail to this bundle. THIS process is the only one that can know
-		// where it is — esbuild rewrites `import.meta.url` to the bundle's own file, so
-		// `<bundle>/dist/CursorPluginBootstrapHook.js` walks up to the bundle root, and
-		// `mirror/` sits beside `dist/`. `CURSOR_PLUGIN_ROOT` says the same thing but only
-		// when Cursor invoked the hook directly; the `/jolli-init` path reaches this code
-		// through `run-cli`, where it is unset.
+		// The front door is BUNDLED now, so there is nothing to write here — only an old
+		// copy to take away. Earlier versions planted it machine-global at
+		// `~/.cursor/skills/jolli/` because the chat-first Agents Window names no
+		// workspace; measured on 3.16.29, a bundled skill reaches that surface perfectly
+		// well (see CURSOR_PLUGIN_SKILLS), and bundling additionally fixes what this hook
+		// could never fix from here: a freshly installed plugin's hooks are not registered
+		// until Cursor fully restarts, so on a new install this line did not run at all and
+		// the user had eleven skills and no menu.
 		//
-		// The reader is a LATER, different process: `/jolli-init` dispatches through
-		// `run-cli`, which resolves to the highest-version dist — the CLI at a version
-		// tie — and from inside the CLI's bundle there is no authoritative way to locate
-		// the plugin's. Without this record its four mirrored skills could not be planted
-		// until the next session.
-		await recordCursorPluginRoot(pathResolve(fileURLToPath(import.meta.url), "..", ".."));
+		// Ownership-guarded, and idempotent once the leftover is gone. Ordered ahead of the
+		// repository branch so a repo-side failure cannot leave a duplicate behind.
+		await removeCursorGlobalMenu();
 		// Then register this runtime, and do it WITHOUT a repository — which is not a
 		// hole in the consent gate below, because nothing here touches a repository.
 		// The three dispatch scripts and `dist-paths/cursor-plugin` are machine-global
@@ -328,7 +337,7 @@ export async function main(): Promise<void> {
 		const projectDir = resolveCursorProjectDir(parsed, process.env);
 		if (projectDir === null) {
 			log.info(
-				"Cursor plugin bootstrap: no workspace named — global /jolli menu ensured, nothing repo-scoped to do",
+				"Cursor plugin bootstrap: no workspace named — runtime registered, nothing repo-scoped to do (the /jolli front door ships in the bundle)",
 			);
 			return;
 		}

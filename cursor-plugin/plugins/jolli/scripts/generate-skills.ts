@@ -21,47 +21,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CURSOR_PLUGIN_SKILLS, renderCursorPluginSkill } from "../../../../cli/src/install/CursorPluginSkills.js";
-import { CURSOR_MIRROR_SKILLS } from "../../../../cli/src/install/SkillInstaller.js";
 
 const pluginDir = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const skillsDir = join(pluginDir, "skills");
-/**
- * The symlink targets.
- *
- * Deliberately NOT under `skills/`: Cursor's scanner matches seven fixed path
- * fragments and `plugins/jolli/mirror/` is none of them, so these are invisible to it
- * where they sit. They become visible one way only — as `<repo>/.cursor/skills/<name>`
- * symlinks pointing here — which is what makes them disappear the moment the plugin is
- * uninstalled, without any code running at that moment. See reconcileCursorRepoSkills.
- *
- * Rendered from the builders VERBATIM, metadata block included, so a symlinked copy and
- * the `.agents/skills/` copy a full `jolli enable` writes are the same document.
- */
-const mirrorDir = join(pluginDir, "mirror");
 const check = process.argv.includes("--check");
 
 const stale: string[] = [];
-for (const skill of CURSOR_MIRROR_SKILLS) {
-	const dir = join(mirrorDir, skill.name);
-	const file = join(dir, "SKILL.md");
-	const expected = skill.build();
-
-	if (check) {
-		let actual: string | null = null;
-		try {
-			actual = readFileSync(file, "utf-8");
-		} catch {
-			// Missing counts as stale, same as for the bundled skills below.
-		}
-		if (actual !== expected) stale.push(`mirror/${skill.name}/SKILL.md`);
-		continue;
-	}
-
-	mkdirSync(dir, { recursive: true });
-	writeFileSync(file, expected, "utf-8");
-	console.log(`wrote mirror/${skill.name}/SKILL.md`);
-}
-
 for (const skill of CURSOR_PLUGIN_SKILLS) {
 	const dir = join(skillsDir, skill.name);
 	const file = join(dir, "SKILL.md");
@@ -91,7 +56,5 @@ if (check) {
 		console.error("         npx tsx cursor-plugin/plugins/jolli/scripts/generate-skills.ts");
 		process.exit(1);
 	}
-	console.log(
-		`${CURSOR_PLUGIN_SKILLS.length} bundled + ${CURSOR_MIRROR_SKILLS.length} mirror skills match their builders.`,
-	);
+	console.log(`${CURSOR_PLUGIN_SKILLS.length} bundled skills match their builders.`);
 }

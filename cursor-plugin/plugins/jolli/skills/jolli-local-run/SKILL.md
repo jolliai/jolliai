@@ -1,10 +1,6 @@
 ---
 name: jolli-local-run
 description: Run a Jolli workflow locally — your own agent executes the workflow's recipe (no Jolli LLM budget) and its file writes land in a git-backed Jolli Space via a branch and pull request that space-cli opens on this machine. Use when the user wants to run a Jolli workflow locally.
-metadata:
-  version: "dev"
-  revision: 5
-  vendor: "jolli.ai"
 ---
 
 # Jolli Local Run
@@ -227,3 +223,15 @@ user to install it and stop:
 ```bash
 npm i -g @jolli.ai/cli @jolli.ai/space-cli
 ```
+
+## If the Jolli CLI dispatcher is missing (Cursor)
+
+`$HOME/.jolli/jollimemory/run-cli` is written by this plugin's `sessionStart` hook,
+and a freshly installed plugin's hooks are not registered until Cursor has been fully
+restarted — a window reload or another chat is not enough (measured). So when that file
+does not exist, the fix is to **quit Cursor completely (⌘Q) and reopen it, then start
+a new chat**, and retry.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+`@jolli.ai/cli` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.

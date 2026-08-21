@@ -118,6 +118,7 @@ on its own whenever setup is incomplete.
 - `$jolli:init` — setup and Space binding.
 - `$jolli:login` / `$jolli:logout` — Jolli account credentials.
 - `$jolli:status` — installation and generation health.
+- `$jolli:dashboard` — open the local dashboard in your browser.
 - `$jolli:recall` / `$jolli:search` / `$jolli:timeline` — read memory.
 - `$jolli:push` — publish memories to a Space.
 - `$jolli:local-run` / `$jolli:remote-run` — run Jolli workflows.

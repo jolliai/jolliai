@@ -74,13 +74,21 @@ describe.each(PLUGINS)("%s publish inventory tracks the dashboard page", (plugin
 	});
 });
 
-// The dashboard half of the two lists is the same page in both bundles; only the
-// hook/entry half above it differs (Claude's PluginBootstrapHook vs Codex's
-// bootstrap + McpLauncher). Asserted directly so a fix applied to one lib and not
-// the other is a failure here rather than a plugin that publishes fine while its
-// sibling refuses.
-it("all plugin libs require the same dashboard assets", () => {
-	const dashboardOnly = (plugin: string) => requiredDist(plugin).filter((e) => e.startsWith("dashboard-assets/"));
-	expect(dashboardOnly("codex-plugin")).toEqual(dashboardOnly("claude-plugin"));
-	expect(dashboardOnly("cursor-plugin")).toEqual(dashboardOnly("claude-plugin"));
-});
+// The dashboard half of every list is the same page in all three bundles; only the
+// hook/entry half above it differs (Claude's PluginBootstrapHook, Codex's bootstrap +
+// McpLauncher, Cursor's own bootstrap). Asserted directly so a fix applied to one lib
+// and not the others is a failure here rather than a plugin that publishes fine while
+// its sibling refuses.
+//
+// `cursor-plugin` was absent from this file until it had already drifted BOTH ways at
+// once — it named a retired `repositories.js`, which made `publish_assert_dist_built`
+// refuse every cursor publish, and omitted `knowledge.js` / `graph.js` / `settings.js`,
+// the silent direction. Neither shows up in `npm run all`, because the publish path is
+// shell. A new bundle belongs in PLUGINS the day it ships a dashboard.
+it.each(PLUGINS.filter((plugin) => plugin !== "claude-plugin"))(
+	"%s requires the same dashboard assets as claude-plugin",
+	(plugin) => {
+		const dashboardOnly = (p: string) => requiredDist(p).filter((e) => e.startsWith("dashboard-assets/"));
+		expect(dashboardOnly(plugin)).toEqual(dashboardOnly("claude-plugin"));
+	},
+);

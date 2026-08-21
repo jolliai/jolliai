@@ -7,15 +7,24 @@
  * outside the CLI's `rootDir`. The plugin's `scripts/generate-skills.ts` is a thin
  * runner over these exports.
  *
- * Shared skill bodies come from `SkillInstaller`; Codex-only onboarding and command
- * equivalents live below. The plugin ships static copies (a marketplace publishes a
- * directory tree, not a build product), so the drift test is what keeps every
- * committed `SKILL.md` aligned with these builders.
+ * Shared skill bodies come from `SkillInstaller` (the four host-neutral ones a full
+ * `jolli enable` also writes) and from `PluginSkillText` (`dashboard`, which no
+ * `jolli enable` writes — see {@link buildDashboardSkillTemplate} for why it is shared
+ * with the Cursor bundle rather than restated per host); Codex-only onboarding and
+ * command equivalents live below. The plugin ships static copies (a marketplace
+ * publishes a directory tree, not a build product), so the drift test is what keeps
+ * every committed `SKILL.md` aligned with these builders.
  */
 
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import type { LocalAgentToolId } from "../Types.js";
-import { SHELL_PREREQUISITE_BLOCK, setFrontmatterName, stripMetadataBlock } from "./PluginSkillText.js";
+import {
+	appendDispatcherRecovery,
+	buildDashboardSkillTemplate,
+	SHELL_PREREQUISITE_BLOCK,
+	setFrontmatterName,
+	stripMetadataBlock,
+} from "./PluginSkillText.js";
 import {
 	buildLocalRunSkillTemplate,
 	buildRecallSkillTemplate,
@@ -233,6 +242,8 @@ This skill takes one optional free-text argument.
 - \`jolli:recall\` — recall current-branch context.
 - \`jolli:search\` — search decisions across branches.
 - \`jolli:status\` — inspect installation and queue health.
+- \`jolli:dashboard\` — open the local dashboard in a browser (machine-wide
+  memories, sessions, token spend, knowledge).
 - \`jolli:timeline\` — show a decision topic's history.
 - \`jolli:push\` — publish this branch's memories to a Space.
 - \`jolli:login\` — sign in to Jolli so memories can sync to a Space. Surface this
@@ -491,6 +502,7 @@ export const CODEX_PLUGIN_SKILLS: ReadonlyArray<CodexPluginSkill> = [
 	{ name: "login", build: buildCodexLoginSkillTemplate },
 	{ name: "logout", build: buildCodexLogoutSkillTemplate },
 	{ name: "status", build: buildCodexStatusSkillTemplate },
+	{ name: "dashboard", build: buildDashboardSkillTemplate },
 	{ name: "timeline", build: buildCodexTimelineSkillTemplate },
 	{ name: "push", build: buildCodexPushSkillTemplate },
 	{ name: "recall", build: buildRecallSkillTemplate },
@@ -535,18 +547,61 @@ const SHARED_SKILL_INVOCATION_NAMES: Readonly<Record<string, string>> = {
 };
 
 /**
+ * Codex's own answer to a missing dispatcher, and the phrase that marks a body as
+ * already carrying it.
+ *
+ * Four bodies in this file route the user to Codex's `/hooks` panel, in three different
+ * sentences ("trust the Jolli SessionStart hook in `/hooks`", "open `/hooks`, trust the
+ * Jolli SessionStart hook", "review the Jolli hook in `/hooks`"), so the backticked
+ * path is the one token all three share. The backticks matter: a bare `/hooks` would
+ * also match a `.git/hooks` mention and silently exempt a body that answers nothing.
+ */
+export const CODEX_HOOKS_PANEL_MARKER = "`/hooks`";
+
+/**
+ * Appended by {@link renderCodexPluginSkill} to a bundled body that shells `run-cli`
+ * without already routing to `/hooks` — see {@link appendDispatcherRecovery} for the
+ * shape and for why this belongs to the renderer.
+ *
+ * The remedy is this host's, and it is NOT Cursor's: on Codex the plugin's SessionStart
+ * hook has to be TRUSTED before it runs, and Codex reads its MCP registrations at
+ * session start, so the first session after an install reaches neither the dispatcher
+ * nor the tools. That is the sentence the umbrella's Step 0 and `init` already use;
+ * this is the same answer, given to the skills that had none.
+ */
+export const CODEX_DISPATCHER_RECOVERY_SECTION = `
+## If the Jolli CLI dispatcher is missing (Codex)
+
+\`$HOME/.jolli/jollimemory/run-cli\` is written by this plugin's SessionStart hook,
+and that hook does not run until it has been trusted. So when that file does not
+exist, ask the user to start a new Codex session and trust the Jolli SessionStart
+hook in \`/hooks\`, then retry. The Jolli Memory MCP tools arrive the same way, one
+session later — Codex reads its registrations at session start.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+\`@jolli.ai/cli\` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.
+`;
+
+/**
  * The exact bytes the plugin's `skills/<name>/SKILL.md` must contain.
  *
- * Three adaptations of the canonical text, all of them consequences of one document
+ * Four adaptations of the canonical text. Three are consequences of one document
  * serving two hosts: drop the upsert-only `metadata:` block, re-head it with the
  * plugin's bare name, and re-point sibling references at their `jolli:*` invocation
  * names — a bundled copy telling the model to "run jolli-recall" would name a skill
- * that does not exist on a plugin-only install.
+ * that does not exist on a plugin-only install. The fourth is
+ * {@link CODEX_DISPATCHER_RECOVERY_SECTION}, and it runs LAST on purpose: the sibling
+ * rewrite is a plain substring replace, so appending afterwards keeps the note out of
+ * its reach instead of depending on the note never containing one of those four names.
  */
 export function renderCodexPluginSkill(skill: CodexPluginSkill): string {
 	let rendered = setFrontmatterName(stripMetadataBlock(skill.build()), skill.name);
 	for (const [canonical, invocation] of Object.entries(SHARED_SKILL_INVOCATION_NAMES)) {
 		rendered = rendered.split(canonical).join(invocation);
 	}
-	return rendered;
+	return appendDispatcherRecovery(rendered, {
+		marker: CODEX_HOOKS_PANEL_MARKER,
+		section: CODEX_DISPATCHER_RECOVERY_SECTION,
+	});
 }

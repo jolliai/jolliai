@@ -37,12 +37,13 @@
  * against every other plugin's and every user's same-named skill, indistinguishable
  * except by icon. The prefix is what makes each one unambiguous.
  *
- * That same flat pool is why this bundle ships only Cursor-SPECIFIC skills. The four
- * host-neutral ones would collide by name with the `.agents/skills/` copies a full
- * `jolli enable` writes, and nothing would collapse the pair; they are placed per-repo
- * in `.cursor/skills/` on demand instead (`reconcileCursorRepoSkills`). What remains
- * here needs no re-heading or substring rewriting either way — these builders are
- * authored for this host and already declare their own names.
+ * That same flat pool means a name this bundle ships can ALSO be supplied by
+ * `.agents/skills/` (which a full `jolli enable` writes, and which Cursor reads), with
+ * nothing collapsing the pair. The bundle ships the complete set anyway and accepts the
+ * duplicate — see {@link CURSOR_PLUGIN_SKILLS} for why optimising the other way left
+ * Cursor-only users with no recall or search at all. Nothing here needs re-heading or
+ * substring rewriting: every builder already declares the name of its own directory,
+ * and the shared builders already name their siblings with this bundle's exact names.
  *
  * Two hard limits come from the same reading, both asserted by the drift test:
  * `name` is lowercase letters/digits/hyphens, max 64 chars, and must equal the
@@ -50,18 +51,53 @@
  * by `kt()` before the model ever sees it.
  */
 
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { LOCAL_AGENT_TOOLS, localAgentToolLabel } from "../core/localagent/ToolMeta.js";
 import type { LocalAgentToolId } from "../Types.js";
-import { SHELL_PREREQUISITE_BLOCK, setFrontmatterName, stripMetadataBlock } from "./PluginSkillText.js";
+import {
+	appendDispatcherRecovery,
+	buildDashboardSkillTemplate,
+	SHELL_PREREQUISITE_BLOCK,
+	setFrontmatterName,
+	stripMetadataBlock,
+} from "./PluginSkillText.js";
+import {
+	buildLocalRunSkillTemplate,
+	buildRecallSkillTemplate,
+	buildRemoteRunSkillTemplate,
+	buildSearchSkillTemplate,
+	removeJolliOwnedSkillDir,
+} from "./SkillInstaller.js";
 
 const RUN_CLI = '"$HOME/.jolli/jollimemory/run-cli"';
 
 /**
+ * What to tell the user when `run-cli` is absent — restated by every skill that
+ * shells it, from one constant so the three cannot drift.
+ *
+ * The remedy is a FULL restart, and never `Developer: Reload Window`. A freshly
+ * installed plugin's hooks are not registered until Cursor has been quit and
+ * reopened (measured on 3.16.29: a window reload plus a new chat both left the
+ * `sessionStart` hook unrun and `~/.jolli/jollimemory/` untouched), and that hook is
+ * what writes the dispatcher. Three skills used to say "reload the window", which
+ * reads as an actionable fix and is not one — the user retries it, sees the same
+ * failure, and never gets past setup. The umbrella's Step 0 already draws this
+ * distinction; these are the skills that reach the same state one step later.
+ */
+export const CURSOR_DISPATCHER_MISSING_BLOCK = `If \`$HOME/.jolli/jollimemory/run-cli\` does not exist, the plugin's \`sessionStart\`
+hook has not run on this machine yet — that hook is what writes it. Ask the user to
+**quit Cursor completely (⌘Q) and reopen it, then start a new chat**, and retry. A
+freshly installed plugin's hooks are not registered until the app has been fully
+restarted, so **Developer: Reload Window** or another chat is not enough (measured).`;
+
+/**
  * Same expression as `SkillInstaller`'s, deliberately restated rather than imported.
  *
- * `SkillInstaller` imports THIS module (for the umbrella the Cursor mirror writes), so
- * importing back would close a cycle. Both read the identical compile-time define, so
- * there is no value to drift — only the expression is duplicated, never a literal.
+ * The cycle this avoided is gone — the dependency is now one-way, THIS module imports
+ * `SkillInstaller` — but the restatement stays because `SkillInstaller` does not export
+ * it, and both read the identical compile-time define, so there is no value to drift:
+ * only the expression is duplicated, never a literal.
  */
 const SKILL_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
 
@@ -85,16 +121,22 @@ function localAgentLoginList(): string {
 }
 
 /**
- * The Cursor front door.
+ * The Cursor front door, shipped in the bundle like every other skill here.
  *
- * Carries the `metadata:` block even though the other builders in this file do not,
- * because this one is no longer bundled — `reconcileCursorRepoSkills` writes it into
- * `<repo>/.cursor/skills/jolli`, where the block does real work in both directions:
- * `upsertSkill` compares `revision` before overwriting a user's file, and
- * `removeJolliOwnedSkillDir` requires the `vendor` marker before deleting anything.
- * Without it the mirror could not be removed at all — uninstall would silently treat
- * it as user-authored and leave a stale front door behind in a repo the user believes
- * they have disabled.
+ * It still carries a `metadata:` block, which {@link renderCursorPluginSkill} strips on
+ * the way into `skills/jolli/SKILL.md` — so the block is inert for the bundled copy and
+ * kept for one reason: earlier versions wrote this same document MACHINE-GLOBAL to
+ * `~/.cursor/skills/jolli/`, and the `vendor` marker in it is what
+ * {@link removeCursorGlobalMenu} matches before deleting that leftover. Dropping the
+ * block would not change what ships; it would make the old copy unrecognisable and so
+ * un-removable.
+ *
+ * This document is NOT the host-neutral `buildJolliMenuSkillTemplate` that a full
+ * `jolli enable` writes to `.agents/skills/jolli`. Both are called `jolli` and both are
+ * front doors, but only this one is state-aware (it reads `status` and leads a
+ * half-configured repo into setup) and carries the Cursor-only notes about enabling the
+ * MCP server in Customize. A repo that ran both shows two `/jolli` entries — the same
+ * accepted duplication as the other four shared names.
  */
 export function buildCursorJolliSkillTemplate(): string {
 	return `---
@@ -102,7 +144,7 @@ name: jolli
 description: State-aware front door for Jolli Memory in Cursor — reads how Jolli is set up in this repository, guides first-time setup through jolli-init, reminds the user to sign in when memories cannot sync yet, then routes to recall, search, status, timeline, push, PR, or workflow actions. Use when the user invokes Jolli or asks what Jolli can do.
 metadata:
   version: "${SKILL_VERSION}"
-  revision: 3
+  revision: 4
   vendor: "jolli.ai"
 ---
 
@@ -119,17 +161,16 @@ invokes an existing skill or an existing Jolli Memory tool.
 ${SHELL_PREREQUISITE_BLOCK}
 
 Getting this wrong is worse here than in the other skills: Step 0 reads a failed
-\`test -f\` as "Jolli is not installed on this machine" and offers to delete this
-menu. Run the check in the wrong shell and that verdict is simply false.
+\`test -f\` as "the sessionStart hook has not run yet" and sends the user off to
+restart Cursor. Run the check in the wrong shell and that advice is simply wrong.
 
 ## Step 0 — confirm this menu can route
 
-This menu lives in \`~/.cursor/skills/jolli/\`, OUTSIDE the Jolli plugin, so that it
-is reachable from Cursor's chat-first window — which starts conversations without
-naming a workspace, and therefore cannot be given a per-repository copy. Being
-outside the plugin, it can also linger after the plugin has been uninstalled. It can
-only route to targets that exist in THIS session, so before doing anything else
-confirm at least one is available. The menu can route if **either** holds:
+This menu ships WITH the Jolli plugin, so it is available the moment the plugin is
+installed — in every window, including Cursor's chat-first window, which starts
+conversations without naming a workspace. Its presence therefore says the plugin is
+installed; it says nothing about whether this session can reach Jolli's plumbing.
+That is what this step checks. The menu can route if **either** holds:
 
 - one or more Jolli Memory MCP tools are available this session, **or**
 - the bundled CLI dispatcher exists:
@@ -148,21 +189,20 @@ discovered project server stays disconnected until it is switched on.
 That is expected, not a fault.
 
 If **neither** holds, do **not** build the menu and do **not** invoke any
-\`/jolli-*\` skill — they share this session's plumbing and the call will fail. This
-alone does NOT mean Jolli is gone: the Jolli CLI installs a memory pipeline that runs
-independently of this plugin (git hooks that generate memories on every commit). The
-dispatcher check above already tells the two apart:
+\`/jolli-*\` skill — they share this session's plumbing and the call will fail. There
+is only ONE state here, and it follows from the test above: the dispatcher is half of
+that test, so neither holding means the dispatcher is absent.
 
-- **dispatcher present** → Jolli still works; only this session's plumbing is
-  missing. Tell the user plainly: commits still generate memories, and they can run
-  \`jolli recall\` / \`jolli search\` directly. Reloading the window and starting a new
-  chat re-runs the Jolli \`sessionStart\` hook, which restores it.
-- **dispatcher absent** → Jolli is no longer installed on this machine, and this
-  \`/jolli\` is a stale leftover from a previous plugin install. They can remove it
-  with \`rm -rf ~/.cursor/skills/jolli\`, and reinstall the Jolli plugin to bring the
-  menu back.
+That means the plugin's \`sessionStart\` hook has not run yet on this machine — that
+hook is what writes the dispatcher. A FRESHLY INSTALLED plugin's hooks are not
+registered until Cursor is fully restarted; reloading the window or starting another
+chat is not enough (measured). Tell the user to **quit Cursor completely (⌘Q) and
+reopen it, then start a new chat**. Do NOT tell them Jolli is uninstalled or missing:
+you are reading this menu, and this menu ships with the plugin, so the plugin is
+installed. Do not suggest deleting anything, and do not offer to install the CLI or
+the VS Code extension — neither is the fix on this host.
 
-Either way, then stop — do not continue to Step 1. Do not guess at install paths.
+Then stop — do not continue to Step 1. Do not guess at install paths.
 
 ## Step 1 — read how Jolli is set up
 
@@ -296,6 +336,8 @@ This skill takes one optional free-text argument.
 - \`/jolli-recall\` — recall current-branch context.
 - \`/jolli-search\` — search decisions across branches.
 - \`/jolli-status\` — inspect installation and queue health.
+- \`/jolli-dashboard\` — open the local dashboard in a browser (machine-wide
+  memories, sessions, token spend, knowledge).
 - \`/jolli-timeline\` — show a decision topic's history.
 - \`/jolli-push\` — publish this branch's memories to a Space.
 - \`/jolli-login\` — sign in to Jolli so memories can sync to a Space. Surface this
@@ -306,13 +348,17 @@ This skill takes one optional free-text argument.
 
 Route a choice by invoking that skill; do not restate its steps here.
 
-**If \`/jolli-recall\`, \`/jolli-search\`, \`/jolli-local-run\` or \`/jolli-remote-run\`
-is not offered this session**, it is not missing — those four live in the repository
-rather than in the plugin (so they appear exactly once instead of twice), and this
-repository has not had them placed yet. That happens on the first session after the
-plugin is installed; if the session hook did not run, \`/jolli-init\` places them.
-Say so in one line and offer \`/jolli-init\`, rather than reporting the skill as
-unavailable. The CLI fallback below works either way.
+**Every skill above ships with this plugin**, this menu included — so none of them
+can be missing while you are reading it, and \`/jolli-init\` neither places nor
+repairs them. If one is genuinely not offered, the plugin's skills did not load for
+this session at all: say that in one line and use the CLI fallback, rather than
+routing to setup.
+
+**If a \`/jolli-*\` skill appears TWICE**, both entries are the same skill. Four of
+them (\`/jolli-recall\`, \`/jolli-search\`, \`/jolli-local-run\`,
+\`/jolli-remote-run\`) are also written into \`.agents/skills/\` by a full
+\`jolli enable\`, which Cursor reads as its own skills root; nothing collapses the
+pair and neither shadows the other. Invoke either one and do not report a conflict.
 
 ### Jolli Memory tools (whatever is registered this session)
 
@@ -342,8 +388,8 @@ ${SHELL_PREREQUISITE_BLOCK}
 ## 1. Inspect state
 
 Call the Jolli Memory \`status\` tool. If unavailable, run \`${RUN_CLI} status\`.
-If the dispatcher is missing, ask the user to run **Developer: Reload Window** and
-start a new chat so the Jolli \`sessionStart\` hook runs, then retry.
+
+${CURSOR_DISPATCHER_MISSING_BLOCK}
 
 ## 2. Enable local memory generation
 
@@ -355,12 +401,12 @@ ${RUN_CLI} enable --repo-hooks-only --source-tag cursor-plugin
 
 This explicit setup records \`cursor-agent\` as the local-agent tool only when none
 is configured yet — an agent tool and a paid provider already on disk are both left
-exactly as they are. It also writes this workspace's
-\`.cursor/mcp.json\`, and places \`/jolli-recall\`, \`/jolli-search\`,
-\`/jolli-local-run\` and \`/jolli-remote-run\` into this repository — those four are
-not bundled with the plugin, so that they appear once in the menu rather than twice
-in a repository that also ran a full \`jolli enable\`. If they were already present
-this step changes nothing. Cursor notices that file within a second — no reload needed —
+exactly as they are. What it writes is this repository's git hooks and this
+workspace's \`.cursor/mcp.json\`. It writes **no skills**: every Jolli skill ships
+with the plugin, so there is nothing here to place or repair — do not report
+skill files as an outcome of this step.
+
+Cursor notices \`.cursor/mcp.json\` within a second — no reload needed —
 but registers the server **disconnected**, so tell the user to open **Customize** in
 the sidebar and enable \`jollimemory\` to get the MCP tools. Everything below works
 without them either way. If the command reports that the repository is manually
@@ -432,9 +478,9 @@ On success, say that Jolli credentials were saved and offer \`/jolli-init\` to b
 the repository to a Space. Clarify that local memory generation still uses the
 configured local agent unless the user explicitly changes providers. On failure,
 surface the command's reason and suggest retrying; if the browser did not open,
-point out the login URL printed by the command. If the dispatcher does not exist,
-ask the user to run **Developer: Reload Window**, start a new chat so the Jolli
-\`sessionStart\` hook runs, and retry.
+point out the login URL printed by the command.
+
+${CURSOR_DISPATCHER_MISSING_BLOCK}
 `;
 }
 
@@ -463,8 +509,7 @@ available. Explain the provider-aware result:
 - \`anthropic\` generation continues when its preserved Anthropic key exists.
 - \`jolli\` generation stops unless another Jolli API key remains configured.
 
-If the dispatcher does not exist, ask the user to run **Developer: Reload Window**,
-start a new chat so the Jolli \`sessionStart\` hook runs, and retry.
+${CURSOR_DISPATCHER_MISSING_BLOCK}
 `;
 }
 
@@ -542,48 +587,120 @@ export interface CursorPluginSkill {
 }
 
 /**
- * What the bundle ships: **only skills that exist nowhere else**.
+ * What the bundle ships: **every skill a Cursor user needs, in one place**.
  *
  * Names keep the canonical `jolli-` prefix — see the module header for why this host
  * takes the opposite choice from the Codex bundle.
  *
- * Five names are deliberately ABSENT: the four host-neutral skills (`jolli-recall`,
- * `jolli-search`, `jolli-local-run`, `jolli-remote-run`) and the `jolli` umbrella.
- * Cursor pools a plugin bundle's `skills/` with `.agents/skills/` and the rest into one
- * flat, un-namespaced menu and collapses neither, so shipping any of them here produced
- * a second, identically-named entry in every repo that had run a full `jolli enable`.
+ * **This list is deliberately complete, and duplication is the accepted cost.** An
+ * earlier design shipped only the Cursor-specific skills and mirrored the four
+ * host-neutral ones per-repo into `.cursor/skills/`, so that Cursor's flat,
+ * un-namespaced menu would show exactly one entry per name even in a repo that had
+ * also run a full `jolli enable` (which writes `.agents/skills/`, a root Cursor reads).
+ * That optimised the wrong user. A **Cursor-only** user — the one this bundle exists
+ * for — got no `jolli-recall` and no `jolli-search` at all: the mirror was planted by
+ * the `sessionStart` bootstrap, whose opt-in gate (`isGitHookInstalled`) is false in a
+ * repo that has not been set up, so the plugin's core capability was missing from its
+ * store page and missing from the menu until the user happened to find `/jolli-init`.
  *
- * They are placed elsewhere, and the two groups land at DIFFERENT SCOPES — worth
- * keeping straight, because "all five are mirrored per-repo" was written here once and
- * was wrong. The four go per-repo into `.cursor/skills/` via
- * `reconcileCursorRepoSkills`, and only when no root Cursor reads has already supplied
- * them — see that function for the whole rule, including why the mirror cannot live in
- * this (machine-global) bundle. The umbrella goes MACHINE-GLOBAL into
- * `~/.cursor/skills/jolli` via `ensureCursorGlobalMenu`, because Cursor's chat-first
- * Agents Window delivers no workspace at all and a per-repo front door cannot be
- * planted from it; the cost is one accepted duplicate `/jolli` in a repo that also ran
- * a full `jolli enable`.
+ * So the four are shipped here now, and a user who ALSO runs Claude or Codex sees two
+ * identically-named entries differing only by a brand icon. That is cosmetic, it is
+ * paid only by multi-host users, and it replaces five silent failure modes — see
+ * {@link CURSOR_RETIRED_MIRROR_SKILLS} for the full list and why each one bit.
  *
- * `buildCursorJolliSkillTemplate` therefore still exists and is still the umbrella a
- * plugin-only user receives; it is simply written on demand rather than shipped.
- * Dropping it from this list without wiring it into that global write would leave such
- * a user with no front door at all.
+ * Nothing needs re-heading or substring rewriting: every builder already declares the
+ * name of its own directory, and the shared four already name their siblings
+ * `jolli-recall` / `jolli-search` / … — exactly what this bundle exposes. That is why
+ * {@link renderCursorPluginSkill} has two transforms where the Codex renderer has three.
  *
- * `jolli-init` MUST stay here, and it is now the ONLY thing standing between a user
- * and a dead end: the reconcile runs from the `sessionStart` bootstrap, and Cursor
- * drops every plugin hook silently whenever its plugins provider times out (measured —
- * see cursor-plugin/DEVELOPMENT.md). When that happens nothing has been mirrored, so
- * `/jolli` does not exist either; typing `jolli` still prefix-matches this skill, which
- * is the manual route back.
+ * **The `jolli` umbrella is in this list too, and that was the last thing to move
+ * here.** It used to be written MACHINE-GLOBAL to `~/.cursor/skills/jolli/` by an
+ * `ensureCursorGlobalMenu` call in the bootstrap, on the theory that Cursor's chat-first
+ * Agents Window (which reports `workspace_roots: []`) could not be given a bundled front
+ * door. Measured on 3.16.29, that theory was simply wrong: reading Cursor's own
+ * slash-menu cache (`agentData.…slashMenuItems.v6.local.glass.<ctx>`), all eleven
+ * bundled skills appear in BOTH no-repository contexts — the `empty-window` one and the
+ * Agents Window's repo-less `Home` project — and `cursor.plugins.installedIds` records
+ * the install under a `no-workspace` key, so its per-workspace sharding is a warm-up
+ * cache and not a load gate.
+ *
+ * Bundling it fixes a first-install hole the machine-global copy could not: the
+ * bootstrap that wrote it is a `sessionStart` hook, and a freshly installed plugin's
+ * hooks are NOT registered until Cursor is fully restarted (measured — a window reload
+ * and a new chat both left the hook unrun, `debug.log` untouched). So every new install
+ * had a window with eleven working skills and no front door, while `/jolli`'s own Step 0
+ * diagnosed the missing dispatcher as "Jolli is no longer installed" and offered to
+ * `rm -rf` itself. A bundled umbrella is present the instant the plugin is.
+ *
+ * The accepted cost, stated plainly: `.cursor/plugins/` is gated behind
+ * `thirdPartyExtensibilityEnabled` plus the server-side `enable_cc_plugin_import`, while
+ * `~/.cursor/skills/` is always loaded — so with a gate off, the umbrella now disappears
+ * along with the other eleven instead of surviving as a last entry point. That trade was
+ * taken deliberately: the first-install hole affects every new user, while the gate-off
+ * case is one where MCP, hooks and every skill are gone anyway.
+ *
+ * `jolli-init` MUST stay in this list for the same reason it always did: Cursor drops
+ * plugin hooks silently when a gate is off or its plugins provider times out, and
+ * nothing else is a manual route back into setup.
  */
 export const CURSOR_PLUGIN_SKILLS: ReadonlyArray<CursorPluginSkill> = [
+	{ name: "jolli", build: buildCursorJolliSkillTemplate },
 	{ name: "jolli-init", build: buildCursorInitSkillTemplate },
 	{ name: "jolli-login", build: buildCursorLoginSkillTemplate },
 	{ name: "jolli-logout", build: buildCursorLogoutSkillTemplate },
 	{ name: "jolli-status", build: buildCursorStatusSkillTemplate },
+	{ name: "jolli-dashboard", build: buildDashboardSkillTemplate },
 	{ name: "jolli-timeline", build: buildCursorTimelineSkillTemplate },
 	{ name: "jolli-push", build: buildCursorPushSkillTemplate },
+	{ name: "jolli-recall", build: buildRecallSkillTemplate },
+	{ name: "jolli-search", build: buildSearchSkillTemplate },
+	{ name: "jolli-local-run", build: buildLocalRunSkillTemplate },
+	{ name: "jolli-remote-run", build: buildRemoteRunSkillTemplate },
 ];
+
+/**
+ * Where earlier versions wrote the `/jolli` umbrella: `~/.cursor/skills/`, Cursor's
+ * MACHINE-GLOBAL skill root.
+ *
+ * Retained only so {@link removeCursorGlobalMenu} can find that leftover. The umbrella
+ * is bundled now — see {@link CURSOR_PLUGIN_SKILLS} for the measurements that retired
+ * the machine-global placement.
+ *
+ * What the root itself is remains true and was measured on Cursor 3.15.19: a
+ * doubled-star glob for `.cursor/skills` is in the skill-scan list (that prefix matches
+ * any parent, `$HOME` included) and `~/.cursor` is in the external-watcher list; the
+ * NEGATED entries for the same path belong to the WORKSPACE FILE INDEX exclusions
+ * alongside the one for `.cursor/worktrees` — a different list for a different purpose.
+ * It is in Cursor's always-loaded group, which is the one property a bundled copy does
+ * NOT have, and therefore the whole cost of bundling the umbrella.
+ *
+ * Note this is the same relative path as `SkillInstaller`'s `CURSOR_SKILLS_DIR` and a
+ * different anchor: that one is joined to a project dir, this one to `homedir()`.
+ */
+export const CURSOR_GLOBAL_SKILLS_DIR: ReadonlyArray<string> = [".cursor", "skills"];
+
+/**
+ * Remove the machine-global `/jolli` umbrella an earlier version planted.
+ *
+ * A one-way migration, called from the Cursor bootstrap where `ensureCursorGlobalMenu`
+ * used to be. Leaving it would be the duplication this bundle accepts everywhere else —
+ * except here it is avoidable at zero cost, because both copies are the SAME document
+ * and one of them now ships with the plugin. The bundled copy is also the better one to
+ * keep: it appears the instant the plugin is installed, and it disappears with it.
+ *
+ * Ownership-guarded through `removeJolliOwnedSkillDir`, so a `~/.cursor/skills/jolli/`
+ * the user wrote themselves is left alone. That guard is why
+ * {@link buildCursorJolliSkillTemplate} keeps its `metadata:` block even though the
+ * bundled render strips it: the `vendor` marker in the OLD file is what makes it
+ * recognisable as ours.
+ *
+ * `jolli uninstall` also reaches this path through `scanCursorGlobalMenu`, for the
+ * machine where the bootstrap never runs again (plugin removed through Cursor's UI, or
+ * its hooks dropped by a gate).
+ */
+export async function removeCursorGlobalMenu(home: string = homedir()): Promise<void> {
+	await removeJolliOwnedSkillDir(join(home, ...CURSOR_GLOBAL_SKILLS_DIR, "jolli"), "cursor global menu");
+}
 
 /**
  * Complete bundle-directory inventory exposed by the Cursor plugin.
@@ -604,12 +721,77 @@ export const CURSOR_PLUGIN_SKILL_NAMES: ReadonlyArray<string> = CURSOR_PLUGIN_SK
 /**
  * The exact bytes the plugin's `skills/<name>/SKILL.md` must contain.
  *
- * Only two adaptations, both consequences of one document serving several hosts:
- * drop the upsert-only `metadata:` block, and keep the frontmatter `name` equal to
- * the bundle directory. There is deliberately no sibling-reference rewrite here (the
- * Codex renderer's third step): the shared builders already name their siblings
- * `jolli-recall` / `jolli-search` / …, which is exactly what this bundle exposes.
+ * Three adaptations. Two are consequences of one document serving several hosts: drop
+ * the upsert-only `metadata:` block, and keep the frontmatter `name` equal to the bundle
+ * directory. There is deliberately no sibling-reference rewrite (the Codex renderer's
+ * third step): the shared builders already name their siblings `jolli-recall` /
+ * `jolli-search` / …, which is exactly what this bundle exposes. The third is this
+ * bundle's own — {@link appendCursorDispatcherRecovery}.
  */
 export function renderCursorPluginSkill(skill: CursorPluginSkill): string {
-	return setFrontmatterName(stripMetadataBlock(skill.build()), skill.name);
+	return appendCursorDispatcherRecovery(setFrontmatterName(stripMetadataBlock(skill.build()), skill.name));
 }
+
+/**
+ * The phrase every Cursor-aware body uses for the one remedy that works here.
+ *
+ * Doubles as the predicate {@link appendCursorDispatcherRecovery} tests, which is why
+ * it is a constant rather than three spellings: the shared dashboard body says "quit
+ * Cursor completely and reopen it" inside a host-neutral sentence, the umbrella's Step 0
+ * and {@link CURSOR_DISPATCHER_MISSING_BLOCK} say it with the ⌘Q, and all three have to
+ * count as "already handled".
+ */
+export const CURSOR_RESTART_PHRASE = "quit Cursor completely";
+
+export const CURSOR_DISPATCHER_RECOVERY_SECTION = `
+## If the Jolli CLI dispatcher is missing (Cursor)
+
+\`$HOME/.jolli/jollimemory/run-cli\` is written by this plugin's \`sessionStart\` hook,
+and a freshly installed plugin's hooks are not registered until Cursor has been fully
+restarted — a window reload or another chat is not enough (measured). So when that file
+does not exist, the fix is to **${CURSOR_RESTART_PHRASE} (⌘Q) and reopen it, then start
+a new chat**, and retry.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+\`@jolli.ai/cli\` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.
+`;
+
+/**
+ * The recovery note appended to every bundled body that shells `run-cli` without
+ * already saying what a Cursor user should do when it is absent.
+ *
+ * Bundling the four host-neutral skills made this necessary, and it is the same
+ * first-install window the umbrella was bundled for: the plugin's skills are present
+ * the instant it is installed, while its `sessionStart` hook — the thing that writes
+ * `run-cli` — does not run until Cursor has been fully restarted. So the FIRST session
+ * after an install has `/jolli-recall` and `/jolli-search` visible, no MCP server (this
+ * bundle ships no `mcp.json`, and `.cursor/mcp.json` is written by the very install
+ * being deferred), and no dispatcher.
+ *
+ * What those two bodies then say is host-neutral and, here, actively wrong: "Jolli not
+ * installed. Please install via `npm install -g @jolli.ai/cli && jolli enable` or
+ * install the Jolli VS Code extension." A Cursor-only user follows it and installs a
+ * second copy of the product to fix a plugin that is already installed and one restart
+ * away from working. `local-run` / `remote-run` have no dispatcher branch at all, so
+ * they fail with whatever the shell says.
+ *
+ * The shape, and why the correction belongs to the renderer rather than to the shared
+ * builders, is {@link appendDispatcherRecovery}'s. What is Cursor's own is the remedy:
+ * a full quit-and-reopen, which is this host's equivalent of Codex's "trust the
+ * SessionStart hook in `/hooks`".
+ */
+export function appendCursorDispatcherRecovery(body: string): string {
+	return appendDispatcherRecovery(body, {
+		marker: CURSOR_RESTART_PHRASE,
+		section: CURSOR_DISPATCHER_RECOVERY_SECTION,
+	});
+}
+
+/**
+ * Appended by {@link appendCursorDispatcherRecovery}. A trailing section rather than a
+ * rewrite of the host-neutral sentence: the four shared bodies word their
+ * dispatcher-missing branch differently (recall states it in prose, search as a bullet,
+ * the two run skills not at all), so a substring replace would hit three shapes and
+ * silently miss the fourth. An override that names what it overrides works on all four.
+ */

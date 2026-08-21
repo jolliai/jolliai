@@ -29,6 +29,7 @@ codex-plugin/
     ├── LICENSE                             # same text again — this dir is the installed unit
     ├── hooks/hooks.json                    # single SessionStart bootstrap hook
     │                                       # (no .mcp.json — see "MCP registration")
+    ├── assets/                             # app-icon.png + logo.png, named by interface.*
     ├── skills/                             # bare-named dirs; Codex shows them as $jolli:*
     ├── scripts/
     │   ├── build.mjs                       # esbuild -> dist/
@@ -183,6 +184,7 @@ $jolli:init
 $jolli:login
 $jolli:logout
 $jolli:status
+$jolli:dashboard
 $jolli:recall
 $jolli:search
 $jolli:timeline
@@ -191,8 +193,10 @@ $jolli:local-run
 $jolli:remote-run
 ```
 
-Canonical templates live in `cli/src/install/CodexPluginSkills.ts` and shared
-builders in `cli/src/install/SkillInstaller.ts`. The committed plugin copies are
+Canonical templates live in `cli/src/install/CodexPluginSkills.ts`, with shared
+builders in `cli/src/install/SkillInstaller.ts` (the four a full `jolli enable` also
+writes) and in `cli/src/install/PluginSkillText.ts` (`dashboard`, shared with the
+Cursor bundle and written by no `jolli enable`, so it carries no revision to bump). The committed plugin copies are
 generated files. After changing a template, regenerate them from the repository
 root:
 
@@ -313,6 +317,29 @@ All publish scripts live in `codex-plugin/scripts/` and share
 `_publish-lib.sh`. Each path builds `dist/`, verifies the exact runtime and skill
 inventories, and validates critical manifest/configuration files before producing
 an artifact.
+
+`PUBLISH_REQUIRED_CONFIG` is that last check, and it covers the two branding assets
+named by `interface.composerIcon` and `interface.logo` alongside the manifests and both
+`LICENSE` copies. It is the only gate on them: a logo path that resolves to nothing
+makes Codex draw its own generated placeholder tile, so the install looks healthy and
+the branding is simply absent — a typo, a renamed file and an asset that was never
+committed are indistinguishable at runtime. `CodexPluginManifest.test.ts` derives the
+required entries from the manifest rather than restating them, so the manifest owns the
+paths and publish owns existence (present-and-non-empty here, and actually staged in
+the mirror).
+
+Both PNGs are exports of the graph mark the other surfaces ship — geometry and node
+fills from `vscode/assets/icon.svg`, whose only primitives are `<line>` and `<circle>`,
+but with the paler `#D9D5F8` edge from the light variant
+(`intellij/.../icons/jollimemory.svg`). That pairing exists nowhere else in the repo, so
+the vector record for it is `cursor-plugin/plugins/jolli/assets/logo.svg` — **re-export
+from there, not from `icon.svg`**, whose `#8F88D8` edge would silently darken the mark.
+That master is 61x56, so each export centres it in a square with ~10% margin. Never
+resample a PNG, and keep the background transparent: `logo` has no `logoDark` beside it,
+so the one file has to read on a light card and a dark one alike — which the vivid node
+fills carry and a baked-in background would not. The trade in the pale edge is
+measured: over white it composites to `#DBD7F8`, so at list-row sizes the connections
+read as very faint and the nodes do the work.
 
 | Script | Default output | Git operation | Use case |
 |---|---|---|---|

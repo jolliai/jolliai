@@ -50,6 +50,39 @@ describe("Cursor plugin manifest", () => {
 	});
 });
 
+// Cursor never reads this path off disk, which is what makes every failure here
+// remote. Measured on 3.15.x: a `logo` starting with `http` is used verbatim, and
+// anything else is rewritten to
+// `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<gitPath>/<logo>` — gitPath
+// being the marketplace entry's own `source` with its leading `./` stripped — then
+// fetched at render time. So the value has to name a file that exists at that spot in
+// the PUBLISHED marketplace repo: there is nothing to resolve locally, and a wrong one
+// is a 404 that surfaces as a plugin with no icon.
+//
+// The manifest is the only place that carries it. The marketplace entry accepts a
+// `logo` too, but the resolver prefers the manifest's and both are resolved against
+// the same gitPath, so a second copy would be a duplicated string with no path that
+// reads it. Existence is the publish gate's job — PUBLISH_REQUIRED_CONFIG is checked
+// present-and-non-empty in this tree AND staged in the mirror, the pair that already
+// caught a global gitignore eating a committed SKILL.md.
+describe("Cursor plugin branding asset", () => {
+	const declaredLogo = () => readJson(pluginRoot, ".cursor-plugin", "plugin.json").logo as string;
+
+	it("keeps the logo a relative ./assets/ path inside the package", () => {
+		// Cursor rejects `..`, absolute paths and anything containing `://` outright.
+		expect(declaredLogo()).toMatch(/^\.\/assets\/[\w.-]+$/u);
+	});
+
+	it("lists the logo in PUBLISH_REQUIRED_CONFIG", () => {
+		const libText = readFileSync(join(repoRoot, "cursor-plugin", "scripts", "_publish-lib.sh"), "utf-8");
+		const block = libText.split("PUBLISH_REQUIRED_CONFIG=(")[1]?.split(")")[0] ?? "";
+		const required = block.split(/\s+/u).filter((entry) => entry.length > 0);
+
+		expect(required.length).toBeGreaterThan(0);
+		expect(required).toContain(`plugins/jolli/${declaredLogo().slice(2)}`);
+	});
+});
+
 describe("Cursor plugin MCP config", () => {
 	/*
 	 * Asserts an ABSENCE, for the same reason the Codex plugin does.
@@ -174,19 +207,21 @@ describe("Cursor plugin hooks", () => {
 
 describe("Cursor plugin skills", () => {
 	/*
-	 * The umbrella is NOT shipped, and that is the design rather than an omission.
-	 * Cursor pools a bundle's `skills/` with `.agents/skills/` into one flat menu and
-	 * collapses neither, so a bundled `jolli` was a second, identically-named entry in
-	 * every repo that had run `jolli enable`. It is written to `.cursor/skills/jolli`
-	 * per repo instead, and only where nothing else already provides it — see
-	 * `reconcileCursorRepoSkills`. Re-adding it here silently restores the duplicate.
+	 * The umbrella IS shipped, and it has to be checked on disk rather than only in the
+	 * skill list, because this is the file Cursor actually loads.
+	 *
+	 * It was machine-global (`~/.cursor/skills/jolli/`) until measurement retired that:
+	 * bundled skills reach Cursor's no-workspace contexts fine, and the bootstrap that
+	 * wrote the global copy does not run on a fresh install (a new plugin's hooks are not
+	 * registered until Cursor fully restarts), so that placement shipped every skill
+	 * except the front door. See CURSOR_PLUGIN_SKILLS.
 	 */
-	it("does not ship the /jolli umbrella — it is mirrored per repo", () => {
-		expect(existsSync(join(pluginRoot, "skills", "jolli"))).toBe(false);
+	it("ships the /jolli umbrella", () => {
+		expect(existsSync(join(pluginRoot, "skills", "jolli", "SKILL.md"))).toBe(true);
 	});
 
-	// The one skill that must survive a bootstrap that never runs: with the mirror
-	// unwritten there is no `/jolli` either, and typing `jolli` prefix-matches this.
+	// The one skill that must survive a bootstrap that never runs — a gate can drop the
+	// plugin's hooks silently, and typing `jolli` prefix-matches this.
 	it("ships jolli-init with the required frontmatter", () => {
 		const skill = readFileSync(join(pluginRoot, "skills", "jolli-init", "SKILL.md"), "utf-8");
 		expect(skill.startsWith("---\n")).toBe(true);
@@ -306,6 +341,58 @@ describe("Cursor publish resolves the README install source", () => {
 });
 
 describe("Cursor plugin marketplace", () => {
+	/*
+	 * The manifest name is the CACHE NAMESPACE, and colliding with the Claude bundle's
+	 * is a real bug rather than a cosmetic clash.
+	 *
+	 * Cursor pools every marketplace by manifest name into `~/.cursor/plugins/cache/<name>/`
+	 * — and it also IMPORTS Claude plugins (`enable_cc_plugin_import`), caching them under
+	 * THEIR marketplace's name in that same tree. Measured on this machine: a Claude plugin
+	 * install produced `~/.cursor/plugins/cache/jolli-marketplace/jolli/1.0.3/`, right
+	 * beside this bundle's own namespace. Reusing `jolli-marketplace` here would put two
+	 * different bundles in one directory.
+	 *
+	 * Until now this constraint lived only in cursor-plugin/DEVELOPMENT.md, which cannot
+	 * fail — so the name was renamed once (to shorten Cursor's title-cased section header)
+	 * with nothing checking it had not landed on the Claude name.
+	 */
+	it("does not reuse the Claude or Codex bundle's marketplace name", () => {
+		const cursorName = readJson(repoRoot, "cursor-plugin", ".cursor-plugin", "marketplace.json").name;
+		const claudeName = readJson(repoRoot, "claude-plugin", ".claude-plugin", "marketplace.json").name;
+		const codexName = readJson(repoRoot, "codex-plugin", ".agents", "plugins", "marketplace.json").name;
+		expect(typeof cursorName).toBe("string");
+		expect(cursorName).not.toBe(claudeName);
+		expect(cursorName).not.toBe(codexName);
+	});
+
+	// Cursor derives the section header shown in Customize from this name (last path
+	// segment → strip a `-HEAD` or 32+ hex suffix → title-case), and uses it verbatim as a
+	// directory name under `~/.cursor/plugins/cache/`. So it has to be a plain slug: an
+	// uppercase letter, a space or a path separator would each make the cache path or the
+	// header wrong, silently.
+	it("is a lowercase slug, safe as both a directory name and a title source", () => {
+		const name = readJson(repoRoot, "cursor-plugin", ".cursor-plugin", "marketplace.json").name as string;
+		expect(name).toMatch(/^[a-z0-9]+(?:-[a-z0-9]+)*$/u);
+	});
+
+	/*
+	 * The name is also what the README has to spell, in two places that go stale silently.
+	 *
+	 * It is the cache directory users are told to look in to tell this bundle apart from
+	 * the imported Claude one, and — because renaming a marketplace does NOT migrate an
+	 * existing install — the subject of the README's "Upgrading from 1.0.0" section. A
+	 * future rename that updates only the manifest leaves users reading a path that does
+	 * not exist and an upgrade note for the wrong identity, with every other check here
+	 * passing. Asserting the cache-path form rather than the bare name is what makes this
+	 * bite: `jolli-cursor` is a substring of `jolli-cursor-marketplace`, so a containment
+	 * check on the name alone is satisfied by the old name the upgrade note still mentions.
+	 */
+	it("is the cache directory the README tells users to look in", () => {
+		const name = readJson(repoRoot, "cursor-plugin", ".cursor-plugin", "marketplace.json").name as string;
+		const readme = readFileSync(join(repoRoot, "cursor-plugin", "README.md"), "utf-8");
+		expect(readme).toContain(`~/.cursor/plugins/cache/${name}/`);
+	});
+
 	it("is discoverable at .cursor-plugin/marketplace.json", () => {
 		const marketplace = readJson(repoRoot, "cursor-plugin", ".cursor-plugin", "marketplace.json");
 		const plugins = marketplace.plugins as Array<Record<string, unknown>>;

@@ -18,13 +18,15 @@ import {
 	buildCodexInitSkillTemplate,
 	buildCodexJolliSkillTemplate,
 	buildCodexLogoutSkillTemplate,
+	CODEX_DISPATCHER_RECOVERY_SECTION,
+	CODEX_HOOKS_PANEL_MARKER,
 	CODEX_PLUGIN_SKILL_NAMES,
 	CODEX_PLUGIN_SKILLS,
 	type CodexPluginSkill,
 	renderCodexPluginSkill,
 	stripMetadataBlock,
 } from "./CodexPluginSkills.js";
-import { SHELL_PREREQUISITE_BLOCK } from "./PluginSkillText.js";
+import { appendDispatcherRecovery, SHELL_PREREQUISITE_BLOCK } from "./PluginSkillText.js";
 import { buildPluginJolliMenuSkillTemplate } from "./SkillInstaller.js";
 
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
@@ -248,6 +250,64 @@ describe("Codex plugin skill inventory", () => {
 		const search = CODEX_PLUGIN_SKILLS.find((skill) => skill.name === "search");
 		expect(search?.build()).toContain("use jolli-recall instead");
 		expect(renderCodexPluginSkill(search as CodexPluginSkill)).toContain("use jolli:recall instead");
+	});
+});
+
+/*
+ * The four host-neutral bodies answer a missing dispatcher with "install
+ * `@jolli.ai/cli` globally or the Jolli VS Code extension" — correct for
+ * `.agents/skills/` on a host with no plugin, and wrong inside one, where Jolli is
+ * already installed and the dispatcher is waiting on this host's own gate: a trusted
+ * SessionStart hook here, a full restart on Cursor.
+ *
+ * Asserted on the RENDERED text, because the transform is the renderer's — a builder
+ * assertion would pass while the committed SKILL.md carried none of it.
+ */
+describe("the Codex render appends a dispatcher recovery note where the body has none", () => {
+	for (const skill of CODEX_PLUGIN_SKILLS) {
+		const body = skill.build();
+		const shellsRunCli = body.includes(".jolli/jollimemory/run-cli");
+		const wants = shellsRunCli && !body.includes(CODEX_HOOKS_PANEL_MARKER);
+
+		it(`${skill.name}: ${wants ? "gets the note" : "already answers for this host"}`, () => {
+			const rendered = renderCodexPluginSkill(skill);
+			expect(rendered.includes(CODEX_DISPATCHER_RECOVERY_SECTION)).toBe(wants);
+			// Either way, a body that reaches the dispatcher must route to `/hooks` — that
+			// is the outcome, and a bare append could miss it by landing on a body that
+			// never mentions the dispatcher at all.
+			if (shellsRunCli) expect(rendered).toContain(CODEX_HOOKS_PANEL_MARKER);
+		});
+	}
+
+	// The remedy is the HOST's, not a copy of Cursor's. Getting this wrong would tell a
+	// Codex user to quit an app whose hooks are gated on trust, not on a restart.
+	it("gives Codex's remedy and never Cursor's", () => {
+		expect(CODEX_DISPATCHER_RECOVERY_SECTION).toContain("trust the Jolli SessionStart");
+		expect(CODEX_DISPATCHER_RECOVERY_SECTION).not.toContain("quit Cursor");
+	});
+
+	// Pin that the advice being overridden is really present, so the override cannot
+	// quietly become dead text if a shared builder is reworded.
+	for (const name of ["recall", "search"]) {
+		it(`${name}: the note overrides advice that is actually present`, () => {
+			const skill = CODEX_PLUGIN_SKILLS.find((s) => s.name === name);
+			expect(skill?.build()).toContain("install the Jolli VS Code extension");
+			expect(renderCodexPluginSkill(skill as CodexPluginSkill)).toContain(CODEX_DISPATCHER_RECOVERY_SECTION);
+		});
+	}
+
+	// The section carries the marker it is selected by, which makes the append
+	// idempotent: re-rendering an already-noted body adds nothing.
+	it("is idempotent, because the section carries its own marker", () => {
+		expect(CODEX_DISPATCHER_RECOVERY_SECTION).toContain(CODEX_HOOKS_PANEL_MARKER);
+		const recall = CODEX_PLUGIN_SKILLS.find((skill) => skill.name === "recall") as CodexPluginSkill;
+		const once = renderCodexPluginSkill(recall);
+		expect(
+			appendDispatcherRecovery(once, {
+				marker: CODEX_HOOKS_PANEL_MARKER,
+				section: CODEX_DISPATCHER_RECOVERY_SECTION,
+			}),
+		).toBe(once);
 	});
 });
 

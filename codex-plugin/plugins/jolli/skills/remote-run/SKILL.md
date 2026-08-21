@@ -160,3 +160,15 @@ While a remote run is still in progress, the user can stop it: call
 `mcp__jollimemory__cancel_remote_workflow`) with the workflow's numeric id —
 `{ "id": <workflow id> }`. After cancelling, re-run `workflow run-status <runId>`
 to report the cancelled outcome (who/when + workflow URL).
+
+## If the Jolli CLI dispatcher is missing (Codex)
+
+`$HOME/.jolli/jollimemory/run-cli` is written by this plugin's SessionStart hook,
+and that hook does not run until it has been trusted. So when that file does not
+exist, ask the user to start a new Codex session and trust the Jolli SessionStart
+hook in `/hooks`, then retry. The Jolli Memory MCP tools arrive the same way, one
+session later — Codex reads its registrations at session start.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+`@jolli.ai/cli` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.

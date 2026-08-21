@@ -16,8 +16,7 @@ const mocks = vi.hoisted(() => ({
 	// The consent gate. Defaults to an OPTED-IN repo so the cases below exercise the
 	// maintenance path they were written for; the opt-out behaviour has its own suite.
 	isGitHookInstalled: vi.fn().mockResolvedValue(true),
-	ensureCursorGlobalMenu: vi.fn().mockResolvedValue(undefined),
-	recordCursorPluginRoot: vi.fn().mockResolvedValue(undefined),
+	removeCursorGlobalMenu: vi.fn().mockResolvedValue(undefined),
 }));
 
 vi.mock("../core/AgentReentry.js", () => ({ isLocalAgentChild: mocks.isLocalAgentChild }));
@@ -34,9 +33,8 @@ vi.mock("../install/Installer.js", () => ({
 	uninstall: mocks.uninstall,
 }));
 vi.mock("../install/GitHookInstaller.js", () => ({ isGitHookInstalled: mocks.isGitHookInstalled }));
-vi.mock("../install/SkillInstaller.js", () => ({
-	ensureCursorGlobalMenu: mocks.ensureCursorGlobalMenu,
-	recordCursorPluginRoot: mocks.recordCursorPluginRoot,
+vi.mock("../install/CursorPluginSkills.js", () => ({
+	removeCursorGlobalMenu: mocks.removeCursorGlobalMenu,
 }));
 vi.mock("./SessionStartHook.js", () => ({
 	buildSessionStartContext: mocks.buildSessionStartContext,
@@ -66,7 +64,7 @@ describe("CursorPluginBootstrapHook", () => {
 		mocks.buildSessionStartContext.mockResolvedValue("cursor briefing");
 		mocks.readStdin.mockResolvedValue(JSON.stringify({ workspace_roots: ["/repo/subdir"] }));
 		mocks.isGitHookInstalled.mockResolvedValue(true);
-		mocks.ensureCursorGlobalMenu.mockResolvedValue(undefined);
+		mocks.removeCursorGlobalMenu.mockResolvedValue(undefined);
 		mocks.withRepoHooksLock.mockImplementation(async (_cwd: string, fn: () => Promise<unknown>) => ({
 			acquired: true,
 			value: await fn(),
@@ -444,9 +442,14 @@ describe("CursorPluginBootstrapHook", () => {
 
 		/*
 		 * The Agents Window is the surface that needs `run-cli` MOST — it names no
-		 * workspace at all, so `/jolli` (machine-global for exactly that reason) and the
-		 * CLI fallbacks behind it are the only Jolli that exists there. Registering the
-		 * runtime inside the repository branch would leave that window unable to route.
+		 * workspace at all, so the bundled `/jolli` and the CLI fallbacks behind it are the
+		 * only Jolli that exists there. Registering the runtime inside the repository
+		 * branch would leave that window unable to route.
+		 *
+		 * `/jolli` itself no longer depends on this hook (it ships in the bundle), but
+		 * `run-cli` still does — which is why a fresh install cannot route until Cursor has
+		 * been fully restarted once, and why the umbrella's Step 0 says exactly that
+		 * instead of claiming Jolli is uninstalled.
 		 */
 		it("registers the runtime even when the host names no workspace", async () => {
 			mocks.readStdin.mockResolvedValue("{}");
@@ -454,7 +457,7 @@ describe("CursorPluginBootstrapHook", () => {
 			try {
 				await main();
 
-				expect(mocks.ensureCursorGlobalMenu).toHaveBeenCalledOnce();
+				expect(mocks.removeCursorGlobalMenu).toHaveBeenCalledOnce();
 				expect(mocks.reconcileRuntimeRegistry).toHaveBeenCalledOnce();
 				expect(mocks.isInsideGitRepo).not.toHaveBeenCalled();
 			} finally {

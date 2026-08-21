@@ -18,8 +18,9 @@ cursor-plugin/
 ├── plugins/jolli/
 │   ├── .cursor-plugin/plugin.json           # the plugin manifest
 │   ├── LICENSE                              # same text again — this dir is the installed unit
+│   ├── assets/logo.svg                      # brand mark, named by plugin.json "logo"
 │   ├── hooks/hooks.json                     # one sessionStart bootstrap
-│   ├── skills/<name>/SKILL.md               # 6 committed static files (generated)
+│   ├── skills/<name>/SKILL.md               # 7 committed static files (generated)
 │   ├── scripts/build.mjs                    # esbuild → dist/  (NOT shipped)
 │   ├── scripts/generate-skills.ts           # skill generator  (NOT shipped)
 │   └── dist/                                # build product, gitignored
@@ -103,13 +104,24 @@ so an edit to a builder in `cli/src` ships nothing until the generator runs.
 `CursorPluginSkills.test.ts` fails on drift, and `publish_assert_skills` re-checks it
 with `--check` because the publish scripts cannot rely on a test that only runs in CI.
 
-Four builders (`recall`, `search`, `local-run`, `remote-run`) serve the Claude and
-Codex bundles as committed files, so editing one is an edit to those two artifacts plus
-the installed copy: bump the revision + fingerprint for `.agents/skills/` AND regenerate
-both plugins' bundled copies. **This bundle is not among them** — it ships none of those
-four (see "The duplicate-entry problem" below); Cursor gets them from `.agents/skills/`
-or from the `.cursor/skills/` mirror, both written at runtime from the same builders, so
-no regeneration step here.
+Four builders (`recall`, `search`, `local-run`, `remote-run`) serve the Claude, Codex
+AND Cursor bundles as committed files, so editing one is an edit to **three** artifacts
+plus the installed copy: bump the revision + fingerprint for `.agents/skills/` AND
+regenerate all three plugins' bundled copies. This bundle joined that set when the
+per-repo mirror was retired (see "The duplicate-entry problem" below) — before that it
+shipped none of the four and needed no regeneration step.
+
+A fifth shared body reaches this bundle the same way: `jolli-dashboard`, built by
+`buildDashboardSkillTemplate` in `cli/src/install/PluginSkillText.ts`. It is shared with
+the Codex bundle rather than restated per host (the two copies differ only in the
+frontmatter `name`, which each renderer rewrites). Unlike the four it has no
+`.agents/skills/` counterpart at all — no `jolli enable` writes that name anywhere — so
+it is the one shared body Cursor's flat menu cannot show twice. Editing it means
+regenerating **both** plugin bundles, and hand-updating the
+Claude plugin's independent copy at
+`claude-plugin/plugins/jolli/skills/dashboard/SKILL.md`, which — like every skill in
+that bundle — no drift test pins. It carries no `metadata.revision`, since nothing
+upserts it.
 
 ## What differs from the Codex plugin
 
@@ -117,7 +129,7 @@ no regeneration step here.
 |---|---|---|
 | Manifest | `.codex-plugin/plugin.json` | `.cursor-plugin/plugin.json` |
 | Marketplace | `.agents/plugins/marketplace.json` | `.cursor-plugin/marketplace.json` |
-| Marketplace `name` | `jolli-marketplace` | `jolli-cursor-marketplace` (must differ) |
+| Marketplace `name` | `jolli-marketplace` | `jolli-cursor` (must differ — see below) |
 | Hook event | `SessionStart` (PascalCase) | `sessionStart` (camelCase) |
 | `hooks.json` shape | nested `[{ hooks: [{ type, command }] }]` | flat `[{ command }]` |
 | Plugin-root variable | `${PLUGIN_ROOT}` | `${CURSOR_PLUGIN_ROOT}` |
@@ -252,12 +264,12 @@ Worth knowing before editing a skill body, all from the same reading:
 |---|---|
 | `name` | lowercase letters/digits/hyphens, ≤64 chars, **must equal the directory**. A mismatch is not an error — the menu invokes the *directory* name and `name` degrades to a label. |
 | `description` | required (a skill without one is loaded with `parseError: "Description is required"`); ≤1024 by the docs, hard-truncated to **1536** by `kt()` before the model sees it. |
-| `alwaysApply: true` | reclassifies the skill as a **global rule**, injected into every session. Never set it here — seven long documents in every context. |
+| `alwaysApply: true` | reclassifies the skill as a **global rule**, injected into every session. Never set it here — eleven long documents in every context. |
 | `disable-model-invocation: true` | makes the skill explicit-invocation only. Cursor's own `create-skill` recommends defaulting to it; Jolli's skills deliberately stay model-invocable, since recall/search must trigger from ambient context. |
 | `paths` / `globs` | interchangeable — the loader reads `data.paths ?? data.globs` — and scope the skill to matching files. |
 | `metadata.*` | genuinely read, not just tolerated, and the mechanism is worth stating exactly because it is tempting to misuse. The frontmatter parser (`qVv`) explicitly handles `metadata.environments` and `metadata.disabledEnvironments`; `q5u(skill, env)` then decides visibility — `disabledEnvironments` containing `env` hides the skill, and a **non-empty** `environments` that does not contain `env` hides it too. **`env` is a RUNTIME mode, not a host**: the only values observed are `"cloud"` and `"auto"` (`q5u(e,"cloud")`), so this cannot express "hide this from Cursor but not from Codex". Declaring `environments` with any value Cursor never uses therefore hides the skill from **every** environment — that is the real mechanism behind "a stray key silently hides a skill", and it is one more reason the generator strips the block. Do not reach for it as a de-duplication trick: the other hosts do not read these keys today, but if any of them starts to, the skill disappears everywhere at once. |
 
-### The duplicate-entry problem, and where the mirror lives
+### The duplicate-entry problem, and why the bundle ships everything anyway
 
 `.agents/skills/` is a **first-class** Cursor skill root. So a repo that ran a full
 `jolli enable` already has `/jolli-recall` in Cursor from `.agents/skills/`, and a
@@ -267,144 +279,74 @@ unconditionally. On Codex the same duplication is invisible because the two land
 *different* names (`jolli:recall` vs `jolli-recall`); here they differ only by a brand
 icon.
 
-Shipped whole, the overlap was **five** entries, not four: `jolli`, `jolli-recall`,
-`jolli-search`, `jolli-local-run`, `jolli-remote-run`. The umbrella is easy to miss —
-the CLI writes `.agents/skills/jolli` too.
+Shipped whole, the overlap is **five** entries: `jolli`, `jolli-recall`, `jolli-search`,
+`jolli-local-run`, `jolli-remote-run`. The umbrella is easy to miss — the CLI writes
+`.agents/skills/jolli` too.
 
-**Resolution: the bundle ships only what exists nowhere else; the four that can collide
-are mirrored per repo; the umbrella is machine-global.**
-
-```
-bundle (6)   jolli-init  jolli-login  jolli-logout
-             jolli-push  jolli-status  jolli-timeline
-
-mirrored (4) jolli-recall  jolli-search  jolli-local-run  jolli-remote-run
-             → <repo>/.cursor/skills/<name>/, written ONLY when no root Cursor
-               reads already provides it, and removed again once one does
-
-global (1)   jolli
-             → ~/.cursor/skills/jolli/, written every session, repo or not
-```
-
-**The umbrella is the exception, and it is the one entry whose duplicate is ACCEPTED.**
-It is bound to `buildCursorJolliSkillTemplate`, not to the entry `SKILLS` registers: the
-two are not the same document — the host-neutral menu the CLI writes to
-`.agents/skills/jolli`, versus the state-aware Cursor variant that reads `status` and
-leads a half-configured repo into setup.
-
-It is not mirrored per repo because the surface that most needs a front door — Cursor's
-chat-first Agents Window — never names a repository, so a per-repo copy can never reach
-it (see "The Agents Window names no repository, ever"). Machine-global it is, and in a
-repo that also ran `jolli enable` that means two `/jolli` entries. Deliberate: a
-duplicate is two working front doors, while pruning it from both places is a missing
-front door with nothing on screen to explain the absence.
-
-### Finding the bundle: `cursor-plugin-root`, and why `dist-paths` cannot answer
-
-The four mirrored skills are symlinks INTO the bundle, so planting one requires knowing
-where the bundle is. That question has exactly one authoritative answer — **the running
-module's own path, when the code is running from inside the bundle**. esbuild rewrites
-`import.meta.url` to the bundle's own file, so the bootstrap resolves
-`<bundle>/dist/CursorPluginBootstrapHook.js` up two levels and finds `mirror/` beside
-`dist/`. Nothing else on the machine knows.
-
-So the bootstrap **records** it, every session, to
-`~/.jolli/jollimemory/cursor-plugin-root` — one absolute path, plain text, the same
-shape as the `node-path` sibling. `cursorPluginMirrorDir()` reads that record and
-**verifies `<root>/mirror` still exists** before using it.
-
-**`dist-paths/cursor-plugin` was the original source and it is the wrong question.**
-That registry slot is keyed by SOURCE TAG ALONE, never by directory — a deliberate
-property (see the `wt-dist-path-repair` decision) so that a same-version reinstall at a
-new path, such as switching worktrees, still claims the slot instead of leaving hooks
-dispatching from a stale directory. What it records is therefore *"the dist of whichever
-runtime most recently installed while claiming this tag"*, which is not *"where that
-host's bundle is"*. Measured: `/jolli-init` runs
-`run-cli enable --repo-hooks-only --source-tag cursor-plugin`, `run-cli` resolves to the
-highest-version dist (the CLI wins a version tie via `SOURCE_PREFERENCE_ORDER`), and the
-CLI correctly recorded its OWN dist under the `cursor-plugin` key — so
-`dirname(distDir)/mirror` came out as `<repo>/cli/mirror`, which does not exist. All four
-links dangled and Cursor dropped the skills with no error anywhere. **Do not "fix" this
-by making the registry refuse a foreign runtime's write** — that re-introduces the stale
-worktree bug the registry was repaired to remove.
-
-Two properties fall out and both are load-bearing:
-
-- **The existence check is what notices an uninstall.** The record lives under
-  `~/.jolli/`, which Cursor's plugin manager never touches, so it outlives the bundle.
-  Its target vanishing is the signal; a resolver that trusted the recorded path would
-  keep planting links into a directory that is gone.
-- **The timing works because the bootstrap always precedes `/jolli-init`.**
-  `sessionStart` fires before the user can type, so by the time anyone invokes the setup
-  skill the record is already there — which is what lets a CLI-dispatched init plant the
-  links correctly in the same pass rather than leaving the user to open another chat.
-
-That works only because the generic menu learned to route to whatever skills the
-session actually has (`revision` 7). It used to hardcode four actions, so on a host
-with a plugin installed it could not route to `jolli-init`, `jolli-status`,
-`jolli-push` and the rest even though they were sitting right there. Its own MCP
-section had said "whatever is registered this session" all along; the skill list is now
-worded the same way. That asymmetry was a defect on Codex and Claude Code too, so
-fixing it widened the front door on every host.
-
-**Which roots count as "already provides it".** Read out of the provider
-(`extensions/cursor-agent-exec/dist/main.js`), which classifies every discovered
-`SKILL.md` by path and matches with `includes` rather than `startsWith` — so the `~`
-variants count as much as the repo-level ones:
+**Resolution: the bundle ships everything and the duplicate is ACCEPTED.**
 
 ```
-always-on   <repo>/.agents/skills/    ~/.agents/skills/
-gated       <repo>/.claude/skills/    ~/.claude/skills/
-            <repo>/.codex/skills/     ~/.codex/skills/
+bundle (12)  jolli
+             jolli-init  jolli-login  jolli-logout  jolli-status
+             jolli-dashboard  jolli-timeline  jolli-push
+             jolli-recall  jolli-search  jolli-local-run  jolli-remote-run
 ```
 
-The gated group is only loaded while `thirdPartyExtensibilityEnabled` is on, so
-[`CursorSettings`](../cli/src/install/CursorSettings.ts) reads it — with the toggle off
-a copy there is invisible, and treating it as "already provided" would leave the user
-with nothing. Checking only `.agents/` left a real hole:
-`.claude/skills/jolli-recall` from a pre-upgrade `jolli enable` is cleaned up by
-`removeClaudeLegacySkills`, which runs only from the CLAUDE plugin bootstrap — a
-Cursor-only user never reaches it. `.claude/plugins/` and `.cursor/plugins/` are
-deliberately NOT probed: the Claude plugin's skill directories are bare (`recall`,
-`search`, `push`) and never collide with `jolli-recall`, and `.cursor/plugins/` is our
-own bundle.
+Nothing is written outside the bundle any more. Two placements were retired to get
+here, in that order — the per-repo mirror of the four shared skills, then the
+machine-global umbrella.
 
-Ownership is not consulted when probing. The goal is one entry per name in a flat menu,
-and a user's own `~/.claude/skills/jolli-recall` occupies that name just as completely —
-theirs is the one they chose.
+#### What was tried instead, and why it was wrong
 
-[`reconcileCursorRepoSkills`](../cli/src/install/SkillInstaller.ts) runs from the
-bootstrap's `install(..., { repoHooksOnly: true })` on every session start.
+The four overlapping skills were once withheld from the bundle and **mirrored per repo**
+into `<repo>/.cursor/skills/<name>/` — as symlinks into the bundle, written only when no
+root Cursor reads already supplied the name, and removed again once one did. It kept the
+menu at one entry per name. It also optimised for the wrong user, and the cost was not
+cosmetic:
 
-**Why `.cursor/skills/` and not somewhere else.** Two properties, both load-bearing:
+- **A Cursor-only user got no `recall` and no `search` at all.** The mirror was planted
+  by the `sessionStart` bootstrap, and this host's consent gate (`isGitHookInstalled`,
+  see below) is false in a repo that has not been set up. So the plugin's core
+  capability was missing from its store page *and* missing from the slash menu until the
+  user happened to find `/jolli-init`. For the audience this bundle exists for — someone
+  who runs Cursor and nothing else — that is the whole product, absent.
+- **The symlink targets needed a second record to locate.** `dist-paths/cursor-plugin`
+  cannot answer "where is this host's bundle" (it is keyed by source tag alone, so it
+  holds whichever runtime last installed under that tag — measured: `/jolli-init`
+  dispatches through `run-cli`, the CLI wins the version tie, and
+  `dirname(distDir)/mirror` came out as `<repo>/cli/mirror`, so all four links dangled
+  silently). The fix was a `~/.jolli/jollimemory/cursor-plugin-root` record written by
+  the bootstrap from its own `import.meta.url` — one more piece of machine-global state,
+  invalidated by every marketplace upgrade until the next Cursor session.
+- **A host-neutral reconcile read another app's private SQLite.** Deciding "is this name
+  already supplied" meant asking whether `.claude/skills/` was visible to Cursor, which
+  meant opening `state.vscdb` for `thirdPartyExtensibilityEnabled` — from every Claude
+  and Codex session start, since the reconcile had to be host-neutral to survive a
+  plugin removed through Cursor's UI.
+- **It needed `.git/info/exclude` upkeep**, and got it wrong once already: git reports an
+  untracked directory as a single `?? .cursor/` line rather than descending, so the
+  per-skill entries alone left the whole tree in `git status`.
+- **The machine-global `/jolli` was collateral.** The reconcile inferred "the plugin is
+  gone" from a stale bundle record and deleted the umbrella — which also fires during the
+  window a marketplace upgrade leaves while moving the version-stamped bundle, so any
+  OTHER runtime reconciling in that window took the front door away from a plugin that
+  was very much installed.
 
-- **Per-repo**, the same granularity as the thing it mirrors. The obvious alternative —
-  delete the *bundle's* copy when `.agents/` has one — fails here: the bundle is
-  machine-global, so one repo's reconcile would strip the skill from every other repo,
-  and two windows open on differently-configured repos would fight over it.
-- **Read by no other host.** Writing and deleting it cannot take away the only copy
-  Codex, Gemini, OpenCode, Windsurf and Copilot have. That is exactly why the reverse
-  direction — de-duplicating by deleting from `.agents/` — stays forbidden, and it is
-  the same property that lets the Claude plugin delete `.claude/skills/jolli-*`.
+A duplicate entry paid only by multi-host users beats all five. What remains is a
+one-way sweep: `removeCursorRepoSkills` plus
+`removeGitExcludePaths(CURSOR_RETIRED_SKILL_GIT_EXCLUDE_PATHS)`, on every install path
+and still host-neutral, because a leftover symlink is now a duplicate of something the
+bundle supplies — and a *dangling* one after an upgrade. Both are ownership-guarded, so a
+`.cursor/skills/jolli-recall` the user wrote themselves is left alone.
 
-Both directions are ownership-guarded (`vendor: "jolli.ai"`), so a user's own
-`.cursor/skills/jolli-recall` is neither overwritten nor deleted. The exclude paths are
-registered unconditionally, whether or not the copies are currently written: the set is
-merged as a union and an exclude line for an absent path is inert, so the block does not
-flap as `.agents/` comes and goes.
+**Two rules survive the retirement and are not up for revisiting.** De-duplicating in
+the `.agents/` direction stays forbidden: it is the only copy Codex, Gemini, OpenCode,
+Windsurf and Copilot have. And `jolli-init` stays in the bundle — Cursor drops every
+plugin hook silently when its provider times out or either extensibility gate is off, and
+it is the only manual route back into setup. Its presence is pinned by a test, as is the
+umbrella's absence from the bundle, so neither moves by accident.
 
-**`jolli-init` stays in the bundle, and it is now the ONLY thing standing between a
-user and a dead end.** The reconcile runs from the `sessionStart` hook, which is
-measured to fail silently and completely (see "The failure mode that actually bit"
-below) — and which, even when perfectly healthy, does not fire until the user starts a
-new conversation (see the next section). On such an install nothing has been mirrored,
-so `/jolli` does not exist either. Typing `jolli` still prefix-matches `jolli-init`,
-which is the manual route back: it runs `enable --repo-hooks-only`, which performs the
-same reconcile. Removing it from the bundle would leave that user with no reachable
-Jolli anything, so its presence is pinned by a test — as is the umbrella's ABSENCE, so
-nobody restores the duplicate by adding it back.
-
-### The Agents Window names no repository, ever — and why `/jolli` is machine-global
+### The Agents Window names no repository, ever — and why the front door is BUNDLED
 
 **Measured 2026-08-13 with a throwaway probe plugin on Cursor 3.15.19**, after a day
 spent misdiagnosing it twice. This is the finding that sets this host's whole install
@@ -444,32 +386,76 @@ on the repo in that window even though the HOOK cannot name it.
 
 Two consequences, and they are the design:
 
-1. **`/jolli` is written machine-global to `~/.cursor/skills/jolli/`**, by
-   `ensureCursorGlobalMenu`, on every session with or without a repository. A per-repo
-   front door cannot reach the surface that most needs one. The cost is one duplicate
-   `/jolli` in a repo that also ran `jolli enable`; the alternative is no front door and
-   nothing on screen explaining why, which is exactly the state this whole
-   investigation started from.
+1. **A PER-REPO front door is impossible on this surface**, so `/jolli` is shipped in the
+   bundle. For a while it was written machine-global to `~/.cursor/skills/jolli/` instead,
+   which reached the surface but was the wrong fix twice over — see the follow-up
+   measurement below.
 2. **The bootstrap installs nothing into a repository that has not opted in.** Not
    because it cannot — in a workspace-bound window it could — but because it should not:
    a `workspaceOpen` fires for EVERY repository in the sidebar at startup, so
    auto-install reaches repositories the user only browsed. See the consent gate below.
 
-Pinned by `CursorPluginSkills.test.ts`, `CursorPluginManifest.test.ts`,
-`SkillInstaller.test.ts` (`ensureCursorGlobalMenu` needs no repo, is idempotent, spares
-a user's own file; the reconcile never plants the umbrella per repo) and
-`CursorPluginBootstrapHook.test.ts` (the consent gate's four cases).
+#### Follow-up, measured 2026-08-21 on Cursor 3.16.29: bundle it, don't plant it
+
+The machine-global placement rested on an untested inference — that a *bundled* skill
+would be as unreachable from this window as a per-repo one. It is not. Read out of
+Cursor's own slash-menu cache
+(`ItemTable` key `agentData.cacheStorage.agentEnvironment.slashMenuItems.v6.local.glass.<ctx>`
+in `~/Library/Application Support/Cursor/User/globalStorage/state.vscdb`):
+
+- all bundled skills appear in **both** no-repository contexts — the `empty-window` one
+  and the Agents Window's repo-less `Home` project (`glass.additionalProjects` lists it
+  with a `workspaceIdentifier` but no `uri`);
+- entry ids carry their origin, which is what makes this readable at all:
+  `skill-cache/<marketplace>/<plugin>/<sha>/skills/<name>/SKILL.md` for a bundled skill
+  versus a bare `skill-<name>/SKILL.md` for one from a skills root;
+- `cursor.plugins.installedIds.no-team|no-workspace` recorded the install, so that
+  store's per-workspace sharding (`KHg(teamId, folders)`, `folders.length === 0` →
+  `"no-workspace"`) is a warm-up cache — its only consumer is
+  `_maybeWarmMarketplacePluginsForCurrentContext` — and **not** a load gate.
+
+And the machine-global copy could not survive its own first install: **a freshly
+installed plugin's hooks are not registered until Cursor is FULLY restarted.** Measured
+in sequence — install, then a new chat: 11 bundled skills appeared in the menu while
+`~/.jolli/jollimemory/debug.log` gained not one line, `~/.cursor/skills/` stayed empty
+and `dist-paths/cursor-plugin` was never written. After ⌘Q and a new chat, the hook ran
+and wrote all three within 4 ms. So on every new install the old design shipped every
+skill except the front door, and `/jolli`'s Step 0 read the missing dispatcher as "Jolli
+is no longer installed on this machine" and offered to `rm -rf` itself.
+
+The cost of bundling it, so nobody re-litigates it by accident: `~/.cursor/skills/` is in
+Cursor's always-loaded group while `.cursor/plugins/` is gated behind
+`thirdPartyExtensibilityEnabled` (measured `'true'` on this machine) plus the server-side
+`enable_cc_plugin_import` — so with a gate off the umbrella now goes with the other
+eleven instead of surviving alone. Taken deliberately: the first-install hole affects
+every new user, the gate-off case is one where MCP, hooks and every skill are gone too.
+
+What survives of the old placement is a one-way sweep — the bootstrap calls
+`removeCursorGlobalMenu` where it used to call `ensureCursorGlobalMenu`, and
+`UninstallScan`'s `scanCursorGlobalMenu` is the second route for a machine whose
+bootstrap never runs again. `buildCursorJolliSkillTemplate` keeps its `metadata:` block
+(stripped from the bundled render) because the `vendor` marker in it is what makes that
+leftover recognisable as ours.
+
+Pinned by `CursorPluginSkills.test.ts` (the umbrella is in the bundle; the sweep removes
+only a marked leftover), `CursorPluginManifest.test.ts` (`skills/jolli/SKILL.md` exists
+on disk) and `CursorPluginBootstrapHook.test.ts` (the consent gate's four cases, and the
+sweep running with no workspace).
 
 ### The consent gate — this host does not install on its own
 
 `runCursorPluginBootstrap` gates the whole `install()` call on
-`isGitHookInstalled(worktreeRoot)`. An un-opted-in repository gets **nothing**: no git
-hooks, no `.cursor/mcp.json`, no mirrored skills, and no briefing either.
+`isGitHookInstalled(worktreeRoot)`. An un-opted-in repository gets no git hooks, no
+`.cursor/mcp.json` and no briefing.
 
-**The gate is drawn around the WORKTREE, not around the machine.** Three writes stay
-unconditional, and all three are in `~/`: the `/jolli` umbrella, the
-`cursor-plugin-root` record, and the runtime registry — the three dispatch scripts plus
-`dist-paths/cursor-plugin`, via `reconcileRuntimeRegistry`. Drawing the gate around
+What it DOES get is every skill, because they are bundled rather than written into the
+repo — which is the point of retiring the mirror. The capability no longer depends on a
+gate a fresh repository cannot pass; only the repo-side plumbing does.
+
+**The gate is drawn around the WORKTREE, not around the machine.** Two writes stay
+unconditional, and both are in `~/`: the `/jolli` umbrella, and the runtime registry —
+the three dispatch scripts plus `dist-paths/cursor-plugin`, via
+`reconcileRuntimeRegistry`. Drawing the gate around
 those too was measured as a **closed loop** on a plugin-only machine, because
 everything the front door falls back to is `run-cli`:
 
@@ -708,11 +694,28 @@ a newer surface wrote — here a dev worktree at 0.99.10 against a machine whose
    the genuinely-empty config, where some tool has to be picked and this host's is
    the best available guess. Verifying the credential store still closes it.
 
-2. **A logo is required for marketplace submission.** `plugin.json` carries no `logo`
-   yet; Cursor's submission checklist wants one committed to the repo and referenced by
-   a relative path (`assets/logo.svg`). Add the real brand asset — do not ship a
-   placeholder, and add `plugins/jolli/assets/logo.svg` to `PUBLISH_REQUIRED_CONFIG`
-   when you do.
+2. ~~A logo is required for marketplace submission.~~ **Closed.** `plugin.json`
+   declares `"logo": "./assets/logo.svg"`, the asset is committed at
+   `plugins/jolli/assets/logo.svg`, and `PUBLISH_REQUIRED_CONFIG` lists it so a
+   publish refuses if it ever goes missing. It is the same graph mark as
+   `vscode/assets/icon.svg` — same geometry, same node fills — carrying the light
+   variant's paler `#D9D5F8` edge, and translated into a square viewBox with ~10%
+   margin since that master is 61x56 and every host renders a logo in a square. That
+   edge/fill pairing exists in no other surface's icon, so this file is the vector
+   record the Codex plugin's PNGs are exported from as well.
+
+   The path is never read off disk, which is why the publish gate is the only local
+   check possible. Measured on 3.15.x: a `logo` starting with `http` is used verbatim,
+   and anything else is rewritten to
+   `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/<gitPath>/<logo>` — gitPath
+   being the marketplace entry's `source` with its leading `./` stripped — then fetched
+   at render time. Two consequences. The asset has to be committed to the PUBLISHED
+   marketplace repo (`raw` serves `.svg` as `image/svg+xml`, so an `<img>` renders it);
+   and a `publish-local.sh` install shows no logo at all, because a local directory has
+   no git URL to resolve against — that is the expected result there, not a regression.
+   The marketplace entry accepts a `logo` too, but the resolver prefers the manifest's
+   and both resolve against the same gitPath, so a second copy would be a duplicated
+   string with no path that reads it.
 
 3. **Server-side client kind.** The bundle self-identifies as `cursor-plugin/<version>`
    via `__JOLLI_CLIENT_KIND__`. Add that kind to the server's allowlist before release,
@@ -739,12 +742,39 @@ a newer surface wrote — here a dev worktree at 0.99.10 against a machine whose
    into a documented requirement. Test before release; it may change what the Install
    section leads with.
 
-7. **The marketplace `name` must not collide with the Claude plugin's, and that is now
-   load-bearing rather than cosmetic.** Settled for this bundle (`jolli-cursor-marketplace`,
-   verified to produce a separate `~/.cursor/plugins/cache/` namespace), and the reasoning
-   is under "What differs from the Codex plugin". Listed here because the constraint binds
-   any FUTURE host bundle too: Cursor pools every marketplace by manifest name, so a
-   fourth plugin reusing `jolli-marketplace` would re-open the same shared-cache bug.
+7. **The marketplace `name` must not collide with the Claude plugin's, and that is
+   load-bearing rather than cosmetic.** Cursor pools every marketplace by manifest name
+   into `~/.cursor/plugins/cache/<name>/` — and it also IMPORTS Claude plugins, caching
+   them under THEIR marketplace's name in the same tree. Measured: a Claude plugin install
+   produced `~/.cursor/plugins/cache/jolli-marketplace/jolli/1.0.3/`, right beside this
+   bundle's namespace. Reusing `jolli-marketplace` here would put two different bundles in
+   one directory. Now `jolli-cursor` (was `jolli-cursor-marketplace`, shortened because
+   Cursor title-cases this name into the Customize section header, which read "Jolli
+   Cursor Marketplace"). It keeps the word **Cursor**: both bundles' plugin cards read
+   "Jolli Memory", so this header is the only thing distinguishing them, and installing
+   the Claude one here yields skills and an MCP server that look healthy and capture
+   nothing. **No longer an open question — `CursorPluginManifest.test.ts` pins it**,
+   both directions (≠ the Claude and Codex names, and a lowercase slug so it is safe as a
+   directory name). The prose above could not fail; the rename happened once with nothing
+   checking it had not landed on the Claude name. The constraint still binds any FUTURE
+   host bundle.
+
+   One consequence for an existing install: the name IS the cache namespace and the
+   identity Cursor lists the marketplace under, so a rename does not migrate. A 1.0.0
+   install keeps pointing at the old identity and is simply told it is up to date — it
+   never sees 1.0.1 or the twelve bundled skills. **That has to be user-visible, not just
+   recorded here**, so the README carries an "Upgrading from 1.0.0" section with the only
+   fix there is: remove the old marketplace in Customize and re-add it. The stale
+   `~/.cursor/plugins/cache/jolli-cursor-marketplace/` directory is then orphaned and can
+   be deleted.
+
+   The rename was taken WITH that cost rather than reverted, on timing: 1.0.0 shipped on
+   2026-08-15, so the install base is the smallest it will ever be, and if the shorter
+   header is wanted at all this is the cheapest moment to pay for it. Sweeping the stale
+   cache directory from the bootstrap was considered and rejected — it is a machine-global
+   delete inside another product's cache, to save a step the README can just name. Do not
+   rename this again without re-reading both halves: after this release the same change
+   costs every install a manual re-add, with no signal that anything is wrong.
 
 8. **An unrecognised key in `hooks.json` silently voids the WHOLE file.** Measured: a
    probe registering four documented events plus `activeBranchChange` — a string that
@@ -844,9 +874,28 @@ user commit** rather than a missing feature (a git hook resolving to
 - `PUBLISH_REQUIRED_DIST` in `scripts/_publish-lib.sh`
 - `REQUIRED_RUNTIME_FILES` in `cli/src/install/DistPathWriter.ts` (the 10 shared ones)
 
+A third pair covers the branding asset: the `logo` in `plugins/jolli/.cursor-plugin/plugin.json`
+and its `PUBLISH_REQUIRED_CONFIG` entry. `CursorPluginManifest.test.ts` derives the
+second from the first rather than restating it, so the manifest owns the path and the
+publish gate owns existence — a renamed or added asset cannot ship unchecked.
+
 A parallel pair covers the skills — `CURSOR_PLUGIN_SKILL_NAMES` and
-`PUBLISH_EXPECTED_SKILLS`, an exact set and never a glob — and a second pair covers the
-symlink targets: `CURSOR_MIRROR_SKILLS` (in `cli/src/install/SkillInstaller.ts`) and
-`PUBLISH_EXPECTED_MIRROR`. **`jolli` belongs to neither.** The umbrella is written
-machine-global at runtime by `ensureCursorGlobalMenu`, so adding it back to either list
-would ship a second `/jolli` into every repo that opted in.
+`PUBLISH_EXPECTED_SKILLS`, an exact set and never a glob, **twelve** entries. `jolli` is
+one of them: nothing this plugin offers is written outside the bundle any more, so these
+two lists are the complete inventory of what a user gets.
+
+Two retired placements each left a list behind, and neither is a publish inventory:
+
+- `CURSOR_RETIRED_MIRROR_SKILLS` (in `cli/src/install/SkillInstaller.ts`) — the four
+  names the per-repo mirror used to plant, kept as the sweep's list of what to remove.
+  Its old publish pair, `PUBLISH_EXPECTED_MIRROR`, is gone.
+- `CURSOR_GLOBAL_SKILLS_DIR` (in `cli/src/install/CursorPluginSkills.ts`) — where the
+  machine-global umbrella used to go, kept so `removeCursorGlobalMenu` can find that
+  leftover.
+
+A third pair covers the marketplace name: the `name` in `.cursor-plugin/marketplace.json`
+is asserted to differ from the Claude and Codex bundles' (read from their own manifests,
+not hard-coded) and to be a lowercase slug. That name is simultaneously the cache
+namespace under `~/.cursor/plugins/cache/` and the source of the title-cased header
+Cursor renders in Customize, so a collision or a stray capital fails silently in two
+different ways.

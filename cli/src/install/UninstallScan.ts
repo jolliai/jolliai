@@ -28,6 +28,7 @@ import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { createLogger, getJolliMemoryDir } from "../Logger.js";
 import { execFileAsyncHidden } from "../util/Subprocess.js";
 import { getStatus } from "./Installer.js";
+import { isJolliOwnedSkill } from "./SkillInstaller.js";
 
 const log = createLogger("UninstallScan");
 
@@ -427,6 +428,39 @@ export async function scanGlobalConfig(): Promise<RemovableItem[]> {
 	];
 }
 
+/**
+ * The machine-global Cursor `/jolli` umbrella at `~/.cursor/skills/jolli/`, if it is ours.
+ *
+ * Nothing writes this any more — the umbrella is bundled (see `CURSOR_PLUGIN_SKILLS`),
+ * and the Cursor bootstrap now REMOVES the old copy instead of refreshing it. This scan
+ * is the second route to that same leftover, for the machine where the bootstrap never
+ * runs again: the plugin removed through Cursor's own UI (which runs no Jolli code), or
+ * its hooks dropped by an extensibility gate.
+ *
+ * Listed under the machine-global surface because that is its scope — shared by every
+ * repository, so a `--scope project` uninstall must not reach it.
+ *
+ * Ownership-guarded at SCAN time, which is what makes the generic path-removal safe: a
+ * `SKILL.md` without our vendor marker is the user's own skill and is never listed.
+ */
+export async function scanCursorGlobalMenu(home: string): Promise<RemovableItem[]> {
+	const dir = join(home, ".cursor", "skills", "jolli");
+	try {
+		if (!(await stat(dir)).isDirectory()) return [];
+		if (!isJolliOwnedSkill(await readFile(join(dir, "SKILL.md"), "utf-8"))) return [];
+	} catch {
+		return [];
+	}
+	return [
+		{
+			surface: "global-config",
+			label: "Cursor `/jolli` menu (machine-global skill)",
+			path: dir,
+			kind: "dir",
+		},
+	];
+}
+
 /** The per-project `<projectDir>/.jolli/jollimemory/` state directory, if present. */
 export async function scanProjectConfig(projectDir: string): Promise<RemovableItem[]> {
 	const dir = getJolliMemoryDir(projectDir);
@@ -485,16 +519,17 @@ export async function scanUninstallInventory(options: ScanOptions = {}): Promise
 	const projectDir = options.projectDir ?? process.cwd();
 	const npmGlobalRoots = options.npmGlobalRoots ?? (await resolveNpmGlobalRoots());
 
-	const [vscode, intellij, cli, globalConfig, projectConfig, repoHooks] = await Promise.all([
+	const [vscode, intellij, cli, globalConfig, cursorMenu, projectConfig, repoHooks] = await Promise.all([
 		scanVscodeExtensions(home),
 		scanIntellijPlugins(home, platform),
 		scanCliGlobal(home, platform, npmGlobalRoots),
 		scanGlobalConfig(),
+		scanCursorGlobalMenu(home),
 		scanProjectConfig(projectDir),
 		scanRepoHooks(projectDir),
 	]);
 
-	const items = [...vscode, ...intellij, ...cli, ...globalConfig, ...projectConfig, ...repoHooks];
+	const items = [...vscode, ...intellij, ...cli, ...globalConfig, ...cursorMenu, ...projectConfig, ...repoHooks];
 
 	const preserved = [
 		"Git orphan branch 'jollimemory/summaries/v3' (your commit memories)",

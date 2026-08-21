@@ -54,37 +54,28 @@ PUBLISH_REQUIRED_DIST=(
 # Mirrors CURSOR_PLUGIN_SKILL_NAMES. These keep the canonical `jolli-` prefix (the
 # Codex bundle drops it); see cli/src/install/CursorPluginSkills.ts for why.
 #
-# SIX, not eleven: the four host-neutral skills (recall, search, local-run,
-# remote-run) AND the `jolli` umbrella are deliberately not bundled. Cursor reads
-# `.agents/skills/` and this bundle into one flat pool and collapses neither, so
-# shipping any of them here duplicated that entry in a repo that had run
-# `jolli enable`. They are written on demand instead, at two DIFFERENT scopes: the
-# four go per-repo into `.cursor/skills/` (reconcileCursorRepoSkills — see also
-# PUBLISH_EXPECTED_MIRROR below), while the umbrella goes machine-global into
-# `~/.cursor/skills/jolli/` (ensureCursorGlobalMenu), per the note on that array.
-# What remains here is the set that exists nowhere else, and `jolli-init` is the
-# manual route back when the bootstrap that does the mirroring never runs.
+# TWELVE — every skill this plugin has, `jolli` umbrella included. Cursor reads
+# `.agents/skills/` and this bundle into one flat pool and collapses neither, so a repo
+# that also ran `jolli enable` shows two entries for the five shared names, differing
+# only by a brand icon. That duplicate is ACCEPTED, twice over:
+#
+#   - the four host-neutral skills (recall, search, local-run, remote-run) were once
+#     mirrored per-repo on demand to avoid it, which meant a Cursor-only user — this
+#     bundle's whole audience — got no recall and no search at all until they found
+#     `/jolli-init`, because the mirror was planted by a bootstrap gated on the repo
+#     already being set up;
+#   - the `jolli` umbrella was once written machine-global to `~/.cursor/skills/jolli/`
+#     by the bootstrap. Measured: a freshly installed plugin's hooks are not registered
+#     until Cursor FULLY restarts, so that write did not happen on a new install and the
+#     user had every other skill and no front door.
+#
+# The cost of bundling the umbrella, stated so nobody re-litigates it by accident:
+# `~/.cursor/skills/` is in Cursor's always-loaded group while `.cursor/plugins/` is
+# gated behind `thirdPartyExtensibilityEnabled` plus a server-side flag, so with a gate
+# off the umbrella now goes with the other eleven instead of surviving alone.
 PUBLISH_EXPECTED_SKILLS=(
-	jolli-init jolli-login jolli-logout jolli-push jolli-status jolli-timeline
-)
-
-# The symlink targets, under `mirror/` rather than `skills/` so Cursor's scanner never
-# sees them where they sit — it matches seven fixed path fragments and this is none of
-# them. They reach the user as `<repo>/.cursor/skills/<name>` symlinks planted by the
-# bootstrap, which is what makes them disappear when the plugin is uninstalled.
-#
-# Asserted as an EXACT set for the same reason as the skills above: if a .gitignore rule
-# drops one, the publish still looks healthy while every repo that installs this bundle
-# gets a dangling link for that skill — an entry Cursor silently omits, with nothing to
-# say why.
-#
-# `jolli` is deliberately NOT here. The umbrella is the front door, and a per-repo copy
-# cannot reach Cursor's chat-first window, which starts conversations without naming a
-# workspace — so it is written machine-global to `~/.cursor/skills/jolli/` by the
-# bootstrap instead (ensureCursorGlobalMenu). Adding it back here would put a second
-# `/jolli` in the flat menu of every repo that opted in.
-PUBLISH_EXPECTED_MIRROR=(
-	jolli-local-run jolli-recall jolli-remote-run jolli-search
+	jolli jolli-dashboard jolli-init jolli-local-run jolli-login jolli-logout
+	jolli-push jolli-recall jolli-remote-run jolli-search jolli-status jolli-timeline
 )
 
 # Critical singleton config files that MUST be present. A .gitignore rule could
@@ -112,6 +103,15 @@ PUBLISH_EXPECTED_MIRROR=(
 # add an `--exclude 'LICENSE'` to publish_sync: these entries would then fail the
 # staged check (rsync --delete removes the file, `git add -A` stages the deletion),
 # which is the gate working — the fix is to drop the exclude, not to drop these lines.
+#
+# The `assets/` entry backs the top-level `logo` in plugin.json. It is listed here
+# because a missing one fails SILENTLY on the host, and on Cursor it fails at a
+# distance: a relative `logo` is not read off disk, it is rewritten to
+# `https://raw.githubusercontent.com/<owner>/<repo>/<ref>/plugins/jolli/<logo>`
+# (measured in Cursor 3.15.x) and fetched at render time — so an unpublished or
+# gitignored file is a 404 nobody sees, in a repository that has already lost a
+# committed `SKILL.md` to a stray global ignore rule. Both checks below cover it:
+# present-and-non-empty in this tree, and actually staged in the mirror.
 PUBLISH_REQUIRED_CONFIG=(
 	plugins/jolli/hooks/hooks.json
 	plugins/jolli/.cursor-plugin/plugin.json
@@ -119,6 +119,7 @@ PUBLISH_REQUIRED_CONFIG=(
 	README.md
 	LICENSE
 	plugins/jolli/LICENSE
+	plugins/jolli/assets/logo.svg
 )
 
 # The neutral token the SOURCE README carries in its install command. Every publish
@@ -168,6 +169,8 @@ publish_assert_skills() {
 		echo "       If you added or removed a skill, update PUBLISH_EXPECTED_SKILLS." >&2
 		echo "       If a skill is stale, regenerate:" >&2
 		echo "         npx tsx cursor-plugin/plugins/jolli/scripts/generate-skills.ts" >&2
+		echo "       If a branding asset is missing, commit the real file under" >&2
+		echo "         cursor-plugin/plugins/jolli/assets/ — the path comes from the top-level "logo" in plugin.json." >&2
 		return 1
 	fi
 
@@ -329,10 +332,6 @@ publish_assert_staged() {
 	skill_count="$(git -C "$dest" ls-files -- 'plugins/jolli/skills/*/SKILL.md' | wc -l | tr -d ' ')"
 	[ "$skill_count" -eq "${#PUBLISH_EXPECTED_SKILLS[@]}" ] ||
 		missing+=("skills/*/SKILL.md (expected ${#PUBLISH_EXPECTED_SKILLS[@]}, found $skill_count)")
-	local mirror_count
-	mirror_count="$(git -C "$dest" ls-files -- 'plugins/jolli/mirror/*/SKILL.md' | wc -l | tr -d ' ')"
-	[ "$mirror_count" -eq "${#PUBLISH_EXPECTED_MIRROR[@]}" ] ||
-		missing+=("mirror/*/SKILL.md (expected ${#PUBLISH_EXPECTED_MIRROR[@]}, found $mirror_count)")
 	if [ "${#missing[@]}" -gt 0 ]; then
 		echo "error: required file(s) not staged: ${missing[*]}" >&2
 		echo "       Check the marketplace checkout's .gitignore and the publish inventory." >&2

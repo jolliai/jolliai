@@ -23,7 +23,7 @@ claude-plugin/
     ├── .mcp.json                       # jolli MCP server (node dist/Cli.js mcp)
     ├── LICENSE                         # same text again — this dir is the installed/zipped unit
     ├── hooks/hooks.json                # SessionStart → PluginBootstrapHook (the only manifest hook)
-    ├── skills/                         # /jolli:recall  /jolli:search  /jolli:push
+    ├── skills/                         # /jolli:recall  /jolli:search  /jolli:push  /jolli:dashboard
     ├── commands/                       # /jolli:init  /jolli:status  /jolli:timeline  /jolli:login  /jolli:logout
     ├── scripts/build.mjs               # esbuild → dist/ (Cli, PluginBootstrapHook, Stop/SessionStart hooks, 5 git hooks, 2 workers)
     └── dist/                           # built bundles (gitignored)

@@ -56,7 +56,7 @@ PUBLISH_REQUIRED_DIST=(
 # count nonzero but wrong. This repo has already lost SKILL.md that way once — a
 # global gitignore matched it and `git add` reported success.
 PUBLISH_EXPECTED_SKILLS=(
-	jolli init local-run login logout push
+	jolli dashboard init local-run login logout push
 	recall remote-run search status timeline
 )
 
@@ -85,6 +85,15 @@ PUBLISH_EXPECTED_SKILLS=(
 # entries would then fail the staged check (rsync --delete removes the file, `git
 # add -A` stages the deletion), which is the gate working — the fix is to drop the
 # exclude, not to drop these lines.
+#
+# The two `assets/` entries back `interface.composerIcon` and `interface.logo` in
+# plugin.json. They are listed here because a missing one fails SILENTLY on the
+# host: Codex renders its own generated placeholder tile for a plugin whose logo
+# path resolves to nothing, so the install looks healthy and the branding is just
+# absent. Publish is therefore the only place that can refuse — and it has to,
+# because both checks below are what caught a global gitignore eating a committed
+# `SKILL.md` once already, and binary files are the class most likely to be swept
+# up by a stray ignore rule.
 PUBLISH_REQUIRED_CONFIG=(
 	plugins/jolli/hooks/hooks.json
 	plugins/jolli/.codex-plugin/plugin.json
@@ -92,6 +101,8 @@ PUBLISH_REQUIRED_CONFIG=(
 	README.md
 	LICENSE
 	plugins/jolli/LICENSE
+	plugins/jolli/assets/app-icon.png
+	plugins/jolli/assets/logo.png
 )
 
 # The neutral token the SOURCE README carries in its install command. Every publish
@@ -141,6 +152,8 @@ publish_assert_skills() {
 		echo "       If you added or removed a skill, update PUBLISH_EXPECTED_SKILLS." >&2
 		echo "       If a skill is stale, regenerate:" >&2
 		echo "         npx tsx codex-plugin/plugins/jolli/scripts/generate-skills.ts" >&2
+		echo "       If a branding asset is missing, commit the real file under" >&2
+		echo "         codex-plugin/plugins/jolli/assets/ — the path comes from interface.composerIcon / interface.logo in plugin.json." >&2
 		return 1
 	fi
 

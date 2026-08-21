@@ -247,3 +247,15 @@ Surface the message verbatim to the user (translated into their language if
 non-English). For "no records in this repo" specifically, suggest running
 `jolli enable` if they expected records. Do NOT retry or fabricate a recall
 payload from nothing.
+
+## If the Jolli CLI dispatcher is missing (Codex)
+
+`$HOME/.jolli/jollimemory/run-cli` is written by this plugin's SessionStart hook,
+and that hook does not run until it has been trusted. So when that file does not
+exist, ask the user to start a new Codex session and trust the Jolli SessionStart
+hook in `/hooks`, then retry. The Jolli Memory MCP tools arrive the same way, one
+session later — Codex reads its registrations at session start.
+
+This REPLACES any instruction above to report Jolli as not installed, or to install
+`@jolli.ai/cli` globally or the Jolli VS Code extension. You are running inside the
+Jolli plugin, so Jolli IS installed, and neither of those is the fix on this host.

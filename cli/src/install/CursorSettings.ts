@@ -1,12 +1,25 @@
 /**
  * Reads the one Cursor setting that changes which skill roots Cursor will load.
  *
+ * **NO PRODUCTION CALLER TODAY**, and that is a deliberate hold rather than an
+ * oversight. Its caller was `cursorSkillRoots`, part of the retired per-repo skill
+ * mirror (see `CURSOR_RETIRED_MIRROR_SKILLS`): the mirror had to know whether a copy in
+ * `.claude/skills/` was actually visible to Cursor before treating that name as already
+ * supplied. The bundle ships every skill directly now, so nothing asks the question.
+ *
+ * It is kept because the gate it reads is the cause of a real, still-open failure mode
+ * rather than a curiosity: with the toggle off, `.cursor/plugins/` is not scanned at
+ * all, so every skill this plugin ships becomes invisible and its `sessionStart` hook
+ * stops running — silently, with the machine-global `/jolli` umbrella as the user's only
+ * remaining entry. Diagnosing that for the user (in `jolli-status`, or in `getStatus`)
+ * is the obvious next use, and the contract below cost a toggle-flip-and-diff to
+ * establish. Re-deriving it from a deleted file would be strictly more expensive than
+ * keeping 130 lines that have their own tests.
+ *
  * `thirdPartyExtensibilityEnabled` gates the OTHER hosts' directories — Cursor's
  * provider re-scans on `onDidChangeThirdPartyExtensibilityEnabled`, and its own
  * classifier splits skill sources into `builtin` / `plugin` / `claude` / `workspace`
- * (verified in `extensions/cursor-agent-exec/dist/main.js`). With it off, a
- * `.claude/skills/jolli-recall` is invisible to Cursor, so treating it as "already
- * provided" would leave the user with no recall at all.
+ * (verified in `extensions/cursor-agent-exec/dist/main.js`).
  *
  * **Everything here is best-effort, and every failure answers `true`** — the default,
  * and the same answer as not reading at all. That is what makes consulting a foreign

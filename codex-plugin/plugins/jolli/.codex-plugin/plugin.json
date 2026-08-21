@@ -1,6 +1,6 @@
 {
 	"name": "jolli",
-	"version": "1.0.2",
+	"version": "1.0.3",
 	"description": "Automatically captures and generates project memory from your development work — team-shareable and synced across devices, so you can recall and search past decisions and context across sessions and agents. Backed by the jolli CLI bundled with this plugin.",
 	"author": { "name": "jolli.ai", "url": "https://jolli.ai" },
 	"homepage": "https://jolli.ai",
@@ -20,6 +20,9 @@
 			"Set up Jolli Memory for this repository.",
 			"Recall the context for this branch.",
 			"Search Jolli Memory for a prior decision."
-		]
+		],
+		"brandColor": "#7A3FF0",
+		"composerIcon": "./assets/app-icon.png",
+		"logo": "./assets/logo.png"
 	}
 }

@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { setFrontmatterName, stripMetadataBlock } from "./PluginSkillText.js";
+import { buildDashboardSkillTemplate, setFrontmatterName, stripMetadataBlock } from "./PluginSkillText.js";
 
 describe("stripMetadataBlock", () => {
 	it("drops the metadata block and keeps the documented fields", () => {
@@ -90,5 +90,35 @@ describe("setFrontmatterName", () => {
 	it("ignores a name-shaped line in the body", () => {
 		const input = ["---", "description: d", "---", "", "name: not-frontmatter"].join("\n");
 		expect(setFrontmatterName(input, "new")).toBe(input);
+	});
+});
+
+/*
+ * The shared dashboard body is generated into three bundles and is the only one of the
+ * five shared bodies that hands the model a shell recipe with a file path in it.
+ *
+ * A fixed `${TMPDIR:-/tmp}/jolli-dashboard.log` was two bugs at once. Concurrent
+ * launches truncate and read ONE file, so the recipe can echo one server's PID beside
+ * another's URL, or report NOT READY for a dashboard that came up fine. And where
+ * TMPDIR is unset the path lands in a world-writable `/tmp`, where another local user
+ * can pre-create it as a symlink and have this shell's redirect write through it.
+ * `mktemp` answers both — a fresh name per launch, created 0600 — at the cost of a
+ * path the model must carry forward, which is why the recipe echoes it.
+ */
+describe("buildDashboardSkillTemplate", () => {
+	const body = buildDashboardSkillTemplate();
+
+	it("creates its log with mktemp rather than at a predictable shared path", () => {
+		// Assembled rather than written inline: the literal contains a shell `${…}` that
+		// biome reads as a stray template placeholder.
+		const tmpdir = ["$", "{TMPDIR:-/tmp}"].join("");
+		expect(body).toContain(`LOG=$(mktemp "${tmpdir}/jolli-dashboard.XXXXXX")`);
+		expect(body).not.toContain("/jolli-dashboard.log");
+	});
+
+	// Every command runs in a fresh shell, so a name that is no longer derivable has to
+	// be printed — the NOT READY branch tells the model to re-run the wait loop.
+	it("echoes the log path, since a later step cannot re-derive it", () => {
+		expect(body).toContain('echo "LOG $LOG"');
 	});
 });

@@ -6,26 +6,28 @@ Cursor.
 
 ## What the plugin includes
 
-- **Skills** — eleven in all, and where each one lives follows from when you need it.
-  - **`/jolli`** — the front door. Available in every chat from the moment you
-    install, in any window, whether or not a repository is open.
-  - **Six more in the bundle**, also available immediately: `/jolli-init`,
-    `/jolli-login`, `/jolli-logout`, `/jolli-status`, `/jolli-timeline`,
-    `/jolli-push`.
-  - **Four more once you set a repository up**: `/jolli-recall`, `/jolli-search`,
-    `/jolli-local-run`, `/jolli-remote-run`. These are placed per repository rather
-    than bundled because Cursor pools every skill source into one flat menu, and
-    bundling them would show each one twice in a repository that already has Jolli's
-    cross-platform copies.
+- **Skills** — twelve, all shipped with the plugin, all available from the moment you
+  install, in any window, whether or not a repository is open.
+  - **`/jolli`** — the front door. Start here; it reads how things stand and routes you.
+  - **Eleven more**: `/jolli-recall`, `/jolli-search`, `/jolli-timeline`,
+    `/jolli-push`, `/jolli-dashboard`, `/jolli-status`, `/jolli-init`,
+    `/jolli-login`, `/jolli-logout`, `/jolli-local-run`, `/jolli-remote-run`.
+  - If you also use Jolli with Claude Code or Codex in the same repository, four of
+    these (`/jolli-recall`, `/jolli-search`, `/jolli-local-run`, `/jolli-remote-run`)
+    will appear **twice** in the slash menu — once from this plugin, once from the
+    cross-platform copy those tools read. The two are the same instructions; Cursor
+    pools every skill source into one flat menu and cannot merge them. Either entry
+    works.
 - **MCP tools** — `recall`, `search`, `get_decision_timeline`, `list_branches`,
   `get_pr_description`, `queue_status`, `status`, plus the Jolli Space tools.
   Registered into a repository when you set it up; enabling the server takes one
   click, see below.
 - **Hooks** — one `sessionStart` bootstrap. **It does not set up your repositories
-  for you.** It makes `/jolli` available, and for repositories you have already set
-  up it keeps them current (re-pointing skills after a plugin upgrade) and injects a
-  branch briefing. Setting a repository up — git hooks, MCP, the four skills above —
-  happens when you ask for it, through `/jolli` or `/jolli-init`.
+  for you.** It installs the `run-cli` dispatcher, and for repositories you have
+  already set up it keeps them current and injects a branch briefing. Setting a
+  repository up — git hooks and MCP — happens when you ask for it, through `/jolli` or
+  `/jolli-init`. The skills need none of this: they ship with the plugin and work from
+  the moment it is installed.
 - **A self-contained runtime** — no global `jolli` CLI installation required.
   Jolli's CLI is still reachable at `~/.jolli/jollimemory/run-cli` (a bash script —
   on Windows run it from Git Bash), which takes the same arguments as `jolli` itself,
@@ -36,9 +38,40 @@ Cursor.
 Add `<marketplace-source>` as a marketplace in Cursor, then install **Jolli Memory**
 from **Customize** in the sidebar and choose the project or user scope.
 
-Then **start a new chat** and run **`/jolli`**. The new chat is not a formality — the
-plugin's hook runs when a conversation starts, and that is what puts `/jolli` in the
-menu. From there `/jolli` reads how things stand and walks you through the rest.
+Then run **`/jolli`** in any chat. All twelve skills are there as soon as the plugin
+is installed — you do not have to restart or open a repository first.
+
+**One thing does need a full restart, and it is worth doing straight away.** The
+plugin's `sessionStart` hook is what writes `~/.jolli/jollimemory/run-cli`, the
+dispatcher the skills fall back on when the MCP server is not reachable yet — and
+Cursor does not register a freshly installed plugin's hooks until it is **completely
+restarted**. Reloading the window is not enough, and neither is starting another chat.
+So after installing: **quit Cursor (⌘Q), reopen it, and start a new chat.**
+
+If you skip that, the skills are all present but `/jolli` will tell you the dispatcher
+is missing and ask you to do exactly this.
+
+### Upgrading from 1.0.0: remove and re-add the marketplace once
+
+**If you installed Jolli Memory for Cursor at version 1.0.0, a normal update will not
+reach you, and Cursor will not tell you so.** The marketplace was renamed in 1.0.1
+(from `jolli-cursor-marketplace` to `jolli-cursor`, so the section header in Customize
+reads **Jolli Cursor** rather than **Jolli Cursor Marketplace**). That name is how
+Cursor identifies a marketplace, not a label on it, so the old entry keeps pointing at
+the old identity and simply reports that you are up to date.
+
+To pick up 1.0.1 and later — which is where all twelve bundled skills live:
+
+1. In **Customize**, remove the **Jolli Cursor Marketplace** entry.
+2. Add `<marketplace-source>` again. It now appears as **Jolli Cursor**.
+3. Install **Jolli Memory** from it, then quit Cursor (⌘Q) and reopen, as above.
+
+Nothing of yours is lost: your memories live in your repositories, and your settings in
+`~/.jolli/`. Afterwards the old cache directory
+`~/.cursor/plugins/cache/jolli-cursor-marketplace/` is orphaned and safe to delete.
+
+This is a one-time step. It does not apply to a fresh install, and no future upgrade
+needs it.
 
 ### If the marketplace appears but lists no plugins
 
@@ -46,7 +79,7 @@ Cursor resolves a marketplace imported from GitHub through its own backend, agai
 your team. On an account with no team we have seen that come back **empty, with no
 error**: the marketplace shows up in the filter, offers nothing, and nothing is written
 to disk. The tell-tale is the entry's title — if it is named after the repository
-instead of **Jolli Cursor Marketplace**, its manifest was never read.
+instead of **Jolli Cursor**, its manifest was never read.
 
 Importing from a local clone takes a different, entirely local route and is not
 affected. Clone the repository, then use **Add Marketplace → Import from Disk** and
@@ -66,10 +99,14 @@ machine with both will list **two** entries offering a plugin called `jolli`:
 
 | In Customize | Where it came from | Use it? |
 |---|---|---|
-| **Jolli Cursor Marketplace** | this plugin, added by you | **Yes** |
+| **Jolli Cursor** | this plugin, added by you | **Yes** |
 | **Jolli Marketplace** | your Claude Code setup, imported automatically | No |
 
-Install from the one with **Cursor** in its name. They are different builds of the
+Install from the one with **Cursor** in its name. Both offer a plugin card reading
+**Jolli Memory**, so the marketplace title above the card is the only thing telling
+them apart; if you are unsure which one you installed, check where it landed: this
+plugin caches under `~/.cursor/plugins/cache/jolli-cursor/`, the imported Claude one
+under `~/.cursor/plugins/cache/jolli-marketplace/`. They are different builds of the
 same product, and the Claude Code one does not work here. Cursor does translate its
 hook configuration and does run it — but that hook resolves the repository from its
 own working directory, which under Cursor is the plugin's folder rather than yours, so
@@ -95,15 +132,15 @@ once from the sidebar, stays exactly as it was. **That is the intended state, no
 fault**, and there is nothing to repair when you see it.
 
 The `sessionStart` hook, which Cursor fires when a **new conversation starts** (not on
-opening a folder, not on switching windows, not on typing `/` in an existing chat),
-does three things and no more:
+opening a folder, not on switching windows, not on typing `/` in an existing chat —
+and not at all until Cursor has been fully restarted once after the install), does two
+things and no more:
 
-- makes `/jolli` available, in every window — including Cursor's chat-first window,
-  which starts conversations without naming a repository at all;
 - installs the `~/.jolli/jollimemory/run-cli` dispatcher the skills fall back on when
   MCP is not reachable;
 - for a repository you have **already** set up: keeps it current — re-pointing its
-  skills after a plugin upgrade — and injects a short briefing for the current branch.
+  git hooks and MCP entry after a plugin upgrade — and injects a short briefing for
+  the current branch.
 
 ## Setting a repository up
 
@@ -113,15 +150,14 @@ prefer to skip the menu. Either one:
 
 - installs the repository's git hooks (that is what captures memory on commit);
 - writes `.cursor/mcp.json` so the Jolli Memory MCP tools are available;
-- places `/jolli-recall`, `/jolli-search`, `/jolli-local-run` and `/jolli-remote-run`
-  into `.cursor/skills/`, unless the repository already provides them (a repository
-  set up with the Jolli CLI has them in `.agents/skills/`, and they are left alone
-  there);
 - records Cursor as the local summarization agent if no provider is configured yet;
 - signs you in and binds a Jolli Space, if you want to share memories.
 
 Commits you made **before** setting up are not lost — `run-cli backfill --all` writes
 memories for the history that is already there.
+
+Note what is NOT in that list: the skills. They ship with the plugin and work before
+any of this — setup is what makes them have something to recall.
 
 Everything it writes is added to `.git/info/exclude`, so none of it shows up in
 `git status`.
@@ -185,6 +221,7 @@ unless you sign in and bind one.
 - `/jolli-init` — setup and Space binding.
 - `/jolli-login` / `/jolli-logout` — Jolli account credentials.
 - `/jolli-status` — installation and generation health.
+- `/jolli-dashboard` — open the local dashboard in your browser.
 - `/jolli-recall` / `/jolli-search` / `/jolli-timeline` — read memory.
 - `/jolli-push` — publish memories to a Space.
 - `/jolli-local-run` / `/jolli-remote-run` — run Jolli workflows.
