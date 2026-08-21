@@ -384,6 +384,15 @@ export interface SidebarWebviewDeps {
 	 */
 	kimiDiscovery?: { discover(): void };
 	/**
+	 * Polling-path Cursor skill discovery. Same contract as {@link codexDiscovery}.
+	 *
+	 * Cursor is not hookless — its IDE delivers a `stop` event — but the CLI does not:
+	 * `cursor-agent -p` fires no `stop` at all (measured), so for a headless run this
+	 * tick and the post-commit pass are the only routes. Optional so existing tests can
+	 * omit it.
+	 */
+	cursorDiscovery?: { discover(): void };
+	/**
 	 * Polling-path OpenCode skill discovery. OpenCode has no hook, so this tick is
 	 * the only thing that can surface its skills WHILE the work is happening —
 	 * waiting for the commit would leave working memory empty for the whole session.
@@ -2582,6 +2591,7 @@ export class SidebarWebviewProvider
 		// reader can never take down the conversation list this method exists to render.
 		try {
 			this.deps.kimiDiscovery?.discover();
+			this.deps.cursorDiscovery?.discover();
 		} catch {
 			// ignore — background discovery must never break the refresh.
 		}

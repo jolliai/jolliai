@@ -27,7 +27,8 @@
 import { readFile } from "node:fs/promises";
 import { createLogger } from "../Logger.js";
 import type { TranscriptCursor, TranscriptEntry, TranscriptReadResult } from "../Types.js";
-import { classifyToolName, ToolUseTally } from "./ToolNameClassify.js";
+import { CURSOR_TIMESTAMP_STRIP_RE, cursorTurnTimestampMs } from "./CursorTurnTimestamp.js";
+import { classifyCursorToolName, ToolUseTally } from "./ToolNameClassify.js";
 import { mergeConsecutiveEntries, throwTranscriptReadError } from "./TranscriptReader.js";
 
 const log = createLogger("CursorCliReader");
@@ -35,20 +36,29 @@ const log = createLogger("CursorCliReader");
 interface CursorCliPart {
 	readonly type?: string;
 	readonly text?: unknown;
-	/** Anthropic-block `tool_use` fields — present only on `type:"tool_use"` parts. */
+	/**
+	 * Anthropic-block `tool_use` fields — present only on `type:"tool_use"` parts.
+	 *
+	 * `id` is declared because the block format has the field, but Cursor does not
+	 * write it: across 10 real transcripts every `tool_use` part's keys were exactly
+	 * `['input','name','type']`. It is kept (rather than removed) so a build that
+	 * starts emitting one is de-duplicated instead of double-counted — see the call
+	 * site, which passes `undefined` today and must keep tolerating that.
+	 */
 	readonly id?: unknown;
 	readonly name?: unknown;
+	/** Tool arguments. Carries the MCP server/tool identity — see `classifyCursorToolName`. */
+	readonly input?: unknown;
 }
 interface CursorCliLine {
 	readonly role?: string;
 	readonly message?: { readonly content?: ReadonlyArray<CursorCliPart> };
 }
 
-const TIMESTAMP_RE = /<timestamp>[\s\S]*?<\/timestamp>\s*/gi;
 const USER_QUERY_RE = /<user_query>\s*([\s\S]*?)\s*<\/user_query>/i;
 
 function unwrapUser(text: string): string {
-	const stripped = text.replace(TIMESTAMP_RE, "");
+	const stripped = text.replace(CURSOR_TIMESTAMP_STRIP_RE, "");
 	const m = USER_QUERY_RE.exec(stripped);
 	return (m ? m[1] : stripped).trim();
 }
@@ -67,53 +77,10 @@ function mapRole(role: string | undefined): "human" | "assistant" | undefined {
 	return undefined;
 }
 
-const MONTHS: Record<string, number> = {
-	Jan: 0,
-	Feb: 1,
-	Mar: 2,
-	Apr: 3,
-	May: 4,
-	Jun: 5,
-	Jul: 6,
-	Aug: 7,
-	Sep: 8,
-	Oct: 9,
-	Nov: 10,
-	Dec: 11,
-};
-const TIMESTAMP_CAPTURE_RE = /<timestamp>([\s\S]*?)<\/timestamp>/i;
-// cursor-agent stamps user turns like "Tuesday, Jul 21, 2026, 6:57 PM (UTC+8)":
-// English 3-letter month, minute resolution, explicit UTC offset. Parsed with an
-// explicit regex (not `new Date`, whose non-ISO parsing is implementation-defined)
-// so a non-matching/localized stamp cleanly falls back to "no timestamp" rather
-// than a wrong-but-valid date.
-const TS_PARSE_RE = /([A-Za-z]{3}) (\d{1,2}), (\d{4}), (\d{1,2}):(\d{2})\s*(AM|PM) \(UTC([+-]\d{1,2})(?::?(\d{2}))?\)/i;
-
-/** Parse a cursor-agent `<timestamp>` tag body to epoch ms, or undefined if it doesn't match. */
-function parseCursorCliTimestamp(raw: string): number | undefined {
-	const m = TS_PARSE_RE.exec(raw);
-	if (!m) return undefined;
-	const month = MONTHS[m[1][0].toUpperCase() + m[1].slice(1).toLowerCase()];
-	if (month === undefined) return undefined;
-	let hour = Number(m[4]) % 12;
-	if (/pm/i.test(m[6])) hour += 12;
-	const offsetHours = Number(m[7]);
-	const offsetMinutes = m[8] ? Number(m[8]) : 0;
-	const offsetTotal = offsetHours >= 0 ? offsetHours * 60 + offsetMinutes : offsetHours * 60 - offsetMinutes;
-	return Date.UTC(Number(m[3]), month, Number(m[2]), hour, Number(m[5])) - offsetTotal * 60000;
-}
-
-/** Epoch ms of a line's embedded timestamp, if any — only user turns carry one. */
-function lineTimestampMs(line: CursorCliLine): number | undefined {
-	if (line.role !== "user") return undefined;
-	for (const p of line.message?.content ?? []) {
-		if (p.type === "text" && typeof p.text === "string") {
-			const m = TIMESTAMP_CAPTURE_RE.exec(p.text);
-			if (m) return parseCursorCliTimestamp(m[1]);
-		}
-	}
-	return undefined;
-}
+// The stamp parser moved to `CursorTurnTimestamp` when the skill scanner needed the
+// same instant: a second copy would let a skill and the tool call beside it date
+// from different times. `lineTimestampMs` is now a one-line adapter over it.
+const lineTimestampMs = cursorTurnTimestampMs;
 
 export async function readCursorCliTranscript(
 	transcriptPath: string,
@@ -142,6 +109,28 @@ export async function readCursorCliTranscript(
 	// Advances only across lines we actually consumed — so the cursor never moves
 	// past a deferred (post-cutoff) turn or a trailing partial line (see below).
 	let lastConsumed = Math.min(startLine, lines.length);
+	/**
+	 * The instant of the most recent USER turn seen in this slice — the clock every
+	 * tool call in the turns that answer it is stamped with.
+	 *
+	 * Carried forward rather than read per line, because the stamp is not a record
+	 * field: it is embedded in the user turn's TEXT, and `tool_use` blocks live in
+	 * ASSISTANT turns, which carry none. Measured across 10 real transcripts: 12 of 12
+	 * user turns parse a `<timestamp>`, 0 of 35 assistant turns do, and 0 of the 24
+	 * lines carrying a `tool_use` do. So the per-line read this replaces could never
+	 * stamp a single tool bucket — while `TOOL_CALL_TIME_SOURCES` had already been told
+	 * this source passes one through, whose own docstring requires that to be true.
+	 *
+	 * The stream is strictly ordered (a user turn, then the assistant turns answering
+	 * it), so the last user instant is the right clock for those calls — minute
+	 * resolution, the same as the skill scanner reading the same tag.
+	 *
+	 * Starts UNDEFINED and stays so until a user turn is seen: a slice resumed from a
+	 * cursor can open on assistant turns whose user turn is behind the mark, and this
+	 * read genuinely does not know when they happened. Absence is the honest answer —
+	 * consumers fall back to the session's own instant.
+	 */
+	let turnMs: number | undefined;
 
 	for (let i = startLine; i < lines.length; i++) {
 		const line = lines[i];
@@ -162,6 +151,9 @@ export async function readCursorCliTranscript(
 		// This turn (and everything after it) was written after the commit's cutoff:
 		// stop here and leave the cursor before it so the next commit picks it up.
 		if (hasCutoff && ts !== undefined && ts > cutoffMs) break;
+		// AFTER the cutoff check, so a deferred turn cannot leave its instant behind
+		// for the next slice to stamp calls with.
+		if (ts !== undefined) turnMs = ts;
 		const role = mapRole(parsed.role);
 		if (role !== undefined) {
 			const text = extractText(parsed);
@@ -170,13 +162,20 @@ export async function readCursorCliTranscript(
 		}
 		// The `tool_use` parts this reader drops from the CONTENT are still counted
 		// here — a pure tool-call turn yields no entry but is real agent activity.
-		// cursor-agent speaks the Anthropic block format, so blocks carry a
-		// `toolu_…` id (dedupe key) and MCP tools are named `mcp__<server>__<tool>`.
+		//
+		// Cursor uses the Anthropic BLOCK shape but not its NAMING: MCP calls arrive
+		// as a generic `CallMcpTool` whose `input` carries `{server, toolName}`, and
+		// no block carries an `id` at all (both measured across 10 real transcripts).
+		// This comment used to assert the opposite of each — `mcp__<server>__<tool>`
+		// names and a `toolu_…` dedupe key — so every MCP call was filed as a builtin
+		// with its server discarded. `classifyCursorToolName` reads the real shape;
+		// the absent id means `addOnce` counts unconditionally, which is right here
+		// because Cursor writes one block per call.
 		for (const p of parsed.message?.content ?? []) {
 			if (p.type !== "tool_use" || typeof p.name !== "string" || p.name.length === 0) continue;
 			tally.addOnce(typeof p.id === "string" ? p.id : undefined, {
-				...classifyToolName(p.name),
-				...(ts !== undefined && { lastCallAtMs: ts }),
+				...classifyCursorToolName(p.name, p.input),
+				...(turnMs !== undefined && { lastCallAtMs: turnMs }),
 			});
 		}
 		lastConsumed = i + 1;

@@ -27,22 +27,49 @@
 import { readFile } from "node:fs/promises";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import type { TranscriptCursor, TranscriptReadResult, TranscriptSource } from "../Types.js";
+// Static, unlike the readers below: this is a pure string predicate in a leaf
+// module that touches no `node:sqlite`, so it carries none of the cost the
+// dynamic-import rule above exists to avoid.
+import { isCursorJsonlTranscript } from "./CursorTranscriptLocator.js";
 import { getParserForSource } from "./TranscriptParser.js";
 import { readTranscript, splitTranscriptLines } from "./TranscriptReader.js";
 
 /**
  * Sources whose transcript is a JSONL FILE, so raw lines are a thing it has.
  *
- * Exactly the sources the dispatch below sends to `readTranscript`; everything
+ * These are the sources the dispatch below sends to `readTranscript`. Everything
  * else is answered by a dedicated reader over a JSON file or a SQLite database,
  * where a `transcriptPath` is a synthetic `<dbPath>#<sessionId>` handle rather
  * than something that can be opened and split.
  *
  * Kept next to that dispatch because the two must agree: a source added to one
  * and not the other either loses its lines silently, or gets handed the bytes of
- * a SQLite file to parse as JSONL.
+ * a SQLite file to parse as JSONL. Cursor is the standing proof that the failure
+ * really is silent — see {@link hasLineOrientedTranscript}.
  */
 const LINE_ORIENTED_SOURCES: ReadonlySet<string> = new Set(["claude", "codex", "kimi"]);
+
+/**
+ * Whether this (source, path) pair names something a line scanner can read.
+ *
+ * A predicate rather than set membership, because "is it JSONL" is not a property
+ * of the source alone for Cursor: `cursor-cli` always writes one, while a `cursor`
+ * conversation is JSONL only when discovery found its `agent-transcripts` file and
+ * a synthetic store handle otherwise. Both are read by a DEDICATED reader rather
+ * than by `readTranscript`, which is why neither can simply be added to the set
+ * above.
+ *
+ * This is the hazard that set's own comment warns about, observed: with Cursor
+ * absent, `readTranscriptLinesForSource` returned `undefined`, so the skill
+ * extractor's `if (!lines) return {}` fired and every Cursor conversation reported
+ * zero skills — while its scanner was correctly registered, its matcher passed its
+ * own tests, and the dashboard's Skills page showed nothing with no error anywhere.
+ */
+function hasLineOrientedTranscript(source: TranscriptSource, transcriptPath: string): boolean {
+	if (LINE_ORIENTED_SOURCES.has(source)) return true;
+	if (source === "cursor-cli") return true;
+	return source === "cursor" && isCursorJsonlTranscript(transcriptPath);
+}
 
 const log = createLogger("TranscriptSourceReader");
 
@@ -57,7 +84,7 @@ export async function readTranscriptLinesForSource(
 	source: TranscriptSource,
 	transcriptPath: string,
 ): Promise<ReadonlyArray<string> | undefined> {
-	if (!LINE_ORIENTED_SOURCES.has(source)) return undefined;
+	if (!hasLineOrientedTranscript(source, transcriptPath)) return undefined;
 	try {
 		return splitTranscriptLines(await readFile(transcriptPath, "utf-8"));
 	} catch (err) {
@@ -88,8 +115,16 @@ export async function readTranscriptForSource(
 			return (await import("./GeminiTranscriptReader.js")).readGeminiTranscript(transcriptPath, cursor);
 		case "opencode":
 			return (await import("./OpenCodeTranscriptReader.js")).readOpenCodeTranscript(transcriptPath, cursor);
+		// TWO readers, chosen by the path's shape rather than by the source. An IDE
+		// conversation whose `agent-transcripts` JSONL was found at discovery time
+		// carries that real path and is read by the shared JSONL reader — which is what
+		// gets its tool/MCP calls and its skill envelope, both invisible in the composer
+		// store. One with no JSONL still carries the synthetic `<db>#<composerId>` handle
+		// and is read exactly as before. See `upgradeToJsonlTranscripts`.
 		case "cursor":
-			return (await import("./CursorTranscriptReader.js")).readCursorTranscript(transcriptPath, cursor);
+			return isCursorJsonlTranscript(transcriptPath)
+				? (await import("./CursorCliTranscriptReader.js")).readCursorCliTranscript(transcriptPath, cursor)
+				: (await import("./CursorTranscriptReader.js")).readCursorTranscript(transcriptPath, cursor);
 		case "copilot":
 			return (await import("./CopilotTranscriptReader.js")).readCopilotTranscript(transcriptPath, cursor);
 		case "devin":

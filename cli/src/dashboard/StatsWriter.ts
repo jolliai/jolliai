@@ -833,6 +833,15 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 				token_coverage: string;
 		  }
 		| undefined;
+	// A pathless stop-hook event knows that the session ended, but knows nothing about
+	// the transcript version that ended. If a full row already exists, advancing its
+	// wall-clock instant here would make a later disk read look older to the monotonic
+	// guard below, permanently stranding the new messages/tools that read came to add.
+	// A bare prior row has no receipt columns and is safe to refresh; a missing row is
+	// inserted normally. The next successful discovery enriches either one.
+	if (event.metadataOnly && prior !== undefined && (prior.started_at_ms !== null || prior.duration_ms !== null)) {
+		return;
+	}
 	if (prior !== undefined && (prior.started_at_ms !== null || prior.duration_ms !== null)) {
 		if (prior.updated_at_ms > event.updatedAtMs) return;
 	}
@@ -1027,12 +1036,13 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			cached_tokens: number | null;
 			usage_confidence: string | null;
 			plugin: string | null;
+			origin_root: string | null;
 		};
 		const previousTools = new Map<string, PreviousTool>();
 		for (const row of db
 			.prepare(
 				`SELECT tool_name, kind, last_call_at_ms, input_tokens, output_tokens,
-				        cached_tokens, usage_confidence, plugin
+				        cached_tokens, usage_confidence, plugin, origin_root
 				   FROM session_tool_use WHERE session_event_id = ?`,
 			)
 			.all(eventId) as ReadonlyArray<PreviousTool>) {
@@ -1042,8 +1052,9 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 		const insertTool = db.prepare(
 			`INSERT INTO session_tool_use
 			   (session_event_id, tool_name, kind, server, calls, last_call_at_ms,
-			    input_tokens, output_tokens, cached_tokens, usage_confidence, plugin, updated_at_ms)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			    input_tokens, output_tokens, cached_tokens, usage_confidence, plugin, origin_root,
+			    updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(session_event_id, tool_name, kind) DO UPDATE SET
 			     calls = excluded.calls,
 			     -- The stamp must be in THIS branch too: a conflict is still a write,
@@ -1078,7 +1089,14 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			     -- recoverable while the transcript that named it is readable, and a pass that
 			     -- could not resolve one (a contested name, or a scanner that reports none)
 			     -- must not blank a label an earlier read established.
-			     plugin           = COALESCE(excluded.plugin, session_tool_use.plugin)`,
+			     plugin           = COALESCE(excluded.plugin, session_tool_use.plugin),
+			     -- Same rule, one difference worth knowing: unlike a namespace, a root can
+			     -- legitimately CHANGE (a repo gains \`.cursor/skills/\` when \`.agents/skills/\`
+			     -- stops supplying a skill), and the scanner already resolves that by taking
+			     -- its newest observation. So the incoming value wins whenever there IS one,
+			     -- and the COALESCE only protects against a pass that could not read a path
+			     -- at all.
+			     origin_root      = COALESCE(excluded.origin_root, session_tool_use.origin_root)`,
 		);
 		// Per-invocation rows, and deliberately NOT preceded by a DELETE — unlike the
 		// aggregate above. Once an agent prunes a conversation its entries can never be
@@ -1138,6 +1156,7 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 				cachedTokens,
 				usageConfidence,
 				tool.plugin ?? previous?.plugin ?? null,
+				tool.originRoot ?? previous?.origin_root ?? null,
 				nowMs,
 			);
 			// Gated on the KIND, not merely on the field being present: the table holds skill

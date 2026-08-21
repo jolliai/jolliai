@@ -51,23 +51,36 @@ const hooksManifest = JSON.parse(readFileSync(resolve(pluginDir, "hooks", "hooks
 const manifestHooks = hooksManifest.hooks ?? {};
 // Cursor's hooks.json is FLATTER than Claude's and Codex's: each event maps straight
 // to an array of `{ command, … }`, with no intermediate `{ hooks: [...] }` group.
-const sessionStartCommands = (manifestHooks.sessionStart ?? []).map((hook) => hook.command);
-// Exactly one sessionStart bootstrap and no business hooks. Capture hooks belong in
-// the repo (installed by the bootstrap, dispatched through run-hook), not in the
-// manifest — a manifest-registered `stop` hook would double-run against the repo one.
-if (
-	Object.keys(manifestHooks).length !== 1 ||
-	sessionStartCommands.length !== 1 ||
-	!sessionStartCommands[0]?.includes("CursorPluginBootstrapHook.js")
-) {
-	throw new Error("hooks.json must register exactly one sessionStart CursorPluginBootstrapHook and no business hooks");
+// The events this manifest may register, each mapped to the single entry it must launch.
+//
+// Still an exact set rather than a shape check, and still for the reason the old
+// one-entry assertion encoded: GIT capture hooks belong in the repo (installed by the
+// bootstrap, dispatched through run-hook), and a manifest-registered post-commit would
+// double-run against the repo one. `stop` is not in that category — it is an
+// AGENT-level event with no repo-installed counterpart on this host, so it duplicates
+// nothing, and scanning cannot see a conversation that is still running.
+const MANIFEST_HOOKS = {
+	sessionStart: "CursorPluginBootstrapHook.js",
+	stop: "CursorStopHook.js",
+};
+const declaredEvents = Object.keys(manifestHooks).sort();
+if (declaredEvents.join(",") !== Object.keys(MANIFEST_HOOKS).sort().join(",")) {
+	throw new Error(
+		`hooks.json must register exactly [${Object.keys(MANIFEST_HOOKS).sort().join(", ")}] — found [${declaredEvents.join(", ")}]`,
+	);
 }
-// `${CURSOR_PLUGIN_ROOT}` is Cursor's own plugin-root variable — NOT Claude's
-// `${CLAUDE_PLUGIN_ROOT}` nor Codex's `${PLUGIN_ROOT}`. An unexpanded variable
-// produces a command that silently fails on every session, so pin it here rather
-// than discovering it in a marketplace build.
-if (!sessionStartCommands[0].includes("${CURSOR_PLUGIN_ROOT}")) {
-	throw new Error("hooks.json must locate the bootstrap through ${CURSOR_PLUGIN_ROOT}");
+for (const [event, entry] of Object.entries(MANIFEST_HOOKS)) {
+	const commands = (manifestHooks[event] ?? []).map((hook) => hook.command);
+	if (commands.length !== 1 || !commands[0]?.includes(entry)) {
+		throw new Error(`hooks.json must register exactly one ${event} hook launching ${entry}`);
+	}
+	// `${CURSOR_PLUGIN_ROOT}` is Cursor's own plugin-root variable — NOT Claude's
+	// `${CLAUDE_PLUGIN_ROOT}` nor Codex's `${PLUGIN_ROOT}`. An unexpanded variable
+	// produces a command that silently fails on every session, so pin it here rather
+	// than discovering it in a marketplace build.
+	if (!commands[0].includes("${CURSOR_PLUGIN_ROOT}")) {
+		throw new Error(`hooks.json must locate the ${event} hook through \${CURSOR_PLUGIN_ROOT}`);
+	}
 }
 
 const options = {
@@ -86,6 +99,13 @@ const options = {
 	entryPoints: [
 		{ in: resolve(jmSrc, "Cli.ts"), out: "Cli" },
 		{ in: resolve(jmSrc, "hooks", "CursorPluginBootstrapHook.ts"), out: "CursorPluginBootstrapHook" },
+		// The second manifest-launched entry. Like the bootstrap it is reached through
+		// ${CURSOR_PLUGIN_ROOT} and never through dist-paths/, so it stays OUT of
+		// DistPathWriter's REQUIRED_RUNTIME_FILES — see EXPECTED_ENTRY_OUTS below.
+		{ in: resolve(jmSrc, "hooks", "CursorStopHook.ts"), out: "CursorStopHook" },
+		// CursorStopHook launches this optional pass by a fixed sibling filename. It is
+		// Cursor-only and never resolves through the machine-global dist registry.
+		{ in: resolve(jmSrc, "hooks", "CursorDiscoveryWorker.ts"), out: "CursorDiscoveryWorker" },
 		// Not used by this host, but required for dist completeness — see header.
 		{ in: resolve(jmSrc, "hooks", "StopHook.ts"), out: "StopHook" },
 		{ in: resolve(jmSrc, "hooks", "SessionStartHook.ts"), out: "SessionStartHook" },
@@ -126,12 +146,24 @@ const options = {
 // Guard the dist against a silently-dropped entry point. esbuild only fails on a
 // missing *source* file, not on a removed `entryPoints` line. Asserting here means
 // `build:cursor-plugin` — and therefore CI — catches the drift. Kept in lockstep with
-// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus one
-// entry that never resolves through dist-paths/: CursorPluginBootstrapHook, which
-// the manifest launches directly).
+// cli/src/install/DistPathWriter.ts REQUIRED_RUNTIME_FILES (those 10, plus the three
+// Cursor-only entries that never resolve through dist-paths/: CursorPluginBootstrapHook
+// and CursorStopHook, which the manifest launches directly via ${CURSOR_PLUGIN_ROOT},
+// and CursorDiscoveryWorker, which the latter launches by fixed sibling filename).
+//
+// Those three must STAY out of REQUIRED_RUNTIME_FILES. That list is a machine-global
+// contract — an incomplete dist is refused registration — so promoting a
+// Cursor-only entry would make every already-installed dist of every other surface
+// fail the completeness check and de-register itself. Same reason McpLauncher.js is
+// deliberately excluded on the Codex side. The blocked-commit hazard that motivates
+// the list does not reach these three either: a missing file here means Cursor's own
+// capture or discovery path does not run, while the ten in REQUIRED_RUNTIME_FILES are
+// exec'd by run-hook, where a missing file aborts the git operation.
 const EXPECTED_ENTRY_OUTS = [
 	"Cli",
 	"CursorPluginBootstrapHook",
+	"CursorStopHook",
+	"CursorDiscoveryWorker",
 	"StopHook",
 	"SessionStartHook",
 	"PostCommitHook",
@@ -169,7 +201,7 @@ if (isWatch) {
 	copyDashboardAssets();
 	console.log(
 		`Built Cursor plugin dist/ v${pluginPkg.version} — ${options.entryPoints.length} entries ` +
-			"(Cli.js, CursorPluginBootstrapHook.js, Stop/SessionStart hooks, the 5 git hooks, both workers) " +
+			"(Cli.js, the 2 Cursor manifest hooks, their discovery worker, Stop/SessionStart hooks, the 5 git hooks, both shared workers) " +
 			"plus the dashboard assets",
 	);
 }

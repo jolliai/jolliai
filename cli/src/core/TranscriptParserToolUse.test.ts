@@ -253,7 +253,10 @@ describe("TOOL_RECORDING_SOURCES", () => {
 
 	it("includes the reader-backed sources whose readers populate toolUse", () => {
 		// Each of these is pinned behaviourally in its own reader's test file.
-		for (const source of ["gemini", "opencode", "antigravity", "cursor-cli", "cline-cli", "devin"]) {
+		// `cursor` is here because its conversations are now read from the same
+		// agent-transcripts JSONL as `cursor-cli` — see CursorCliTranscriptReader's
+		// real-capture cases, which cover both.
+		for (const source of ["gemini", "opencode", "antigravity", "cursor", "cursor-cli", "cline-cli", "devin"]) {
 			expect(TOOL_RECORDING_SOURCES.has(source)).toBe(true);
 		}
 	});
@@ -262,7 +265,7 @@ describe("TOOL_RECORDING_SOURCES", () => {
 		// Not a wish-list: a source here reports `toolUse: []`, which downstream
 		// reads as the positive claim "called no tools". Omission degrades to
 		// "unavailable" instead. Move an entry up only with a real capture.
-		for (const source of ["cursor", "copilot", "copilot-chat", "cline"]) {
+		for (const source of ["copilot", "copilot-chat", "cline"]) {
 			expect(TOOL_RECORDING_SOURCES.has(source)).toBe(false);
 		}
 	});

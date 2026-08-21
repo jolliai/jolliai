@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
 	builtinTool,
 	classifyCodexToolName,
+	classifyCursorToolName,
 	classifyToolName,
 	mcpTool,
 	skillTool,
@@ -178,5 +179,71 @@ describe("ToolUseTally", () => {
 		expect(tally.hasSeen("toolu_1")).toBe(false);
 		tally.addOnce("toolu_1", builtinTool("Bash"));
 		expect(tally.hasSeen("toolu_1")).toBe(true);
+	});
+});
+
+describe("classifyCursorToolName (identity lives in `input`)", () => {
+	it("classifies every observed bare name as a builtin", () => {
+		// The complete builtin set across 10 real Cursor transcripts.
+		for (const name of ["Shell", "Read", "WebSearch", "WebFetch"]) {
+			expect(classifyCursorToolName(name, {})).toEqual({ name, kind: "builtin", calls: 0 });
+		}
+	});
+
+	it("reads the server and tool out of a real CallMcpTool input", () => {
+		expect(
+			classifyCursorToolName("CallMcpTool", {
+				server: "jollimemory",
+				toolName: "search",
+				description: "Search Jolli memories for this branch's work",
+				arguments: { query: "cursor session rescan", limit: 10 },
+			}),
+		).toEqual({ name: "jollimemory.search", kind: "mcp", server: "jollimemory", calls: 0 });
+	});
+
+	it("does NOT classify by the presence of a server — GetMcpTools carries one too", () => {
+		// A real discovery call: it names a server and invokes nothing. Keying on the
+		// input rather than on the tool name would file every one of these (9 in the
+		// corpus) as an MCP call and inflate every MCP figure on the dashboard.
+		expect(classifyCursorToolName("GetMcpTools", { server: "jollimemory", toolName: "search" })).toEqual({
+			name: "GetMcpTools",
+			kind: "builtin",
+			calls: 0,
+		});
+	});
+
+	it("never invents a server", () => {
+		// Each of these is a real call that must still be counted, but filing it under
+		// an empty server would put a nameless row in the group-by-server ranking.
+		for (const input of [{}, undefined, null, "not an object", { server: "" }, { server: 42 }]) {
+			expect(classifyCursorToolName("CallMcpTool", input)).toEqual({
+				name: "CallMcpTool",
+				kind: "builtin",
+				calls: 0,
+			});
+		}
+	});
+
+	it("keeps the server when the tool half is missing or malformed", () => {
+		// Mirrors classifyToolName's `mcp__server`-with-no-tool rule: attribute to the
+		// server rather than dropping the call.
+		for (const toolName of [undefined, "", 7]) {
+			expect(classifyCursorToolName("CallMcpTool", { server: "jollimemory", toolName })).toEqual({
+				name: "jollimemory",
+				kind: "mcp",
+				server: "jollimemory",
+				calls: 0,
+			});
+		}
+	});
+
+	it("does not treat an mcp__-prefixed name as MCP — Cursor never writes one", () => {
+		// The corpus has zero of these. Recognising one here would resurrect the
+		// premise this classifier exists to replace.
+		expect(classifyCursorToolName("mcp__jollimemory__search", {})).toEqual({
+			name: "mcp__jollimemory__search",
+			kind: "builtin",
+			calls: 0,
+		});
 	});
 });

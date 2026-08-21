@@ -308,35 +308,110 @@ describe("readCursorCliTranscript toolUse", () => {
 		await rm(dir, { recursive: true, force: true });
 	});
 
-	// cursor-agent speaks the Anthropic block format, so a tool call is a
-	// `type:"tool_use"` part with a `toolu_…` id — the same parts the reader
-	// deliberately drops from the conversation text.
+	// Shapes copied from a real capture (see the `mcp` cases below for the whole
+	// story): a tool call is a `type:"tool_use"` part, and Cursor writes NO `id` on
+	// it. The `id`s are omitted here for that reason — an earlier version of this
+	// fixture invented `toolu_…` ids and an `mcp__jollimemory__search` name, neither
+	// of which appears anywhere in the corpus.
 	const withTools = [
 		JSON.stringify({
 			role: "assistant",
 			message: {
 				content: [
 					{ type: "text", text: "Checking." },
-					{ type: "tool_use", id: "toolu_1", name: "read_file", input: {} },
-					{ type: "tool_use", id: "toolu_2", name: "mcp__jollimemory__search", input: {} },
+					{ type: "tool_use", name: "Read", input: {} },
+					{ type: "tool_use", name: "Shell", input: {} },
 				],
 			},
 		}),
 		JSON.stringify({
 			role: "assistant",
-			message: { content: [{ type: "tool_use", id: "toolu_3", name: "read_file", input: {} }] },
+			message: { content: [{ type: "tool_use", name: "Read", input: {} }] },
 		}),
 		"",
 	].join("\n");
 
-	it("counts tool_use parts, classifying MCP names by their mcp__ prefix", async () => {
+	it("counts tool_use parts, bucketing repeats of one builtin together", async () => {
 		const p = join(dir, "t.jsonl");
 		await writeFile(p, withTools);
 		const result = await readCursorCliTranscript(p);
 		expect(result.toolUse).toEqual([
-			{ name: "read_file", kind: "builtin", calls: 2 },
-			{ name: "jollimemory.search", kind: "mcp", server: "jollimemory", calls: 1 },
+			{ name: "Read", kind: "builtin", calls: 2 },
+			{ name: "Shell", kind: "builtin", calls: 1 },
 		]);
+	});
+
+	// ── MCP: the shape Cursor actually writes ────────────────────────────────────
+	//
+	// These replace a case that asserted an `mcp__<server>__<tool>` name was
+	// classified by its prefix. That case passed, agreed with the reader's comment,
+	// and described a transcript Cursor has never produced: across 10 real captures
+	// there are ZERO `mcp__` names, and every MCP call is a generic `CallMcpTool`
+	// carrying `{server, toolName}` in `input`. Both the fixture and the code it
+	// verified were imagined, so the three real calls in that corpus were being filed
+	// as `builtin:CallMcpTool` with their server discarded and nothing failing.
+
+	it("classifies CallMcpTool from its input, not its name — the real MCP shape", async () => {
+		const p = join(dir, "t.jsonl");
+		// Verbatim block shape from ~/.cursor/projects/…/78230cc6…jsonl.
+		await writeFile(
+			p,
+			`${JSON.stringify({
+				role: "assistant",
+				message: {
+					content: [
+						{
+							type: "tool_use",
+							name: "CallMcpTool",
+							input: {
+								server: "jollimemory",
+								toolName: "search",
+								description: "Search Jolli memories for this branch's work",
+								arguments: { query: "cursor session rescan", limit: 10 },
+							},
+						},
+					],
+				},
+			})}\n`,
+		);
+		const result = await readCursorCliTranscript(p);
+		expect(result.toolUse).toEqual([{ name: "jollimemory.search", kind: "mcp", server: "jollimemory", calls: 1 }]);
+	});
+
+	it("keeps GetMcpTools a builtin — it is a discovery call that invokes no server", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(
+			p,
+			`${JSON.stringify({
+				role: "assistant",
+				message: {
+					content: [
+						// Both real `input` shapes: a name filter, and a server+tool probe.
+						{ type: "tool_use", name: "GetMcpTools", input: { pattern: "jolli" } },
+						{ type: "tool_use", name: "GetMcpTools", input: { server: "jollimemory", toolName: "search" } },
+					],
+				},
+			})}\n`,
+		);
+		const result = await readCursorCliTranscript(p);
+		// Notably the second one names a server, so a classifier keyed on "does input
+		// have a server" rather than on the tool name would file it as an MCP call.
+		expect(result.toolUse).toEqual([{ name: "GetMcpTools", kind: "builtin", calls: 2 }]);
+	});
+
+	it("keeps a CallMcpTool with no server as a builtin rather than an empty-server MCP row", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(
+			p,
+			`${JSON.stringify({
+				role: "assistant",
+				message: { content: [{ type: "tool_use", name: "CallMcpTool", input: {} }] },
+			})}\n`,
+		);
+		const result = await readCursorCliTranscript(p);
+		// The call is real and must not be dropped; inventing a server for it would put
+		// a nameless row in the dashboard's group-by-server ranking.
+		expect(result.toolUse).toEqual([{ name: "CallMcpTool", kind: "builtin", calls: 1 }]);
 	});
 
 	it("counts a turn that is nothing but tool calls, which produces no entry", async () => {
@@ -364,6 +439,80 @@ describe("readCursorCliTranscript toolUse", () => {
 		const p = join(dir, "t.jsonl");
 		await writeFile(p, withTools);
 		const first = await readCursorCliTranscript(p, { transcriptPath: p, lineNumber: 1, updatedAt: "" });
-		expect(first.toolUse).toEqual([{ name: "read_file", kind: "builtin", calls: 1 }]);
+		// Resuming past line 0 skips the first record's two calls, leaving only the
+		// second record's single `Read`.
+		expect(first.toolUse).toEqual([{ name: "Read", kind: "builtin", calls: 1 }]);
+	});
+
+	// ── The tool-call clock ──────────────────────────────────────────────────────
+	//
+	// `TOOL_CALL_TIME_SOURCES` lists both Cursor sources, and its docstring requires
+	// that a listed source is "actually passing a timestamp through". The stamp is not
+	// a record field: it is embedded in the USER turn's text, while `tool_use` blocks
+	// are in ASSISTANT turns. Measured across 10 real transcripts — 12/12 user turns
+	// carry one, 0/35 assistant turns do, and 0 of the 24 lines carrying a `tool_use`
+	// do — so a per-line read could never stamp a single bucket.
+
+	/** A user turn stamped at `hhmm`, then an assistant turn calling `tool`. */
+	const stampedTurn = (time: string, tool: string) =>
+		[
+			JSON.stringify({
+				role: "user",
+				message: { content: [{ type: "text", text: `hi <timestamp>${time}</timestamp>` }] },
+			}),
+			JSON.stringify({ role: "assistant", message: { content: [{ type: "tool_use", name: tool, input: {} }] } }),
+		].join("\n");
+
+	it("stamps a tool call with the instant of the user turn it answers", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(p, `${stampedTurn("Thursday, Aug 20, 2026, 3:24 PM (UTC+8)", "Shell")}\n`);
+		const result = await readCursorCliTranscript(p);
+		expect(result.toolUse).toEqual([
+			{
+				name: "Shell",
+				kind: "builtin",
+				calls: 1,
+				lastCallAtMs: Date.parse("2026-08-20T07:24:00.000Z"),
+			},
+		]);
+	});
+
+	it("advances the clock as later user turns arrive", async () => {
+		const p = join(dir, "t.jsonl");
+		await writeFile(
+			p,
+			`${stampedTurn("Thursday, Aug 20, 2026, 3:24 PM (UTC+8)", "Shell")}\n` +
+				`${stampedTurn("Thursday, Aug 20, 2026, 4:00 PM (UTC+8)", "Shell")}\n`,
+		);
+		const result = await readCursorCliTranscript(p);
+		// One bucket, carrying the LATER of the two — `lastCallAtMs`, not first-call.
+		expect(result.toolUse).toEqual([
+			{ name: "Shell", kind: "builtin", calls: 2, lastCallAtMs: Date.parse("2026-08-20T08:00:00.000Z") },
+		]);
+	});
+
+	it("leaves the stamp ABSENT when the slice opens on an assistant turn", async () => {
+		// A resumed read can begin past the user turn that dated these calls. Absence is
+		// the honest answer — the consumer falls back to the session's own instant — and
+		// an invented one would file the call under the wrong day.
+		const p = join(dir, "t.jsonl");
+		await writeFile(p, `${stampedTurn("Thursday, Aug 20, 2026, 3:24 PM (UTC+8)", "Shell")}\n`);
+		const resumed = await readCursorCliTranscript(p, { transcriptPath: p, lineNumber: 1, updatedAt: "" });
+		expect(resumed.toolUse).toEqual([{ name: "Shell", kind: "builtin", calls: 1 }]);
+	});
+
+	it("does not stamp calls with the instant of a turn deferred past the cutoff", async () => {
+		// The carry-forward is assigned AFTER the cutoff check, so a turn this commit
+		// refused cannot leave its clock behind for the calls it never consumed.
+		const p = join(dir, "t.jsonl");
+		await writeFile(
+			p,
+			`${stampedTurn("Thursday, Aug 20, 2026, 3:24 PM (UTC+8)", "Shell")}\n` +
+				`${stampedTurn("Thursday, Aug 20, 2026, 5:00 PM (UTC+8)", "Read")}\n`,
+		);
+		const result = await readCursorCliTranscript(p, null, "2026-08-20T08:00:00.000Z");
+		expect(result.toolUse).toEqual([
+			{ name: "Shell", kind: "builtin", calls: 1, lastCallAtMs: Date.parse("2026-08-20T07:24:00.000Z") },
+		]);
 	});
 });

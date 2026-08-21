@@ -328,6 +328,34 @@ describe("foldSkillUse", () => {
 		expect(second.plugin).toBe("superpowers");
 	});
 
+	it("lets a NEWER pass overwrite originRoot — the opposite of detection's sticky rule", () => {
+		// A skill genuinely moves between roots: a repo gains `.cursor/skills/` the
+		// moment `.agents/skills/` stops supplying it. Pinning the first observation
+		// would keep naming a root the host has stopped loading from.
+		const first = foldSkillUse(use({ originRoot: "repo-agents" }), undefined);
+		expect(first.originRoot).toBe("repo-agents");
+
+		const second = foldSkillUse(
+			use({ originRoot: "repo-cursor", invocations: [inv("2026-07-30T07:00:00.000Z")] }),
+			first,
+		);
+		expect(second.originRoot).toBe("repo-cursor");
+	});
+
+	it("keeps the prior originRoot when a later pass reports none", () => {
+		// Not-sticky is not the same as erasable: a source that reports no path at all
+		// must not wipe what a source that does report one already established.
+		const first = foldSkillUse(use({ originRoot: "cursor-global" }), undefined);
+		const second = foldSkillUse(use({ invocations: [inv("2026-07-30T07:00:00.000Z")] }), first);
+		expect(second.originRoot).toBe("cursor-global");
+	});
+
+	it("leaves originRoot absent when no pass has ever reported one", () => {
+		// Absent means "this source does not report a path", which is every source but
+		// Cursor. A default would claim a root nobody observed.
+		expect(foldSkillUse(use(), undefined).originRoot).toBeUndefined();
+	});
+
 	it("walks firstUsedAt backwards when a catch-up pass finds older invocations", () => {
 		// The prior file's bound is a candidate, not a floor: a rewound cursor can
 		// surface rows older than anything the file has ever seen.
@@ -357,6 +385,23 @@ describe("renderSkillMarkdown / parseSkillMarkdownFromString", () => {
 		const content = foldSkillUse(use({ detection: "heuristic" }), undefined);
 		expect(renderSkillMarkdown(content)).toContain('detection: "heuristic"');
 		expect(parseSkillMarkdownFromString(renderSkillMarkdown(content))?.detection).toBe("heuristic");
+	});
+
+	it("round-trips originRoot", () => {
+		const content = foldSkillUse(use({ originRoot: "repo-agents" }), undefined);
+		expect(renderSkillMarkdown(content)).toContain('originRoot: "repo-agents"');
+		expect(parseSkillMarkdownFromString(renderSkillMarkdown(content))?.originRoot).toBe("repo-agents");
+	});
+
+	it("drops an originRoot the union does not contain", () => {
+		// This file is hand-editable, so an unrecognised value must degrade to absent —
+		// which reads as "the source reports no path" — rather than flowing into the
+		// panel as a root that does not exist.
+		const rendered = renderSkillMarkdown(foldSkillUse(use({ originRoot: "repo-agents" }), undefined)).replace(
+			'originRoot: "repo-agents"',
+			'originRoot: "invented-root"',
+		);
+		expect(parseSkillMarkdownFromString(rendered)?.originRoot).toBeUndefined();
 	});
 
 	it("ignores a frontmatter line that carries no key/value separator", () => {

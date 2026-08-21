@@ -5,6 +5,11 @@
 			{
 				"command": "node \"${CURSOR_PLUGIN_ROOT}/dist/CursorPluginBootstrapHook.js\""
 			}
+		],
+		"stop": [
+			{
+				"command": "node \"${CURSOR_PLUGIN_ROOT}/dist/CursorStopHook.js\""
+			}
 		]
 	}
 }
