@@ -132,6 +132,31 @@ window.JD = window.JD || {};
 		return step * 4;
 	};
 
+	/* Typed read, not `|| 0`: `topSeries` hands its INPUT series straight back when the
+	   key count is within the limit, so `bySeries` here can still be the JSON.parse'd
+	   object with a prototype. A series named `constructor` then yields the inherited
+	   function on any day it is absent — `|| 0` treats it as a value, and the bar
+	   geometry becomes NaN. */
+	var readSeriesValue = (point, key) => (typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0);
+
+	/* The axis bound for a stacked set. ONE function shared by both stacked-bar entry
+	   points below, because THE BARS ARE SCALED BY THIS SAME BOUND: a caller that
+	   rounded the LABELS on its own would leave a tallest bar touching the top gridline
+	   while the gridline claimed a larger number. That is the whole reason
+	   `stackedBarsFrame` returns its ticks rather than letting its caller derive them. */
+	var stackedAxisMax = (series, keys) => {
+		var max = 0;
+		series.forEach((point) => {
+			var total = 0;
+			keys.forEach((key) => {
+				total += readSeriesValue(point, key);
+			});
+			if (total > max) max = total;
+		});
+		/* Seeded at 0, not 1 — `niceAxisMax` owns the no-data case. */
+		return niceAxisMax(max);
+	};
+
 	/* Tokens' and Spend's daily chart.
 	 *
 	 * **The date axis is the two ENDPOINTS, not a tick per bar.** It used to label
@@ -162,25 +187,10 @@ window.JD = window.JD || {};
 		var plotW = W - left - 8;
 		var slot = plotW / Math.max(1, series.length);
 		var barW = slot * 0.58;
-		/* Seeded at 0, not 1 — `niceAxisMax` owns the no-data case. */
-		var max = 0;
-		/* Typed read, not `|| 0`: `topSeries` hands its INPUT series straight back
-		   when the key count is within the limit, so `bySeries` here can still be
-		   the JSON.parse'd object with a prototype. A series named `constructor`
-		   then yields the inherited function on any day it is absent — `|| 0`
-		   treats it as a value, and the bar geometry below becomes NaN. */
-		var read = (point, key) => (typeof point.bySeries[key] === "number" ? point.bySeries[key] : 0);
-		series.forEach((point) => {
-			var total = 0;
-			keys.forEach((key) => {
-				total += read(point, key);
-			});
-			if (total > max) max = total;
-		});
 		/* The bars are scaled by this same bound, deliberately. Rounding only the
 		   LABELS would leave a tallest bar that touches the top gridline while the
 		   gridline claims a larger number. */
-		max = niceAxisMax(max);
+		var max = stackedAxisMax(series, keys);
 		var svg =
 			'<svg viewBox="0 0 ' +
 			W +
@@ -213,7 +223,7 @@ window.JD = window.JD || {};
 			var x = left + dayIndex * slot + (slot - barW) / 2;
 			var yCursor = bottom;
 			keys.forEach((key, keyIndex) => {
-				var value = read(point, key);
+				var value = readSeriesValue(point, key);
 				if (value <= 0) return;
 				var h = ((bottom - 10) * value) / max;
 				yCursor -= h;
@@ -253,6 +263,112 @@ window.JD = window.JD || {};
 			if (series.length > 1) svg += axis(W - 8, "end", series[series.length - 1].date);
 		}
 		return svg + "</svg>";
+	};
+
+	/**
+	 * The same stacked bars with NO TEXT INSIDE THE SVG — the plot area alone, for a
+	 * caller that renders the axis in HTML beside it.
+	 *
+	 * WHY THIS IS A SECOND ENTRY POINT RATHER THAN A FLAG ON THE FIRST. `stackedBars`
+	 * puts 7 `<text>` nodes in its viewBox, which rules out `preserveAspectRatio="none"`:
+	 * text under a `none` aspect ratio is text that has been stretched. So that chart can
+	 * only scale UNIFORMLY — its height is width × 238/660, and a caller who has to bound
+	 * the height has no handle but `max-width`. The Skills band was paying exactly that:
+	 * its chart was pinned to a width derived from the WINDOW'S HEIGHT, so a wider browser
+	 * did nothing for it and its axis labels rendered at ~5px on a 1280x800 window.
+	 *
+	 * With the text out, the SVG is rectangles and lines only, `none` is safe, and the two
+	 * axes come apart: the caller pins the height in CSS and the bars stretch to whatever
+	 * width the page has. Same division of labour `JD.dayBars` below already draws for the
+	 * pane's small charts, and the same reason its own labels stay HTML.
+	 *
+	 * `stackedBars` is left untouched rather than growing a mode, because its three
+	 * callers in `stats.js` sit on a SCROLLING page with no height budget — there "wider
+	 * window → bigger, more legible chart" is the wanted behaviour and a pinned height
+	 * would be a regression. Its signature and string return value stay a contract they
+	 * never have to know about.
+	 *
+	 * Returns the pieces rather than assembled markup: the tick VALUES are the caller's to
+	 * lay out (this module has no business knowing the band's markup), while `max` stays
+	 * private inside `stackedAxisMax` so the ticks and the bars cannot end up scaled by
+	 * two different bounds.
+	 *
+	 * @returns {{svg: string, ticks: string[], firstDay: string, lastDay: string}}
+	 *   `ticks` runs TOP-DOWN (highest first), the order a column renders in, one per
+	 *   gridline. `firstDay`/`lastDay` are formatted, and `lastDay` is `""` on a
+	 *   single-day window — the same day at both ends would read as a range that is not
+	 *   one, which is the rule `stackedBars` states for its own endpoints.
+	 */
+	JD.stackedBarsFrame = (series, keys, valueLabel, fmt) => {
+		var format = fmt || JD.fmtTokens;
+		/* THE PLOT AREA ALONE: `stackedBars`' 660x238 box less its 42-wide tick gutter,
+		   its 8px right margin and the 24px band its endpoint labels sat in. Both numbers
+		   are arbitrary now that the box is scaled on each axis independently — nothing
+		   here is measured in viewBox units on screen — but keeping the plot's own
+		   proportions means the 0.58 bar/gap split below reads the same as in the chart it
+		   was lifted from. */
+		var W = 610;
+		var H = 204;
+		var max = stackedAxisMax(series, keys);
+		var slot = W / Math.max(1, series.length);
+		var barW = slot * 0.58;
+		var svg =
+			'<svg class="sk-bandbars" viewBox="0 0 ' +
+			W +
+			" " +
+			H +
+			'" preserveAspectRatio="none" role="img" aria-label="Daily ' +
+			JD.esc(valueLabel) +
+			', stacked bars">';
+		/* Five gridlines, baseline included, one per tick the caller prints.
+		 *
+		 * `vector-effect="non-scaling-stroke"` is load-bearing under `none`, not a
+		 * flourish: a horizontal line's stroke width is measured on the axis being
+		 * scaled, so a 1-unit stroke in a 204-unit box renders at height/204 px — a
+		 * hairline that thins or thickens with whatever height the caller pinned. The
+		 * attribute takes the stroke out of the transform and leaves it at 1 device
+		 * pixel at every size. */
+		for (var g = 0; g <= 4; g++) {
+			var y = H - (g * H) / 4;
+			svg +=
+				'<line x1="0" y1="' +
+				y +
+				'" x2="' +
+				W +
+				'" y2="' +
+				y +
+				'" stroke="var(--grid)" stroke-width="1" vector-effect="non-scaling-stroke"></line>';
+		}
+		series.forEach((point, dayIndex) => {
+			var x = dayIndex * slot + (slot - barW) / 2;
+			var yCursor = H;
+			keys.forEach((key, keyIndex) => {
+				var value = readSeriesValue(point, key);
+				if (value <= 0) return;
+				var h = (H * value) / max;
+				yCursor -= h;
+				svg +=
+					'<rect x="' +
+					x.toFixed(2) +
+					'" y="' +
+					yCursor.toFixed(2) +
+					'" width="' +
+					barW.toFixed(2) +
+					'" height="' +
+					Math.max(1, h).toFixed(2) +
+					'" fill="' +
+					JD.seriesColor(keyIndex) +
+					'"><title>' +
+					JD.esc(point.date + " · " + key + " · " + format(value)) +
+					"</title></rect>";
+			});
+		});
+		return {
+			svg: svg + "</svg>",
+			ticks: [4, 3, 2, 1, 0].map((g) => format((max * g) / 4)),
+			firstDay: series.length > 0 ? dayLabel(series[0].date) : "",
+			lastDay: series.length > 1 ? dayLabel(series[series.length - 1].date) : "",
+		};
 	};
 
 	/**

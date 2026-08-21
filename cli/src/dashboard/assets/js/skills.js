@@ -1,7 +1,7 @@
 /* Skills page — a chart band, a chooser column, and a reading pane.
  *
  * THE SELECTION LIVES IN THE URL (`?skill=`), not in a module variable. It survives
- * the 30 s poll for free, it can be shared and reloaded, and it is what the Stats
+ * an explicit model refresh for free, it can be shared and reloaded, and it is what the Stats
  * card's rows link into — so "open this skill" has one implementation rather than a
  * modal here and a link there.
  *
@@ -12,6 +12,28 @@
  * answered once because "no skill in the address" ALSO means "the reader just closed
  * the pane": answering it again there would re-open the first row on the click that
  * closed it, and the row's own toggle would be unusable.
+ *
+ * THE COLUMN HOLDS EVERY SKILL, and it gets there without being asked. The model
+ * carries only the Stats card's first page, so anything past it is fetched as soon as
+ * the page is drawn — there is no "Show more" here any more. The button was removed
+ * because this view IS the skills view: a reader who opened it has already said which
+ * list they want, and making them click through it a page at a time hid the tail of
+ * their own corpus behind a control that answers a question they had already answered.
+ * The Stats card keeps its button (`stats.js`), where the list is one of three sharing
+ * a band and the reader came for something else.
+ *
+ * THE ROWS STILL LIVE IN A WINDOW, and it is now the page's ONLY one. The whole view is
+ * a fixed frame — the page does not scroll, the two columns are the same height, and the
+ * reading pane holds its whole skill without scrolling — so the rows are the one region
+ * with a scrollbar. `main.css`'s `.skills-page` header owns that rule and the measurements
+ * behind it; what matters here is that the height comes from a flex chain rather than from
+ * anything this file computes. The MEASURED inline cap that used to create the window
+ * (`listCapPx`, read off the first page) is gone with it.
+ *
+ * WHY THE ROWS AND NOT THE PANE: the corpus is unbounded while a skill's detail is not.
+ * A machine can hold hundreds of skills, but the server caps the outcome strip at 50
+ * entries, `agents` is an enum, and `The record` is five fixed fields — so the pane's
+ * height has a ceiling that the frame can be sized against, and the column's does not.
  *
  * THE FIGURES ARE THE SERVER'S, never a sum over the rows on screen: `usage.skills`
  * is ONE PAGE, so a header line computed from it changes every time more rows arrive
@@ -57,21 +79,18 @@
 (function (JD) {
 	"use strict";
 
-	/* How many rows ONE Show more click adds — matching the model's own first page (the
-	   Stats card's `TOOL_ROWS_LIMIT`), so the column pages in the size it opened at.
-
-	   IT WAS 60, and that number quietly deleted the control it was paging: one fetch
-	   loaded past it in a single go, so on any real corpus `shown >= total` held on the
-	   first paint and the button never existed (measured: 23 skills, every range, all
-	   ≤ 60 — the column read "Showing 23 of 23 skills" with nothing to click, which
-	   reads as a broken control rather than as a finished list). The design mock pages
-	   at its first page for this reason and its button is on screen doing its job. */
-	var PAGE_ROWS = 8;
-
 	/* Series kept in the band before the rest rolls into "Other". FIVE is the whole
 	   reason: the categorical ramp holds five CVD-validated colours, so four plus
 	   Other is what can be told apart. */
 	var BAND_SERIES = 4;
+	/* A failed tail read retries without opting the whole Skills page into the global
+	   model poll. That poll intentionally belongs to My Dashboard only; repainting this
+	   page underneath a reader would also re-fetch the open detail pane. */
+	var REST_RETRY_MS = 30000;
+	/* An absolute backstop for a server whose total grows at least as fast as pages can
+	   be consumed. Real reads stop on offset/total equality; this prevents a corrupt or
+	   adversarial response stream from keeping the browser in an unbounded request loop. */
+	var MAX_LIST_REQUESTS = 1000;
 
 	/* The `†` a row takes when any entry behind it was inferred rather than observed,
 	   and the sentence that spells it out.
@@ -82,11 +101,12 @@
 	   between its `†` and its footnote, and `buildSkillsSummaryLabel` leaves the
 	   marker to its caller for the same reason — a dagger where a footnote is in
 	   reach, words where it is not. Here the footnote IS in reach: it sits at the end of
-	   the rows, which on the first screenful is the page's own scroll and after a Show
-	   more is the bottom of the rows' own window — either way, the scroll that reaches
-	   the last row reaches it. So the column gets both. The paging row is NOT in there —
-	   it is a control, and a control may not be reachable only by scrolling the rows it
-	   pages; see `navPagingHtml`.
+	   the rows, which on a corpus small enough to need no window is the page's own
+	   scroll and on any larger one is the bottom of the rows' own window — either way,
+	   the scroll that reaches the last row reaches it. So the column gets both. The
+	   loading line is NOT in there — a reader waiting on the rest of the list may not
+	   have to scroll the half that arrived to find out more is coming; see
+	   `navPagingHtml`.
 
 	   IT NAMES THE COUNT, not just the inference. A reader who learns only "this was
 	   inferred" still reads `47 runs` as 47 runs; the count is the figure the
@@ -98,68 +118,70 @@
 	var INFERRED_MARK = ' <span class="sk-inferred" title="' + INFERRED_TITLE + '">†</span>';
 
 	/* Everything an async answer can land in, so the two fetches below do not have to
-	   re-render each other's half. Module-scoped because the poll re-enters
-	   `renderSkills`, and a local would be re-seeded from the payload on every tick —
-	   dropping a pane the reader is in the middle of. */
+	   re-render each other's half. Module-scoped because an explicit model refresh can
+	   re-enter `renderSkills`, and a local would be re-seeded from the payload — dropping
+	   a pane the reader is in the middle of. */
 	var state = { rows: null, paneName: null, pane: null, paneError: null };
 
-	/* Which render is current. An answer from an earlier one must not paint over a
-	   later one — the same staleness any polled surface has. */
+	/* Which render is current — the staleness guard for THE PANE'S detail fetch, and only
+	   that one. An answer for a skill the reader has since navigated away from must not
+	   paint over the one they are looking at.
+
+	   The list read next door is staled by a new PAYLOAD instead (`collectRows` records
+	   why): a render is not the same event as a refresh, and opening a skill is a render. */
 	var seq = 0;
 
-	/* How many rows the column asks the server for, or ZERO while the model's own first
-	   page is still the whole column — the state every page load opens in, so the common
-	   case costs no request at all and the first paint is the only paint.
-
-	   Grown by Show more, and THE POLL READS THE SAME FIGURE: the 30 s refresh re-fetches
-	   this list, so a fixed `PAGE_ROWS` there would silently throw away every click the
-	   reader had made and shrink the column back under them. Reset by a range change for
-	   free, since changing the range is a full page load.
-
-	   Its two companions are the button's own state. `moreError` is deliberately set
-	   by the POLL's failure too: once the column is short of the total, "could not
-	   load more" is the honest label for a list that may be missing rows, whoever
-	   asked last. */
-	var pageWidth = 0;
-	/* The next ranked position for a Show more read. Usually equal to rows.length;
-	   kept separately because a row can shift across an offset boundary and be
-	   deduped without changing the server position already consumed. */
-	var pageOffset = 0;
-	/* The freshest total belongs to the latest page response. A new polled model
+	/* The freshest total belongs to the latest page response. A newly refreshed model
 	   resets it before that model's expanded list is verified. */
 	var rowsTotal = null;
 	var renderedModel = null;
-	var moreLoading = false;
-	var moreError = false;
 
-	/* The height the rows region is capped at once the reader has paged past the column's
-	   first screenful — MEASURED off that screenful, never declared.
+	/* The model whose full list has already been asked for — the guard that keeps the
+	   automatic read to ONE per payload.
+
+	   It is the model OBJECT, not a row count, because two different things re-enter
+	   `renderSkills` and only one of them wants a fresh read. An explicit refresh hands
+	   over a new payload and must re-read the tail; a row click re-renders the SAME payload
+	   to open a pane, and re-reading the whole list on every click would spend a request
+	   per click for rows already in hand.
+	   A count cannot tell those apart — both see the same short first page.
+
+	   NOT RESET ON FAILURE, deliberately. The retry timer below owns another attempt;
+	   clearing it here would instead make every click on a failed column fire the failing
+	   request again. */
+	var fetchedModel = null;
+	/* The loading line's state. `restError` is what keeps a short column honest: while
+	   it is set, the column is missing rows and says so rather than reading as the
+	   whole list. */
+	var restLoading = false;
+	var restError = false;
+	/* The one pending retry for the current payload. Cleared on success and whenever a
+	   different payload takes ownership, so an old timer cannot wake a stale read. */
+	var restRetryTimer = null;
+
+	/* Which of the pane's two long fixed paragraphs the reader has opened.
 	 *
-	 * THE FIRST PAGE MUST NOT SCROLL. What it comes to in pixels is not something this
-	 * file can know: it is `PAGE_ROWS` rows plus the column header, plus a footnote that
-	 * is present only on a corpus with an inferred row. A declared constant is therefore
-	 * a few pixels wrong on one of those shapes, and being wrong LOW grows a scrollbar on
-	 * exactly the state that is supposed to have none. So the first paint is laid out
-	 * free, its own height is read back, and that becomes the cap: Show more then grows
-	 * the list INSIDE the region it opened at, instead of pushing the page down.
+	 * MODULE STATE, not DOM state, because every path in this file repaints the WHOLE pane
+	 * — a row click, that row's detail landing, the tail of the list arriving, a refresh —
+	 * so an `aria-expanded` left on the node would be discarded moments after the click
+	 * that set it. Keyed by the block's own class name, which is what `bindProse` below
+	 * reads back off the event target.
 	 *
-	 * `offsetHeight` is the BORDER box, and `.jd * { box-sizing: border-box }` makes
-	 * `max-height` mean the same box — so the cap is exactly the height just measured. If
-	 * that reset ever goes, this becomes 16px of padding short and the first page scrolls.
-	 *
-	 * RE-MEASURED ON EVERY UNPAGED PAINT rather than latched once, so it tracks what the
-	 * first page actually looks like now: a poll can bring in the row that adds the
-	 * footnote, and a window resize between load and click would otherwise leave a stale
-	 * figure. A HIDDEN page measures 0 and is never recorded (`stats.js` guards its own
-	 * cap the same way) — capping at 0 would collapse the region and hide every row, so
-	 * null stands for "no cap yet" and an uncapped column is the safe way to be wrong. */
-	var listCapPx = null;
+	 * DELIBERATELY NOT PER SKILL. The two paragraphs are FIXED text (the inferred caveat
+	 * and the basis line say the same thing on every skill), so "I have read this one" is a
+	 * fact about the reader, not about the row — resetting it per selection would make them
+	 * re-open the same sentence on every skill they looked at. */
+	var openProse = { "sk-caveat": false, "sk-basis": false };
 
 	/* Whether "the address names no skill" has already been answered for this page
 	   load — see the header. Nav is a full page reload, so this starts false on every
 	   arrival; it is set by the default pick AND by any click, because a click is the
 	   reader answering the same question themselves. */
 	var defaultAnswered = false;
+
+	/* The skill the column has already been scrolled to, so a selection is revealed ONCE
+	   rather than on every repaint — see `revealSelectedRow`. */
+	var scrolledToSkill = null;
 
 	/** The selected skill, read from the address rather than from a variable. */
 	function selectedSkill() {
@@ -190,9 +212,10 @@
 	}
 
 	/**
-	 * The rows the column is showing: the fetched page once it lands, else the first
+	 * The rows the column is showing: the fetched list once it lands, else the first
 	 * page the model already carries (`skills` view shares the Stats payload, so the
-	 * first paint is never empty for a window that has data).
+	 * first paint is never empty for a window that has data — and on a corpus that fits
+	 * in one page it is also the last).
 	 *
 	 * One helper rather than the same expression twice, because the default pick below
 	 * must name a row the reader can actually see — picking from a different list would
@@ -206,10 +229,13 @@
 	 * The page the model already carries, which IS the column's first page — the Stats
 	 * payload this view shares, capped at the card's `TOOL_ROWS_LIMIT`.
 	 *
-	 * Named rather than inlined because two callers ask different questions of it: the
-	 * fallback above ("what do I draw before a fetch lands") and the fetch guard in
-	 * `renderSkills` ("is a fetch needed at all"). The second is what keeps a fresh page
-	 * load at zero requests, so the two must read the same list.
+	 * Named rather than inlined because TWO callers ask different questions of it: the
+	 * fallback above ("what do I draw before the fetch lands") and the fetch guard in
+	 * `renderSkills` ("is there anything past this page to read"). The second is what keeps
+	 * a corpus that fits in one page at zero requests.
+	 *
+	 * There was a third, `isExpanded`, asking "has the tail landed, so the rows region needs
+	 * its measured cap". The fixed frame retired both it and the cap — see `listOpenTag`.
 	 */
 	function modelFirstPage(model) {
 		var usage = (model.stats && model.stats.toolUsage) || {};
@@ -246,10 +272,12 @@
 		if (!app) return;
 		var mine = ++seq;
 		if (renderedModel !== model) {
+			cancelRowsRetry();
 			renderedModel = model;
 			var freshUsage = (model.stats && model.stats.toolUsage) || {};
 			rowsTotal = freshUsage.skillsTotal || 0;
-			if (pageWidth === 0) pageOffset = modelFirstPage(model).length;
+			restLoading = false;
+			restError = false;
 		}
 		var selected = selectedSkill();
 		if (!selected) selected = defaultSelection(model);
@@ -257,15 +285,22 @@
 		   previous skill's figures under the new skill's name. */
 		if (state.paneName !== selected) state = { rows: state.rows, paneName: selected, pane: null, paneError: null };
 
+		/* THE REST OF THE LIST, on nobody's ask — this is what replaced the Show more
+		   button. Skipped entirely when the model's first page already IS every skill,
+		   which is the common small-corpus case and costs no request at all.
+		 *
+		 * The flags move BEFORE the draw below, so the loading line is on screen for the
+		 * whole flight rather than appearing one repaint late. */
+		var needsRest = skillTotal(model) > modelFirstPage(model).length && fetchedModel !== model;
+		if (needsRest) {
+			fetchedModel = model;
+			restLoading = true;
+			restError = false;
+		}
+
 		draw(app, model);
 
-		/* ONLY once a click has asked for more than the model already carries. The model's
-		   first page IS the column's first page, so an unconditional fetch re-requests
-		   rows already in hand — and while `PAGE_ROWS` was 60 it also loaded straight past
-		   the paging control, which is what made the control unreachable. */
-		if (pageWidth > modelFirstPage(model).length) {
-			fetchRows(app, model, mine, [], 0, Math.min(pageWidth, skillTotal(model)));
-		}
+		if (needsRest) fetchRows(app, model);
 
 		if (!selected) return;
 		JD.getJson(JD.withParams("/api/skill-detail" + JD.query(model, {}), { name: selected }))
@@ -295,47 +330,91 @@
 	}
 
 	/**
-	 * Reads enough ranked pages to reach `wanted`, starting at one explicit server
-	 * offset and deduping against rows already held.
+	 * Reads the whole ranked list, from the top.
 	 *
-	 * Show more starts after the current page and appends. The poll starts from zero and
-	 * rebuilds the width on screen; when that width exceeds the route's per-request cap,
-	 * the short response advances `offset` and the next request finishes it. Progress is
-	 * measured in raw server rows while identity dedupe is measured by skill name, so a
-	 * row shifting across a page boundary neither duplicates nor stalls the control.
+	 * ALWAYS FROM ZERO AND ALWAYS TO THE END — there is no caller-supplied width any
+	 * more, because every caller wants the same thing. Several requests are still the
+	 * normal case: `/api/tool-usage` clamps a page at 200 rows, so a short response
+	 * advances `offset` and the next request finishes the job.
+	 *
+	 * THE STOP IS THE SERVER'S POSITION, not a row count fixed when the read began. That
+	 * is the difference the button's removal forced: a width decided up front silently
+	 * lost whatever the window gained mid-read, which was invisible but harmless while a
+	 * click had asked for exactly one page, and is a short list presented as the complete
+	 * one now that nothing else will ask. `total` is therefore re-read from every
+	 * response and the loop keeps going while `offset` trails it.
+	 *
+	 * Progress is measured in raw server rows while identity is measured by skill name.
+	 * A row shifting across a page boundary can therefore make two offsets return the same
+	 * skill and skip the row it displaced. Such a pass is discarded and restarted from
+	 * zero; shrinking the total to the deduped count would present the skipped row as if it
+	 * had never existed.
+	 *
+	 * WHAT MAKES THIS READ STALE IS A NEW PAYLOAD, never the render counter `seq`. Those
+	 * are different questions and the distinction became load-bearing when the button
+	 * went: opening a skill re-renders and bumps `seq`, so a `seq` test would void a read
+	 * that is still perfectly current — and with nothing left to press, nothing would
+	 * ever start it again. The column would sit at the model's first page, still saying
+	 * "loading the rest…", for as long as the payload lived. `seq` stays where it belongs,
+	 * guarding the pane's own detail fetch, whose answer really is per selection.
 	 */
-	function collectRows(model, mine, initialRows, initialOffset, wanted) {
-		var rows = initialRows.slice();
+	function collectRows(model) {
+		var rows = [];
 		var names = Object.create(null);
-		rows.forEach((row) => {
-			names[row.name] = true;
-		});
-		var offset = initialOffset;
+		var offset = 0;
 		var total = skillTotal(model);
+		/* Two clean re-reads are enough to recover from a rank shift without turning an
+		   actively changing database into a tight loop. Exhaustion is a failed/incomplete
+		   read, never a smaller invented total; the retry timer starts a fresh attempt. */
+		var restartsLeft = 2;
+		/* Scales with the corpus the model announced, using its small first page as a
+		   deliberately conservative width, so a legitimate list far beyond 5,000 rows is
+		   not cut off by the old fixed 25-request ceiling. The absolute cap above only owns
+		   the pathological case where the target runs away while it is being read. */
+		var requestBudget = Math.min(
+			MAX_LIST_REQUESTS,
+			Math.max(25, Math.ceil(total / Math.max(1, modelFirstPage(model).length)) * (restartsLeft + 1)),
+		);
+
+		function restart() {
+			if (restartsLeft <= 0) return Promise.reject(new Error("skill list changed while it was being read"));
+			restartsLeft--;
+			rows = [];
+			names = Object.create(null);
+			offset = 0;
+			return next();
+		}
 
 		function next() {
-			if (mine !== seq || rows.length >= wanted || offset >= total) {
-				if (offset >= total && rows.length < total) total = rows.length;
-				return Promise.resolve({ rows: rows, offset: offset, total: total });
+			if (renderedModel !== model) return Promise.resolve({ rows: rows, total: total });
+			if (offset >= total) {
+				if (rows.length === total) return Promise.resolve({ rows: rows, total: total });
+				return restart();
 			}
+			if (requestBudget <= 0) return Promise.reject(new Error("skill list kept growing while it was being read"));
+			requestBudget--;
 			return JD.getJson(
 				JD.withParams("/api/tool-usage" + JD.query(model, {}), {
 					list: "skill",
 					offset: String(offset),
-					limit: String(wanted - rows.length),
+					limit: String(total - offset),
 				}),
 			).then((page) => {
-				if (mine !== seq) return { rows: rows, offset: offset, total: total };
+				if (renderedModel !== model) return { rows: rows, total: total };
 				var incoming = (page && page.rows) || [];
 				if (page && typeof page.totalCount === "number") total = page.totalCount;
+				var repeated = false;
 				incoming.forEach((row) => {
 					if (!names[row.name]) {
 						names[row.name] = true;
 						rows.push(row);
-					}
+					} else repeated = true;
 				});
 				offset += incoming.length;
-				if (incoming.length === 0) total = rows.length;
+				/* A repeated identity proves this offset partition moved. An empty page while
+				   positions remain is the same inconsistency in another shape. Start from the
+				   latest total rather than finalising a partial set. */
+				if (repeated || (incoming.length === 0 && offset < total)) return restart();
 				return next();
 			});
 		}
@@ -343,58 +422,55 @@
 		return next();
 	}
 
-	function fetchRows(app, model, mine, initialRows, initialOffset, wanted) {
-		collectRows(model, mine, initialRows, initialOffset, wanted)
+	function cancelRowsRetry() {
+		if (restRetryTimer === null) return;
+		window.clearTimeout(restRetryTimer);
+		restRetryTimer = null;
+	}
+
+	/** Retries only the list tail; the open detail pane and the rest of the page stay put. */
+	function scheduleRowsRetry(app, model) {
+		cancelRowsRetry();
+		restRetryTimer = window.setTimeout(() => {
+			restRetryTimer = null;
+			if (renderedModel !== model || fetchedModel !== model || !restError || restLoading) return;
+			restLoading = true;
+			restError = false;
+			draw(app, model);
+			fetchRows(app, model);
+		}, REST_RETRY_MS);
+	}
+
+	function fetchRows(app, model) {
+		cancelRowsRetry();
+		collectRows(model)
 			.then(
 				(result) => {
-					if (mine !== seq) return false;
+					if (renderedModel !== model) return false;
 					state.rows = result.rows;
-					pageWidth = result.rows.length;
-					pageOffset = result.offset;
 					rowsTotal = result.total;
-					moreLoading = false;
-					moreError = false;
+					restLoading = false;
+					restError = false;
+					cancelRowsRetry();
 					return true;
 				},
 				/* Two callbacks, for the reason `renderSkills` states: under a trailing
 				   `.catch` a throw from the repaint would land here and paint "could not
-				   load more" over a page of rows that had just arrived intact. */
+				   load the rest" over a list that had just arrived intact. */
 				() => {
-					if (mine !== seq) return false;
+					if (renderedModel !== model) return false;
 					/* THE ROWS ARE LEFT ALONE — a list that empties itself over one failed
-					   fetch is worse than a short one, and the poll asks again in 30 s. Only
-					   the button's state moves, because a click that silently stayed on
-					   "Loading…" forever is the one failure the reader cannot wait out. */
-					moreLoading = false;
-					moreError = true;
+					   fetch is worse than a short one. Only the loading line moves, and the
+					   page-owned timer retries this same payload without re-fetching its pane. */
+					restLoading = false;
+					restError = true;
+					scheduleRowsRetry(app, model);
 					return true;
 				},
 			)
 			.then((changed) => {
 				if (changed) draw(app, model);
 			});
-	}
-
-	/**
-	 * One more page, on the reader's ask.
-	 *
-	 * Deliberately NOT `renderSkills`, which would also re-fetch the open pane's detail
-	 * — a second round trip for a pane whose skill has not changed. This grows the
-	 * width, paints the button as busy, and re-reads the rows and nothing else.
-	 */
-	function loadMoreRows(app, model) {
-		if (moreLoading) return;
-		var current = visibleRows(model);
-		var shown = current.length;
-		var total = skillTotal(model);
-		if (shown >= total) return;
-		pageWidth = Math.min(shown + PAGE_ROWS, total);
-		moreLoading = true;
-		moreError = false;
-		/* Paint the busy label before the request, so a slow answer is visibly pending
-		   rather than a click that appeared to do nothing. */
-		draw(app, model);
-		fetchRows(app, model, seq, current, pageOffset || shown, pageWidth);
 	}
 
 	function skillTotal(model) {
@@ -439,37 +515,98 @@
 	}
 
 	/**
-	 * Whether the reader has asked for rows beyond the page the column opened with.
+	 * The rows region's opening tag.
 	 *
-	 * `pageWidth` is the one thing that answers it: it is zero for the whole life of a
-	 * page load that never presses Show more, and only `loadMoreRows` (and the fetch it
-	 * starts) ever raises it. Row COUNTS cannot answer it — the poll can return a
-	 * different number of first-page rows without the reader having asked for anything.
+	 * NOTHING TO DECIDE ANY MORE, and that is the point. This used to choose between an
+	 * uncapped region and one carrying a MEASURED inline `max-height` (plus an `sk-scroll`
+	 * marker class), because the page was what scrolled and the rows had to earn a window
+	 * of their own by outgrowing the model's first page. The page is now a fixed frame and
+	 * `.sk-list` takes its height from the flex chain, so the region is always the same
+	 * shape and there is no pixel value for JS to measure. `isExpanded` went with it — its
+	 * only reader was the branch here.
+	 *
+	 * Kept as a function rather than inlined into `draw`'s template so the region stays one
+	 * named thing that `main.css` and this file can be read against together.
 	 */
-	function isPaged() {
-		return pageWidth > 0;
+	function listOpenTag() {
+		return '<div class="sk-list">';
 	}
 
 	/**
-	 * The rows region's opening tag — a scroll region ONLY once Show more has been
-	 * pressed, and then only as tall as the first page measured.
+	 * Whether the current row is already somewhere the reader can see it.
 	 *
-	 * THE FIRST SCREENFUL HAS ONE SCROLLBAR, the window's. That is the whole rule: a
-	 * column showing everything it has needs no window onto itself, and a second bar
-	 * there on arrival is one more scroll region for the reader to discover before they
-	 * have asked for anything. A click asking for more rows than the column opened with
-	 * is what puts them behind a window — an outcome the reader can attribute to what
-	 * they just did.
+	 * TWO BOXES, and each answers for a different layout. The rows live in a scroll region,
+	 * so a row can be far outside it while the page looks fine — that is the common case,
+	 * since the column holds every skill. The viewport check then covers the case where the
+	 * region ITSELF is off screen, which is what the ≤899px breakpoint produces: there the
+	 * fixed frame comes off, the columns stack and the page scrolls again, so the list can
+	 * sit an arbitrary distance below the fold. Inside the desktop frame the second check is
+	 * always satisfied — the region cannot leave a viewport the frame is pinned to — and it
+	 * is kept rather than dropped because that is true of the frame, not of the page.
+	 * It also used to be load-bearing on the desktop, when the band was ~450px tall and a
+	 * row "visible" in the panel could still be under the fold.
 	 *
-	 * THE CAP IS AN INLINE STYLE because it is a measured pixel value (see `listCapPx`),
-	 * which no stylesheet constant can stand in for; `.sk-list.sk-scroll` in `main.css`
-	 * carries everything about it that is not that number, including the visible
-	 * scrollbar the platform will not draw. With no cap recorded yet the region stays
-	 * uncapped — the safe direction, since an uncapped column is merely tall.
+	 * A HOST THAT CANNOT MEASURE gets `true` — do not scroll. Every branch here degrades
+	 * that way on purpose: without layout there is nothing to be outside of, and a
+	 * scroll computed from zeroes is a jump to an arbitrary place rather than a fix.
 	 */
-	function listOpenTag() {
-		if (!isPaged() || listCapPx === null) return '<div class="sk-list">';
-		return '<div class="sk-list sk-scroll" style="max-height:' + Math.round(listCapPx) + 'px">';
+	function isRowRevealed(list, row) {
+		if (!row.getBoundingClientRect || !list || !list.getBoundingClientRect) return true;
+		var rect = row.getBoundingClientRect();
+		var box = list.getBoundingClientRect();
+		if (rect.top < box.top || rect.bottom > box.bottom) return false;
+		var viewportHeight = window.innerHeight || 0;
+		if (!viewportHeight) return true;
+		return rect.top >= 0 && rect.bottom <= viewportHeight;
+	}
+
+	/**
+	 * Brings the selected row into view, ONCE per selection.
+	 *
+	 * WHY AT ALL: the Stats card's rows link in here with `?skill=`, so a reader can
+	 * arrive with the 25th skill selected — the pane opens on it correctly while the
+	 * column sits at row 1, with the highlighted row 1,222px down a 504px window
+	 * (measured). Nothing on screen connects the two, and the reader has no reason to
+	 * think the list is scrollable at all. The band's key does the same thing to any
+	 * skill outside its top four.
+	 *
+	 * ONCE PER SELECTION, which is what `scrolledToSkill` buys and what makes this safe
+	 * to run from `draw`. Every path here repaints the whole page — an explicit refresh among
+	 * them — so scrolling on each repaint would drag a reader browsing the list back to
+	 * the selected row twice a minute. The one thing that MAY move the column is the
+	 * reader changing what is selected.
+	 *
+	 * NOT RECORDED WHEN THE ROW IS ABSENT, for the reason `memories.js` states about its
+	 * anchor: the selection can name a skill sitting in the tail of the list, which is
+	 * fetched a moment after the first paint, and recording here would spend the single
+	 * chance to reveal it on a paint where it did not exist. The arriving tail repaints,
+	 * and that is the paint that scrolls.
+	 *
+	 * ALREADY-VISIBLE ROWS ARE LEFT ALONE, unlike `memories.js`'s unconditional centring.
+	 * The high-frequency action on this page is clicking a row in the list — a row that
+	 * is on screen by definition, since the reader just clicked it — and centring it
+	 * would slide the column under the pointer for no reason. The selection is still
+	 * recorded, so this stays once-per-selection either way.
+	 *
+	 * CENTRED when it does move: the neighbours above and below say where in the ranking
+	 * the skill sits, which top-alignment throws away. `scrollIntoView` also walks every
+	 * scrollable ancestor, so it fixes the viewport half of `isRowRevealed` in the same
+	 * call — on a window tall enough for the panel, the page does not move at all.
+	 */
+	function revealSelectedRow(app, list) {
+		var name = state.paneName;
+		/* Closing the pane forgets the scroll, so re-opening the same skill later — from
+		   the band's key, after the reader has scrolled elsewhere — reveals it again. */
+		if (!name) {
+			scrolledToSkill = null;
+			return;
+		}
+		if (scrolledToSkill === name) return;
+		var row = app.querySelector('.sk-row[aria-current="true"]');
+		if (!row) return;
+		scrolledToSkill = name;
+		if (isRowRevealed(list, row)) return;
+		if (row.scrollIntoView) row.scrollIntoView({ block: "center" });
 	}
 
 	function draw(app, model) {
@@ -479,10 +616,10 @@
 		   node that holds it — and only that node scrolls, so this is the whole of it.
 		 *
 		 * Every path here repaints the WHOLE page — a row click, that row's detail landing
-		 * moments later, a Show more, the 30 s poll — so without this the column snapped
-		 * back to its first row on all four. Clicking the 18th skill scrolled the list away
-		 * from the row that was just clicked, which also takes the `aria-current` row off
-		 * screen; and the poll did it unprompted every 30 s, mid-read.
+		 * moments later, the tail of the list arriving, an explicit refresh — so without this the
+		 * column snapped back to its first row on all four. Clicking the 18th skill
+		 * scrolled the list away from the row that was just clicked, which also takes the
+		 * `aria-current` row off screen; and a refresh did it unprompted, mid-read.
 		 *
 		 * A whole-page repaint is what this view is built on (`renderSkills` re-reads the
 		 * address on every render), so restoring the offset is the fix that fits it —
@@ -505,20 +642,23 @@
 			paneHtml(usage, model.timeZone) +
 			"</article>" +
 			"</section>";
-		/* Both halves address the NEW node. The measurement runs BEFORE the restore for no
-		   reason beyond reading order — they touch different properties — but it must run
-		   while the region is still uncapped, which `isPaged` is what guarantees.
+		/* Addresses the NEW node. The restore is conditional because assigning 0 to a fresh
+		   render is a no-op that would still cost a layout write. A shrunk list (a refresh
+		   returning fewer rows) is clamped by the browser, so this cannot leave the column
+		   past its own content.
 		 *
-		 * The restore is conditional because assigning 0 to a fresh render is a no-op that
-		 * would still cost a layout write. A shrunk list (the poll returning fewer rows) is
-		 * clamped by the browser, so this cannot leave the column past its own content. */
+		 * There used to be a MEASUREMENT here too, reading the uncapped region's height back
+		 * to use as its own cap. The flex chain supplies that height now — see `listOpenTag`. */
 		var list = app.querySelector(".sk-list");
 		if (list) {
-			if (!isPaged() && rows.length > 0 && list.offsetHeight > 0) listCapPx = list.offsetHeight;
 			if (offset > 0) list.scrollTop = offset;
+			/* AFTER the restore, never before: this measures where the row actually sits,
+			   and it is the one thing allowed to overrule the carried-across offset — a
+			   new selection is the reader asking to look somewhere else. */
+			revealSelectedRow(app, list);
 		}
 		bindSelection(app, model);
-		bindMore(app, model);
+		bindProse(app);
 	}
 
 	// ── The band ────────────────────────────────────────────────────────────────
@@ -598,13 +738,40 @@
 			})
 			.join("");
 
+		/* `stackedBarsFrame`, NOT `stackedBars`: this chart's height is a budget (the pane
+		   below it needs the rest of the window), and the plain entry point can only be
+		   bounded through its WIDTH — its axis text lives in the viewBox, so the whole box
+		   scales uniformly. That coupling is what used to pin this chart to a width derived
+		   from the window's height, leaving a wide browser with a 477px chart and a
+		   1280x800 one with 240px of chart and 5px axis labels. The frame hands back a
+		   text-free plot that CSS pins by height, so the width is free to follow the page.
+		   `charts.js` carries the full reasoning.
+		 *
+		   An integer formatter, not the default `fmtTokens`: "0.5" on an axis counting
+		   sessions is a claim the unit cannot make. */
+		var frame = JD.stackedBarsFrame(rolled, keys, "skill sessions", (n) => String(Math.round(n)));
+		/* The ticks come from the frame rather than being derived here, so the labels and
+		   the bars cannot be scaled by two different bounds. */
+		var ticks = frame.ticks.map((tick) => "<span>" + JD.esc(tick) + "</span>").join("");
+		/* The endpoint labels sit INSIDE `.sk-bandmain`, beside the plot and not beside the
+		   tick column, so `space-between` lines them up with the plot's own edges — the
+		   same thing `stackedBars` achieved by anchoring them to its plot bounds. A
+		   single-day window prints one, matching the pane's small charts. */
+		var axis =
+			'<div class="sk-axis"><span>' +
+			JD.esc(frame.firstDay) +
+			"</span>" +
+			(frame.lastDay ? "<span>" + JD.esc(frame.lastDay) + "</span>" : "") +
+			"</div>";
 		return (
 			head +
-			'<div class="sk-bandrow"><div class="chart-box">' +
-			/* An integer formatter, not the default `fmtTokens`: "0.5" on an axis counting
-			   sessions is a claim the unit cannot make. */
-			JD.stackedBars(rolled, keys, "skill sessions", (n) => String(Math.round(n))) +
-			'</div><div class="sk-key">' +
+			'<div class="sk-bandrow"><div class="chart-box"><div class="sk-bandplot">' +
+			'<div class="sk-bandticks">' +
+			ticks +
+			'</div><div class="sk-bandmain">' +
+			frame.svg +
+			axis +
+			'</div></div></div><div class="sk-key">' +
 			legend +
 			"</div></div></div>"
 		);
@@ -629,8 +796,12 @@
 
 	/**
 	 * The list. THE ORDER IS THE SERVER'S (adoption) and the header is NOT a sort
-	 * control: these rows are one page of a ranked list, so re-sorting them by tokens
-	 * would name a "heaviest" that may sit unloaded on the next page.
+	 * control. That rule survived the loss of its first reason: while these rows were one
+	 * page of a ranked list, a client-side re-sort by tokens would name a "heaviest" that
+	 * might sit unloaded on the next page. The column now holds every skill, so the same
+	 * re-sort would usually be right — but only usually, since the tail is still absent
+	 * while it is in flight and after a failed read, and a header that silently sorts a
+	 * partial list is the same lie arriving less often.
 	 */
 	function listHtml(rows) {
 		if (rows.length === 0) return '<div class="empty-note">No skill invocations recorded in this window.</div>';
@@ -675,66 +846,60 @@
 	}
 
 	/**
-	 * The paging row, PINNED BELOW THE ROWS rather than inside them.
+	 * The loading line's band, PINNED BELOW THE ROWS rather than inside them.
 	 *
-	 * IT IS A CONTROL, so it may not be reachable only by scrolling the very rows it
-	 * pages — and from the first Show more onwards those rows ARE a capped region, so
-	 * inside it that is exactly what it would be. Measured back when the region was
-	 * capped from the first paint: at a 1440x900 viewport the list showed 7 of 23 rows
-	 * and the row sat 882px past its fold, while the window itself scrolled 3px, so a
-	 * reader spinning the wheel over the page never moved the list at all. The first
-	 * screenful no longer has that problem (nothing is capped until a click), but the
-	 * click that creates the cap is the same click that needs this button again, so the
-	 * placement is what keeps it in reach. The head and the coverage foot are pinned for
-	 * this same reason; this belongs with them, and the region keeps only the rows and
-	 * their footnote.
+	 * IT SAYS THE COLUMN IS INCOMPLETE, so it may not be reachable only by scrolling the
+	 * very rows that are missing their tail — and on any corpus that can show this line
+	 * those rows ARE a capped region, so inside it that is exactly what it would be.
+	 * Measured back when the region was capped from the first paint: at a 1440x900
+	 * viewport the list showed 7 of 23 rows and the row sat 882px past its fold, while
+	 * the window itself scrolled 3px, so a reader spinning the wheel over the page never
+	 * moved the list at all. The head and the coverage foot are pinned for this same
+	 * reason; this belongs with them, and the region keeps only the rows and their
+	 * footnote.
 	 *
-	 * NOTHING AT ALL on an empty column, which is what a row inside `listHtml` got for
-	 * free from its early return: `Showing 0 of 0 skills` under a note that already
-	 * says there are no invocations is the same sentence twice.
+	 * NOTHING AT ALL on a complete column — which is the steady state, so the band is
+	 * normally absent. It used to be permanent, carrying `Showing 12 of 40 skills`
+	 * because that was the only place the reader learnt the column was NOT the whole
+	 * list. Now it always is, `navHeadHtml` already prints the skill count, and a
+	 * permanent `Showing 25 of 25 skills` under a header reading `25 skills` is the same
+	 * sentence twice. Nothing on an empty column either, for the same reason its
+	 * predecessor said nothing there.
 	 */
 	function navPagingHtml(rows, usage) {
 		if (rows.length === 0) return "";
-		return '<div class="sk-paging">' + moreRowHtml(rows, usage) + "</div>";
+		var body = restStatusHtml(rows, usage);
+		return body ? '<div class="sk-paging">' + body + "</div>" : "";
 	}
 
 	/**
-	 * `Showing 12 of 40 skills`, plus the button that fetches the next page.
+	 * `Showing 8 of 25 skills — loading the rest…`, and only while that is true.
 	 *
-	 * ALWAYS PRESENT once there is a row, unlike the Stats cards' version which hides
-	 * itself until a click has grown the list. That rule exists because those three
-	 * cards share one equal-third band and dropping the row resized the card under the
-	 * reader; here the row is the last band of a column whose height is its own content,
-	 * so keeping it costs one line — and it is the only place the reader is told the
-	 * column IS the whole list. Without it a 60-row column and a 60-of-300 column look
-	 * identical.
+	 * TWO STATES, NO BUTTON. The reader is not being asked for anything: the rest of the
+	 * list is already on its way, and on a failure this page's 30 s timer asks again — so
+	 * a `Try again` control here would duplicate a retry that happens automatically, on the one
+	 * page whose entire point is that the reader does not click to see their own skills.
+	 * The failure still has to be SAID, because a column short of its total is otherwise
+	 * indistinguishable from a reader who owns eight skills.
 	 *
-	 * Same classes and same wording as `stats.js`'s `toolMoreRow`, so the two read as
-	 * one control at two zooms rather than two conventions.
+	 * The count and its classes are `stats.js`'s `toolMoreRow`'s, so the two lines read
+	 * as one convention at two zooms even though only one of them still has a button.
 	 */
-	function moreRowHtml(rows, usage) {
+	function restStatusHtml(rows, usage) {
+		if (!restLoading && !restError) return "";
 		var shown = rows.length;
 		var total = rowsTotal === null ? (usage && usage.skillsTotal) || shown : rowsTotal;
-		var count =
-			'<span class="more-count">Showing ' +
+		/* A total the column already meets has nothing left to report, whichever flag is
+		   still up — a stale `restError` beside a full list would call it short. */
+		if (shown >= total) return "";
+		return (
+			'<div class="more-row"><span class="more-count">Showing ' +
 			shown +
 			" of " +
 			total +
 			(total === 1 ? " skill" : " skills") +
-			/* The failure belongs beside the count it stopped from growing: this button
-			   still being here IS why it matters. */
-			(moreError && !moreLoading ? " — could not load more" : "") +
-			"</span>";
-		if (shown >= total) return '<div class="more-row is-done">' + count + "</div>";
-		var label = moreLoading ? "Loading…" : moreError ? "Try again" : "Show more";
-		return (
-			'<div class="more-row">' +
-			count +
-			'<button type="button" class="cta ghost sm" data-skillmore' +
-			(moreLoading ? " disabled" : "") +
-			">" +
-			label +
-			"</button></div>"
+			(restLoading ? " — loading the rest…" : " — could not load the rest; retrying shortly") +
+			"</span></div>"
 		);
 	}
 
@@ -742,9 +907,9 @@
 	 * The `†` spelled out under the column, and only when a loaded row wears one.
 	 *
 	 * ON THE ROWS IN HAND, not on a window-wide flag: a footnote explaining a mark that
-	 * is nowhere on screen is a reader hunting for something that is not there. So a
-	 * Show more click can bring the footnote in, which is correct — the mark arrived
-	 * with it.
+	 * is nowhere on screen is a reader hunting for something that is not there. So the
+	 * tail of the list landing can bring the footnote in, which is correct — the mark
+	 * arrived with it.
 	 */
 	function inferredFootnoteHtml(rows) {
 		var marked = rows.some((row) => row.detection === "heuristic");
@@ -829,11 +994,13 @@
 		html += section("The record", recordHtml(detail, timeZone));
 		html += section("Who ran it", agentsHtml(detail));
 
-		html +=
-			'<span class="sk-basis">Runs, sessions and the agent split are counted over this window. The two ' +
-			"charts above share the day axis the chart at the top of the page uses, so a column is the same day " +
-			"in all three; spend is attributed per session and summed per day, never per run. Outcomes are per " +
-			"recorded run and carry no date axis.</span>";
+		html += proseBlock(
+			"sk-basis",
+			"Runs, sessions and the agent split are counted over this window. The two " +
+				"charts above share the day axis the chart at the top of the page uses, so a column is the same day " +
+				"in all three; spend is attributed per session and summed per day, never per run. Outcomes are per " +
+				"recorded run and carry no date axis.",
+		);
 		return html + "</div>";
 	}
 
@@ -859,11 +1026,45 @@
 	 */
 	function inferredCaveatHtml(detail) {
 		if (detail.detection !== "heuristic") return "";
+		return proseBlock(
+			"sk-caveat",
+			"† At least one entry here was inferred from a command that read the skill " +
+				"file, not from an observed invocation — a person reading that file leaves the same trace, and " +
+				"reading it is not the same as using it. Inferred entries are counted once per session however " +
+				"many reads produced them, so the run figures above are a floor rather than a count.",
+		);
+	}
+
+	/**
+	 * One of the pane's two long fixed paragraphs, shown as a single line until clicked.
+	 *
+	 * WHY THESE TWO AND NOTHING ELSE: they are ~4 lines each and 82px of the pane's height
+	 * budget between them (measured), and they are the only blocks here whose text is FIXED
+	 * rather than a measurement. Clamping a data row would destroy a count; clamping these
+	 * hides a qualifier one click brings back. `main.css`'s `.sk-clamp` owns the visual side.
+	 *
+	 * TEXT ONLY, NEVER MARKUP. The whole string is repeated into `title` (so a pointer user
+	 * gets it without clicking) and `JD.esc` there would mangle any tags — so callers pass
+	 * prose, and the one non-ASCII character in it, the inferred dagger, is a literal.
+	 *
+	 * `role="button"` + `tabindex="0"` rather than a real `<button>`: the clickable thing IS
+	 * the paragraph, and a button element would inherit type/appearance resets and take the
+	 * text out of the reading flow for a screen reader. `aria-expanded` is what makes the
+	 * collapsed state audible rather than merely visual, and `main.css` keys the open state
+	 * off that same attribute so there is ONE source of truth on the node.
+	 */
+	function proseBlock(cls, text) {
+		var open = openProse[cls] === true;
 		return (
-			'<div class="sk-caveat">† At least one entry here was inferred from a command that read the skill ' +
-			"file, not from an observed invocation — a person reading that file leaves the same trace, and " +
-			"reading it is not the same as using it. Inferred entries are counted once per session however " +
-			"many reads produced them, so the run figures above are a floor rather than a count.</div>"
+			'<div class="' +
+			cls +
+			' sk-clamp" role="button" tabindex="0" aria-expanded="' +
+			(open ? "true" : "false") +
+			'" title="' +
+			JD.esc(text) +
+			'">' +
+			JD.esc(text) +
+			"</div>"
 		);
 	}
 
@@ -1191,11 +1392,28 @@
 		return command ? "you" : null;
 	}
 
+	/**
+	 * Rows of the agent split shown in full before the rest are rolled into one line.
+	 *
+	 * THE ONLY UNBOUNDED-ENOUGH LIST IN THE PANE. Every other section has a ceiling the
+	 * fixed frame can be sized against — the outcome strip is capped at 50 ticks by the
+	 * server, `The record` is five fixed fields — but this one is one row per agent that
+	 * ran the skill, and the product recognises a dozen-odd of them. Measured with 12 rows
+	 * at 1440x900 the pane overflowed its frame by 54px; capped at 5 it fits with room.
+	 *
+	 * FIVE, not three: a skill genuinely shared between the agents on a machine is the
+	 * interesting case, and a cap that rolls up the third one stops answering the question
+	 * the section exists for. Five covers every real row measured on this machine, so the
+	 * roll-up is a guard rather than something a reader meets day to day.
+	 */
+	var AGENT_ROWS_SHOWN = 5;
+
 	/** Per-agent runs, most first. The swatch is the agent's colour, page-wide. */
 	function agentsHtml(detail) {
 		var agents = (detail.agents || []).slice().sort((a, b) => b.calls - a.calls);
 		if (agents.length === 0) return '<div class="sk-note">No agent recorded against this skill.</div>';
-		return agents
+		var html = agents
+			.slice(0, AGENT_ROWS_SHOWN)
 			.map((agent) =>
 				line(
 					agent.source,
@@ -1204,6 +1422,22 @@
 				),
 			)
 			.join("");
+		var rest = agents.slice(AGENT_ROWS_SHOWN);
+		if (rest.length === 0) return html;
+		/* The rolled-up line carries its own RUN TOTAL, not just a count of agents — the
+		   section is a split of the runs, so "3 further agents" alone would drop runs out of
+		   a total the four figures above still count in full. Same rule the outcome strip's
+		   own capped note follows: the cap changes what is drawn, never what is claimed. */
+		var restCalls = rest.reduce((sum, agent) => sum + agent.calls, 0);
+		return (
+			html +
+			'<div class="sk-note">' +
+			rest.length +
+			(rest.length === 1 ? " further agent ran it, " : " further agents ran it, ") +
+			restCalls +
+			(restCalls === 1 ? " run" : " runs") +
+			" between them.</div>"
+		);
 	}
 
 	// ── Interaction ─────────────────────────────────────────────────────────────
@@ -1231,10 +1465,35 @@
 		});
 	}
 
-	/** The paging button. Absent on a fully-loaded column, so this binds nothing. */
-	function bindMore(app, model) {
-		var button = app.querySelector("[data-skillmore]");
-		if (button) button.onclick = () => loadMoreRows(app, model);
+	/**
+	 * Wires the two clamped paragraphs (see `proseBlock`).
+	 *
+	 * IT TOGGLES THE ATTRIBUTE AND DOES NOT RE-RENDER, which is the opposite of every other
+	 * interaction on this page. Opening a sentence is not a change of what the page is
+	 * about: a repaint would cost the rows their scroll offset and the pane its own, for a
+	 * result CSS reaches from `aria-expanded` alone. `openProse` is updated in step so the
+	 * next repaint — driven by something else — still renders it open.
+	 *
+	 * SPACE IS PREVENTED, Enter is not. On a `role="button"` element the browser supplies
+	 * neither activation, so both are handled here; Space would otherwise also scroll the
+	 * nearest scrollable ancestor, which on this page is a column the reader is reading.
+	 */
+	function bindProse(app) {
+		Array.prototype.forEach.call(app.querySelectorAll(".sk-clamp"), (element) => {
+			/* Read back off the node rather than closed over, so one binder serves both
+			   blocks and the key cannot drift from the class the stylesheet matches. */
+			var key = element.classList.contains("sk-caveat") ? "sk-caveat" : "sk-basis";
+			var toggle = () => {
+				openProse[key] = openProse[key] !== true;
+				element.setAttribute("aria-expanded", openProse[key] ? "true" : "false");
+			};
+			element.onclick = toggle;
+			element.onkeydown = (event) => {
+				if (event.key !== "Enter" && event.key !== " ") return;
+				event.preventDefault();
+				toggle();
+			};
+		});
 	}
 
 	JD.renderSkills = renderSkills;

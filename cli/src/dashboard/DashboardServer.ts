@@ -1164,17 +1164,22 @@ const TOOL_USAGE_LISTS: ReadonlyArray<ToolUsageList> = ["skill", "server", "tool
  * Widest `?limit=` this route will serve — 25 pages of {@link TOOL_ROWS_LIMIT}.
  *
  * The limit used to be ours alone, because the only caller was a "Show more"
- * click and one click means one page. The 30 s poll needs the other shape: to
- * decide whether a list the reader has already expanded still looks the same, it
- * has to re-read exactly as many rows as are on screen, which is a number only
- * the client knows (see `carryForwardToolLists` in `assets/js/stats.js`).
+ * click and one click means one page. Two callers need the other shape now. The
+ * 30 s poll, to decide whether a list the reader has already expanded still
+ * looks the same, has to re-read exactly as many rows as are on screen, which is
+ * a number only the client knows (see `carryForwardToolLists` in
+ * `assets/js/stats.js`). And the Skills PAGE asks for the whole list outright —
+ * it has no button, so it reads to the end on arrival (`assets/js/skills.js`).
  *
  * Clamped rather than rejected, so a caller asking past the cap still gets a
- * readable page. On the poll path that degrades in the safe direction: a client
- * holding more rows than the cap receives fewer than it asked for, reads that as
- * "the card changed", and collapses back to the first page — the pre-existing
- * behaviour — rather than trusting rows it could not verify. It takes 25 clicks
- * on one list to get there.
+ * readable page, and each of the three degrades safely in its own way. A Show
+ * more click cannot reach the cap in under 25 clicks on one list. A poll holding
+ * more rows than the cap receives fewer than it asked for, reads that as "the
+ * card changed", and collapses back to the first page — the pre-existing
+ * behaviour — rather than trusting rows it could not verify. The Skills page
+ * reaches the cap on its FIRST request for any corpus past 200 skills, which is
+ * the case it is built for: the short answer advances its offset and it comes
+ * back for the remainder, so the clamp costs it a round trip rather than rows.
  *
  * A cap at all because this is an unauthenticated-shaped GET on a local server:
  * without one, `?limit=1e9` turns a card's paging endpoint into an unbounded
@@ -1617,10 +1622,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
-		// One page of a Skills / MCPs list, behind those cards' "Show more" button.
-		// Same shape as `/api/memories` above and for the same reason: the model is
-		// inlined into the page HTML, so only the first page can ride there. A read
-		// like every other GET here — no token.
+		// One page of a Skills / MCPs list — behind those cards' "Show more" button on
+		// the Stats page, and read straight through to the end by the Skills page, which
+		// has no button. Same shape as `/api/memories` above and for the same reason: the
+		// model is inlined into the page HTML, so only the first page can ride there. A
+		// read like every other GET here — no token.
 		//
 		// The window params ride along (`range`/`from`/`to`) because the rows are
 		// an aggregate OVER a window: paging with a different one than the card was
