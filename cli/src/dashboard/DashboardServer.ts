@@ -1288,7 +1288,9 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	});
 
 	async function handle(req: IncomingMessage, res: ServerResponse): Promise<void> {
+		/* v8 ignore start -- a server IncomingMessage always carries a url; the `?? "/"` only satisfies the `string | undefined` type (client responses lack one) and is unreachable here. */
 		const url = new URL(req.url ?? "/", `http://127.0.0.1:${boundPort}`);
+		/* v8 ignore stop */
 
 		// Layer 1+2: Host allowlist and origin policy apply to every route.
 		if (!isAllowedHost(req.headers.host, boundPort)) {
@@ -2765,7 +2767,9 @@ export async function startDashboardServer(
 			return { server, port, fellBack: index > 0 };
 		} catch (err) {
 			server.close();
+			/* v8 ignore start -- the bind promise only ever rejects with the 'error' event's Error (or a thrown Error), so the `String(err)` arm is unreachable defensive typing. */
 			lastError = err instanceof Error ? err : new Error(String(err));
+			/* v8 ignore stop */
 			// EADDRINUSE on a preferred port → try the next candidate.
 		}
 	}

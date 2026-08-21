@@ -424,7 +424,13 @@ export async function recordSessionsFromTick(
 				const updatedAtMs = Date.parse(s.updatedAt);
 				if (!Number.isFinite(updatedAtMs) || updatedAtMs <= since) continue;
 				const event = await sessionEventFromInfo(repoIdentity, s);
+				// `sessionEventFromInfo` returns null ONLY when `s.updatedAt` fails the
+				// same `Number.isFinite(Date.parse(...))` check this loop already made
+				// two lines up (its only `return null`), so `event` is never falsy here
+				// — unlike `recordSessionFromHook`, which has no such pre-filter.
+				/* v8 ignore start */
 				if (event) {
+					/* v8 ignore stop */
 					events.push(event);
 					if (updatedAtMs > newestSeen) newestSeen = updatedAtMs;
 				}

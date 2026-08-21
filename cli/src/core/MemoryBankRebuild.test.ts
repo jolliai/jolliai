@@ -2,12 +2,14 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { acquireVaultWriteLock } from "../sync/VaultWriteLock.js";
 import { extractRepoName, getRemoteUrl, resolveKBPath, resolveKbParent } from "./KBPathResolver.js";
 import { rebuildMemoryBank } from "./MemoryBankRebuild.js";
+import { MigrationEngine } from "./MigrationEngine.js";
 import { writeManualDisableFlag } from "./RepoProfile.js";
 import { resolveSotStorage } from "./SotStorageResolver.js";
+import * as StoredMemories from "./StoredMemories.js";
 
 /** A minimal v3 summary index for one commit. */
 function makeIndex(hash: string): string {
@@ -76,6 +78,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	vi.restoreAllMocks();
 	for (const k of MANAGED_ENV) {
 		if (savedEnv[k] === undefined) delete process.env[k];
 		else process.env[k] = savedEnv[k];
@@ -160,5 +163,74 @@ describe("rebuildMemoryBank", () => {
 		} finally {
 			await held?.release();
 		}
+	});
+
+	it("reports a storage read failure without archiving anything — never guesses 'none'", async () => {
+		const repo = initRepo();
+		// A read failure ("unknown") must take the same non-destructive exit as
+		// "no stored memories" but say so distinctly — a guess here is the exact
+		// destructive branch this three-state answer exists to prevent.
+		vi.spyOn(StoredMemories, "detectStoredMemories").mockResolvedValueOnce("unknown");
+
+		const result = await rebuildMemoryBank(repo);
+
+		expect(result.ok).toBe(false);
+		expect(result.message).toMatch(/could not read stored memories/i);
+	});
+
+	it("archives an existing Memory Bank folder before re-migrating into a fresh one", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo, "f.txt"), "hi");
+		execFileSync("git", ["add", "-A"], { cwd: repo });
+		execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+		const sot = await resolveSotStorage(repo);
+		const hash = "abc123def456";
+		await sot.writeFiles(
+			[
+				{ path: "index.json", content: makeIndex(hash) },
+				{ path: `summaries/${hash}.json`, content: makeSummary(hash) },
+			],
+			"seed summary",
+		);
+
+		const first = await rebuildMemoryBank(repo);
+		expect(first.ok).toBe(true);
+
+		// A second rebuild must archive the folder the first one just created
+		// (freeing the canonical `<repo>` slot) rather than climbing to `-N`.
+		const second = await rebuildMemoryBank(repo);
+
+		expect(second.ok).toBe(true);
+		expect(second.folder).toBe(first.folder);
+		const vaultRoot = resolveKbParent(undefined);
+		expect(existsSync(join(vaultRoot, ".jolli", "archive"))).toBe(true);
+	});
+
+	it("reports a non-completed migration status rather than claiming success", async () => {
+		const repo = initRepo();
+		writeFileSync(join(repo, "f.txt"), "hi");
+		execFileSync("git", ["add", "-A"], { cwd: repo });
+		execFileSync("git", ["commit", "-qm", "init"], { cwd: repo });
+		const sot = await resolveSotStorage(repo);
+		const hash = "abc123def456";
+		await sot.writeFiles(
+			[
+				{ path: "index.json", content: makeIndex(hash) },
+				{ path: `summaries/${hash}.json`, content: makeSummary(hash) },
+			],
+			"seed summary",
+		);
+		vi.spyOn(MigrationEngine.prototype, "runMigration").mockResolvedValueOnce({
+			status: "partial",
+			totalEntries: 1,
+			migratedEntries: 0,
+			failedHashes: [hash],
+		});
+
+		const result = await rebuildMemoryBank(repo);
+
+		expect(result.ok).toBe(false);
+		expect(result.message).toMatch(/Rebuild partial: 0\/1 entries/);
+		expect(result.folder).toBeTruthy();
 	});
 });

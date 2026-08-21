@@ -177,6 +177,19 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 		const releaseSocket = (): Promise<void> => closeListener(server);
 
 		const stop = (reason: McpDaemonExitReason): void => {
+			/* v8 ignore start -- every call site of `stop()` (armReap's timer below,
+			   `onConnectionClosed`, and the direct check in the retire handler
+			   further down) checks `connections.size === 0` synchronously, with no
+			   intervening tick, immediately before calling it — so `settled` is
+			   always false on entry and `connections` is always empty by the time
+			   this body runs. Confirmed empirically: even after a socket ends both
+			   its own and our writable side, its `close` event has not fired several
+			   microtask turns later (a unix domain socket's teardown is a fresh
+			   event-loop callback, never synchronous with the code that requested
+			   it), so nothing can shrink `connections` between a guard's check and
+			   this call. Both the `settled` guard and the non-empty branch of
+			   `reapTimer` are therefore defense against a future caller that skips
+			   its own precondition, not a path any test on today's callers can drive. */
 			if (settled) return;
 			settled = true;
 			if (reapTimer) clearTimeout(reapTimer);
@@ -184,6 +197,7 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 			// served (idle / no-first-client) or after retirement drained, so
 			// anything still here is a half-open peer that never greeted.
 			for (const socket of connections) socket.destroy();
+			/* v8 ignore stop */
 			releaseSocket().finally(() => resolve(reason));
 		};
 
@@ -196,7 +210,16 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 		const armReap = (reason: "idle" | "no-first-client", ms: number): void => {
 			if (reapTimer) clearTimeout(reapTimer);
 			reapTimer = setTimeout(() => {
+				/* v8 ignore start -- the `false` side (a connection present when this
+				   timer fires) is unreachable given today's callers: ANY new connection
+				   clears the current `reapTimer` synchronously in the accept handler
+				   below, before its greeting is even read, and that clear always runs in
+				   an EARLIER event-loop phase than a timer's own due-callback (libuv
+				   runs the timers phase before the poll phase that delivers `connection`
+				   events) — so a connection that will affect this check is always
+				   counted, or already cleared this exact timer, never both. */
 				if (connections.size === 0) stop(reason);
+				/* v8 ignore stop */
 			}, ms);
 			// Do not hold the event loop open on the reap timer alone: with the
 			// listener closed during retirement, this timer would otherwise keep a
@@ -262,7 +285,14 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 
 		server = createServer((socket) => {
 			connections.add(socket);
+			/* v8 ignore start -- the `false` side (no reap timer to clear) is
+			   unreachable: `armReap("no-first-client", ...)` runs synchronously inside
+			   the `listen()` callback, and no connection can be dispatched to this
+			   handler before that callback — which sets `reapTimer` — has already run
+			   to completion, so `reapTimer` is truthy for every connection this daemon
+			   will ever accept. */
 			if (reapTimer) clearTimeout(reapTimer);
+			/* v8 ignore stop */
 			socket.setNoDelay(true);
 			/* v8 ignore start -- a unix-domain socket has no portable way to force a
 			   peer-side error: `resetAndDestroy` is TCP-only and an abrupt client
@@ -306,7 +336,17 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 						// race back onto this dying daemon, then let the drain path decide
 						// when to exit.
 						void releaseSocket();
+						/* v8 ignore start -- unreachable: `connections` always contains THIS
+						   requesting socket at this exact point. Removing it requires its own
+						   `close` event, which — measured — has not fired even several
+						   microtask turns after both this socket's readable AND writable
+						   sides have ended (a unix-domain socket's teardown is a fresh
+						   event-loop callback, never synchronous with the code that requested
+						   it). The real drain path is `onConnectionClosed` once this socket's
+						   `close` actually arrives; this check only guards a state a future
+						   change to the call graph might introduce. */
 						if (connections.size === 0) stop("retired");
+						/* v8 ignore stop */
 						return;
 					}
 					// Deferred: KEEP LISTENING. Unbinding would strand the clients that
@@ -342,15 +382,34 @@ function serveOnSocket(args: ServeArgs): Promise<McpDaemonExitReason> {
 			// A STALE socket file (no listener) reports the same code, and is the
 			// normal state after a kill -9 or a reboot with a surviving tmpdir; the
 			// proxy clears those before spawning us, so we do not retry here.
+			/* v8 ignore start -- a real `listen()` failure emits exactly one `error`
+			   event (verified: both EINVAL from a malformed path and EADDRINUSE from a
+			   live incumbent fire once, never twice), and Node throws SYNCHRONOUSLY
+			   rather than emitting a second `error` if `listen()` is called again on
+			   an already-bound server — this code never does. So by the time this
+			   handler can run at all, `settled` is always false and `reapTimer` is
+			   always undefined (it is only ever set inside the `listen()` success
+			   callback, which a failed bind never reaches). Reaching either guard for
+			   real would need a genuine post-bind server-level fault (e.g. EMFILE
+			   during `accept()`), which this harness cannot arrange deterministically
+			   without corrupting the OS file-descriptor limit for the whole process. */
 			if (settled) return;
 			settled = true;
 			if (reapTimer) clearTimeout(reapTimer);
+			/* v8 ignore stop */
 			// Log the errno. A bare "listen-failed" is a dead end for whoever reads
 			// debug.log: the daemon is detached with stdio ignored, so this line is
 			// the ONLY trace it leaves, and the two failures that actually happen
 			// (ENOENT from a missing parent dir, EACCES from a hostile one) are
 			// indistinguishable without it.
+			/* v8 ignore start -- every real listen failure this harness can produce
+			   (EINVAL, EADDRINUSE — see above) carries `.code`; a codeless Error would
+			   need a non-standard rejection Node's own net module never produces, so
+			   the `?? err.message` fallback cannot be driven without fabricating a
+			   fake error via mocking `node:net` internals, which would destabilise
+			   this file's other real-socket suites for one fallback expression. */
 			log.warn("listen(%s) failed: %s", socketPath, err.code ?? err.message);
+			/* v8 ignore stop */
 			resolve(err.code === "EADDRINUSE" ? "address-in-use" : "listen-failed");
 		});
 

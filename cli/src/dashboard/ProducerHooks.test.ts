@@ -20,6 +20,21 @@ vi.mock("./DashboardDb.js", async (importOriginal) => {
 	return { ...actual, canUseDashboardDb: vi.fn().mockReturnValue(true) };
 });
 
+// `defaultConfigDirOverride` lets one test exercise the no-explicit-`dbPath`
+// branch of `refreshMemoryRows` without touching the developer's real
+// ~/.jolli path. `DashboardDb.ts`'s `getDashboardDbPath()` and `RepoRegistry.ts`'s
+// registry-path default both resolve through THIS module's `getGlobalConfigDir`
+// (a cross-module import in both, so mocking it here reaches both), which is
+// what makes overriding it here — rather than `getDashboardDbPath` itself —
+// actually take effect: a same-file call inside `DashboardDb.ts` to its own
+// `getDashboardDbPath` cannot be redirected by re-exporting a wrapper for it.
+// Read lazily, at call time, so setting it in a test body still takes effect.
+let defaultConfigDirOverride: string | undefined;
+vi.mock("../core/SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/SessionTracker.js")>();
+	return { ...actual, getGlobalConfigDir: () => defaultConfigDirOverride ?? actual.getGlobalConfigDir() };
+});
+
 // Partial: only the opt-out flag is a seam (the memories refresh honours it),
 // everything else — createLogger above all — must stay real.
 vi.mock("../Logger.js", async (importOriginal) => {
@@ -281,11 +296,89 @@ describe("recordCommitsFromWorker", () => {
 		expect(memories).toEqual([{ n: 0 }]);
 	});
 
+	it("skips enrichment for a stored summary whose commit date cannot be parsed", async () => {
+		vi.mocked(getSummary).mockResolvedValue({
+			version: 5,
+			commitHash: "abc123",
+			commitMessage: "feat: add thing",
+			commitAuthor: "Dev",
+			commitDate: "not-a-real-date",
+			branch: "feature/x",
+			generatedAt: "2026-07-30T09:01:00Z",
+			topics: [],
+			transcripts: [],
+			// biome-ignore lint/suspicious/noExplicitAny: minimal CommitSummary fixture
+		} as any);
+		const ok = await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
+		expect(ok).toBe(true);
+		const commits = await readRows("SELECT hash FROM commits");
+		expect(commits).toEqual([{ hash: "abc123" }]);
+	});
+
 	it("survives a summary read failure — the plain commit row still lands", async () => {
 		vi.mocked(getSummary).mockRejectedValue(new Error("orphan read failed"));
 		const ok = await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
 		expect(ok).toBe(true);
 		expect((await readRows("SELECT hash FROM commits")).length).toBe(1);
+	});
+
+	it("carries the author's email when git reports one", async () => {
+		vi.mocked(getCommitInfo).mockResolvedValue({
+			hash: "abc123",
+			message: "feat: add thing",
+			author: "Dev",
+			authorEmail: "dev@example.com",
+			date: "2026-07-30T09:00:00Z",
+		} as CommitInfo);
+		await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
+		const rows = await readRows("SELECT author_email FROM commits");
+		expect(rows).toEqual([{ author_email: "dev@example.com" }]);
+	});
+
+	it("attaches the numstat file breakdown when the batch pass succeeds", async () => {
+		const REC = "\u0001";
+		vi.mocked(execGit).mockImplementation((args: ReadonlyArray<string>) =>
+			Promise.resolve(
+				args[0] === "diff"
+					? { stdout: " 2 files changed, 7 insertions(+), 1 deletion(-)", stderr: "", exitCode: 0 }
+					: args.includes("--numstat")
+						? { stdout: `${REC}abc123\n1\t2\tsrc/a.ts\n`, stderr: "", exitCode: 0 }
+						: { stdout: "", stderr: "", exitCode: 1 },
+			),
+		);
+		await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
+		const rows = await withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT cf.path, cf.insertions, cf.deletions FROM commit_files cf JOIN commits c ON c.id = cf.commit_id",
+					)
+					.all(),
+			{ dbPath },
+		);
+		expect(rows).toEqual([{ path: "src/a.ts", insertions: 1, deletions: 2 }]);
+	});
+
+	it("drops a commit whose date git reported cannot be parsed", async () => {
+		vi.mocked(getCommitInfo).mockResolvedValue({
+			hash: "abc123",
+			message: "feat: add thing",
+			author: "Dev",
+			date: "not-a-real-date",
+		} as CommitInfo);
+		const ok = await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
+		// No commit.created landed, but the worktree-status write from the same
+		// batch still counts as "the write happened".
+		expect(ok).toBe(true);
+		expect(await readRows("SELECT hash FROM commits")).toEqual([]);
+	});
+
+	it("still lands the commit row when the branch read itself throws", async () => {
+		vi.mocked(getCurrentBranch).mockRejectedValue(new Error("detached, no ref"));
+		const ok = await recordCommitsFromWorker("/repo", ["abc123"], dbPath);
+		expect(ok).toBe(true);
+		const commits = await readRows("SELECT hash, branch FROM commits");
+		expect(commits).toEqual([{ hash: "abc123", branch: null }]);
 	});
 });
 
@@ -342,6 +435,44 @@ describe("recordSessionsFromTick", () => {
 		// the watermark on a dropped batch skipped it until it changed again.
 		vi.mocked(execGit).mockResolvedValue({ stdout: "", stderr: "", exitCode: 1 });
 		expect(await recordSessionsFromTick("/repo", [sessionInfo()], dbPath)).toBe(true);
+		expect(await readRows("SELECT session_id FROM sessions")).toEqual([{ session_id: "s1" }]);
+	});
+
+	it("keeps the watermark at the newest of several sessions in one tick, even when a later one in the array is older", async () => {
+		vi.mocked(getCurrentBranch).mockResolvedValue("main");
+		const ok = await recordSessionsFromTick(
+			"/repo",
+			[
+				sessionInfo({ sessionId: "newer", updatedAt: "2026-07-30T09:00:00Z" }),
+				// Still newer than `since` (0 on the first tick), but OLDER than the
+				// one just processed — must not move the watermark backward.
+				sessionInfo({ sessionId: "older", updatedAt: "2026-07-30T08:05:00Z" }),
+			],
+			dbPath,
+		);
+		expect(ok).toBe(true);
+		const rows = await readRows("SELECT session_id FROM sessions ORDER BY session_id");
+		expect(rows).toEqual([{ session_id: "newer" }, { session_id: "older" }]);
+	});
+
+	it("omits branch fields on a detached HEAD tick", async () => {
+		vi.mocked(getCurrentBranch).mockResolvedValue("HEAD");
+		vi.mocked(execGit).mockImplementation((args: ReadonlyArray<string>) =>
+			Promise.resolve(
+				args[0] === "diff"
+					? { stdout: " 1 file changed, 3 insertions(+)", stderr: "", exitCode: 0 }
+					: { stdout: "", stderr: "", exitCode: 1 },
+			),
+		);
+		await recordSessionsFromTick("/repo", [sessionInfo()], dbPath);
+		const worktree = await readRows("SELECT branch FROM worktree_status");
+		expect(worktree).toEqual([{ branch: null }]);
+	});
+
+	it("still writes the session when the branch read itself throws", async () => {
+		vi.mocked(getCurrentBranch).mockRejectedValue(new Error("detached, no ref"));
+		const ok = await recordSessionsFromTick("/repo", [sessionInfo()], dbPath);
+		expect(ok).toBe(true);
 		expect(await readRows("SELECT session_id FROM sessions")).toEqual([{ session_id: "s1" }]);
 	});
 });
@@ -454,6 +585,35 @@ describe("repo self-registration", () => {
 
 		expect(ok).toBe(true);
 		expect(await readRows("SELECT session_id FROM sessions")).toEqual([{ session_id: "s1" }]);
+	});
+
+	it("unions in a second clone's worktree even with no dbPath (hence no explicit configDir)", async () => {
+		defaultConfigDirOverride = dir;
+		try {
+			const { identity } = await resolveRepoIdentity("/repo");
+			await writeFile(
+				join(dir, "dashboard-repos.json"),
+				JSON.stringify({
+					version: 1,
+					repos: [
+						{
+							repoIdentity: identity,
+							repoName: "repo",
+							worktreeRoot: "/clone-a",
+							worktrees: ["/clone-a"],
+							enabledAt: "t",
+						},
+					],
+				}),
+			);
+
+			await recordSessionFromHook("/repo", sessionInfo());
+
+			const [entry] = (await readRepoRegistry(dir)).repos;
+			expect(entry.worktrees).toEqual(["/clone-a", "/repo"]);
+		} finally {
+			defaultConfigDirOverride = undefined;
+		}
 	});
 });
 
@@ -576,5 +736,86 @@ describe("memories live-refresh on commit.summary", () => {
 			{ dbPath },
 		);
 		expect(n).toBe(0);
+	});
+
+	it("logs and swallows a refresh failure rather than throwing — a stored summary that is not valid JSON", async () => {
+		// `getTranscriptIds(JSON.parse(content))` throws synchronously for a
+		// corrupt stored file; the outer catch is what stops that from taking the
+		// whole producer down with it.
+		storageFiles.set(`summaries/${"a".repeat(40)}.json`, "{not valid json");
+		try {
+			await expect(recordMemoryEdit("/repo", ["a".repeat(40)], dbPath)).resolves.toBeUndefined();
+		} finally {
+			storageFiles.clear();
+		}
+	});
+
+	it("refreshes nothing when the repo has no repos row yet — safeApply above never ran", async () => {
+		// `recordMemoryEdit` never goes through `safeApply` (only `recordCommitsFromWorker`
+		// / `recordSessionFromHook` do), so calling it in isolation is the one way to
+		// reach `refreshMemoryRows` with no `repos` row at all: the SQLite `repos` table
+		// is created but empty, so the `SELECT id FROM repos` lookup answers undefined.
+		const summary = {
+			version: "5",
+			commitHash: "f".repeat(40),
+			commitMessage: "m",
+			commitDate: "2026-07-30T08:00:00Z",
+			branch: "main",
+			commitType: "commit",
+			topics: [],
+			children: [],
+		};
+		storageFiles.set(`summaries/${"f".repeat(40)}.json`, JSON.stringify(summary, null, "\t"));
+		try {
+			await recordMemoryEdit("/repo", ["f".repeat(40)], dbPath);
+			const n = await withDashboardDb(
+				(db) => (db.prepare("SELECT COUNT(*) AS n FROM memories").get() as { n: number }).n,
+				{ dbPath },
+			);
+			expect(n).toBe(0);
+		} finally {
+			storageFiles.clear();
+		}
+	});
+
+	it("refreshes memories against the default dashboard db path when none is injected", async () => {
+		// Redirects BOTH the dashboard db's default location and the repo
+		// registry's — without this, calling the producer with no `dbPath` would
+		// write to the developer's real ~/.jolli/jollimemory, exactly the bug
+		// `configDirFor` exists to prevent for every OTHER test in this file.
+		defaultConfigDirOverride = dir;
+		const defaultDbPath = join(dir, "jollimemory.db");
+		try {
+			vi.mocked(getCommitInfo).mockResolvedValue({
+				hash: "d".repeat(40),
+				author: "a",
+				date: "2026-07-30T08:00:00Z",
+				message: "m",
+			} as CommitInfo);
+			vi.mocked(getCurrentBranch).mockResolvedValue("main");
+			const summary = {
+				version: "5",
+				commitHash: "d".repeat(40),
+				commitMessage: "m",
+				commitDate: "2026-07-30T08:00:00Z",
+				branch: "main",
+				commitType: "commit",
+				topics: [],
+				children: [],
+			};
+			vi.mocked(getSummary).mockResolvedValue(summary as never);
+			storageFiles.set(`summaries/${"d".repeat(40)}.json`, JSON.stringify(summary, null, "\t"));
+			// No dbPath argument — this exercises `refreshMemoryRows`' own default path.
+			await recordCommitsFromWorker("/repo", ["d".repeat(40)]);
+			const n = await withDashboardDb(
+				(db) => (db.prepare("SELECT COUNT(*) AS n FROM memories").get() as { n: number }).n,
+				{ dbPath: defaultDbPath },
+			);
+			expect(n).toBe(1);
+		} finally {
+			storageFiles.clear();
+			vi.mocked(getSummary).mockResolvedValue(null);
+			defaultConfigDirOverride = undefined;
+		}
 	});
 });

@@ -1,10 +1,19 @@
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // import type { KnowledgeGraph } from "../graph/GraphSchema.js"; // parked with the graph case
-import { withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
-import type { CommitCreatedEvent, SessionUpsertedEvent, WorktreeStatusEvent } from "./DashboardModel.js";
+import type { StorageProvider } from "../core/StorageProvider.js";
+import type { DashboardDbHandle } from "./DashboardDb.js";
+import { getDashboardDbPath, withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
+import type {
+	CommitCreatedEvent,
+	CommitSummaryEvent,
+	SessionUpsertedEvent,
+	StatsModelUsage,
+	WorktreeStatusEvent,
+} from "./DashboardModel.js";
 import type { RegisteredRepo } from "./RepoRegistry.js";
 
 vi.mock("./DashboardCollector.js", () => ({
@@ -125,7 +134,7 @@ import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js
 import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
-import type { SkillUsage } from "../Types.js";
+import type { SkillUsage, StoredTranscript, ToolCallCount } from "../Types.js";
 import {
 	collectCommitEvents,
 	collectRepoGraph,
@@ -134,7 +143,14 @@ import {
 	collectWorktreeEvent,
 } from "./DashboardCollector.js";
 import { sessionEventId } from "./DashboardModel.js";
-import { dbBackfillRepo, dbBackfillRepos, dbRescanSessions, pruneUnreachableCommits } from "./DbBackfill.js";
+import {
+	backfillStoredActivity,
+	dbBackfillRepo,
+	dbBackfillRepos,
+	dbRescanSessions,
+	projectRepoRegistryState,
+	pruneUnreachableCommits,
+} from "./DbBackfill.js";
 import { importRepoMemory } from "./SotImport.js";
 
 let dir: string;
@@ -3678,5 +3694,625 @@ describe("dbRescanSessions", () => {
 
 			expect(await eventColumns()).toContain("failed_kind");
 		});
+	});
+});
+
+describe("DbBackfill — coverage edges", () => {
+	function repoId(db: DashboardDbHandle, identity: string = repo.repoIdentity): number {
+		return (db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as { id: number }).id;
+	}
+	function insertMemory(db: DashboardDbHandle, id: number, hash: string): void {
+		db.prepare(
+			`INSERT INTO memories (repo_id, commit_hash, root_hash, summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+			 VALUES (?, ?, ?, '{}', 0, 0, 0)`,
+		).run(id, hash, hash);
+	}
+	function insertTranscript(db: DashboardDbHandle, id: number, tid: string, stored: StoredTranscript): void {
+		const blob = deflateSync(Buffer.from(JSON.stringify(stored)));
+		db.prepare(
+			"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, 0)",
+		).run(id, tid, blob);
+	}
+	function linkSession(db: DashboardDbHandle, id: number, tid: string, sessionId: string, source: string): void {
+		db.prepare(
+			"INSERT INTO transcript_sessions (repo_id, transcript_id, session_id, source) VALUES (?, ?, ?, ?)",
+		).run(id, tid, sessionId, source);
+	}
+	function insertSessionRow(db: DashboardDbHandle, id: number, source: string, sessionId: string): string {
+		const eventId = sessionEventId(repo.repoIdentity, source, sessionId);
+		db.prepare(
+			"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms) VALUES (?, ?, ?, ?, 1)",
+		).run(eventId, id, source, sessionId);
+		return eventId;
+	}
+
+	it("hashes branch tips into the commit cursor when for-each-ref returns real lines", async () => {
+		// checkoutFingerprint's filter runs over non-empty ref lines: `line && !isJolliInternalRef(...)`.
+		vi.mocked(execGit).mockImplementation(async (args) => {
+			if (args[0] === "rev-parse" && args[1] === "--verify")
+				return { stdout: `${"ab".repeat(20)}\n`, stderr: "", exitCode: 0 };
+			if (args[0] === "for-each-ref")
+				return { stdout: "refs/heads/main aaaaaaaaaa\n\n", stderr: "", exitCode: 0 };
+			return { stdout: "", stderr: "", exitCode: 0 };
+		});
+		await dbBackfillRepo({ repo, dbPath });
+		const cursor = (
+			await query<{ cursor: string }>("SELECT cursor FROM ingest_cursors WHERE source = 'git-commits'")
+		)[0].cursor;
+		expect(cursor).toMatch(/@head-1\+[0-9a-f]{64}$/);
+	});
+
+	it("treats a failed getIndex as no summary index", async () => {
+		// summaryIndexFingerprint's `.catch(() => null)`.
+		vi.mocked(getIndex).mockRejectedValue(new Error("index unreadable"));
+		const result = await dbBackfillRepo({ repo, dbPath });
+		expect(result.mode).toBe("bootstrapped");
+		expect((await query("SELECT source FROM ingest_cursors WHERE source = 'summaries'")).length).toBe(0);
+	});
+
+	it("omits remoteUrl from the enabled event when the repo has none", async () => {
+		// repoEnabledEvent's `repo.remoteUrl ? { remoteUrl } : {}` empty arm.
+		const result = await dbBackfillRepo({ repo: { ...repo, remoteUrl: undefined }, dbPath });
+		expect(result.mode).toBe("bootstrapped");
+	});
+
+	it("projects a disabled repo's paused state with a freshly minted timestamp", async () => {
+		// projectRepoRegistryState's disabled arm and the null side of
+		// `storedDisabledAt(...) ?? new Date(now())` — driven through dbBackfillRepos (the
+		// same path the sibling paused-state tests use) rather than a direct sync call. A
+		// direct call has to force `readManualDisableFlagSync` true so the real
+		// `isRepoDisabled` chain reports disabled; under a full-suite run that mock can lose
+		// its return value to worker scheduling, and the real chain then reports ENABLED,
+		// silently skipping the arm under test (measured as a flaky `null` paused_at). Going
+		// through dbBackfillRepos keeps the arm covered while matching the proven-stable
+		// mechanism above.
+		const off: RegisteredRepo = { ...repo, repoIdentity: "local:off", repoName: "off" };
+		await dbBackfillRepos([off], { dbPath }); // enabled first: creates the row, disabled_at NULL
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		await dbBackfillRepos([off], { dbPath, now: () => 1234 });
+		expect(await pausedAt("local:off")).toBe(new Date(1234).toISOString());
+	});
+
+	it("does not mark firstRun on a recovered commit re-sweep", async () => {
+		// The commits phase-start marker's `isBootstrap ? { firstRun } : {}` empty arm.
+		await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		const markers: Array<{ kind: string; done: number; firstRun?: boolean }> = [];
+		await dbBackfillRepo({ repo, dbPath, onProgress: (p) => markers.push(p) });
+		const start = markers.find((m) => m.kind === "commits" && m.done === 0);
+		expect(start).toBeDefined();
+		expect(start?.firstRun).toBeUndefined();
+	});
+
+	it("reports a fully-skipped source in the session breakdown", async () => {
+		// The session tier's onCounts callback and `processedBySource[source] ?? 0`.
+		vi.mocked(collectSessionEvents).mockImplementation(async (o) => {
+			o.onCounts?.({
+				discovered: 1,
+				skipped: 1,
+				bySource: { cursor: { discovered: 1, skipped: 1 } },
+				discoveredKeys: ["cursor:c1"],
+				skippedKeys: ["cursor:c1"],
+			});
+			return [];
+		});
+		const result = await dbBackfillRepo({ repo, dbPath });
+		expect(result.sessions?.bySource.cursor).toEqual({ discovered: 1, skipped: 1, processed: 0 });
+	});
+
+	it("forwards importer progress with and without a total", async () => {
+		// The importer onProgress wrapper's `p.total !== undefined ? { total } : {}`.
+		vi.mocked(importRepoMemory).mockImplementation(async (_db, o) => {
+			o.onProgress?.({ done: 1, total: 3 });
+			o.onProgress?.({ done: 2 });
+			return {
+				nodes: 0,
+				updated: 0,
+				commitTopics: 0,
+				aliases: 0,
+				transcripts: 0,
+				links: 0,
+				docs: 0,
+				planProgress: 0,
+				topics: 0,
+				skipped: 0,
+				pruned: 0,
+			};
+		});
+		const mem: Array<{ done: number; total?: number }> = [];
+		await dbBackfillRepo({
+			repo,
+			dbPath,
+			onProgress: (p) => {
+				if (p.kind === "memories") mem.push({ done: p.done, total: p.total });
+			},
+		});
+		expect(mem).toContainEqual({ done: 1, total: 3 });
+		expect(mem).toContainEqual({ done: 2, total: undefined });
+	});
+
+	it("drops to catch-up when a cutover is recorded but the fence is gone", async () => {
+		// The seed-legality `hasCutoverRecord` branch.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				db.prepare("INSERT INTO repo_state (repo_id, key, value) VALUES (?, 'cutover', '{}')").run(repoId(db));
+			},
+			{ dbPath },
+		);
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			await dbBackfillRepo({ repo, dbPath });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(importRepoMemory).toHaveBeenLastCalledWith(
+			expect.anything(),
+			expect.objectContaining({ mode: "catch-up" }),
+		);
+	});
+
+	function storageListing(entries: string[]): StorageProvider {
+		return {
+			listFiles: async (prefix: string) => (prefix === "summaries/" ? entries : []),
+		} as unknown as StorageProvider;
+	}
+
+	it("drops to catch-up when a single stored memory is absent from the orphan tip", async () => {
+		// unlisted === 1 arms of the two ternaries, plus the listing filter/map callbacks.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb((db) => insertMemory(db, repoId(db), "hash-0"), { dbPath });
+		const storage = storageListing(["summaries/other.json", "summaries/skip.txt"]);
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			await dbBackfillRepo({ repo, dbPath, storage });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(importRepoMemory).toHaveBeenLastCalledWith(
+			expect.anything(),
+			expect.objectContaining({ mode: "catch-up" }),
+		);
+	});
+
+	it("drops to catch-up when several stored memories are absent from the orphan tip", async () => {
+		// unlisted > 1 arms of the two ternaries.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				const id = repoId(db);
+				insertMemory(db, id, "hash-0");
+				insertMemory(db, id, "hash-1");
+			},
+			{ dbPath },
+		);
+		const storage = storageListing(["summaries/other.json"]);
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			await dbBackfillRepo({ repo, dbPath, storage });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(importRepoMemory).toHaveBeenLastCalledWith(
+			expect.anything(),
+			expect.objectContaining({ mode: "catch-up" }),
+		);
+	});
+
+	it("re-projects a session whose tool recorded a later call", async () => {
+		// sameToolSet's `lastCallAtMs > row.lastCallAtMs` branch.
+		const tools1: ToolCallCount[] = [{ name: "Bash", kind: "builtin", calls: 1, lastCallAtMs: 100 }];
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: tools1 }]);
+		await dbBackfillRepo({ repo, dbPath });
+		const tools2: ToolCallCount[] = [{ name: "Bash", kind: "builtin", calls: 1, lastCallAtMs: 200 }];
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: tools2 }]);
+		await dbBackfillRepo({ repo, dbPath });
+		const row = (await query<{ last_call_at_ms: number }>("SELECT last_call_at_ms FROM session_tool_use"))[0];
+		expect(row.last_call_at_ms).toBe(200);
+	});
+
+	it("compares a summary's sessions-only links with and without models", async () => {
+		// unchangedSummaryEvent's `coverage === 'sessions-only' && (link.models ?? []).length > 0`:
+		// the not-return arm (model-less link) and the return arm (link that carries models).
+		const base = {
+			type: "commit.summary" as const,
+			repoIdentity: repo.repoIdentity,
+			hash: "aaa",
+			committedAtMs: 1_700_000_000_000,
+			references: [],
+		};
+		// Pass 1: seed sa and sb as sessions-only (neither link carries models).
+		vi.mocked(getIndex).mockResolvedValue({ version: 3, entries: [] });
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					...base,
+					sessionLinks: [
+						{ source: "claude" as const, sessionId: "sa", confidence: "exact" as const },
+						{ source: "claude" as const, sessionId: "sb", confidence: "exact" as const },
+					],
+				},
+			],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+		// Pass 2: change the index so the tier re-sweeps; sb stays model-less (the
+		// not-return arm), sa now carries models (the return arm). Both rows are still
+		// stored `sessions-only` at comparison time.
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			entries: [
+				{
+					commitHash: "zzz",
+					parentCommitHash: null,
+					commitMessage: "m",
+					commitDate: "2026-07-30T00:00:00Z",
+					branch: "main",
+					generatedAt: "2026-07-30T00:01:00Z",
+				},
+			],
+		});
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					...base,
+					sessionLinks: [
+						{ source: "claude" as const, sessionId: "sb", confidence: "exact" as const },
+						{
+							source: "claude" as const,
+							sessionId: "sa",
+							confidence: "exact" as const,
+							models: [{ model: "claude-opus-4-8", inputTokens: 1, outputTokens: 1, cachedTokens: 0 }],
+						},
+					],
+				},
+			],
+			complete: true,
+		});
+		await dbBackfillRepo({ repo, dbPath });
+		const ids = (
+			await query<{ session_id: string }>(
+				"SELECT session_id FROM sessions WHERE session_id IN ('sa', 'sb') ORDER BY session_id",
+			)
+		).map((r) => r.session_id);
+		expect(ids).toEqual(["sa", "sb"]);
+	});
+
+	it("warns without advancing the summaries cursor when a summary fails to project", async () => {
+		// The cursor-skip warn's `summaries.complete ? 0 : 1` = 0 arm: the read COMPLETED
+		// but a summary event parked unprojected (pending > 0). Pass 2 is a recovered pass
+		// whose commit tier is cursor-skipped, so `reachableHashes` stays null and the
+		// unstored-hash event is judged CHANGED rather than pruned — then it parks because
+		// this build cannot project its type.
+		await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(getIndex).mockResolvedValue({
+			version: 3,
+			entries: [
+				{
+					commitHash: "zzz",
+					parentCommitHash: null,
+					commitMessage: "m",
+					commitDate: "2026-07-30T00:00:00Z",
+					branch: "main",
+					generatedAt: "2026-07-30T00:01:00Z",
+				},
+			],
+		});
+		vi.mocked(collectSummaryEvents).mockResolvedValue({
+			events: [
+				{
+					type: "commit.summary",
+					repoIdentity: repo.repoIdentity,
+					hash: "newhash",
+					committedAtMs: 1_700_000_000_000,
+					references: [],
+					// A session link whose model omits the token fields the seed inserts →
+					// the projection throws and the event parks, though the read completed.
+					sessionLinks: [
+						{
+							source: "claude",
+							sessionId: "px",
+							confidence: "exact",
+							models: [
+								{ inputTokens: 1, outputTokens: 1, cachedTokens: 0 } as unknown as StatsModelUsage,
+							],
+						},
+					],
+				} as unknown as CommitSummaryEvent,
+			],
+			complete: true,
+		});
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			await dbBackfillRepo({ repo, dbPath });
+		} finally {
+			warnSpy.mockRestore();
+			errSpy.mockRestore();
+		}
+		// Pass 1 wrote no summaries cursor (getIndex was null), and this pass did not
+		// advance one either, because the sweep left an event pending.
+		expect((await query("SELECT cursor FROM ingest_cursors WHERE source = 'summaries'")).length).toBe(0);
+	});
+
+	it("re-projects each commit field difference on a re-sweep", async () => {
+		// unchangedCommitEvent's per-field return-false checks (committed_at, message,
+		// author_name/email, files_changed, insertions, deletions) and the branch loop.
+		const full = (hash: string, over: Record<string, unknown> = {}): CommitCreatedEvent =>
+			({
+				type: "commit.created",
+				repoIdentity: repo.repoIdentity,
+				hash,
+				committedAtMs: 1_700_000_000_000,
+				message: "msg",
+				authorName: "Alice",
+				authorEmail: "a@example.com",
+				filesChanged: 1,
+				insertions: 2,
+				deletions: 3,
+				branches: ["main"],
+				...over,
+			}) as CommitCreatedEvent;
+		const hashes = ["c1", "c2", "c3", "c4", "c5", "c6", "c7", "c8", "c9", "c10"];
+		vi.mocked(collectCommitEvents).mockResolvedValue(hashes.map((h) => full(h)));
+		await dbBackfillRepo({ repo, dbPath });
+		// Re-sweep with one field changed per commit (c8 unchanged; c9 a different branch;
+		// c10 carries no branch set at all, so the branch comparison is skipped).
+		vi.mocked(getHeadHash).mockResolvedValue("head-2");
+		vi.mocked(collectCommitEvents).mockResolvedValue([
+			full("c1", { committedAtMs: 42 }),
+			full("c2", { message: "other" }),
+			full("c3", { authorName: "Bob" }),
+			full("c4", { authorEmail: "b@example.com" }),
+			full("c5", { filesChanged: 9 }),
+			full("c6", { insertions: 9 }),
+			full("c7", { deletions: 9 }),
+			full("c8"),
+			full("c9", { branches: ["feature"] }),
+			full("c10", { branches: undefined }),
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect((await query("SELECT hash FROM commits")).length).toBe(10);
+	});
+
+	it("seeds the emission gate from the log, with and without a limit", async () => {
+		// readEmittedFromLog's `limit === undefined ? … : … LIMIT ?` and its args.
+		await dbBackfillRepo({ repo, dbPath });
+		const withLimit = new Map<string, number>();
+		await dbRescanSessions({ repos: [repo], dbPath, emitted: withLimit, seedEmitted: true, emittedLimit: 100 });
+		const noLimit = new Map<string, number>();
+		await dbRescanSessions({ repos: [repo], dbPath, emitted: noLimit, seedEmitted: true });
+		expect(noLimit.size).toBeGreaterThanOrEqual(withLimit.size);
+		expect(noLimit.size).toBeGreaterThan(0);
+	});
+
+	it("counts discovered sessions and reads no failures from a caller-supplied scan", async () => {
+		// dbRescanSessions' onCounts callback, `preScanned ? undefined : …`, `scan?.failures ?? []`.
+		await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(collectSessionEvents).mockImplementation(async (o) => {
+			o.onCounts?.({ discovered: 2, skipped: 0, bySource: {}, discoveredKeys: [], skippedKeys: [] });
+			return [{ ...sessionEvent, updatedAtMs: sessionEvent.updatedAtMs + 60_000 }];
+		});
+		const result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), preScanned: {} });
+		expect(result.discovered).toBe(2);
+	});
+
+	it("logs and continues when a per-repo scan throws inside the tick", async () => {
+		// dbRescanSessions' per-repo catch.
+		await dbBackfillRepo({ repo, dbPath });
+		vi.mocked(collectSessionEvents).mockRejectedValue(new Error("scan boom"));
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		let result: Awaited<ReturnType<typeof dbRescanSessions>>;
+		try {
+			result = await dbRescanSessions({ repos: [repo], dbPath, emitted: new Map(), preScanned: {} });
+		} finally {
+			spy.mockRestore();
+		}
+		expect(result.processed).toBe(0);
+	});
+
+	it("skips already-recorded sessions across repos on a second pass", async () => {
+		// readRecordedSessions: floor across two repos (`instant < seen`), the returned
+		// predicate, and its invocation by an opted-in scanner.
+		const repo2: RegisteredRepo = { ...repo, repoIdentity: "https://github.com/jolliai/other", repoName: "other" };
+		vi.mocked(collectSessionEvents).mockImplementation(async (o) => [
+			{ ...sessionEvent, repoIdentity: o.repoIdentity },
+		]);
+		await dbBackfillRepos([repo, repo2], { dbPath });
+		let predicateCalled = false;
+		vi.mocked(scanClaudeSessionsOnDisk).mockImplementation(async (o) => {
+			const alreadyRecorded = (o as { alreadyRecorded?: (s: string, id: string, ms: number) => boolean })
+				.alreadyRecorded;
+			if (alreadyRecorded) {
+				alreadyRecorded("claude", "s1", sessionEvent.updatedAtMs);
+				predicateCalled = true;
+			}
+			return [];
+		});
+		await dbBackfillRepos([repo, repo2], { dbPath });
+		expect(predicateCalled).toBe(true);
+	});
+
+	it("uses the machine dashboard path when dbBackfillRepos gets no dbPath", async () => {
+		// The `rest.dbPath ? { dbPath } : {}` empty arms and `?? getDashboardDbPath()`.
+		const realHome = process.env.HOME;
+		process.env.HOME = join(dir, "home-repos");
+		try {
+			const results = await dbBackfillRepos([repo], {});
+			expect(results[0].mode).toBe("bootstrapped");
+			expect(existsSync(getDashboardDbPath())).toBe(true);
+		} finally {
+			if (realHome === undefined) delete process.env.HOME;
+			else process.env.HOME = realHome;
+		}
+	});
+
+	it("projects paused repos against the machine path when given no dbPath", async () => {
+		// The paused-repos `rest.dbPath ? { dbPath } : {}` empty arm.
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		const realHome = process.env.HOME;
+		process.env.HOME = join(dir, "home-paused");
+		try {
+			const results = await dbBackfillRepos([repo], {});
+			expect(results[0].mode).toBe("disabled");
+		} finally {
+			if (realHome === undefined) delete process.env.HOME;
+			else process.env.HOME = realHome;
+		}
+	});
+
+	it("reports paused repos as skipped when their projection open fails", async () => {
+		// The paused-repos catch → mapped to `skipped`.
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
+		const blocker = join(dir, "blocker-file");
+		writeFileSync(blocker, "x");
+		const badPath = join(blocker, "nested", "db.db");
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			const results = await dbBackfillRepos([repo], { dbPath: badPath });
+			expect(results[0]).toMatchObject({ mode: "skipped", error: expect.any(String) });
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("uses the machine dashboard path when dbRescanSessions gets no dbPath", async () => {
+		// dbRescanSessions' `opts.dbPath ? { dbPath } : {}` and `opts.dbPath ?? getDashboardDbPath()`.
+		const realHome = process.env.HOME;
+		process.env.HOME = join(dir, "home-rescan");
+		try {
+			const result = await dbRescanSessions({ repos: [repo], emitted: new Map() });
+			expect(result.idleReason).toBe("no-database");
+		} finally {
+			if (realHome === undefined) delete process.env.HOME;
+			else process.env.HOME = realHome;
+		}
+	});
+
+	it("backfillStoredActivity: writes buckets, skipping bad, source-less and covered rows", async () => {
+		// backfillStoredActivity's `stored.sessions ?? []`, source guard, uncovered guard,
+		// and the unreadable-blob catch.
+		const written = await withDashboardDb(
+			(db) => {
+				// A repo row (FK target).
+				db.prepare(
+					"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES (?, ?, ?, 't')",
+				).run(repo.repoIdentity, repo.repoName, repo.worktreeRoot);
+				const id = repoId(db);
+
+				insertSessionRow(db, id, "claude", "good-sess");
+				insertSessionRow(db, id, "claude", "no-buckets");
+				const good = {
+					sessions: [
+						{
+							sessionId: "good-sess",
+							source: "claude",
+							entries: [{ timestamp: "2026-08-01T00:00:00.000Z" }],
+						},
+						{ sessionId: "no-source", entries: [{ timestamp: "2026-08-01T00:00:00.000Z" }] },
+						{ sessionId: "not-uncovered", source: "claude", entries: [] },
+						// Uncovered and has a source, but its entries carry no timestamp → 0 buckets.
+						{ sessionId: "no-buckets", source: "claude", entries: [{}] },
+					],
+				} as unknown as StoredTranscript;
+				insertTranscript(db, id, "t-good", good);
+				linkSession(db, id, "t-good", "good-sess", "claude");
+
+				// A transcript whose parsed body has no `sessions` key at all.
+				insertSessionRow(db, id, "claude", "empty-sess");
+				insertTranscript(db, id, "t-empty", {} as unknown as StoredTranscript);
+				linkSession(db, id, "t-empty", "empty-sess", "claude");
+
+				// A blob that cannot be inflated → per-row catch.
+				insertSessionRow(db, id, "claude", "bad-sess");
+				db.prepare(
+					"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, 0)",
+				).run(id, "t-bad", Buffer.from("not a deflate stream"));
+				linkSession(db, id, "t-bad", "bad-sess", "claude");
+
+				const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+				try {
+					return backfillStoredActivity(db);
+				} finally {
+					spy.mockRestore();
+				}
+			},
+			{ dbPath },
+		);
+		expect(written).toBe(1);
+	});
+
+	it("dbBackfillRepos backfills stored activity for uncovered sessions", async () => {
+		// dbBackfillRepos' `if (covered > 0)` log branch.
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				const id = repoId(db);
+				insertSessionRow(db, id, "claude", "act-sess");
+				const good = {
+					sessions: [
+						{
+							sessionId: "act-sess",
+							source: "claude",
+							entries: [{ timestamp: "2026-08-01T00:00:00.000Z" }],
+						},
+					],
+				} as unknown as StoredTranscript;
+				insertTranscript(db, id, "t-act", good);
+				linkSession(db, id, "t-act", "act-sess", "claude");
+			},
+			{ dbPath },
+		);
+		await dbBackfillRepos([repo], { dbPath });
+		const rows = await query(
+			`SELECT 1 FROM session_activity a JOIN sessions s ON s.event_id = a.session_event_id
+			  WHERE s.session_id = 'act-sess'`,
+		);
+		expect(rows.length).toBeGreaterThan(0);
+	});
+
+	it("pruneUnreachableCommits forgets the day a surviving memory lands on", async () => {
+		// The `landed?.at_ms != null` push branch: a pruned commit whose memory survives
+		// moves to another calendar day, which must be forgotten too.
+		const removed = await withDashboardDb(
+			(db) => {
+				db.prepare(
+					"INSERT INTO repos (repo_identity, repo_name, worktree_root, enabled_at) VALUES (?, ?, ?, 't')",
+				).run(repo.repoIdentity, repo.repoName, repo.worktreeRoot);
+				const id = repoId(db);
+				db.prepare(
+					"INSERT INTO commits (event_id, repo_id, hash, committed_at_ms) VALUES ('e', ?, 'x', 111)",
+				).run(id);
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, root_hash, summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'x', 'x', '{}', 0, 0, 222)`,
+				).run(id);
+				return pruneUnreachableCommits(db, repo.repoIdentity, new Set());
+			},
+			{ dbPath },
+		);
+		expect(removed).toBe(1);
+	});
+
+	it("projects an enabled repo's registry row (the non-disabled arm)", async () => {
+		// projectRepoRegistryState's `: repoEnabledEvent(repo)` arm.
+		vi.mocked(readManualDisableFlagSync).mockReturnValue(false);
+		await withDashboardDb((db) => projectRepoRegistryState(db, repo), { dbPath });
+		expect(await pausedAt(repo.repoIdentity)).toBeNull();
+		expect((await query("SELECT repo_name FROM repos WHERE repo_identity = ?", repo.repoIdentity)).length).toBe(1);
+	});
+
+	it("falls back to no-skip when the recorded-sessions pre-read fails", async () => {
+		// readRecordedSessions' catch: a corrupt database opens but throws on first use.
+		writeFileSync(dbPath, "not a database");
+		const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+		try {
+			const results = await dbBackfillRepos([repo], { dbPath });
+			expect(results[0].mode).toBe("skipped");
+		} finally {
+			warnSpy.mockRestore();
+			errSpy.mockRestore();
+		}
 	});
 });

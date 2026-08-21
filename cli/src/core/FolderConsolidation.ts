@@ -161,8 +161,14 @@ export async function classifyDuplicateFolders(
 	}
 
 	const orphan = await readOrphanSummaryHashes(cwd);
+	// `hashSets` is populated above for every element of this exact `folders`
+	// array, so `.get(...)` can never miss for a key drawn from `folders` itself —
+	// the `?? new Set()` fallbacks exist only to satisfy `Map.get`'s `T | undefined`
+	// return type.
+	/* v8 ignore start */
 	const first = hashSets.get(folders[0]) ?? new Set<string>();
 	const allEqual = folders.every((f) => setsEqual(hashSets.get(f) ?? new Set(), first));
+	/* v8 ignore stop */
 
 	let kind: ConsolidationKind;
 	let survivor: string;
@@ -519,7 +525,13 @@ function shortestNamed(folders: readonly string[]): string {
 
 /** Folder with the most summaries; ties broken by {@link shortestNamed}. */
 function largestNamed(folders: readonly string[], perFolder: Readonly<Record<string, number>>): string {
+	// `perFolder` is always built (by `classifyDuplicateFolders`) from exactly the
+	// same folder list passed in here — as a real count, possibly 0, never absent —
+	// so `perFolder[f]` can never be `undefined` for `f` drawn from `folders`. The
+	// `?? 0` fallbacks exist only to satisfy the index signature's `number | undefined`.
+	/* v8 ignore start */
 	const max = Math.max(...folders.map((f) => perFolder[f] ?? 0));
 	const tied = folders.filter((f) => (perFolder[f] ?? 0) === max);
+	/* v8 ignore stop */
 	return shortestNamed(tied);
 }

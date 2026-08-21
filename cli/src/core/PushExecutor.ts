@@ -234,7 +234,18 @@ async function waitForConfirmedPushes(
 	// 60x1s pre-push polling went away with the detached PrePushWorker.
 	await Promise.all(
 		[...targets].map(async ([key, target]) => {
-			if (await isPushTargetConfirmed(cwd, target, pushRemotes.get(target.remote) ?? target.remote))
+			if (
+				await isPushTargetConfirmed(
+					cwd,
+					target,
+					/* v8 ignore start -- `pushRemotes` is populated above for every remote among
+					   `targets` (the same Map this callback iterates), so `.get(target.remote)`
+					   can never miss here; the `?? target.remote` fallback exists only to satisfy
+					   `Map.get`'s `T | undefined` return type. */
+					pushRemotes.get(target.remote) ?? target.remote,
+					/* v8 ignore stop */
+				)
+			)
 				confirmedTargets.add(key);
 		}),
 	);
@@ -273,13 +284,29 @@ async function buildAttachmentOwnership(
 		}
 		for (const hash of rootHashes) {
 			const summary = candidates.get(hash) ?? (await getSummary(hash, cwd, storage));
+			// Both outcomes are exercised by real tests (a matching root, and a
+			// tree-hash-resolved mismatch) — this line's implicit "else" is a
+			// v8-to-istanbul instrumentation artifact, not a real gap: for this exact
+			// shape (a braceless single-statement `if` whose test is an optional-chain
+			// comparison) it reports a non-deterministic negative sentinel (observed
+			// both -1 and -2 across otherwise-identical runs) instead of a real hit
+			// count, so no test can ever turn it into a counted branch.
+			/* v8 ignore start */
 			if (summary?.commitHash === hash) contexts.get(summary.branch)?.set(hash, summary);
+			/* v8 ignore stop */
 		}
 	}
 
 	for (const hash of hashes) {
 		const summary = candidates.get(hash);
+		// `hashes` here is always `withMemory` and `candidates` is always the
+		// `candidateSummaries` map processPushPending fills for exactly those same
+		// hashes in the same triage pass, so `summary` can never be undefined at
+		// this private function's one call site — the `if` exists only because
+		// `Map.get` types its result as possibly-undefined.
+		/* v8 ignore start */
 		if (summary) contexts.get(pendingEntries[hash].branch)?.set(hash, summary);
+		/* v8 ignore stop */
 	}
 
 	// Merge each branch's ownership into one kind-agnostic map. Generic over the

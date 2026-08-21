@@ -7,7 +7,9 @@ import { initTelemetry, shutdownTelemetry } from "./Telemetry.js";
 import { readTelemetryEvents } from "./TelemetryBuffer.js";
 import {
 	commandPath,
+	getInvokedRootCommand,
 	installCommandTelemetryHooks,
+	markSkipExitFlush,
 	shouldSkipExitFlush,
 	trackCommandFailureIfPending,
 } from "./TelemetryCommandHook.js";
@@ -62,6 +64,36 @@ describe("installCommandTelemetryHooks", () => {
 		await program.parseAsync(["node", "jolli", "auth", "login"]);
 		const [event] = await readTelemetryEvents(cwd);
 		expect(event.properties.command).toBe("auth login");
+	});
+
+	it("getInvokedRootCommand reflects the root-level name of the resolved command", async () => {
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "auth", "login"]);
+		expect(getInvokedRootCommand()).toBe("auth");
+	});
+
+	it("emits duration_ms: undefined when pending was already cleared before postAction runs", async () => {
+		// `pending` and `invokedRootCommand` are module-level state, not per-hook —
+		// registering the hooks twice on the same program (a misuse, but not one
+		// commander itself rejects) attaches two independent preAction/postAction
+		// pairs sharing that state. commander runs postAction hooks in REVERSE
+		// registration order, so the second registration's postAction claims
+		// `pending` and nulls it first; the first registration's postAction then
+		// reads a `pending` that is already null, exercising the `start ===
+		// undefined` branch of the duration_ms ternary rather than throwing.
+		const program = new Command();
+		program.name("jolli").exitOverride();
+		installCommandTelemetryHooks(program);
+		installCommandTelemetryHooks(program);
+		program.command("recall").action(async () => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		const events = await readTelemetryEvents(cwd);
+		expect(events).toHaveLength(2);
+		expect(events[0].properties).toMatchObject({ command: "recall", ok: true });
+		expect(typeof events[0].properties.duration_ms).toBe("number");
+		expect(events[1].properties.command).toBe("recall");
+		expect(events[1].properties.ok).toBe(true);
+		expect(events[1].properties.duration_ms).toBeUndefined();
 	});
 
 	it("does not emit when the command action throws (postAction skipped)", async () => {
@@ -191,6 +223,19 @@ describe("shouldSkipExitFlush", () => {
 
 	it("stays correct when a global option precedes the subcommand (unlike an argv-position check)", async () => {
 		await programWithTelemetry().parseAsync(["node", "jolli", "--verbose", "telemetry", "inspect"]);
+		expect(shouldSkipExitFlush()).toBe(true);
+	});
+});
+
+// `markSkipExitFlush()` flips a module-level flag with no unset — once called it
+// stays true for the rest of this file's run. Kept last, and in its own describe,
+// so it cannot leak into the `shouldSkipExitFlush` assertions above.
+describe("markSkipExitFlush", () => {
+	it("forces shouldSkipExitFlush() to true regardless of the resolved command", async () => {
+		const program = programWith(() => {});
+		await program.parseAsync(["node", "jolli", "recall"]);
+		expect(shouldSkipExitFlush()).toBe(false);
+		markSkipExitFlush();
 		expect(shouldSkipExitFlush()).toBe(true);
 	});
 });

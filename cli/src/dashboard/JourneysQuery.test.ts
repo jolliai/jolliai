@@ -84,6 +84,22 @@ function addMemory(over: {
 	);
 }
 
+/**
+ * Inserts a `memories` row with a HAND-WRITTEN `summary_json` string, bypassing
+ * `addMemory`'s typed summary shape. Needed to exercise the defensive
+ * `parseSummary`/`collectDecisions`/`earliestPlanMs` guards against a summary
+ * that is not valid JSON, or whose `topics`/`plans` arrays hold malformed
+ * entries a real writer could never produce but which this read path must not
+ * throw on.
+ */
+function addMemoryRaw(over: { repoId?: number; hash: string; atMs?: number; summaryJson: string }): void {
+	const atMs = over.atMs ?? NOW;
+	db.prepare(
+		`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+		 VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?)`,
+	).run(over.repoId ?? 1, over.hash, over.hash, over.summaryJson, atMs, atMs, atMs);
+}
+
 /** A `commits` row — the COMMITTER-date clock, distinct from `memories.commit_date_ms` (author date). */
 function addCommitRow(hash: string, committedAtMs: number, repoId = 1): void {
 	db.prepare("INSERT INTO commits (event_id, repo_id, hash, committed_at_ms) VALUES (?, ?, ?, ?)").run(
@@ -416,6 +432,77 @@ describe("buildJourneys", () => {
 			expect(journey?.title).toBe("bump lockfile");
 			expect(journey?.shape.kind).not.toBe("chore");
 		}));
+
+	it("titles an unmessaged commit '(no message)', never a blank line", () =>
+		inDb(() => {
+			addMemoryRaw({ hash: "h1", summaryJson: JSON.stringify({ commitHash: "h1", commitMessage: null }) });
+			const journey = build().journeys[0];
+			expect(journey?.title).toBe("(no message)");
+		}));
+
+	it("takes the EARLIER of two commits' plans in the same journey via Math.min", () =>
+		inDb(() => {
+			// Both commits share a ticket, so they fold into ONE journey, and BOTH
+			// carry a plan — the first commit's sets `earliestPlanMs` (the
+			// `earliestPlanMs === null` branch), and the second's, being later, must
+			// go through the accumulator-level `Math.min` branch rather than
+			// overwriting it.
+			addMemory({
+				hash: "h1",
+				message: "Closes JOLLI-9: part one",
+				atMs: NOW - 2 * DAY,
+				planAddedAtMs: NOW - 3 * DAY,
+			});
+			addMemory({
+				hash: "h2",
+				message: "Closes JOLLI-9: part two",
+				atMs: NOW - DAY,
+				planAddedAtMs: NOW - 5 * DAY,
+			});
+			const journey = build().journeys.find((j) => j.ticket === "JOLLI-9");
+			// The earlier of the two (5 days back) is what wins, and it predates the
+			// FIRST commit (2 days back), so the journey is plan-first.
+			expect(journey?.planFirst).toBe(true);
+		}));
+
+	it("tolerates a summary body that parses to a non-object (a bare number)", () =>
+		inDb(() => {
+			addMemoryRaw({ hash: "h1", summaryJson: "42" });
+			const journey = build().journeys[0];
+			expect(journey?.decisionCount).toBe(0);
+		}));
+
+	it("skips non-object topics/plans entries and malformed dates, but still finds the real ones", () =>
+		inDb(() => {
+			addMemoryRaw({
+				hash: "h1",
+				summaryJson: JSON.stringify({
+					commitHash: "h1",
+					commitMessage: "feat: mixed bag",
+					topics: [
+						42,
+						null,
+						{ title: "t1", decisions: 123 },
+						{ title: "t2", decisions: "- a real decision" },
+					],
+					plans: [
+						42,
+						null,
+						{ title: "no addedAt at all" },
+						{ addedAt: 123 },
+						{ addedAt: "not-a-date" },
+						{ addedAt: new Date(NOW - DAY).toISOString() },
+						{ addedAt: new Date(NOW - 5 * DAY).toISOString() },
+					],
+				}),
+			});
+			const journey = build().journeys[0];
+			// Only the one real bullet survived the malformed topics.
+			expect(journey?.decisions.map((d) => d.text)).toEqual(["a real decision"]);
+			// Only the two well-formed plans could set `earliestPlanMs`, and the
+			// EARLIER of the two (5 days back) is what wins via Math.min.
+			expect(journey?.planFirst).toBe(true);
+		}));
 });
 
 describe("buildJourneyDetail", () => {
@@ -438,6 +525,250 @@ describe("buildJourneyDetail", () => {
 			expect(
 				buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - DAY, endMs: NOW }, "T\x00repo-a\x00NOPE-1"),
 			).toBeUndefined();
+		}));
+});
+
+/** Writes an arbitrary (already-deflated-ready) object as a transcript blob, linked to a commit. */
+function addRawTranscript(transcriptId: string, commitHash: string, stored: unknown, repoId = 1): void {
+	const blob = deflateSync(Buffer.from(JSON.stringify(stored), "utf8"));
+	db.prepare(
+		"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, ?)",
+	).run(repoId, transcriptId, blob, NOW);
+	db.prepare("INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)").run(
+		repoId,
+		commitHash,
+		transcriptId,
+	);
+}
+
+describe("buildJourneyDetail — tolerates malformed/unusual transcript shapes", () => {
+	it("ignores an entry whose timestamp cannot be parsed rather than producing a bogus wait", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW - DAY });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					{
+						sessionId: "s1",
+						source: "codex",
+						entries: [
+							{ role: "assistant", content: "x", timestamp: "not-a-real-date" },
+							{ role: "human", content: "y", timestamp: new Date(NOW - DAY + 10 * 60_000).toISOString() },
+						],
+					},
+				],
+			});
+			const id = build().journeys[0]?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.waits).toEqual([]);
+		}));
+
+	it("treats a blob with no recognizable sessions array as carrying zero sessions", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW - DAY });
+			addRawTranscript("t1", "h1", {});
+			const id = build().journeys[0]?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.attribution).toEqual({ humanTurns: 0, agentTurns: 0 });
+			expect(detail?.waits).toEqual([]);
+			expect(detail?.compactions).toEqual([]);
+		}));
+
+	it("treats a session with no entries field at all as having none", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW - DAY });
+			addRawTranscript("t1", "h1", { sessions: [{ sessionId: "s1", source: "codex" }] });
+			const id = build().journeys[0]?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.attribution).toEqual({ humanTurns: 0, agentTurns: 0 });
+		}));
+
+	// Forces mergeSessionSlices' sort comparator to compare a slice with NO
+	// determinable start time (no timestamped entries) against one that has
+	// one — the `ta === undefined || tb === undefined` branch.
+	it("keeps slice order stable when one of an amend chain's slices has no timestamped entries", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "Closes JOLLI-9: one", atMs: NOW - 2 * DAY });
+			addMemory({ hash: "h2", message: "Closes JOLLI-9: two", atMs: NOW - DAY });
+			addRawTranscript("t1", "h1", {
+				sessions: [{ sessionId: "shared", source: "codex", entries: [{ role: "assistant", content: "x" }] }],
+			});
+			addRawTranscript("t2", "h2", {
+				sessions: [
+					{
+						sessionId: "shared",
+						source: "codex",
+						entries: [{ role: "human", content: "y", timestamp: new Date(NOW - DAY).toISOString() }],
+					},
+				],
+			});
+			const id = build().journeys.find((j) => j.ticket === "JOLLI-9")?.id ?? "";
+			// Must not throw, and the merged stream still carries both entries.
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.attribution).toEqual({ humanTurns: 1, agentTurns: 1 });
+		}));
+});
+
+describe("buildJourneys — test-first signal", () => {
+	it("evaluates a second test run against the earliest already seen, in both directions", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					{
+						sessionId: "s1",
+						source: "codex",
+						entries: [],
+						// A later run first (sets earliest), then an EARLIER one (Math.min
+						// equivalent: `atMs < earliest` true, updates), then a LATER one
+						// again (`atMs < earliest` false — the earliest already seen wins).
+						testRuns: [NOW - DAY, NOW - 2 * DAY, NOW - 1 * DAY],
+					},
+				],
+			});
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, { withTests: true });
+			expect(model.journeys[0]?.tested?.availability).toBe("measured");
+			// The earliest of the three (2 days back) predates the commit, so test-first.
+			expect(model.journeys[0]?.tested?.testFirst).toBe(true);
+		}));
+
+	it("marks the verdict partial when a measured session sits beside an unmeasured codex/claude one, across friction and test-first alike", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					// Measured: reports both signals.
+					{
+						sessionId: "measured",
+						source: "codex",
+						entries: [],
+						testRuns: [NOW - DAY],
+						turnAborts: [NOW - DAY],
+					},
+					// Unmeasured codex — predates the testRuns/turnAborts fields.
+					{ sessionId: "unmeasured-codex", source: "codex", entries: [] },
+					// Unmeasured claude — the OTHER source deriveTested (but not
+					// deriveTurnAborts, which is codex-only) treats as unmeasured.
+					{ sessionId: "unmeasured-claude", source: "claude", entries: [] },
+					// A source neither derivation recognizes as an unmeasured signal —
+					// contributes to neither "measured" nor "sawUnmeasuredSource".
+					{ sessionId: "other-source", source: "opencode", entries: [] },
+				],
+			});
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, {
+				withTests: true,
+				withFriction: true,
+			});
+			expect(model.journeys[0]?.tested?.availability).toBe("partial");
+			expect(model.journeys[0]?.friction?.availability).toBe("partial");
+		}));
+
+	it("skips a compaction-free/entry-free session cleanly and de-duplicates+sorts real compaction instants", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					{ sessionId: "s1", source: "codex", entries: [], compactions: [NOW - 60_000, NOW - 3 * 60_000] },
+					{ sessionId: "s2", source: "codex", entries: [], compactions: [NOW - 3 * 60_000] },
+				],
+			});
+			const id = build().journeys[0]?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			// Sorted ascending, and the instant shared by both sessions counts once.
+			expect(detail?.compactions).toEqual([NOW - 3 * 60_000, NOW - 60_000]);
+		}));
+
+	it("counts only human/assistant turns, silently skipping any other recorded role", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					{
+						sessionId: "s1",
+						source: "codex",
+						// A role outside the type's own "human" | "assistant" union — real
+						// transcript files are untrusted input this code must not choke on.
+						entries: [
+							{ role: "human", content: "hi" },
+							{ role: "assistant", content: "hey" },
+							{ role: "system", content: "context injected" },
+						],
+					},
+				],
+			});
+			const id = build().journeys[0]?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.attribution).toEqual({ humanTurns: 1, agentTurns: 1 });
+		}));
+});
+
+describe("buildJourneys — transcript read dedup and cache sharing", () => {
+	it("reads a transcript shared by two commits of the SAME journey only once", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "Closes JOLLI-9: one", atMs: NOW - 2 * DAY });
+			addMemory({ hash: "h2", message: "Closes JOLLI-9: two", atMs: NOW - DAY });
+			addRawTranscript("shared-t", "h1", {
+				sessions: [{ sessionId: "s1", source: "codex", entries: [{ role: "human", content: "hi" }] }],
+			});
+			// The SAME transcript row, linked to the second commit too (e.g. an amend
+			// that re-filed the same transcript id) — must be read once, not twice.
+			linkMemoryTranscript("h2", "shared-t");
+			const id = build().journeys.find((j) => j.ticket === "JOLLI-9")?.id ?? "";
+			const detail = buildJourneyDetail(db, { kind: "all" }, { startMs: NOW - 90 * DAY, endMs: NOW + DAY }, id);
+			expect(detail?.attribution).toEqual({ humanTurns: 1, agentTurns: 0 });
+		}));
+
+	it("reuses the SAME window-wide cache entry when two different journeys reference one transcript", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", branch: "solo-a", message: "one", atMs: NOW - 2 * DAY });
+			addMemory({ hash: "h2", branch: "solo-b", message: "two", atMs: NOW - DAY });
+			addRawTranscript("cross-journey-t", "h1", {
+				sessions: [{ sessionId: "shared-sess", source: "codex", entries: [{ role: "human", content: "hi" }] }],
+			});
+			linkMemoryTranscript("h2", "cross-journey-t");
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, {
+				withFriction: true,
+			});
+			// Both journeys parsed the exact same session (from the shared cache),
+			// so both report the same measured (empty) friction rather than one
+			// failing to read it.
+			expect(model.journeys).toHaveLength(2);
+			expect(model.journeys.every((j) => j.friction?.availability === "unavailable")).toBe(true);
+		}));
+});
+
+describe("buildJourneys — longestWaitMinutes sort", () => {
+	it("sorts more than one wait period into ascending start order", () =>
+		inDb(() => {
+			addMemory({ hash: "h1", message: "do the thing", atMs: NOW });
+			addRawTranscript("t1", "h1", {
+				sessions: [
+					{
+						sessionId: "s1",
+						source: "codex",
+						entries: [
+							{
+								role: "assistant",
+								content: "a1",
+								timestamp: new Date(NOW - 4 * 60 * 60_000).toISOString(),
+							},
+							{
+								role: "human",
+								content: "h1",
+								timestamp: new Date(NOW - 4 * 60 * 60_000 + 10 * 60_000).toISOString(),
+							},
+							{ role: "assistant", content: "a2", timestamp: new Date(NOW - 60 * 60_000).toISOString() },
+							{
+								role: "human",
+								content: "h2",
+								timestamp: new Date(NOW - 60 * 60_000 + 20 * 60_000).toISOString(),
+							},
+						],
+					},
+				],
+			});
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, { withWaits: true });
+			// The longer of the two waits (20 min) is what the roster reports.
+			expect(model.journeys[0]?.longestWaitMinutes).toBe(20);
 		}));
 });
 

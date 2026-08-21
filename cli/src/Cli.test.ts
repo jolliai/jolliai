@@ -159,6 +159,102 @@ describe("serveMcpInProcess (the fast path's fallback)", () => {
 		vi.doUnmock("./mcp/McpServer.js");
 		vi.resetModules();
 	});
+
+	it("skips the flush entirely when the telemetry module itself never loaded", async () => {
+		// The `telemetry` handle stays null when the dynamic import rejects (as
+		// opposed to loading fine and then having `bootstrapTelemetry` throw) — the
+		// `finally` must not call through a null handle in that case.
+		vi.doMock("./core/TelemetryStartup.js", () => {
+			throw new Error("module unavailable");
+		});
+		const startMcpServer = vi.fn(async () => {});
+		vi.doMock("./mcp/McpServer.js", () => ({ startMcpServer }));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { serveMcpInProcess } = await import("./Cli.js");
+
+		await expect(serveMcpInProcess("/repo")).resolves.toBeUndefined();
+
+		expect(startMcpServer).toHaveBeenCalledWith("/repo");
+		expect(errorSpy).toHaveBeenCalledWith("telemetry unavailable for this MCP session:", expect.any(Error));
+		// Only the "module unavailable" line — no second call attempting a flush
+		// through a null handle.
+		expect(errorSpy).toHaveBeenCalledTimes(1);
+		errorSpy.mockRestore();
+		vi.doUnmock("./core/TelemetryStartup.js");
+		vi.doUnmock("./mcp/McpServer.js");
+		vi.resetModules();
+	});
+
+	it("swallows a failing telemetry flush without throwing out of the finally", async () => {
+		// The exit flush is best-effort even on the fallback path — a network hiccup
+		// during flush must not replace whatever the server itself reported.
+		vi.doMock("./core/TelemetryStartup.js", () => ({
+			bootstrapTelemetry: vi.fn(async () => {}),
+			flushTelemetryNow: vi.fn(async () => {
+				throw new Error("network down");
+			}),
+			maybeShowCliTelemetryNotice: vi.fn(async () => {}),
+			BOUNDED_FLUSH_BUDGET_MS: 2_000,
+		}));
+		vi.doMock("./mcp/McpServer.js", () => ({ startMcpServer: vi.fn(async () => {}) }));
+		const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+		const { serveMcpInProcess } = await import("./Cli.js");
+
+		await expect(serveMcpInProcess("/repo")).resolves.toBeUndefined();
+
+		expect(errorSpy).toHaveBeenCalledWith("telemetry flush failed for this MCP session:", expect.any(Error));
+		errorSpy.mockRestore();
+		vi.doUnmock("./core/TelemetryStartup.js");
+		vi.doUnmock("./mcp/McpServer.js");
+		vi.resetModules();
+	});
+});
+
+describe("runMcpProxyFastPath", () => {
+	it("resolves the worktree-aware project dir and hands the proxy the in-process fallback", async () => {
+		// Exported solely so this real-process-startup path (otherwise only reached
+		// from inside the VITEST-gated auto-execute block) can be exercised directly,
+		// the same way `serveMcpInProcess` already is.
+		const runMcpProxy = vi.fn(async () => {});
+		vi.doMock("./mcp/McpProxy.js", () => ({ runMcpProxy }));
+		vi.doMock("./core/ProjectDir.js", () => ({
+			resolveProjectDir: () => "/repo",
+			resolveProjectDirInfo: () => ({ dir: "/repo", fromGit: true }),
+		}));
+		const { runMcpProxyFastPath, serveMcpInProcess } = await import("./Cli.js");
+
+		await runMcpProxyFastPath();
+
+		// `resolveProjectDirInfo`, not `resolveProjectDir`: a cwd from the non-git
+		// fallback must not key a shared daemon — asserted via `isWorktreeRoot`.
+		expect(runMcpProxy).toHaveBeenCalledWith({
+			cwd: "/repo",
+			isWorktreeRoot: true,
+			fallback: serveMcpInProcess,
+		});
+		vi.doUnmock("./mcp/McpProxy.js");
+		vi.doUnmock("./core/ProjectDir.js");
+		vi.resetModules();
+	});
+
+	it("propagates isWorktreeRoot: false for the non-git fallback cwd", async () => {
+		const runMcpProxy = vi.fn(async () => {});
+		vi.doMock("./mcp/McpProxy.js", () => ({ runMcpProxy }));
+		vi.doMock("./core/ProjectDir.js", () => ({
+			resolveProjectDir: () => "/tmp/not-a-repo",
+			resolveProjectDirInfo: () => ({ dir: "/tmp/not-a-repo", fromGit: false }),
+		}));
+		const { runMcpProxyFastPath } = await import("./Cli.js");
+
+		await runMcpProxyFastPath();
+
+		expect(runMcpProxy).toHaveBeenCalledWith(
+			expect.objectContaining({ cwd: "/tmp/not-a-repo", isWorktreeRoot: false }),
+		);
+		vi.doUnmock("./mcp/McpProxy.js");
+		vi.doUnmock("./core/ProjectDir.js");
+		vi.resetModules();
+	});
 });
 
 describe("Cli entry — cold-start import graph", () => {

@@ -67,8 +67,29 @@ interface SeedMemoryOptions {
 		source?: string;
 	};
 	readonly recap?: string;
-	readonly references?: ReadonlyArray<{ source: string; nativeId: string; title: string; url?: string }>;
+	readonly references?: ReadonlyArray<{
+		source: string;
+		nativeId: string;
+		title: string;
+		url?: string;
+		/** `ReferenceCommitRef.archivedKey` — absent on a hand-written fixture, present on a real archive. */
+		archivedKey?: string;
+		/** Newest query text of an `accumulateBody` source (context7, jollimemory). */
+		latestQuery?: string;
+	}>;
 	readonly plans?: ReadonlyArray<{ slug: string; title: string; addedAt: string; updatedAt: string }>;
+	/** `summary.skills` — the per-commit skill-usage snapshot. */
+	readonly skills?: ReadonlyArray<{
+		archivedKey: string;
+		source: string;
+		skill: string;
+		entryPaths: ReadonlyArray<unknown>;
+		invocationCount: number;
+		firstUsedAt: string;
+		lastUsedAt: string;
+		usage?: { input: number; output: number; cached: number };
+		detection?: "heuristic";
+	}>;
 	readonly notes?: ReadonlyArray<{
 		id: string;
 		title: string;
@@ -124,6 +145,7 @@ async function seedMemory(
 				...(opts.references ? { references: opts.references } : {}),
 				...(opts.plans ? { plans: opts.plans } : {}),
 				...(opts.notes ? { notes: opts.notes } : {}),
+				...(opts.skills ? { skills: opts.skills } : {}),
 				...(opts.excludedContext ? { excludedContext: opts.excludedContext } : {}),
 				...(opts.e2eTestGuide ? { e2eTestGuide: opts.e2eTestGuide } : {}),
 				...(opts.jolliDocId != null ? { jolliDocId: opts.jolliDocId } : {}),
@@ -496,6 +518,15 @@ describe("MemoriesQuery", () => {
 			expect(detail).toBeUndefined();
 		});
 
+		it("returns undefined for an empty hash rather than matching an arbitrary row", async () => {
+			// With the prefix predicate, `length("") = 0` would make
+			// `substr(commit_hash, 1, 0) = ""` true for EVERY row — guarded explicitly.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", "a".repeat(40), "feat: x");
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, ""), { dbPath });
+			expect(detail).toBeUndefined();
+		});
+
 		it("resolves a SHORT hash prefix to the same memory as the full hash", async () => {
 			// The wiki's source-commit links carry an 8-char hash, so /memories?hash=a742fa47
 			// must open the same memory the full 40-char hash does.
@@ -677,6 +708,205 @@ describe("MemoriesQuery", () => {
 			expect(bare?.excluded).toEqual([]);
 		});
 
+		it("resolves a reference's context key from its archived key, drops it on an unsafe one, and falls back to the latest query for an accumulating source", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x", {
+				references: [
+					// A real archive: the prefix is stripped and the remainder is path-safe.
+					{
+						source: "linear",
+						nativeId: "ACME-9",
+						title: "Rate limit followup",
+						url: "https://linear.app/y",
+						archivedKey: "linear:ACME-9-deadbeef",
+					},
+					// A path-unsafe nativeId behind the archived key — the catch branch.
+					{ source: "linear", nativeId: "ACME-BAD", title: "broken key", archivedKey: "linear:../../etc" },
+					// An accumulating source: leads with its title, not the nativeId, and
+					// shows its newest query text instead of a `<nativeId> (Source)` meta.
+					{
+						source: "context7",
+						nativeId: "lookup-1",
+						title: "Context7 lookup",
+						latestQuery: "how to use useEffect",
+					},
+					// Same source, no latestQuery at all — meta has nothing to show.
+					{ source: "context7", nativeId: "lookup-2", title: "Context7 lookup 2" },
+					// A legacy archived key with no `<source>:` prefix at all — used as-is
+					// rather than stripped.
+					{
+						source: "linear",
+						nativeId: "ACME-LEGACY",
+						title: "old shape",
+						archivedKey: "ACME-LEGACY-deadbeef",
+					},
+				],
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			const [withKey, unsafeKey, withQuery, withoutQuery, noPrefix] = detail?.context ?? [];
+			expect(noPrefix).toEqual({
+				kind: "reference",
+				title: "ACME-LEGACY — old shape",
+				source: "linear",
+				contextKey: "linear/ACME-LEGACY-deadbeef",
+				meta: "ACME-LEGACY (Linear)",
+			});
+			expect(withKey).toEqual({
+				kind: "reference",
+				title: "ACME-9 — Rate limit followup",
+				source: "linear",
+				contextKey: "linear/ACME-9-deadbeef",
+				meta: "ACME-9 (Linear)",
+				url: "https://linear.app/y",
+			});
+			// The unsafe nativeId means no document to open — the badge still renders.
+			expect(unsafeKey).toEqual({
+				kind: "reference",
+				title: "ACME-BAD — broken key",
+				source: "linear",
+				meta: "ACME-BAD (Linear)",
+			});
+			expect(withQuery).toEqual({
+				kind: "reference",
+				title: "Context7 lookup",
+				source: "context7",
+				meta: "how to use useEffect",
+			});
+			expect(withoutQuery).toEqual({ kind: "reference", title: "Context7 lookup 2", source: "context7" });
+		});
+
+		it("carries a synced JM-id in the detail payload when jolli_doc_id is set", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x", { jolliDocId: 7 });
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.memoryRefId).toBe("JM-7");
+			expect(detail?.synced).toBe(true);
+		});
+
+		it("carries a skills row, flagging inferred detection, when the commit used any", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x", {
+				skills: [
+					{
+						archivedKey: "claude:brainstorming-abcdefg",
+						source: "claude",
+						skill: "superpowers:brainstorming",
+						entryPaths: [],
+						invocationCount: 3,
+						firstUsedAt: "t",
+						lastUsedAt: "t",
+						usage: { input: 100, output: 50, cached: 10 },
+					},
+					{
+						archivedKey: "codex:review-abcdefg",
+						source: "codex",
+						skill: "review",
+						entryPaths: [],
+						invocationCount: 1,
+						firstUsedAt: "t",
+						lastUsedAt: "t",
+						detection: "heuristic",
+					},
+				],
+			});
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			const skillsRow = detail?.context.find((row) => row.kind === "skills");
+			expect(skillsRow).toMatchObject({ kind: "skills", title: "Skills used", contextKey: hash });
+			expect(skillsRow?.meta).toContain("some inferred");
+		});
+
+		it("prefers the live sessions title but defaults a source-less archived session to claude", async () => {
+			// The same default `buildConversations` gives an archived session with no
+			// recorded source — `readConversationEntries` already covers this default
+			// for the dialog; this pins it on the tree row too.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await withDashboardDb(
+				(db) => {
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+						id: number;
+					};
+					const blob = deflateSync(
+						Buffer.from(
+							JSON.stringify({
+								sessions: [
+									{
+										sessionId: "sess-nosource",
+										entries: [{ role: "human", content: "hi" }],
+									},
+								],
+							}),
+						),
+					);
+					db.prepare(
+						"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, 1)",
+					).run(repoId, `${hash}-t`, blob);
+					db.prepare(
+						"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)",
+					).run(repoId, hash, `${hash}-t`);
+				},
+				{ dbPath },
+			);
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations[0]?.source).toBe("claude");
+		});
+
+		it("ignores a blank live session title, falling through to the next rung", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "sess-blank",
+				title: "",
+				messageCount: 1,
+				entries: [{ role: "human", content: "restart the proxy" }],
+			});
+			// A live title that is present but blank must not win over the derived one.
+			await withDashboardDb((db) => db.prepare("UPDATE sessions SET title = NULL").run(), { dbPath });
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations[0]?.title).toBe("restart the proxy");
+		});
+
+		it("skips one unreadable transcript blob without blanking the rest of the panel", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x");
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "sess-good",
+				title: "readable",
+				messageCount: 1,
+			});
+			await withDashboardDb(
+				(db) => {
+					const { id: repoId } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+						id: number;
+					};
+					// Not deflated — inflateSync throws, which is exactly the "unreadable
+					// blob" case one bad transcript file must not take the others down with.
+					db.prepare(
+						"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, 1)",
+					).run(repoId, `${hash}-broken`, Buffer.from("not a valid zlib stream"));
+					db.prepare(
+						"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)",
+					).run(repoId, hash, `${hash}-broken`);
+				},
+				{ dbPath },
+			);
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations).toHaveLength(1);
+			expect(detail?.conversations[0]?.title).toBe("readable");
+		});
+
 		it("joins linked sessions into conversations and their tool calls into activity", async () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			const hash = "a".repeat(40);
@@ -816,6 +1046,31 @@ describe("MemoriesQuery", () => {
 
 			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
 			expect(detail?.conversations.map((c) => c.sessionId)).toEqual(["s3", "s1", "s2"]);
+		});
+
+		it("keeps the FIRST rank for a transcript id repeated in summary.transcripts[]", async () => {
+			// A squash that concatenated two summaries' transcripts[] arrays can repeat
+			// a shared id — first occurrence wins, so a later repeat must not move it.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "c".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: z", {
+				transcripts: [`${hash}-s2`, `${hash}-s1`, `${hash}-s2`],
+			});
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s1",
+				title: "first",
+				messageCount: 1,
+			});
+			await seedLinkedSession(dbPath, "repo-1", hash, {
+				source: "claude",
+				sessionId: "s2",
+				title: "second",
+				messageCount: 1,
+			});
+
+			const detail = await withDashboardDb((db) => buildMemoryDetail(db, ALL, hash), { dbPath });
+			expect(detail?.conversations.map((c) => c.sessionId)).toEqual(["s2", "s1"]);
 		});
 
 		it("carries ONE conversation figure, with no transcript-file count beside it", async () => {
@@ -1231,6 +1486,44 @@ describe("MemoriesQuery", () => {
 			const wrongKey = await withDashboardDb((db) => readContextDoc(db, "repo-1", "plan", "nope"), { dbPath });
 			expect([wrongRepo, wrongKind, wrongKey]).toEqual([undefined, undefined, undefined]);
 		});
+
+		it("renders the skills doc from the summary for kind 'skills'", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "a".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "feat: x", {
+				skills: [
+					{
+						archivedKey: "claude:brainstorming-abcdefg",
+						source: "claude",
+						skill: "superpowers:brainstorming",
+						entryPaths: [],
+						invocationCount: 2,
+						firstUsedAt: "t",
+						lastUsedAt: "t",
+					},
+				],
+			});
+			const doc = await withDashboardDb((db) => readContextDoc(db, "repo-1", "skills", hash), { dbPath });
+			expect(doc?.kind).toBe("skills");
+			expect(doc?.title).toBe(`Skills used — ${hash.substring(0, 8)}`);
+			expect(doc?.bodyMd).toContain("superpowers:brainstorming");
+		});
+
+		it("returns undefined for 'skills' on an unknown commit", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const doc = await withDashboardDb((db) => readContextDoc(db, "repo-1", "skills", "f".repeat(40)), {
+				dbPath,
+			});
+			expect(doc).toBeUndefined();
+		});
+
+		it("returns undefined for 'skills' on a commit that used none", async () => {
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			const hash = "b".repeat(40);
+			await seedMemory(dbPath, "repo-1", hash, "chore: y");
+			const doc = await withDashboardDb((db) => readContextDoc(db, "repo-1", "skills", hash), { dbPath });
+			expect(doc).toBeUndefined();
+		});
 	});
 
 	/**
@@ -1607,6 +1900,28 @@ describe("MemoriesQuery", () => {
 
 			expect(model.selected).toBeDefined();
 			expect(model.selected).not.toHaveProperty("transcriptRepairState");
+		});
+
+		it("resolves the lazy sibling-summaries and storage providers when the predicate actually asks for them", async () => {
+			// The predicate normally short-circuits before touching either provider
+			// (every other case in this suite proves that). Here it deliberately
+			// calls both, so the repo-wide sibling replay and the per-worktree
+			// storage build actually run at least once.
+			await seedRepo(dbPath, "repo-1", "acme-api");
+			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
+			// A sibling with no memory_transcripts rows — an empty candidate the
+			// dedup-floor replay must fold in.
+			const sibling = "c".repeat(40);
+			await seedMemory(dbPath, "repo-1", sibling, "feat: sibling");
+			vi.mocked(transcriptRepairState).mockImplementation(async (_summary, _worktreeRoot, providers) => {
+				const siblings = (await providers?.siblingSummaries?.()) ?? [];
+				await providers?.storage?.().catch(() => undefined);
+				return siblings.length > 0 ? "repairable" : "unrepairable";
+			});
+
+			const state = await withDashboardDb((db) => readMemoryTranscriptRepairState(db, ALL, HASH), { dbPath });
+
+			expect(state).toBe("repairable");
 		});
 	});
 });

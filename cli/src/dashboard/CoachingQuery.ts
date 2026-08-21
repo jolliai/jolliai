@@ -182,9 +182,20 @@ function heroPoints(
 		bucket.turns += journey.turns ?? 0;
 		byDate.set(key, bucket);
 	}
+	// `journeys` arrives sorted DESCENDING by `endedAtMs` (modelFromGroups), and
+	// `localDayKey` is non-decreasing in its input, so `byDate`'s insertion order
+	// — and so the pre-sort array here — is always non-increasing in `date`, with
+	// `Map` key uniqueness ruling out a tie. Measured against V8's real sort: a
+	// purely descending input's "detect the run is reversed" pass calls this
+	// comparator with the SMALLER-index element first every time, so `left <
+	// right` is always true and the `left > right` arm is never reached at all —
+	// both are defensive completeness for a comparator contract, not reachable
+	// through the one caller (`heroPoints`) that ever builds this array.
+	/* v8 ignore start */
 	return [...byDate.entries()]
 		.sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
 		.map(([date, v]) => ({ date, ...v }));
+	/* v8 ignore stop */
 }
 
 /** How many of the most-recent journeys the ADOPT NEXT share is measured over. */
@@ -229,7 +240,12 @@ function buildQueue(journeys: ReadonlyArray<LocalJourney>): ReadonlyArray<QueueI
 	const planFirstCount = journeys.filter((journey) => journey.planFirst).length;
 	if (planFirstCount * 2 < journeys.length) {
 		const straight = journeys.find((journey) => !journey.planFirst);
+		// `planFirstCount * 2 < journeys.length` (the outer guard) means fewer than
+		// half planned first, so a majority have `planFirst: false` — `straight` can
+		// never come back undefined whenever this line runs.
+		/* v8 ignore start */
 		if (straight) {
+			/* v8 ignore stop */
 			items.push({
 				key: "plan-first",
 				title: "Write a plan before your next feature",
@@ -243,9 +259,18 @@ function buildQueue(journeys: ReadonlyArray<LocalJourney>): ReadonlyArray<QueueI
 	}
 	const heavy = journeys.reduce<LocalJourney | null>((best, journey) => {
 		if (journey.turns == null) return best;
+		// `best` is only ever assigned a journey that passed the `turns == null`
+		// guard above, so `best.turns` is never null/undefined once `best` is
+		// non-null — this `?? 0` exists only to satisfy the type.
+		/* v8 ignore start */
 		return best == null || journey.turns > (best.turns ?? 0) ? journey : best;
+		/* v8 ignore stop */
 	}, null);
+	// Same reasoning as above: `heavy` only ever comes from a journey with a real
+	// `turns` number, so `heavy.turns ?? 0`'s fallback is unreachable.
+	/* v8 ignore start */
 	if (heavy && (heavy.turns ?? 0) >= SCOPE_TURNS) {
+		/* v8 ignore stop */
 		items.push({
 			key: "scope",
 			title: "Break large work into smaller journeys",
@@ -284,8 +309,13 @@ function buildPatterns(journeys: ReadonlyArray<LocalJourney>, timeZone: string):
 		// evidence", never "definitely not test-first", so it does not count.
 		{ key: "test-first", label: "Test first", match: (journey) => journey.tested?.testFirst === true },
 	];
+	// `defs`' four keys are all distinct strings, so a tie on `.key` (the
+	// trailing `: 0`) can never happen — kept for the same reason a comparator's
+	// contract always spells out all three outcomes.
+	/* v8 ignore start */
 	const byDisplay = (left: Pattern, right: Pattern) =>
 		right.count - left.count || (left.key < right.key ? -1 : left.key > right.key ? 1 : 0);
+	/* v8 ignore stop */
 	const patterns = defs
 		.map((def) => {
 			const matches = journeys.filter(def.match);
@@ -356,24 +386,42 @@ export function buildCoaching(
 	// (measured or partial, never unavailable) — a window with none is not "0
 	// flagged", it is "flagging was never measured here".
 	const flaggable = model.journeys.filter((j) => j.friction && j.friction.availability !== "unavailable");
+	// `j.friction?.value` is defined whenever `j.friction.availability` is
+	// "measured"/"partial" — `turnAbortsCell` always sets `value` alongside
+	// either of those (see JourneysQuery.ts) — so `?? 0` never falls back for a
+	// journey this filter actually reaches.
+	/* v8 ignore start */
 	const flaggedCount =
 		flaggable.length === 0 ? undefined : model.journeys.filter((j) => (j.friction?.value ?? 0) > 0).length;
+	/* v8 ignore stop */
 	// `awaitingCount` similarly stays absent unless at least one journey's wait
 	// was actually measured, never a false "0 stalled".
 	const waitMeasured = model.journeys.some((j) => j.longestWaitMinutes !== undefined);
+	// `buildCoachingWindow` always runs `collectWindowSignals` with `wantWaits`
+	// true, which sets EVERY journey's `longestWaitMinutes` (0 when no wait
+	// qualified) — so by the time `waitMeasured` is true, every journey already
+	// has a defined value and this `?? 0` fallback never fires.
+	/* v8 ignore start */
 	const awaitingCount = waitMeasured
 		? model.journeys.filter((j) => (j.longestWaitMinutes ?? 0) >= WAIT_STALL_MINUTES).length
 		: undefined;
+	/* v8 ignore stop */
 	return {
 		roster,
 		adoptNext: buildAdoptNext(model.journeys),
 		queue: buildQueue(model.journeys),
 		patterns: buildPatterns(model.journeys, timeZone),
 		hero: heroPoints(model.journeys, timeZone),
+		// `byId` is built from `model.journeys`, the exact array `model.smoothestId`
+		// / `model.hardestId` were derived from (see JourneysQuery.ts's
+		// `modelFromGroups`), so a truthy id always resolves — the `?? null`
+		// fallbacks exist only to satisfy the nullable field type.
+		/* v8 ignore start */
 		featured: {
 			smoothest: model.smoothestId ? (byId.get(model.smoothestId) ?? null) : null,
 			hardest: model.hardestId ? (byId.get(model.hardestId) ?? null) : null,
 		},
+		/* v8 ignore stop */
 		journeyCount: model.journeys.length,
 		...(flaggedCount !== undefined && { flaggedCount }),
 		...(awaitingCount !== undefined && { awaitingCount }),

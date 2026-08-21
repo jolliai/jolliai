@@ -1,6 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { resolveProjectDir } from "../core/ProjectDir.js";
-import { DEFAULT_SERVER_FLUSH_MS, startServerTelemetry } from "./ServerTelemetry.js";
+import { flushTelemetryNow } from "../core/TelemetryStartup.js";
+import { DEFAULT_SERVER_FLUSH_MS, SERVER_FLUSH_TIMEOUT_MS, startServerTelemetry } from "./ServerTelemetry.js";
+
+// Wraps the real `flushTelemetryNow` by default, so every test below that
+// supplies its own `deps.flush` never touches it. The one test exercising the
+// `deps.flush ?? default` fallback overrides it with `mockResolvedValue`
+// instead of letting the real implementation load config and hit the network.
+vi.mock("../core/TelemetryStartup.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("../core/TelemetryStartup.js")>();
+	return { ...actual, flushTelemetryNow: vi.fn(actual.flushTelemetryNow) };
+});
 
 describe("startServerTelemetry", () => {
 	beforeEach(() => {
@@ -56,5 +66,13 @@ describe("startServerTelemetry", () => {
 
 	it("exposes a sane default flush cadence", () => {
 		expect(DEFAULT_SERVER_FLUSH_MS).toBeGreaterThanOrEqual(10_000);
+	});
+
+	it("falls back to the real flushTelemetryNow and the default cadence when neither is supplied", async () => {
+		vi.mocked(flushTelemetryNow).mockResolvedValue(undefined);
+		const { stop } = await startServerTelemetry({ cwd: "/work" });
+		await vi.advanceTimersByTimeAsync(DEFAULT_SERVER_FLUSH_MS);
+		expect(flushTelemetryNow).toHaveBeenCalledWith("/work", { timeoutMs: SERVER_FLUSH_TIMEOUT_MS });
+		await stop();
 	});
 });

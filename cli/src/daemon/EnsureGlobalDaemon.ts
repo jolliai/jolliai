@@ -140,7 +140,16 @@ function tryConnect(socketPath: string): Promise<ConnectResult> {
 		let settled = false;
 		const socket = connect(socketPath);
 		const done = (result: ConnectResult): void => {
+			// Defensive: `done` has exactly three callers — the timer callback
+			// (cleared below), the `connect` once-listener (removed below, and
+			// self-removing besides), and the `error` handler, which itself checks
+			// `settled` before ever calling `done`. By the time any one of them
+			// could re-enter, the other two are already disarmed, so this guard is
+			// unreachable given that interlock. It stays as a fail-safe against a
+			// future caller adding a fourth trigger without preserving it.
+			/* v8 ignore start -- unreachable: done()'s three callers already interlock via clearTimeout/removeAllListeners/an external settled check */
 			if (settled) return;
+			/* v8 ignore stop */
 			settled = true;
 			clearTimeout(timer);
 			socket.removeAllListeners("connect");

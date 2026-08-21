@@ -328,4 +328,54 @@ describe("PluginBootstrapHook", () => {
 		mocks.readStdin.mockResolvedValueOnce("{bad");
 		await expect(main()).resolves.toBeUndefined();
 	});
+
+	it("keeps going when saveSession rejects — the first session is best-effort", async () => {
+		mocks.saveSession.mockRejectedValueOnce(new Error("disk full"));
+		const output = await runPluginBootstrap("/repo", { sessionId: "s1", transcriptPath: "/tmp/t.jsonl" });
+		expect(mocks.saveSession).toHaveBeenCalled();
+		// The rejection is caught and logged; the rest of the bootstrap still runs.
+		expect(mocks.install).toHaveBeenCalled();
+		expect(output).not.toBeNull();
+	});
+
+	it("skips context-phase work when manual-disable flips true between the two lock phases", async () => {
+		// menuPhase's read (line ~120) sees not-disabled and proceeds to `install`;
+		// the SECOND read, inside the context phase, sees disabled and returns early
+		// — a race the first check alone cannot catch.
+		mocks.readManualDisableFlag.mockResolvedValueOnce(false).mockResolvedValueOnce(true);
+		await runPluginBootstrap("/repo");
+		expect(mocks.install).toHaveBeenCalled();
+		expect(mocks.ensurePluginDefaultProvider).not.toHaveBeenCalled();
+		expect(mocks.buildSessionStartContext).not.toHaveBeenCalled();
+	});
+
+	it("main falls back to process.cwd() when stdin is blank, and writes nothing when there is no output", async () => {
+		mocks.readStdin.mockResolvedValueOnce("   ");
+		mocks.isInsideGitRepo.mockResolvedValueOnce(false);
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		try {
+			await main();
+			expect(mocks.isInsideGitRepo).toHaveBeenCalledWith(process.cwd());
+			expect(writeSpy).not.toHaveBeenCalled();
+			// The daemon trigger runs regardless of whether bootstrap produced output.
+			expect(mocks.triggerEnsureGlobalDaemon).toHaveBeenCalled();
+		} finally {
+			writeSpy.mockRestore();
+		}
+	});
+
+	it("main writes the JSON output to stdout and triggers the global daemon on a full run", async () => {
+		mocks.isPluginJolliMenuCanonical.mockResolvedValueOnce(false).mockResolvedValue(true);
+		mocks.readStdin.mockResolvedValueOnce(JSON.stringify({ cwd: "/repo/subdir" }));
+		const writeSpy = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+		try {
+			await main();
+			expect(writeSpy).toHaveBeenCalledTimes(1);
+			const written = JSON.parse(writeSpy.mock.calls[0]?.[0] as string);
+			expect(written.hookSpecificOutput.hookEventName).toBe("SessionStart");
+			expect(mocks.triggerEnsureGlobalDaemon).toHaveBeenCalled();
+		} finally {
+			writeSpy.mockRestore();
+		}
+	});
 });

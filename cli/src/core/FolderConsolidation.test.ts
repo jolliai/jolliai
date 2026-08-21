@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -148,6 +148,13 @@ describe("FolderConsolidation", () => {
 			expect(await classifyDuplicateFolders("/cwd", "app", REMOTE, parent)).toBeNull();
 		});
 
+		it("declines to classify while the project is manually disabled", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			setManuallyDisabled(true);
+			expect(await classifyDuplicateFolders("/cwd", "app", REMOTE, parent)).toBeNull();
+		});
+
 		it("classifies identical folders and keeps the shortest name as survivor", async () => {
 			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
 			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
@@ -187,6 +194,26 @@ describe("FolderConsolidation", () => {
 			expect(plan?.kind).toBe("orphan-superset");
 			expect(plan?.survivor).toBe(join(parent, "app")); // canonical base slot
 			expect(plan?.archived).toEqual([join(parent, "app"), join(parent, "app-2")]);
+		});
+
+		it("ignores a non-.json entry in the orphan branch's summaries listing", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a3"] });
+			const sot = new InMemoryStorage(true);
+			await sot.writeFiles(
+				[
+					{ path: "index.json", content: indexJson(["a1", "a2", "a3"]) },
+					{ path: "summaries/a1.json", content: summaryJson("a1") },
+					{ path: "summaries/a2.json", content: summaryJson("a2") },
+					{ path: "summaries/a3.json", content: summaryJson("a3") },
+					{ path: "summaries/.keep", content: "" },
+				],
+				"seed",
+			);
+			__setSotResolverForTests(async () => sot);
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			expect(plan?.kind).toBe("orphan-superset");
+			expect(plan?.counts.orphan).toBe(3);
 		});
 
 		it("groups folders split only by an ssh host alias", async () => {
@@ -330,12 +357,53 @@ describe("FolderConsolidation", () => {
 			expect(plan?.kind).toBe("union-largest");
 		});
 
+		it("treats a non-Error throw from the source of truth as empty too", async () => {
+			// `readOrphanSummaryHashes` must handle a thrown NON-Error value (a bare
+			// string, say) the same way it handles a real Error.
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a3"] });
+			__setSotResolverForTests(async () => {
+				throw "boom-string";
+			});
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			expect(plan?.kind).toBe("union-largest");
+		});
+
+		it("treats a source of truth that reports itself absent as empty → union-largest", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a3"] });
+			__setSotResolverForTests(async () => new InMemoryStorage(false));
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			expect(plan?.kind).toBe("union-largest");
+			expect(plan?.counts.orphan).toBe(0);
+		});
+
 		it("breaks a size tie toward the shortest folder name", async () => {
 			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
 			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a3"] });
 			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
 			expect(plan?.kind).toBe("union-largest");
 			expect(plan?.survivor).toBe(join(parent, "app")); // 2 == 2 → shortest name wins
+		});
+
+		it("breaks a same-length name tie via localeCompare when there is no base folder", async () => {
+			// Folder names are always `<repo>` or `<repo>-<suffix>`, so a length tie
+			// only happens with no base folder and two SAME-suffix-digit-width names
+			// ("app-2" and "app-3" are both 5 characters).
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-3", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			expect(plan?.kind).toBe("union-largest");
+			expect(plan?.survivor).toBe(join(parent, "app-2")); // same length → localeCompare("app-2","app-3")
+		});
+
+		it("ignores a non-.json entry in a folder's summaries directory", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			writeFileSync(join(app, ".jolli", "summaries", ".DS_Store"), "junk");
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			expect(plan?.kind).toBe("identical");
+			expect(plan?.counts.perFolder[app]).toBe(2);
 		});
 
 		it("unions manifest and branches across folders, deduping by id/branch", async () => {
@@ -530,6 +598,116 @@ describe("FolderConsolidation", () => {
 			await executeConsolidation(plan, "/cwd", REMOTE, parent);
 			const idx = JSON.parse(readFileSync(join(parent, "app", ".jolli", "index.json"), "utf-8")) as SummaryIndex;
 			expect(idx.commitAliases).toMatchObject({ unknownhash: "z9" });
+		});
+
+		it("keeps the survivor's own commitAlias when two folders alias the same key differently", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			writeFileSync(
+				join(app, ".jolli", "index.json"),
+				JSON.stringify({
+					version: 3,
+					entries: [
+						{ commitHash: "a1", parentCommitHash: null },
+						{ commitHash: "a2", parentCommitHash: null },
+					],
+					commitAliases: { shared: "a1" },
+				}),
+			);
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			writeFileSync(
+				join(parent, "app-2", ".jolli", "index.json"),
+				JSON.stringify({
+					version: 3,
+					entries: [
+						{ commitHash: "a1", parentCommitHash: null },
+						{ commitHash: "z9", parentCommitHash: null },
+					],
+					commitAliases: { shared: "z9" },
+				}),
+			);
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			await executeConsolidation(plan, "/cwd", REMOTE, parent);
+			const idx = JSON.parse(readFileSync(join(app, ".jolli", "index.json"), "utf-8")) as SummaryIndex;
+			// Survivor (app) is processed first, so its own "shared" alias wins.
+			expect(idx.commitAliases).toMatchObject({ shared: "a1" });
+		});
+
+		it("falls back to index version 3 and skips a source with no entries when the survivor has no index.json", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			// Survivor ("app", the shorter name) has no index.json of its own.
+			rmSync(join(app, ".jolli", "index.json"));
+			// The other folder's index.json is present but carries no `entries` array.
+			writeFileSync(join(parent, "app-2", ".jolli", "index.json"), JSON.stringify({ version: 3 }));
+
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			expect(plan.kind).toBe("identical");
+			await executeConsolidation(plan, "/cwd", REMOTE, parent);
+
+			const idx = JSON.parse(readFileSync(join(app, ".jolli", "index.json"), "utf-8")) as SummaryIndex;
+			expect(idx.version).toBe(3);
+			expect(idx.entries).toEqual([]);
+		});
+
+		it("does not copy a plain file literally named .git into the survivor", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			const app2 = makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			// A worktree/submodule-style ".git" pointer FILE (not a directory) at the
+			// loser's root — the copy-if-absent walk must skip it by exact name match.
+			writeFileSync(join(app2, ".git"), "gitdir: /elsewhere/.git/worktrees/app-2\n");
+
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			await executeConsolidation(plan, "/cwd", REMOTE, parent);
+
+			expect(existsSync(join(app, ".git"))).toBe(false);
+		});
+
+		it("does not descend into a nested archive/ or .git/ directory while copying", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			const app2 = makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			mkdirSync(join(app2, ".git"), { recursive: true });
+			writeFileSync(join(app2, ".git", "config"), "junk");
+			mkdirSync(join(app2, ".jolli", "archive"), { recursive: true });
+			writeFileSync(join(app2, ".jolli", "archive", "old.json"), "junk");
+
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			await executeConsolidation(plan, "/cwd", REMOTE, parent);
+
+			expect(existsSync(join(app, ".git"))).toBe(false);
+			expect(existsSync(join(app, ".jolli", "archive", "old.json"))).toBe(false);
+		});
+
+		it("skips a symlink entry while walking a folder's tree", async () => {
+			const app = makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			const app2 = makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1"] });
+			// A Dirent for a symlink is neither `isFile()` nor `isDirectory()` (readdirSync
+			// with withFileTypes does not follow it) — the walk must not choke on it.
+			symlinkSync(join(app2, ".jolli", "config.json"), join(app2, "link-to-config"));
+
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+			await expect(executeConsolidation(plan, "/cwd", REMOTE, parent)).resolves.toBeDefined();
+			expect(existsSync(join(app, "link-to-config"))).toBe(false);
+		});
+
+		it("reports a stale plan when the folder set drops below two, not just when it changes", async () => {
+			makeKbFolder(parent, "app", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "a2"] });
+			makeKbFolder(parent, "app-2", { remoteUrl: REMOTE, repoName: "app", hashes: ["a1", "z9"] });
+			const plan = await classifyDuplicateFolders("/cwd", "app", REMOTE, parent);
+			assertPlan(plan);
+
+			// One folder disappears entirely (e.g. archived by another window) before
+			// this window's confirmation runs — `classifyDuplicateFolders` now returns
+			// null (fewer than two folders), which is a stale plan, not "disabled".
+			rmSync(join(parent, "app-2"), { recursive: true, force: true });
+
+			await expect(revalidateConsolidationPlan(plan, "/cwd", REMOTE, parent)).rejects.toBeInstanceOf(
+				ConsolidationStalePlanError,
+			);
 		});
 	});
 });

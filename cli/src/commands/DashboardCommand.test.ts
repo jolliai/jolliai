@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import type { Server } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -1055,6 +1055,125 @@ describe("executeDashboard", () => {
 	});
 });
 
+describe("seam threading and import reporting", () => {
+	it("runs with a bare deps object — no configDir, dbPath or now", async () => {
+		// Exercises the falsy side of every optional-seam spread: registerRepo and
+		// pruneDisposableRepos get no configDir, dbBackfillRepos no dbPath and no now.
+		await importDashboardHistory("/w", {});
+		expect(dbBackfillRepos).toHaveBeenCalledTimes(1);
+		expect(registerRepo).toHaveBeenCalledWith({ cwd: "/w" });
+		expect(vi.mocked(pruneDisposableRepos).mock.calls[0]?.[0]).toEqual({});
+		expect(vi.mocked(dbBackfillRepos).mock.calls[0]?.[1]).not.toHaveProperty("dbPath");
+		expect(vi.mocked(dbBackfillRepos).mock.calls[0]?.[1]).not.toHaveProperty("now");
+	});
+
+	it("threads configDir, dbPath and now through the prune, import and cutover sweep", async () => {
+		await importDashboardHistory("/w", { configDir: "/cfg", dbPath: "/db", now: () => 7 });
+		expect(registerRepo).toHaveBeenCalledWith({ cwd: "/w", configDir: "/cfg" });
+		expect(vi.mocked(pruneDisposableRepos).mock.calls[0]?.[0]).toMatchObject({ configDir: "/cfg", dbPath: "/db" });
+		expect(vi.mocked(dbBackfillRepos).mock.calls[0]?.[1]).toMatchObject({ dbPath: "/db" });
+		expect(vi.mocked(dbBackfillRepos).mock.calls[0]?.[1]?.now?.()).toBe(7);
+		expect(autoCutoverAllRepos).toHaveBeenCalledWith(expect.objectContaining({ dbPath: "/db" }));
+	});
+
+	it("titles the block by the tier that has work, forwarding each event to the printer", async () => {
+		// dbBackfillRepos drives onProgress: a `commits` event reveals the history
+		// header, a `memories` event the migration header (the first reveal wins), and
+		// a `sessions` event falls through to the printer without revealing either.
+		vi.mocked(dbBackfillRepos).mockImplementationOnce(async (_repos, opts) => {
+			const base = { repoName: "a", repoIndex: 1, repoTotal: 1, total: undefined } as const;
+			opts?.onProgress?.({ ...base, kind: "commits", done: 0 } as never);
+			opts?.onProgress?.({ ...base, kind: "memories", done: 1 } as never);
+			opts?.onProgress?.({ ...base, kind: "sessions", done: 0 } as never);
+			return [{ mode: "bootstrapped", repoName: "a", sotImport: { nodes: 1, updated: 1 } }] as never;
+		});
+
+		await importDashboardHistory("/w", deps());
+
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		// First reveal wins — a commits event arrived first, so the block is titled as
+		// history indexing, not migration.
+		expect(out).toContain("Indexing your git history");
+	});
+
+	it("names each skipped repo under the migration header and counts a single migrated memory", async () => {
+		registered([
+			{ repoIdentity: "r1", repoName: "a", worktreeRoot: "/a", enabledAt: "t" },
+			{ repoIdentity: "r2", repoName: "b", worktreeRoot: "/b", enabledAt: "t" },
+		]);
+		vi.mocked(dbBackfillRepos).mockResolvedValue([
+			// Has sotImport → the reduce reads its nodes/updated (the left side of `?.`).
+			{ mode: "bootstrapped", repoName: "a", sotImport: { nodes: 1, updated: 1 } },
+			// No sotImport → the reduce takes the `?? 0` fallback.
+			{ mode: "recovered", repoName: "b" },
+			// A skipped repo WITH an error, and one WITHOUT → both sides of `?? "unknown error"`.
+			{ mode: "skipped", repoName: "c", error: "boom" },
+			{ mode: "skipped", repoName: "d" },
+		] as unknown as Awaited<ReturnType<typeof dbBackfillRepos>>);
+
+		await importDashboardHistory("/w", deps());
+
+		const out = vi.mocked(console.log).mock.calls.flat().join("\n");
+		expect(out).toContain("c — migration failed: boom");
+		expect(out).toContain("d — migration failed: unknown error");
+		// One memory migrated (only `a` carried a node) → the singular noun.
+		expect(out).toContain("Migrated 1 memory");
+	});
+
+	it("passes a valid --port through and binds it", async () => {
+		const d = deps();
+		await executeDashboard("stats", { cwd: "/w", port: "8080" }, d);
+		expect(d.started[0]?.port).toBe(8080);
+	});
+
+	it("rejects a --port at or below zero and above the 16-bit ceiling", async () => {
+		await expect(executeDashboard("stats", { cwd: "/w", port: "0" }, deps())).resolves.toBe(false);
+		await expect(executeDashboard("stats", { cwd: "/w", port: "70000" }, deps())).resolves.toBe(false);
+	});
+
+	it("threads dbPath through the bind and the machine-db ensure step", async () => {
+		const dbPath = join(configDir, "dash.db");
+		const d = deps({ dbPath });
+		await executeDashboard("stats", { cwd: "/w" }, d);
+		expect(d.started).toHaveLength(1);
+		expect(autoCutoverAllRepos).toHaveBeenCalledWith(expect.objectContaining({ dbPath }));
+	});
+
+	it("registers with no configDir when deps omits one", async () => {
+		const dbPath = join(configDir, "dash-noconfig.db");
+		await executeDashboard("stats", { cwd: "/w" }, deps({ configDir: undefined, dbPath }));
+		expect(registerRepo).toHaveBeenCalledWith({ cwd: "/w" });
+	});
+
+	it("reports a failure to create the dashboard database as a message and returns false", async () => {
+		// ensureDashboardDbExists throws when its parent path is a regular file — the
+		// launch reports it and bails rather than crashing.
+		const blocker = join(configDir, "not-a-dir");
+		writeFileSync(blocker, "x");
+		const errors: string[] = [];
+		vi.mocked(console.error).mockImplementation((...a: unknown[]) => {
+			errors.push(a.map(String).join(" "));
+		});
+		const ok = await executeDashboard("stats", { cwd: "/w" }, deps({ dbPath: join(blocker, "x.db") }));
+		expect(ok).toBe(false);
+		expect(errors.join("\n")).toContain("could not create the dashboard database");
+	});
+
+	it("resolves the server cwd from process.cwd() when no cwd is given", async () => {
+		const d = deps();
+		await startForegroundDashboard("stats", {}, d);
+		expect(d.started).toHaveLength(1);
+		expect(d.started[0]?.serverCwd).toBe(await resolveServerCwd(process.cwd()));
+	});
+
+	it("threads dbPath into the bound server options", async () => {
+		const dbPath = join(configDir, "fg.db");
+		const d = deps({ dbPath });
+		await startForegroundDashboard("stats", { cwd: "/w" }, d);
+		expect(d.started).toHaveLength(1);
+	});
+});
+
 describe("registerDashboardCommand", () => {
 	it("registers dashboard alone, with its flags", () => {
 		const program = new Command();
@@ -1270,6 +1389,31 @@ describe("createProgressPrinter", () => {
 		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined }));
 		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined, sessionBreakdown: {} }));
 		expect(lines).toEqual(["  Reading AI sessions…"]);
+	});
+
+	it("defaults its writer to console.log when no log seam is injected", () => {
+		// The `deps.log ?? CONSOLE_OUTPUT.log` fallback — with no seam it prints
+		// straight to the console (spied in beforeEach).
+		const printer = createProgressPrinter();
+		printer.onProgress(event({ kind: "sessions", done: 0, total: undefined }));
+		expect(vi.mocked(console.log).mock.calls.flat().join("\n")).toContain("Reading AI sessions…");
+	});
+
+	it("prints a phase label once per detail, dropping a repeat", () => {
+		const lines: string[] = [];
+		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
+		printer.onProgress(event({ kind: "summaries", done: 0, total: undefined }));
+		printer.onProgress(event({ kind: "summaries", done: 0, total: undefined }));
+		expect(lines).toEqual(["  Indexing stored memories…"]);
+	});
+
+	it("prints no commit counter below the progress floor", () => {
+		const lines: string[] = [];
+		const printer = createProgressPrinter({ log: (line) => lines.push(line) });
+		// done>0 so it is past the phase-label branch, total<PROGRESS_MIN_TOTAL so the
+		// quarter counter is suppressed — the whole event produces nothing.
+		printer.onProgress(event({ kind: "commits", done: 10, total: 50 }));
+		expect(lines).toEqual([]);
 	});
 });
 

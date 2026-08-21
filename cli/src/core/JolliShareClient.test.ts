@@ -17,18 +17,26 @@ function jsonResponse(status: number, value: unknown): Response {
 	return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } });
 }
 
-function client(response: Response | (() => Promise<Response>)) {
+function client(response: Response | (() => Promise<Response>), opts: { readonly apiKey?: string } = {}) {
 	const fetchImpl = vi.fn(
 		typeof response === "function" ? response : async () => response,
 	) as unknown as typeof fetch;
 	return {
 		client: new JolliShareClient({
-			apiKey: "sk-jol-test",
+			apiKey: opts.apiKey ?? "sk-jol-test",
 			baseUrlOverride: "https://jolli.dev/acme",
 			fetchImpl,
 		}),
 		fetchImpl,
 	};
+}
+
+/** A `sk-jol-` key whose embedded meta carries an org slug, for the `x-org-slug` header. */
+function apiKeyWithOrg(org: string): string {
+	const meta = Buffer.from(JSON.stringify({ t: "tenant-1", u: "https://jolli.dev/acme", o: org })).toString(
+		"base64url",
+	);
+	return `sk-jol-${meta}.secret`;
 }
 
 describe("JolliShareClient", () => {
@@ -67,6 +75,27 @@ describe("JolliShareClient", () => {
 		).resolves.toMatchObject({ shareId: "7", shareUrl: "https://jolli.dev/s/7" });
 	});
 
+	it("treats a non-string, non-finite-number share id as absent", async () => {
+		// Neither a string (line one) nor a finite number (line two) — the
+		// malformed-response guard must still catch it.
+		await expect(
+			client(jsonResponse(200, { shareId: true, shareUrl: "https://jolli.dev/s/x" })).client.create(payload),
+		).rejects.toThrow("missing shareId/shareUrl");
+	});
+
+	it("defaults to the global fetch when no fetchImpl override is supplied", async () => {
+		const realFetch = globalThis.fetch;
+		const spy = vi.fn(async () => jsonResponse(201, { shareId: "1", shareUrl: "https://jolli.dev/s/1" }));
+		globalThis.fetch = spy as unknown as typeof fetch;
+		try {
+			const api = new JolliShareClient({ apiKey: "sk-jol-test", baseUrlOverride: "https://jolli.dev/acme" });
+			await expect(api.create(payload)).resolves.toMatchObject({ shareId: "1" });
+			expect(spy).toHaveBeenCalledTimes(1);
+		} finally {
+			globalThis.fetch = realFetch;
+		}
+	});
+
 	it("rejects malformed success and maps ordinary server errors", async () => {
 		await expect(client(jsonResponse(200, { shareId: "only-id" })).client.create(payload)).rejects.toThrow(
 			"missing shareId/shareUrl",
@@ -89,6 +118,31 @@ describe("JolliShareClient", () => {
 		await expect(client(jsonResponse(426, { message: "upgrade" })).client.update("s", {})).rejects.toMatchObject({
 			name: "ClientOutdatedError",
 			message: "upgrade",
+		});
+	});
+
+	it("carries shareUrl/expiresAt/token through when shareId/visibility/recipients are absent", async () => {
+		// The mirror image of the previous test's field presence — together the two
+		// exercise both sides of every optional field in the update response.
+		await expect(
+			client(
+				jsonResponse(200, {
+					shareUrl: "https://jolli.dev/s/2",
+					expiresAt: "2027-01-01T00:00:00Z",
+					token: "tok-2",
+				}),
+			).client.update("s", {}),
+		).resolves.toEqual({
+			shareUrl: "https://jolli.dev/s/2",
+			expiresAt: "2027-01-01T00:00:00Z",
+			token: "tok-2",
+		});
+	});
+
+	it("maps a 426 with a body that isn't JSON to the default outdated-client message", async () => {
+		await expect(client(new Response("not json", { status: 426 })).client.update("s", {})).rejects.toMatchObject({
+			name: "ClientOutdatedError",
+			message: "Client outdated — update Jolli Memory.",
 		});
 	});
 
@@ -115,6 +169,36 @@ describe("JolliShareClient", () => {
 			sent: [],
 			failed: [],
 		});
+	});
+
+	it("maps a failed invite the same way as the other endpoints", async () => {
+		await expect(
+			client(new Response("gateway down", { status: 502 })).client.invite("share", ["a@example.com"]),
+		).rejects.toThrow("request failed (HTTP 502): gateway down");
+	});
+
+	it("omits x-tenant-slug when the base URL carries no tenant path segment", async () => {
+		const fetchImpl = vi.fn(async () =>
+			jsonResponse(201, { shareId: "1", shareUrl: "https://jolli.dev/s/1" }),
+		) as unknown as typeof fetch;
+		const api = new JolliShareClient({
+			apiKey: "sk-jol-test",
+			baseUrlOverride: "https://jolli.dev",
+			fetchImpl,
+		});
+		await api.create(payload);
+		const [, init] = vi.mocked(fetchImpl).mock.calls[0];
+		expect(init?.headers).not.toHaveProperty("x-tenant-slug");
+	});
+
+	it("sends x-org-slug when the API key's own metadata carries an org", async () => {
+		const { client: api, fetchImpl } = client(
+			jsonResponse(201, { shareId: "1", shareUrl: "https://jolli.dev/s/1" }),
+			{ apiKey: apiKeyWithOrg("acme-org") },
+		);
+		await api.create(payload);
+		const [, init] = vi.mocked(fetchImpl).mock.calls[0];
+		expect(init?.headers).toMatchObject({ "x-org-slug": "acme-org" });
 	});
 
 	it("filters malformed organization members and degrades failures to empty", async () => {

@@ -205,7 +205,14 @@ export async function serveMcpInProcess(dir: string): Promise<void> {
 	}
 }
 
-async function runMcpProxyFastPath(): Promise<void> {
+/**
+ * Exported (rather than kept file-private, like the rest of the auto-execute
+ * block below) solely so a unit test can call it directly — the block that
+ * invokes it at real-process startup is itself `v8 ignore`d because it only
+ * runs outside VITEST. `serveMcpInProcess` above is exported for the same
+ * reason.
+ */
+export async function runMcpProxyFastPath(): Promise<void> {
 	const { runMcpProxy } = await import("./mcp/McpProxy.js");
 	// `resolveProjectDirInfo`, not `resolveProjectDir`: a cwd that came from the
 	// non-git fallback must not key a shared daemon. This is the path that

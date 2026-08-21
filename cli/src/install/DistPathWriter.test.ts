@@ -2,8 +2,26 @@ import { mkdtemp, readFile, rm, stat, utimes, writeFile } from "node:fs/promises
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { installDistPath } from "./DistPathWriter.js";
+
+// Redirect homedir() so the "globalDir omitted" fallback test doesn't touch the
+// developer's real ~/.jolli/jollimemory — mirrors the pattern in
+// SessionTracker.test.ts. Default passes through to the real homedir(); the one
+// test that needs the fallback branch opts in via mockHomedir.mockReturnValue().
+const { mockHomedir, realHomedir } = vi.hoisted(() => ({
+	mockHomedir: vi.fn<typeof import("node:os").homedir>(),
+	realHomedir: { current: null as typeof import("node:os").homedir | null },
+}));
+vi.mock("node:os", async (importOriginal) => {
+	const original = await importOriginal<typeof import("node:os")>();
+	realHomedir.current = original.homedir;
+	mockHomedir.mockImplementation(original.homedir);
+	return {
+		...original,
+		homedir: mockHomedir,
+	};
+});
 
 const cleanup: string[] = [];
 const requiredRuntimeFiles = [
@@ -128,6 +146,49 @@ describe("installDistPath — source-tag write-boundary guard", () => {
 		// complete dist — otherwise a single-source install would resolve to nothing.
 		expect(await installDistPath("claude-plugin", incomplete, "9.0.0", globalDir)).toBe(true);
 		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(`2.0.0\n${complete}`);
+	});
+
+	// Both defaulted params (`distDir`, `globalDir`) are `??` fallbacks that every
+	// other case in this file bypasses by passing explicit values — cover the
+	// fallback side of each separately.
+	it("falls back to the caller's own directory when distDir is omitted", async () => {
+		const globalDir = await mkdtemp(join(tmpdir(), "jolli-global-"));
+		cleanup.push(globalDir);
+		// DistPathWriter.ts and this test file are co-located, so the module's own
+		// `dirname(fileURLToPath(import.meta.url))` fallback resolves to the same
+		// directory as this test's.
+		const expectedCallerDir = dirname(fileURLToPath(import.meta.url));
+
+		expect(await installDistPath("claude-plugin", undefined, "1.0.0", globalDir)).toBe(true);
+		expect(await readFile(join(globalDir, "dist-paths", "claude-plugin"), "utf-8")).toBe(
+			`1.0.0\n${expectedCallerDir}`,
+		);
+	});
+
+	it("falls back to the real home directory when globalDir is omitted", async () => {
+		const fakeHome = await mkdtemp(join(tmpdir(), "jolli-fakehome-"));
+		cleanup.push(fakeHome);
+		mockHomedir.mockReturnValue(fakeHome);
+		try {
+			const dist = await completeDist("home-fallback");
+			expect(await installDistPath("claude-plugin", dist, "1.0.0")).toBe(true);
+			expect(
+				await readFile(join(fakeHome, ".jolli", "jollimemory", "dist-paths", "claude-plugin"), "utf-8"),
+			).toBe(`1.0.0\n${dist}`);
+		} finally {
+			if (realHomedir.current) mockHomedir.mockImplementation(realHomedir.current);
+		}
+	});
+
+	it("returns false and logs a warning when the filesystem write fails", async () => {
+		// A plain FILE where a directory is expected makes `mkdir(distPathsDir, {
+		// recursive: true })` throw ENOTDIR, exercising the catch branch.
+		const notADir = await mkdtemp(join(tmpdir(), "jolli-notadir-"));
+		cleanup.push(notADir);
+		const filePath = join(notADir, "im-a-file");
+		await writeFile(filePath, "");
+
+		expect(await installDistPath("claude-plugin", "/some/dist", "1.0.0", filePath)).toBe(false);
 	});
 });
 

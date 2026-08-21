@@ -31,13 +31,21 @@ vi.mock("./McpDaemonProtocol.js", async (importOriginal) => ({
 // Only the OS-level spawn is stubbed, so the argv the proxy builds for its
 // daemon is asserted for real. Every other test in this file injects
 // `spawnDaemon` and never reaches this.
-const spawnHidden = vi.fn(() => ({ pid: 4242, unref: vi.fn() }));
+const spawnHidden = vi.fn<() => { pid: number | undefined; unref: () => void }>(() => ({ pid: 4242, unref: vi.fn() }));
 vi.mock("../util/Subprocess.js", () => ({ spawnHidden: (...args: unknown[]) => spawnHidden(...(args as [])) }));
 
 // The real resolver answers `undefined` under `vitest`, which runs from the
 // source tree where no `Cli.js` sits beside the proxy. The resolution rule
-// itself is covered by `util/CliEntry.test.ts`.
-vi.mock("../util/CliEntry.js", () => ({ resolveCliEntry: () => "/opt/jolli/dist/Cli.js" }));
+// itself is covered by `util/CliEntry.test.ts`. Wrapped in a `vi.fn()` (rather
+// than a fixed factory) so one test can simulate the "cannot locate it" case.
+const resolveCliEntry = vi.fn<() => string | undefined>(() => "/opt/jolli/dist/Cli.js");
+vi.mock("../util/CliEntry.js", () => ({ resolveCliEntry: () => resolveCliEntry() }));
+
+// The default fallback dynamically imports this module — mocked so the ONE
+// test that reaches it (every other test injects its own `fallback`) never
+// pulls in the real storage/search/push stack.
+const startMcpServer = vi.fn().mockResolvedValue(undefined);
+vi.mock("./McpServer.js", () => ({ startMcpServer: (...args: unknown[]) => startMcpServer(...(args as [string])) }));
 
 const { runMcpProxy } = await import("./McpProxy.js");
 const {
@@ -132,6 +140,9 @@ beforeEach(async () => {
 	isPluginBundleCwd.mockReturnValue(false);
 	isLocalAgentChild.mockReturnValue(false);
 	isManagedSocketDirSafe.mockReturnValue(true);
+	resolveCliEntry.mockReset().mockReturnValue("/opt/jolli/dist/Cli.js");
+	startMcpServer.mockReset().mockResolvedValue(undefined);
+	spawnHidden.mockClear();
 });
 
 afterEach(async () => {
@@ -285,6 +296,40 @@ describeUnixSocket("runMcpProxy — cwd guards", () => {
 		await runMcpProxy({ cwd: CWD, socketPath, fallback, spawnDaemon: vi.fn() });
 		expect(fallback).toHaveBeenCalledTimes(1);
 	});
+
+	it("uses startMcpServer as the default fallback when none is injected", async () => {
+		// Every other test in this file injects its own `fallback` to avoid pulling
+		// in the real server; this is the one that exercises the production
+		// default, reached by dynamic import so the cold-start path never pays for
+		// it. `isWorktreeRoot: false` reaches the fallback without any daemon
+		// dance.
+		const stderr = vi.spyOn(process.stderr, "write").mockReturnValue(true);
+		try {
+			await expect(runMcpProxy({ cwd: "/", isWorktreeRoot: false, spawnDaemon: vi.fn() })).resolves.toBe(
+				"refused",
+			);
+			expect(startMcpServer).toHaveBeenCalledWith("/");
+		} finally {
+			stderr.mockRestore();
+		}
+	});
+});
+
+describeUnixSocket("runMcpProxy — uid resolution", () => {
+	it("falls back to uid 0 when process.getuid is unavailable, as on Windows", async () => {
+		const original = process.getuid;
+		process.getuid = undefined;
+		try {
+			const daemon = await startFakeDaemon();
+			const stdin = new PassThrough();
+			const run = runMcpProxy({ cwd: CWD, socketPath, stdin, stdout: new PassThrough(), spawnDaemon: vi.fn() });
+			await vi.waitFor(() => expect(daemon.greetings).toEqual(["attach"]));
+			stdin.end();
+			await expect(run).resolves.toBe("proxied");
+		} finally {
+			process.getuid = original;
+		}
+	});
 });
 
 describeUnixSocket("runMcpProxy — attaching to an existing daemon", () => {
@@ -387,6 +432,55 @@ describeUnixSocket("runMcpProxy — attaching to an existing daemon", () => {
 		const run = runMcpProxy({ cwd: CWD, socketPath, stdin, stdout: new PassThrough(), spawnDaemon: vi.fn() });
 		await vi.waitFor(() => expect(daemon.greetings).toEqual(["attach"]));
 		stdin.end();
+		await run;
+	});
+
+	it("falls back to process.stdin/stdout when the caller supplies neither", async () => {
+		// Every other test in this file injects PassThroughs; production never
+		// does, so this is what actually ships. Ending the underlying socket right
+		// after attach keeps this from ever reading real process.stdin.
+		const daemon = await startFakeDaemon();
+		const run = runMcpProxy({ cwd: CWD, socketPath, spawnDaemon: vi.fn() });
+		await vi.waitFor(() => expect(daemon.greetings).toEqual(["attach"]));
+		for (const s of sockets) s.destroy();
+		await expect(run).resolves.toBe("proxied");
+	});
+
+	it("replays bytes that arrived behind the hello line before anything else is written", async () => {
+		// If the daemon's hello and a stray extra byte land in the SAME read chunk,
+		// `readHandshakeLine` cannot put them back on the socket — flowing mode
+		// makes `unshift` a documented no-op-with-loss — so `negotiate` hands them
+		// back as `pending`, and `pipeUntilClosed` has to replay them before
+		// anything else reaches stdout.
+		const server = createServer((socket) => {
+			sockets.push(socket);
+			socket.write(
+				`${encodeHandshakeLine({
+					t: "hello",
+					protocol: MCP_DAEMON_PROTOCOL,
+					version: cliCoreVersion(),
+					pid: 1,
+					cwd: CWD,
+				})}TRAILING-BYTES`,
+			);
+			void readHandshakeLine(socket).then(() => {
+				// Nothing further needed: the test only cares about what arrived
+				// before the greeting was even sent.
+			});
+		});
+		servers.push(server);
+		await new Promise<void>((r) => server.listen(socketPath, () => r()));
+
+		const stdin = new PassThrough();
+		const stdout = new PassThrough();
+		const out: string[] = [];
+		stdout.on("data", (c: Buffer) => out.push(c.toString()));
+
+		const run = runMcpProxy({ cwd: CWD, socketPath, stdin, stdout, spawnDaemon: vi.fn() });
+		await vi.waitFor(() => expect(out.join("")).toBe("TRAILING-BYTES"));
+
+		stdin.end();
+		for (const s of sockets) s.destroy();
 		await run;
 	});
 });
@@ -750,6 +844,97 @@ describeUnixSocket("runMcpProxy — socket generations", () => {
 		stdin.end();
 		await expect(run).resolves.toBe("proxied");
 	});
+
+	it("falls back when a freshly SPAWNED daemon turns out to be superseded and cannot release", async () => {
+		// The rarer sibling of "moves the successor to the next generation": there,
+		// an INCUMBENT answers "advance" to the probe branch. Here every generation
+		// was free, so WE spawn — and the one that answers back is itself an old,
+		// deferring instance (two proxies racing into the same free slot, say).
+		// The spawn branch's own ternary has to fall back rather than treat that
+		// "advance" as an attachable socket.
+		const spawnDaemon = vi.fn((_cwd: string, path: string) => {
+			void startFakeDaemon({ path, version: "0.0.1", deferRetire: true });
+		});
+		const fallback = vi.fn().mockResolvedValue(undefined);
+		const outcome = await runMcpProxy({
+			cwd: CWD,
+			socketPath,
+			platform: "win32",
+			spawnDaemon,
+			fallback,
+			readyTimeoutMs: 5000,
+		});
+		expect(outcome).toBe("fallback-inprocess");
+		expect(fallback).toHaveBeenCalledWith(CWD);
+		expect(spawnDaemon).toHaveBeenCalledTimes(1);
+	});
+
+	it("skips the unlink for a Windows pipe name — there is no file to remove", async () => {
+		// On win32 the derived address is `\\.\pipe\...`; unlinking that string
+		// would be either a no-op or, worse, target an unrelated file that happens
+		// to share the name. No explicit socketPath here, so the generation scan
+		// derives the real pipe-shaped string via `mcpSocketPath`, exactly as it
+		// would for a caller actually on Windows.
+		const spawnDaemon = vi.fn();
+		const fallback = vi.fn().mockResolvedValue(undefined);
+		const outcome = await runMcpProxy({
+			cwd: CWD,
+			platform: "win32",
+			spawnDaemon,
+			fallback,
+			readyTimeoutMs: 20,
+		});
+		expect(outcome).toBe("fallback-inprocess");
+		expect(fallback).toHaveBeenCalledWith(CWD);
+	});
+});
+
+describeUnixSocket("runMcpProxy — retire drain timing", () => {
+	it("keeps polling while the retiring peer is still reachable, then gives up and spawns anyway", async () => {
+		// `waitUntilUnreachable` can observe the peer still alive (its own
+		// non-string branch) many times before its fixed 5 s budget elapses —
+		// the return value is deliberately ignored either way, since the caller
+		// always proceeds to spawn regardless of whether the peer actually went
+		// quiet in time.
+		const oldServer = createServer((socket) => {
+			sockets.push(socket);
+			socket.write(
+				encodeHandshakeLine({ t: "hello", protocol: MCP_DAEMON_PROTOCOL, version: "0.0.1", pid: 1, cwd: CWD }),
+			);
+			void readHandshakeLine(socket).then((first) => {
+				const greeting = first ? parseClientGreeting(first.line) : undefined;
+				if (greeting?.t === "retire") {
+					// Silence = released, but the LISTENER is deliberately left bound —
+					// simulating a daemon that answered the retire but never actually
+					// drains within the budget.
+					socket.end();
+				}
+			});
+		});
+		servers.push(oldServer);
+		await new Promise<void>((r) => oldServer.listen(socketPath, () => r()));
+
+		let replacement: FakeDaemon | undefined;
+		const spawnDaemon = vi.fn(() => {
+			oldServer.close();
+			void startFakeDaemon().then((d) => {
+				replacement = d;
+			});
+		});
+		const stdin = new PassThrough();
+		const run = runMcpProxy({
+			cwd: CWD,
+			socketPath,
+			spawnDaemon,
+			stdin,
+			stdout: new PassThrough(),
+			readyTimeoutMs: 5000,
+		});
+
+		await vi.waitFor(() => expect(replacement?.greetings).toEqual(["attach"]), { timeout: 10_000 });
+		stdin.end();
+		await expect(run).resolves.toBe("proxied");
+	}, 15_000);
 });
 
 describeUnixSocket("runMcpProxy — bounded retries", () => {
@@ -802,6 +987,28 @@ describeUnixSocket("runMcpProxy — the daemon it spawns", () => {
 		);
 		const [, argv] = spawnHidden.mock.calls[0] as unknown as [string, string[], unknown];
 		expect(argv[0]).not.toBe(process.argv[1]);
+	});
+
+	it("serves in-process without spawning when the CLI entry cannot be located", async () => {
+		// Nothing beside this bundle to exec — e.g. a `tsx` run against the source
+		// tree, which has no `Cli.js`. Logging and giving up beats spawning a path
+		// that does not exist.
+		resolveCliEntry.mockReturnValueOnce(undefined);
+		const fallback = vi.fn().mockResolvedValue(undefined);
+		await expect(runMcpProxy({ cwd: CWD, socketPath, fallback, readyTimeoutMs: 0 })).resolves.toBe(
+			"fallback-inprocess",
+		);
+		expect(fallback).toHaveBeenCalledWith(CWD);
+		expect(spawnHidden).not.toHaveBeenCalled();
+	});
+
+	it("logs -1 for the spawned child's pid when the subprocess reports none", async () => {
+		spawnHidden.mockReturnValueOnce({ pid: undefined, unref: vi.fn() });
+		const fallback = vi.fn().mockResolvedValue(undefined);
+		await expect(runMcpProxy({ cwd: CWD, socketPath, fallback, readyTimeoutMs: 0 })).resolves.toBe(
+			"fallback-inprocess",
+		);
+		expect(spawnHidden).toHaveBeenCalledTimes(1);
 	});
 });
 

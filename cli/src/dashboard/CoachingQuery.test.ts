@@ -133,6 +133,44 @@ function seedJourneyWithWait(over: { branch: string; waitMinutes: number; atMs?:
 	});
 }
 
+/**
+ * A `sessions` + `session_activity` pair giving a journey a MEASURED duration
+ * (see `JourneysQuery.ts`'s `readSessionBuckets` — duration comes only from
+ * these bucket rows, never from the transcript blob or `sessions.duration_ms`).
+ * Links through `transcript_sessions`, the SAME relation `readSessionAggregates`
+ * joins on — a bare `addJourneyTranscript` blob has no such row.
+ */
+function seedJourneyWithDuration(over: { branch: string; buckets: ReadonlyArray<number>; atMs?: number }): void {
+	const hash = seedJourney({ branch: over.branch, planFirst: false, atMs: over.atMs });
+	const transcriptId = `dur-${hash}`;
+	db.prepare(
+		"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, ?, ?, ?)",
+	).run(1, transcriptId, Buffer.from("{}"), NOW);
+	db.prepare("INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, ?, ?)").run(
+		1,
+		hash,
+		transcriptId,
+	);
+	const sessionId = `dur-sess-${hash}`;
+	db.prepare("INSERT INTO transcript_sessions (repo_id, transcript_id, session_id, source) VALUES (?, ?, ?, ?)").run(
+		1,
+		transcriptId,
+		sessionId,
+		"claude",
+	);
+	const eventId = `dur-evt-${hash}`;
+	db.prepare(
+		"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, duration_ms) VALUES (?, ?, ?, ?, ?, ?)",
+	).run(eventId, 1, "claude", sessionId, NOW, 0);
+	for (const bucket of over.buckets) {
+		db.prepare("INSERT INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)").run(
+			eventId,
+			bucket,
+			NOW,
+		);
+	}
+}
+
 let sessionSeq = 0;
 
 /** One session plus a single `session_tool_use` row of kind `'skill'`. */
@@ -341,5 +379,95 @@ describe("buildCoaching", () => {
 			seedJourneyWithWait({ branch: "feat/two", waitMinutes: 5, atMs: NOW });
 			const model = buildCoaching(db, { kind: "all" }, NOW - DAY, NOW + DAY, "UTC");
 			expect(model.awaitingCount).toBe(1);
+		}));
+
+	it("does not count a journey with no wait transcript toward awaitingCount", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			seedJourneyWithWait({ branch: "feat/one", waitMinutes: 45, atMs: NOW }); // ≥ WAIT_STALL_MINUTES
+			// No transcript at all — `collectWindowSignals` still gives it a defined
+			// `longestWaitMinutes` of 0 (the reduce's own initial value), which must
+			// not clear the WAIT_STALL_MINUTES bar either.
+			seedJourney({ branch: "feat/untimed", planFirst: false, atMs: NOW });
+			const model = buildCoaching(db, { kind: "all" }, NOW - DAY, NOW + DAY, "UTC");
+			expect(model.awaitingCount).toBe(1);
+		}));
+
+	it("trends both plan-first share and cost against a prior window that also has journeys", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			// Prior window: nobody planned first, low cost.
+			seedJourney({ branch: "feat/prior-a", planFirst: false, costUsd: 5, atMs: NOW - DAY - 60_000 });
+			seedJourney({ branch: "feat/prior-b", planFirst: false, atMs: NOW - DAY - 60_000 });
+			// Current window: everybody planned first, higher cost.
+			seedJourney({ branch: "feat/cur-a", planFirst: true, costUsd: 10, atMs: NOW });
+			seedJourney({ branch: "feat/cur-b", planFirst: true, atMs: NOW });
+
+			const model = buildCoaching(db, { kind: "all" }, NOW - 60_000, NOW + DAY, "UTC");
+
+			expect(model.roster.planFirst.value).toBe(100);
+			expect(model.roster.planFirst.trendPct).toBe(100);
+			expect(model.roster.cost.value).toBeCloseTo(10, 2);
+			expect(model.roster.cost.trendPct).toBe(100);
+		}));
+
+	it("reports the median turnaround with an odd measured count, with no trend when the prior window has none measured", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			seedJourneyWithDuration({ branch: "feat/one", buckets: [900_000, 1_800_000], atMs: NOW });
+			const model = buildCoaching(db, { kind: "all" }, NOW - 60_000, NOW + DAY, "UTC");
+			expect(model.roster.turnaround.availability).toBe("measured");
+			expect(model.roster.turnaround.value).toBe(30);
+			expect(model.roster.turnaround.trendPct).toBeUndefined();
+		}));
+
+	it("reports the median turnaround with an even measured count, trended against a measured prior window", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			// Prior window: one measured journey at 15 minutes.
+			seedJourneyWithDuration({ branch: "feat/prior", buckets: [900_000], atMs: NOW - DAY - 60_000 });
+			// Current window: two measured journeys (30 and 60 minutes) — an EVEN
+			// count, so the median averages the middle pair.
+			seedJourneyWithDuration({ branch: "feat/cur-a", buckets: [900_000, 1_800_000], atMs: NOW });
+			seedJourneyWithDuration({
+				branch: "feat/cur-b",
+				buckets: [900_000, 1_800_000, 2_700_000, 3_600_000],
+				atMs: NOW,
+			});
+			const model = buildCoaching(db, { kind: "all" }, NOW - 60_000, NOW + DAY, "UTC");
+			expect(model.roster.turnaround.value).toBe(45);
+			expect(model.roster.turnaround.trendPct).toBeGreaterThan(0);
+		}));
+
+	it("recommends breaking up the single largest-turn journey among several timed ones", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			seedJourney({ branch: "feat/small", planFirst: true, turns: 10, atMs: NOW - 2 * DAY });
+			seedJourney({ branch: "feat/biggest", planFirst: true, turns: 50, atMs: NOW - DAY });
+			seedJourney({ branch: "feat/medium", planFirst: true, turns: 30, atMs: NOW });
+			const model = buildCoaching(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, "UTC");
+			const scopeItem = model.queue.find((item) => item.key === "scope");
+			expect(scopeItem?.journeyTitle).toContain("journey work");
+			expect(scopeItem?.detail).toContain("50 turns");
+		}));
+
+	it("breaks a pattern tie by key, alphabetically", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			// Two journeys planned first, two not — plan-first and straight-to-execute
+			// tie at count 2, forcing buildPatterns' comparator into its key tie-break.
+			seedJourney({ branch: "feat/a", planFirst: true, atMs: NOW - 3 * DAY });
+			seedJourney({ branch: "feat/b", planFirst: true, atMs: NOW - 2 * DAY });
+			seedJourney({ branch: "feat/c", planFirst: false, atMs: NOW - DAY });
+			seedJourney({ branch: "feat/d", planFirst: false, atMs: NOW });
+			const model = buildCoaching(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, "UTC");
+			const keys = [...model.patterns.established, ...model.patterns.emerging].map((p) => p.key);
+			const planFirstIdx = keys.indexOf("plan-first");
+			const straightIdx = keys.indexOf("straight-to-execute");
+			expect(planFirstIdx).toBeGreaterThanOrEqual(0);
+			expect(straightIdx).toBeGreaterThanOrEqual(0);
+			// Tied on count, so alphabetical: "plan-first" sorts before
+			// "straight-to-execute".
+			expect(planFirstIdx).toBeLessThan(straightIdx);
 		}));
 });

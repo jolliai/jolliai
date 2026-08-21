@@ -1507,6 +1507,8 @@ export function registerDashboardCommand(program: Command): void {
 		.option("--no-open", "Do not open the browser, just print the URL")
 		.option("--cwd <dir>", "Repo directory to register (default: current directory)")
 		.action(async (options: DashboardOptions) => {
+			/* v8 ignore start -- the success branch of this one-line delegation binds a real loopback server, launches the browser and blocks in `defaultWaitForShutdown` until an OS signal, none of which a unit test can drive; `executeDashboard`'s own return values (true/false) are covered directly by the `executeDashboard` describe. */
 			if (!(await executeDashboard("stats", options))) process.exitCode = 1;
+			/* v8 ignore stop */
 		});
 }

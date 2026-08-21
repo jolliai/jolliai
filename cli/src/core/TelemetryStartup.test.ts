@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { JolliMemoryConfig } from "../Types.js";
+import { loadConfig } from "./SessionTracker.js";
 import { getTelemetryContext, shutdownTelemetry } from "./Telemetry.js";
 import { appendTelemetryEvent, readTelemetryEvents, type TelemetryEnvelope } from "./TelemetryBuffer.js";
 import {
@@ -13,6 +14,17 @@ import {
 	maybeShowCliTelemetryNotice,
 	resolveTelemetryOrigin,
 } from "./TelemetryStartup.js";
+
+// Wraps the real `loadConfig` by default, so every test below that supplies its
+// own `deps.loadConfig` never touches it. The handful of tests that exercise the
+// `deps?.loadConfig ?? defaultLoadConfig` fallback (the one branch omitting
+// `loadConfig` from `deps` actually reaches) override it once with
+// `mockResolvedValueOnce` instead of letting the real implementation read this
+// machine's actual `~/.jolli/jollimemory/config.json`.
+vi.mock("./SessionTracker.js", async (importOriginal) => {
+	const actual = await importOriginal<typeof import("./SessionTracker.js")>();
+	return { ...actual, loadConfig: vi.fn(actual.loadConfig) };
+});
 
 let cwd: string;
 
@@ -162,6 +174,22 @@ describe("bootstrapTelemetry", () => {
 		).resolves.toBeUndefined();
 		expect(getTelemetryContext()).toBeNull();
 	});
+
+	it("falls back to the default loadConfig when deps omit it", async () => {
+		vi.mocked(loadConfig).mockResolvedValueOnce({ jolliUrl: "https://acme.jolli.ai" });
+		await bootstrapTelemetry({
+			cwd,
+			deps: {
+				getOrCreateInstallId: async () => ({
+					installId: "22222222-2222-4222-8222-222222222222",
+					created: false,
+				}),
+				getJolliUrl: () => "https://jolli.ai",
+			},
+		});
+		expect(getTelemetryContext()?.installId).toBe("22222222-2222-4222-8222-222222222222");
+		expect(getTelemetryContext()?.env).toBe("prod");
+	});
 });
 
 describe("flushTelemetryNow", () => {
@@ -206,6 +234,16 @@ describe("flushTelemetryNow", () => {
 		).resolves.toBeUndefined();
 		// Buffer is left intact for the next flush.
 		expect(await readTelemetryEvents(cwd)).toHaveLength(1);
+	});
+
+	it("falls back to the default loadConfig when deps omit it", async () => {
+		appendTelemetryEvent(cwd, ev());
+		vi.mocked(loadConfig).mockResolvedValueOnce({ telemetry: "off" });
+		// `deps` present but without `loadConfig` — exercises the `??` fallback
+		// rather than `flushTelemetryNow`'s own default-parameter branch.
+		await expect(flushTelemetryNow(cwd, {})).resolves.toBeUndefined();
+		// Opted out (per the mocked config): the buffer is dropped, not sent.
+		expect(await readTelemetryEvents(cwd)).toEqual([]);
 	});
 
 	it("drops the buffer without sending when opted out via config", async () => {
@@ -286,5 +324,24 @@ describe("maybeShowCliTelemetryNotice", () => {
 				},
 			}),
 		).resolves.toBe(false);
+	});
+
+	it("falls back to the default loadConfig and default stderr write when deps omit them", async () => {
+		vi.mocked(loadConfig).mockResolvedValueOnce({});
+		const saved: Partial<JolliMemoryConfig>[] = [];
+		const writeSpy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+		try {
+			const printed = await maybeShowCliTelemetryNotice({
+				saveConfig: async (u) => {
+					saved.push(u);
+				},
+				env: {},
+			});
+			expect(printed).toBe(true);
+			expect(writeSpy).toHaveBeenCalledWith(CLI_TELEMETRY_NOTICE);
+			expect(saved).toEqual([{ telemetryNoticeShown: true }]);
+		} finally {
+			writeSpy.mockRestore();
+		}
 	});
 });

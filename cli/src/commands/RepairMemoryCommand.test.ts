@@ -323,6 +323,45 @@ describe("repair-memory", () => {
 		expect(lines.join("\n")).toContain("← a1source  (no commit message)");
 	});
 
+	it("truncates a commit subject longer than the terminal column with an ellipsis", async () => {
+		// oneLine caps the subject at SUBJECT_WIDTH (64) so a long stranded-commit
+		// message stays on one line; the ellipsis marks the cut.
+		const longMessage = "x".repeat(120);
+		vi.mocked(buildRepairPlan).mockResolvedValue([
+			{
+				kind: "migrate",
+				targetHash: "targethash1",
+				targetSubject: longMessage,
+				needsLlm: false,
+				sources: [{ oldHash: "a1source", root: { commitMessage: "m" }, conversationCount: 0, skillCount: 0 }],
+			},
+		] as never);
+
+		const lines = await run("--status");
+
+		const out = lines.join("\n");
+		// 63 chars of the message plus the ellipsis — never the full 120.
+		expect(out).toContain(`${"x".repeat(63)}…`);
+		expect(out).not.toContain("x".repeat(120));
+	});
+
+	it("prints a non-Error rejection via String(err), not a fatal stack trace", async () => {
+		// `buildRepairPlan` (or createStorage) can reject with a non-Error value; the
+		// command must still print it as a plain line and set exit code 1.
+		vi.mocked(buildRepairPlan).mockRejectedValue("plain string failure");
+		const errors: string[] = [];
+		const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+			errors.push(a.map(String).join(" "));
+		});
+
+		await run();
+
+		spy.mockRestore();
+		expect(errors).toEqual(["plain string failure"]);
+		expect(process.exitCode).toBe(1);
+		expect(executeRepairs).not.toHaveBeenCalled();
+	});
+
 	it("reports 'no stranded memory trees' when the plan is empty", async () => {
 		vi.mocked(buildRepairPlan).mockResolvedValue([] as never);
 

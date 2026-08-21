@@ -311,6 +311,54 @@ describeUnixSocket("runMcpDaemon — degraded platform tools", () => {
 		socket.destroy();
 		await retireDaemon(done);
 	});
+
+	it("logs a non-Error rejection from the platform retry without a `.message`", async () => {
+		// The handler formats the reason for debug.log — a thrown string (or any
+		// non-Error) has no `.message`, and assuming one would print `undefined`.
+		const degraded = fakeRuntime({ platformDegraded: true });
+		prepareMcpRuntime.mockResolvedValue(degraded);
+		rebuildPlatformHalf.mockRejectedValue("plain string failure");
+
+		const { done } = await startDaemon({ idleTimeoutMs: 5000 });
+		const { socket } = await connectClient();
+		socket.write(encodeHandshakeLine({ t: "attach" }));
+		await vi.waitFor(() => expect(createMcpServer).toHaveBeenCalledWith(degraded));
+		socket.destroy();
+		await retireDaemon(done);
+	});
+
+	it("keeps serving the built-ins when the retry succeeds but is STILL degraded", async () => {
+		// A retry that resolves without throwing is not the same as a retry that
+		// fixed anything: a repeated network blip can answer a second empty
+		// manifest without ever rejecting. `refreshIfDegraded` must not log a
+		// bogus "recovered" line for that case.
+		const degraded = fakeRuntime({ platformDegraded: true });
+		prepareMcpRuntime.mockResolvedValue(degraded);
+		const stillDegraded = fakeRuntime({ platformDegraded: true, toolDefinitions: [] });
+		rebuildPlatformHalf.mockResolvedValue(stillDegraded);
+
+		const { done } = await startDaemon({ idleTimeoutMs: 5000 });
+		const { socket } = await connectClient();
+		socket.write(encodeHandshakeLine({ t: "attach" }));
+		await vi.waitFor(() => expect(createMcpServer).toHaveBeenCalledWith(stillDegraded));
+		socket.destroy();
+		await retireDaemon(done);
+	});
+});
+
+describeUnixSocket("runMcpDaemon — uid resolution", () => {
+	it("falls back to uid 0 when process.getuid is unavailable, as on Windows", async () => {
+		const original = process.getuid;
+		process.getuid = undefined;
+		try {
+			// A path OUTSIDE the managed directory so the fallback's actual value
+			// cannot change the outcome — only that the line runs without throwing.
+			const { done } = await startDaemon({ firstClientTimeoutMs: 30, idleTimeoutMs: 30 });
+			await expect(done).resolves.toBe("no-first-client");
+		} finally {
+			process.getuid = original;
+		}
+	});
 });
 
 describeUnixSocket("runMcpDaemon — reaping", () => {

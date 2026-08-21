@@ -150,6 +150,52 @@ describe("triggerEnsureGlobalDaemon", () => {
 		expect(triggerEnsureGlobalDaemon({ command: "status", nodeVersion: "20.19.0" })).toBe(false);
 		expect(spawnHidden).not.toHaveBeenCalled();
 	});
+
+	it("falls back to the null command default and reports an internal spawn failure without throwing", () => {
+		// No `command` in deps: exercises the `deps.command ?? null` fallback —
+		// `shouldSkipGlobalDaemon(null)` is false, so the helper proceeds. Forcing
+		// `resolveCliInvocation` to throw (rather than just returning `undefined`)
+		// is what drives this function's own top-level catch.
+		vi.mocked(resolveCliInvocation).mockImplementationOnce(() => {
+			throw new Error("boom");
+		});
+		expect(triggerEnsureGlobalDaemon({ nodeVersion: "22.13.0" })).toBe(false);
+	});
+
+	it("falls back to the real Node version and omits --socket when neither is supplied", () => {
+		const fakeChild = Object.assign(new EventEmitter(), { pid: 4242, unref: vi.fn() });
+		vi.mocked(spawnHidden).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawnHidden>);
+
+		// No `nodeVersion` (falls back to this machine's real, supported runtime)
+		// and no `socketPath` (so `--socket` is never appended to argv).
+		expect(triggerEnsureGlobalDaemon({ command: "status" })).toBe(true);
+		expect(spawnHidden).toHaveBeenCalledWith(
+			process.execPath,
+			["/opt/jolli/dist/Cli.js", GLOBAL_DAEMON_ENSURE_COMMAND],
+			expect.objectContaining({ detached: true, stdio: "ignore" }),
+		);
+	});
+
+	it("logs and returns true without spawning when the ensure helper's own invocation cannot be resolved", () => {
+		vi.mocked(resolveCliInvocation).mockReturnValueOnce(undefined);
+
+		// Same "an incomplete runtime still answers success" shape as
+		// `ensureGlobalDaemon`'s equivalent case: the outcome describes what this
+		// trigger decided, and the warning is the only trace such a run can leave.
+		expect(triggerEnsureGlobalDaemon({ command: "status", nodeVersion: "22.13.0" })).toBe(true);
+		expect(spawnHidden).not.toHaveBeenCalled();
+	});
+
+	it("leaves an error handler on the spawned ensure-helper child, falling back to pid -1 when unknown", () => {
+		// A bare EventEmitter with no `pid` at all — the `child.pid ?? -1` fallback
+		// in the final log line, and a stand-in for a detached spawn whose `error`
+		// event fires asynchronously with no listener otherwise.
+		const fakeChild = Object.assign(new EventEmitter(), { unref: vi.fn() });
+		vi.mocked(spawnHidden).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawnHidden>);
+
+		expect(triggerEnsureGlobalDaemon({ command: "status", nodeVersion: "22.13.0" })).toBe(true);
+		expect(() => fakeChild.emit("error", new Error("ENOENT"))).not.toThrow();
+	});
 });
 
 describeUnixSocket("ensureGlobalDaemon", () => {
@@ -327,6 +373,18 @@ describeUnixSocket("ensureGlobalDaemon", () => {
 		expect(spawnHidden).toHaveBeenCalled();
 	});
 
+	it("leaves an error handler on the spawned daemon child, falling back to pid -1 when unknown", async () => {
+		const socketPath = join(scratch, "d.sock");
+		// No `pid` at all — the `child.pid ?? -1` fallback in the final log line —
+		// and a stand-in for a detached spawn whose `error` event fires
+		// asynchronously with no listener otherwise (Node would re-raise it).
+		const fakeChild = Object.assign(new EventEmitter(), { unref: vi.fn() });
+		vi.mocked(spawnHidden).mockReturnValueOnce(fakeChild as unknown as ReturnType<typeof spawnHidden>);
+
+		await expect(ensureGlobalDaemon({ socketPath, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
+		expect(() => fakeChild.emit("error", new Error("ENOENT"))).not.toThrow();
+	});
+
 	it("spawns the CLI entry beside this bundle, never the script that triggered it", async () => {
 		const socketPath = join(scratch, "d.sock");
 		const fakeChild = Object.assign(new EventEmitter(), { pid: 4242, unref: vi.fn() });
@@ -397,6 +455,14 @@ describeUnixSocket("ensureGlobalDaemon", () => {
 		// reboot that kept tmpdir) leaves behind: bind it, then close the server
 		// WITHOUT deleting the file, so the path still exists but nothing answers —
 		// a real connect() to it gives ECONNREFUSED, same as production.
+		//
+		// NB: Node's own `net.Server.close()` auto-unlinks the unix socket file it
+		// bound, so by the time `ensureGlobalDaemon` connects there is no file left
+		// at all and the real error code is ENOENT, not ECONNREFUSED (verified) —
+		// this test therefore does NOT exercise `removeStaleSocket` itself (see the
+		// dedicated tests below, which force a real ECONNREFUSED with the mocked
+		// `connect()` instead). It still documents the end state: either way, no
+		// file is left behind.
 		const stale = createServer(() => {});
 		await new Promise<void>((resolve) => stale.listen(socketPath, resolve));
 		await new Promise<void>((resolve) => stale.close(() => resolve()));
@@ -404,6 +470,80 @@ describeUnixSocket("ensureGlobalDaemon", () => {
 		await expect(ensureGlobalDaemon({ socketPath, spawnDaemon, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
 		expect(spawnDaemon).toHaveBeenCalledWith(socketPath);
 		await expect(stat(socketPath)).rejects.toThrow();
+	});
+
+	it("actually removes a real stale socket file on a genuine ECONNREFUSED", async () => {
+		const socketPath = join(scratch, "d.sock");
+		const spawnDaemon = vi.fn();
+		// Node auto-unlinks a unix socket file on a graceful `server.close()` (see
+		// the note above), so the only way to get a REAL ECONNREFUSED with the file
+		// still present — the actual `kill -9` scenario — is to fake the connect
+		// failure while leaving a real file on disk for `removeStaleSocket` to act
+		// on for real.
+		await writeFile(socketPath, "");
+		vi.mocked(connect).mockImplementationOnce(() => {
+			const fake = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+			setImmediate(() => fake.emit("error", Object.assign(new Error("ECONNREFUSED"), { code: "ECONNREFUSED" })));
+			return fake as unknown as Socket;
+		});
+
+		await expect(ensureGlobalDaemon({ socketPath, spawnDaemon, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
+		expect(spawnDaemon).toHaveBeenCalledWith(socketPath);
+		await expect(stat(socketPath)).rejects.toThrow();
+	});
+
+	it("swallows unlink failure when the stale socket file is already gone by the time removeStaleSocket runs", async () => {
+		const socketPath = join(scratch, "already-gone.sock");
+		const spawnDaemon = vi.fn();
+		// No file is ever created at this path — `removeStaleSocket`'s own
+		// `unlink()` throws ENOENT, silently swallowed rather than propagating.
+		vi.mocked(connect).mockImplementationOnce(() => {
+			const fake = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+			setImmediate(() => fake.emit("error", Object.assign(new Error("ECONNREFUSED"), { code: "ECONNREFUSED" })));
+			return fake as unknown as Socket;
+		});
+
+		await expect(ensureGlobalDaemon({ socketPath, spawnDaemon, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
+		expect(spawnDaemon).toHaveBeenCalledWith(socketPath);
+	});
+
+	it("does not attempt to unlink a Windows named-pipe path (no file to remove)", async () => {
+		// `removeStaleSocket` no-ops for a `\\.\pipe\` path without ever touching
+		// the filesystem — this holds regardless of the host platform, since the
+		// early return is on the string shape, not a platform check.
+		const socketPath = "\\\\.\\pipe\\jolli-test-ensure";
+		const spawnDaemon = vi.fn();
+		vi.mocked(connect).mockImplementationOnce(() => {
+			const fake = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+			setImmediate(() => fake.emit("error", Object.assign(new Error("ECONNREFUSED"), { code: "ECONNREFUSED" })));
+			return fake as unknown as Socket;
+		});
+
+		await expect(ensureGlobalDaemon({ socketPath, spawnDaemon, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
+		expect(spawnDaemon).toHaveBeenCalledWith(socketPath);
+	});
+
+	it("done() ignores a redundant settle after error already resolved it", async () => {
+		// `tryConnect` guards `done()` against being invoked twice. The `connect`
+		// listener is registered with `.once`, so the only way to fire it a SECOND
+		// time (after the promise already settled via the `error` path) is for
+		// `error` to arrive first while the `connect` listener is still armed —
+		// this exercises done()'s own `if (settled) return;` guard, as opposed to
+		// the outer `socket.on("error", …)` handler's separate settled check
+		// (covered by "leaves an error handler on the socket it hands back").
+		const socketPath = join(scratch, "d.sock");
+		const spawnDaemon = vi.fn();
+		const fake = Object.assign(new EventEmitter(), { destroy: vi.fn() });
+		vi.mocked(connect).mockImplementationOnce(() => {
+			setImmediate(() => {
+				fake.emit("error", Object.assign(new Error("ECONNREFUSED"), { code: "ECONNREFUSED" }));
+				fake.emit("connect");
+			});
+			return fake as unknown as Socket;
+		});
+
+		await expect(ensureGlobalDaemon({ socketPath, spawnDaemon, nodeVersion: "22.13.0" })).resolves.toBe("spawned");
+		expect(spawnDaemon).toHaveBeenCalledWith(socketPath);
 	});
 
 	it("does NOT remove the socket file when connect() only times out", async () => {

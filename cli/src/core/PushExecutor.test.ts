@@ -8,16 +8,16 @@ import {
 	NotAuthenticatedError,
 	PermissionDeniedError,
 } from "./JolliMemoryPushClient.js";
-import { pushSummary } from "./JolliMemoryPushOrchestrator.js";
+import { type PushSummaryResult, pushSummary } from "./JolliMemoryPushOrchestrator.js";
 import { loadBranchSummaries } from "./PrDescription.js";
-import { isOutboundPushAllowed } from "./PushControl.js";
+import { isOutboundPushAllowed, PushDisabledError } from "./PushControl.js";
 import {
 	type CommitPushOutcome,
 	classifyError,
 	processPushPending,
 	triggerPushForNewSummaries,
 } from "./PushExecutor.js";
-import { claimForPush, loadPushPending, type PushPendingEntry, updateBatch } from "./PushPendingStore.js";
+import { claimForPush, loadPushPending, type PushPendingEntry, renewClaims, updateBatch } from "./PushPendingStore.js";
 import { assignOwnedContext, type ContextSelection } from "./push/ContextPush.js";
 import { loadConfig } from "./SessionTracker.js";
 import { clearSpaceBindingCache, saveSpaceBindingCache } from "./SpaceBindingCache.js";
@@ -46,7 +46,13 @@ vi.mock("./PushControl.js", async (orig) => ({
 vi.mock("./PrDescription.js", () => ({ loadBranchSummaries: vi.fn() }));
 vi.mock("./PushPendingStore.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./PushPendingStore.js")>();
-	return { ...actual, loadPushPending: vi.fn(), updateBatch: vi.fn(), claimForPush: vi.fn() };
+	return {
+		...actual,
+		loadPushPending: vi.fn(),
+		updateBatch: vi.fn(),
+		claimForPush: vi.fn(),
+		renewClaims: vi.fn(),
+	};
 });
 vi.mock("./JolliMemoryPushOrchestrator.js", async (importOriginal) => {
 	const actual = await importOriginal<typeof import("./JolliMemoryPushOrchestrator.js")>();
@@ -115,6 +121,35 @@ function entry(retryCount = 0, overrides: Partial<PushPendingEntry> = {}): PushP
 	return { branch: "feature/x", enqueuedAt: new Date().toISOString(), retryCount, ...overrides };
 }
 
+/**
+ * Captures the push loop's heartbeat callback (registered via `setInterval`)
+ * without letting a real timer fire mid-test — `CLAIM_RENEW_INTERVAL_MS` is a
+ * real ~100s, far longer than any test runs. Calling the captured function
+ * directly (rather than racing a fake/real clock) is what lets these tests
+ * deterministically exercise a beat while a push is in flight, and again
+ * after it settles — including AFTER the real `clearInterval` call, since our
+ * fake handle makes that a no-op and the captured reference stays valid.
+ */
+function captureHeartbeat(): { call: () => void } {
+	let captured: (() => void) | undefined;
+	vi.spyOn(global, "setInterval").mockImplementation(((cb: () => void) => {
+		captured = cb;
+		return { unref: () => {} } as unknown as NodeJS.Timeout;
+	}) as unknown as typeof setInterval);
+	vi.spyOn(global, "clearInterval").mockImplementation((() => {}) as unknown as typeof clearInterval);
+	return {
+		call: () => {
+			if (!captured) throw new Error("heartbeat callback was not registered yet");
+			captured();
+		},
+	};
+}
+
+/** Drains every microtask already queued — enough to reach the next genuinely pending promise. */
+async function flushMicrotasks(): Promise<void> {
+	await new Promise((r) => setImmediate(r));
+}
+
 beforeEach(() => {
 	vi.clearAllMocks();
 	vi.mocked(loadConfig).mockResolvedValue({ jolliApiKey: "sk-jol-x" });
@@ -138,6 +173,10 @@ beforeEach(() => {
 		docId: 1,
 	});
 	vi.mocked(updateBatch).mockResolvedValue(undefined);
+	// The heartbeat only matters to the dedicated capture-based tests below; every
+	// other test finishes in milliseconds, long before CLAIM_RENEW_INTERVAL_MS (a
+	// real ~100s), so the real timer this default backs never actually fires.
+	vi.mocked(renewClaims).mockResolvedValue(undefined);
 	// Default: every candidate is claimed successfully, and the returned
 	// `entries` mirror whatever the current `loadPushPending` mock has been
 	// set up to return — so tests that seed a specific retryCount into
@@ -174,6 +213,11 @@ describe("classifyError", () => {
 		const c = classifyError(new Error("ECONNRESET"));
 		expect(c.increment).toBe(true);
 		expect(c.message).toContain("ECONNRESET");
+	});
+	it("does not increment retry for the repo's own outbound opt-out", () => {
+		const c = classifyError(new PushDisabledError());
+		expect(c.increment).toBe(false);
+		expect(c.message).toBe("push-disabled");
 	});
 });
 
@@ -342,6 +386,33 @@ describe("processPushPending", () => {
 		expect(vi.mocked(pushSummary).mock.calls[0][3]).toEqual({ skipOrphanCleanup: false });
 	});
 
+	it("reports a pushed outcome with no url when the push result carries none", async () => {
+		vi.mocked(pushSummary).mockResolvedValue({ summary: summary(HASH_A), docId: 1 } as never);
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const settled: CommitPushOutcome[] = [];
+
+		const r = await processPushPending(CWD, {
+			source: "activation",
+			client: fakeClient(),
+			onCommitSettled: (o) => settled.push(o),
+		});
+
+		expect(r.pushed).toBe(1);
+		expect(settled).toEqual([{ hash: HASH_A, status: "pushed" }]);
+	});
+
+	it("does not fail an otherwise-successful push when persisting the accounting update fails", async () => {
+		// The push already happened; a bookkeeping failure must not fail it — the
+		// entry stays claimed and a later drain re-reads the stored docId.
+		vi.mocked(updateBatch).mockRejectedValueOnce(new Error("disk full"));
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(r.pushed).toBe(1);
+		expect(r.failed).toBe(0);
+	});
+
 	it("grafts the recovered docId/url into the push", async () => {
 		vi.mocked(loadPushPending).mockResolvedValue({
 			version: 1,
@@ -355,6 +426,29 @@ describe("processPushPending", () => {
 		expect(vi.mocked(pushSummary).mock.calls[0][0]).toMatchObject({
 			jolliDocId: 55,
 			jolliDocUrl: "https://acme.jolli.ai/articles/doc-55",
+		});
+	});
+
+	it("does not graft a recovered docId onto a summary that already has one", async () => {
+		const withOwnId: CommitSummary = {
+			...summary(HASH_A),
+			jolliDocId: 999,
+			jolliDocUrl: "https://acme.jolli.ai/articles/doc-999",
+		};
+		vi.mocked(getSummary).mockResolvedValue(withOwnId);
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			// A stale recovered id sitting on the entry must not override the
+			// summary's own, already-correct id.
+			entries: { [HASH_A]: entry(0, { pushedDocId: 55, pushedUrl: "https://acme.jolli.ai/articles/doc-55" }) },
+		});
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(r.pushed).toBe(1);
+		expect(vi.mocked(pushSummary).mock.calls[0][0]).toMatchObject({
+			jolliDocId: 999,
+			jolliDocUrl: "https://acme.jolli.ai/articles/doc-999",
 		});
 	});
 
@@ -385,6 +479,17 @@ describe("processPushPending", () => {
 			spaceName: "Acme Core",
 			canPush: true,
 		});
+	});
+
+	it("does not fail an otherwise-successful push when persisting the confirmed Space binding fails", async () => {
+		vi.mocked(pushSummary).mockResolvedValue(pushed(HASH_A, { jmSpace: { id: 7, name: "Acme Core" } }));
+		vi.mocked(saveSpaceBindingCache).mockRejectedValueOnce(new Error("disk full"));
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(r.pushed).toBe(1);
+		expect(r.failed).toBe(0);
 	});
 
 	it("leaves the binding cache untouched when the server echoes no Space (older server)", async () => {
@@ -542,6 +647,53 @@ describe("processPushPending", () => {
 		expect(pushSummary).not.toHaveBeenCalled();
 	});
 
+	it("treats a remote with no matching ref in ls-remote's output as unconfirmed", async () => {
+		// ls-remote succeeds (exitCode 0) but the requested ref simply isn't in the
+		// listing — a different failure shape than an offline/erroring remote.
+		const remoteRef = "refs/heads/feature/x";
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "remote") return { stdout: "origin\n", stderr: "", exitCode: 0 };
+			if (args[0] === "ls-remote") return { stdout: `${HASH_B}\trefs/heads/other\n`, stderr: "", exitCode: 0 };
+			return { stdout: "", stderr: "", exitCode: 1 };
+		});
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: {
+				[HASH_A]: entry(0, { pushTargets: [{ remote: "origin", remoteRef, localSha: HASH_A }] }),
+			},
+		});
+
+		const result = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(result.note).toBe("push not confirmed");
+		expect(pushSummary).not.toHaveBeenCalled();
+	});
+
+	it("resolves a remote shared by multiple push targets only once", async () => {
+		const refA = "refs/heads/feature/x";
+		const refB = "refs/heads/feature/y";
+		vi.mocked(execGit).mockImplementation(async (args: ReadonlyArray<string>) => {
+			if (args[0] === "remote") return { stdout: "https://example.com/acme/repo.git\n", stderr: "", exitCode: 0 };
+			if (args[0] === "ls-remote")
+				return { stdout: `${HASH_A}\t${refA}\n${HASH_B}\t${refB}\n`, stderr: "", exitCode: 0 };
+			return { stdout: "", stderr: "", exitCode: 1 };
+		});
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: {
+				[HASH_A]: entry(0, { pushTargets: [{ remote: "origin", remoteRef: refA, localSha: HASH_A }] }),
+				[HASH_B]: entry(0, { pushTargets: [{ remote: "origin", remoteRef: refB, localSha: HASH_B }] }),
+			},
+		});
+
+		const result = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(result.pushed).toBe(2);
+		// Both targets share "origin" — `resolvePushRemote` ("remote get-url") must
+		// only run once, not once per target.
+		expect(vi.mocked(execGit).mock.calls.filter((call) => call[0][0] === "remote")).toHaveLength(1);
+	});
+
 	it("passes the owned selection into each commit's push (cross-commit dedup)", async () => {
 		vi.mocked(assignOwnedContext).mockReturnValue(
 			new Map([["plan", { owned: new Map([[HASH_A, [{ slug: "p-1234abcd" }]]]), seeds: new Map() }]]) as never,
@@ -586,6 +738,136 @@ describe("processPushPending", () => {
 		expect(assignOwnedContext).toHaveBeenCalledWith([offSummary]);
 		const selection = vi.mocked(pushSummary).mock.calls[0][2] as ContextSelection;
 		expect(selection.get("plan")).toHaveLength(1);
+	});
+
+	it("merges a kind's seed map across branches alongside its owned items", async () => {
+		// `seeds` (an already-minted docId for a reused-across-commits attachment)
+		// merges into the kind-agnostic map exactly like `owned` does.
+		vi.mocked(assignOwnedContext).mockReturnValue(
+			new Map([["plan", { owned: new Map(), seeds: new Map([["p-1234abcd", 42]]) }]]) as never,
+		);
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+
+		const r = await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		expect(r.pushed).toBe(1);
+		expect(pushSummary).toHaveBeenCalledTimes(1);
+	});
+
+	it("excludes a non-root off-branch index entry from the off-branch root scan", async () => {
+		const offBranch = "feature/off-current";
+		const childHash = "c".repeat(40);
+		vi.mocked(getSummary).mockResolvedValue(summary(HASH_A, offBranch));
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					HASH_A,
+					{
+						commitHash: HASH_A,
+						parentCommitHash: null,
+						branch: offBranch,
+						commitMessage: "off branch root",
+						commitDate: "2026-01-01T00:00:00.000Z",
+						generatedAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+				// A non-root entry on the same off-current branch: `parentCommitHash` is
+				// set, so it must NOT be treated as a root and pulled into the context.
+				[
+					childHash,
+					{
+						commitHash: childHash,
+						parentCommitHash: HASH_A,
+						branch: offBranch,
+						commitMessage: "off branch child",
+						commitDate: "2026-01-01T00:00:00.000Z",
+						generatedAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+			]),
+		);
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: { [HASH_A]: entry(0, { branch: offBranch }) },
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		// getSummary is called once for the triage check and once for HASH_A as the
+		// off-branch root; the child must never be looked up as a root candidate.
+		expect(vi.mocked(getSummary).mock.calls.map((call) => call[0])).not.toContain(childHash);
+	});
+
+	it("falls back to a direct summary lookup for an off-branch root not among the pushed candidates", async () => {
+		const offBranch = "feature/off-current";
+		const rootHash = "c".repeat(40);
+		vi.mocked(getSummary).mockImplementation(async (hash: string) => summary(hash, offBranch));
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					rootHash,
+					{
+						commitHash: rootHash,
+						parentCommitHash: null,
+						branch: offBranch,
+						commitMessage: "off branch root",
+						commitDate: "2026-01-01T00:00:00.000Z",
+						generatedAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+			]),
+		);
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: { [HASH_A]: entry(0, { branch: offBranch }) },
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		// `rootHash` is not among the pushed candidates (only HASH_A is), so it must
+		// have been resolved via the direct `getSummary` fallback rather than the
+		// already-built candidates map.
+		expect(getSummary).toHaveBeenCalledWith(rootHash, CWD, expect.anything());
+		const summaries = vi.mocked(assignOwnedContext).mock.calls[0][0];
+		expect(summaries.map((s) => s.commitHash).sort()).toEqual([HASH_A, rootHash].sort());
+	});
+
+	it("drops an off-branch root whose resolved summary does not match its own hash", async () => {
+		// Tree-hash fallback resolved `getSummary` to a DIFFERENT commit's summary
+		// (the real summary for this root hasn't landed yet) — it must not be
+		// folded into the off-branch context under the wrong hash.
+		const offBranch = "feature/off-current";
+		const rootHash = "c".repeat(40);
+		const otherHash = "d".repeat(40);
+		vi.mocked(getSummary).mockImplementation(async (hash: string) =>
+			hash === rootHash ? summary(otherHash, offBranch) : summary(hash, offBranch),
+		);
+		vi.mocked(getIndexEntryMap).mockResolvedValue(
+			new Map([
+				[
+					rootHash,
+					{
+						commitHash: rootHash,
+						parentCommitHash: null,
+						branch: offBranch,
+						commitMessage: "off branch root",
+						commitDate: "2026-01-01T00:00:00.000Z",
+						generatedAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+			]),
+		);
+		vi.mocked(loadPushPending).mockResolvedValue({
+			version: 1,
+			entries: { [HASH_A]: entry(0, { branch: offBranch }) },
+		});
+
+		await processPushPending(CWD, { source: "activation", client: fakeClient() });
+
+		const summaries = vi.mocked(assignOwnedContext).mock.calls[0][0];
+		// Only HASH_A (the pushed candidate) is included — the mismatched root is
+		// dropped rather than folded in under a hash it doesn't match.
+		expect(summaries.map((s) => s.commitHash)).toEqual([HASH_A]);
 	});
 
 	it("increments retryCount when the push fails operationally", async () => {
@@ -843,6 +1125,122 @@ describe("processPushPending — pre-push options", () => {
 			onCommitSettled: (o) => settled.push(o),
 		});
 		expect(settled).toEqual([{ hash: HASH_A, status: "failed", reason: "failed repeatedly — giving up" }]);
+	});
+
+	it("maps each config/permanent failure to its own friendly reason", async () => {
+		const cases: ReadonlyArray<{ readonly err: Error; readonly reason: string }> = [
+			{ err: new NotAuthenticatedError(), reason: "not signed in to Jolli" },
+			{ err: new PermissionDeniedError(), reason: "no permission to write to the bound Jolli Space" },
+			{
+				err: new BindingRequiredError("https://github.com/acme/repo"),
+				reason: "repo is not bound to a Jolli Space",
+			},
+			{ err: new ClientOutdatedError(), reason: "Jolli client is outdated — please update" },
+		];
+		for (const { err, reason } of cases) {
+			vi.mocked(pushSummary).mockRejectedValueOnce(err);
+			vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+			const settled: CommitPushOutcome[] = [];
+
+			await processPushPending(CWD, {
+				source: "activation",
+				client: fakeClient(),
+				onCommitSettled: (o) => settled.push(o),
+			});
+
+			expect(settled).toEqual([{ hash: HASH_A, status: "failed", reason }]);
+		}
+	});
+
+	it("keeps a short, whitespace-collapsed generic failure reason unmodified", async () => {
+		vi.mocked(pushSummary).mockRejectedValueOnce(new Error("  network   down  "));
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const settled: CommitPushOutcome[] = [];
+
+		await processPushPending(CWD, {
+			source: "activation",
+			client: fakeClient(),
+			onCommitSettled: (o) => settled.push(o),
+		});
+
+		expect(settled).toEqual([{ hash: HASH_A, status: "failed", reason: "network down" }]);
+	});
+
+	it("truncates an overly long generic failure reason to 60 characters", async () => {
+		vi.mocked(pushSummary).mockRejectedValueOnce(new Error("x".repeat(80)));
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		const settled: CommitPushOutcome[] = [];
+
+		await processPushPending(CWD, {
+			source: "activation",
+			client: fakeClient(),
+			onCommitSettled: (o) => settled.push(o),
+		});
+
+		expect(settled[0]?.reason).toBe(`${"x".repeat(59)}…`);
+		expect(settled[0]?.reason).toHaveLength(60);
+	});
+
+	it("renews claims while a push is in flight, adopting the refreshed token on the next beat", async () => {
+		const heartbeat = captureHeartbeat();
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		let resolvePush!: (value: PushSummaryResult) => void;
+		vi.mocked(pushSummary).mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolvePush = resolve;
+				}),
+		);
+		vi.mocked(renewClaims).mockResolvedValueOnce("2026-01-01T00:05:00.000Z");
+
+		const resultPromise = processPushPending(CWD, { source: "activation", client: fakeClient() });
+		await flushMicrotasks(); // let the drain reach pushSummary and register the heartbeat
+
+		// First beat: the push is still in flight, so the heartbeat renews the claim
+		// with the token this drain started with.
+		heartbeat.call();
+		await flushMicrotasks();
+		expect(renewClaims).toHaveBeenNthCalledWith(1, CWD, [HASH_A], CLAIMED_AT);
+
+		// Second beat: still in flight, but the token from the first beat's
+		// successful renewal must now be what gets renewed.
+		heartbeat.call();
+		await flushMicrotasks();
+		expect(renewClaims).toHaveBeenNthCalledWith(2, CWD, [HASH_A], "2026-01-01T00:05:00.000Z");
+
+		resolvePush(pushed(HASH_A));
+		const result = await resultPromise;
+		expect(result.pushed).toBe(1);
+
+		// Third beat, fired after every task settled: must short-circuit rather than
+		// renew a claim nothing in this drain owns any more.
+		heartbeat.call();
+		await flushMicrotasks();
+		expect(renewClaims).toHaveBeenCalledTimes(2);
+	});
+
+	it("swallows a claim-renewal failure mid-push without failing the drain", async () => {
+		const heartbeat = captureHeartbeat();
+		vi.mocked(loadPushPending).mockResolvedValue({ version: 1, entries: { [HASH_A]: entry() } });
+		let resolvePush!: (value: PushSummaryResult) => void;
+		vi.mocked(pushSummary).mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					resolvePush = resolve;
+				}),
+		);
+		vi.mocked(renewClaims).mockRejectedValueOnce(new Error("renew failed"));
+
+		const resultPromise = processPushPending(CWD, { source: "activation", client: fakeClient() });
+		await flushMicrotasks();
+
+		heartbeat.call();
+		await flushMicrotasks();
+		expect(renewClaims).toHaveBeenCalledTimes(1);
+
+		resolvePush(pushed(HASH_A));
+		const result = await resultPromise;
+		expect(result.pushed).toBe(1);
 	});
 });
 

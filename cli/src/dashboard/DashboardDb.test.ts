@@ -9,9 +9,11 @@ import {
 	type DashboardDbHandle,
 	DashboardRuntimeError,
 	DEFAULT_BUSY_TIMEOUT_MS,
+	ensureDashboardDbExists,
 	findDriftedMigrations,
 	getDashboardDbPath,
 	inTransaction,
+	isSchemaCurrent,
 	MIGRATIONS,
 	type MigrationLogRow,
 	migrateDashboardDb,
@@ -1308,6 +1310,68 @@ describe("edges of the version reader", () => {
 		}
 	});
 
+	it("re-applies an entry the in-lock read sees seeded as 'baseline', not 'applied'", async () => {
+		// The `|| baseline` half of the in-lock skip predicate. Staged like the
+		// `skipped`-row test: the FIRST log read (which computes `done`) hides one name
+		// so it lands in `todo`, and the in-lock read then reports that name with a
+		// `baseline` outcome — a rival that seeded it from a version stamp while this
+		// pass held the entry pending. The predicate must treat baseline as "already
+		// run" and skip rather than re-execute.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			const hidden = "RECALL_RECEIPTS_DDL";
+			let reads = 0;
+			const patched: DashboardDbHandle = {
+				exec: (sql) => raw.exec(sql),
+				close: () => raw.close(),
+				prepare: (sql) => {
+					const stmt = raw.prepare(sql);
+					if (!sql.includes("FROM schema_migrations")) return stmt;
+					return {
+						...stmt,
+						all: (...params) => {
+							const rows = stmt.all(...params) as MigrationLogRow[];
+							reads += 1;
+							if (reads === 1) return rows.filter((r) => r.name !== hidden);
+							return rows.map((r) => (r.name === hidden ? { ...r, outcome: "baseline" } : r));
+						},
+						get: (...params) => stmt.get(...params),
+						run: (...params) => stmt.run(...params),
+					};
+				},
+			};
+			migrateDashboardDb(patched, { appliedBy: "test/1.0" });
+			const rows = readMigrationLog(raw);
+			// It skipped rather than re-ran: a `skipped` row is appended and the entry's
+			// original `applied` row still stands alone.
+			expect(rows?.filter((r) => r.outcome === "skipped").map((r) => r.name)).toEqual([hidden]);
+			expect(rows?.filter((r) => r.name === hidden && r.outcome === "applied")).toHaveLength(1);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("migrates a database whose log cannot be READ AT ALL — warns tableConfirmed=false", async () => {
+		// The `tableConfirmed` false arm of the migrate-time warn: a garbage file whose
+		// existence probe itself fails, so migration proceeds from the version stamp and
+		// records nothing before the first DDL statement dies on the corrupt file.
+		const { writeFileSync } = await import("node:fs");
+		writeFileSync(dbPath, "this is not a database");
+		const raw = await rawDb(dbPath);
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
+		try {
+			expect(() => migrateDashboardDb(raw, { appliedBy: "test/1.0" })).toThrow();
+		} finally {
+			spy.mockRestore();
+			raw.close();
+		}
+		expect(lines.filter((l) => l.includes("could not be queried for its migration log"))).toHaveLength(1);
+	});
+
 	it("skips silently when a rival bumps the version of a PRE-LOG database", async () => {
 		// The one skip that cannot be recorded: there is no log table yet, so the
 		// version stamp is both the fence and the only evidence. Staged by making the
@@ -1338,6 +1402,351 @@ describe("edges of the version reader", () => {
 			expect(readMigrationLog(raw)).toBeUndefined();
 		} finally {
 			raw.close();
+		}
+	});
+});
+
+/**
+ * A handle whose `schema_migrations` reads misbehave in specific ways — for the
+ * defensive edges of the log probes that a real SQLite file never reaches.
+ */
+function fakeMigrationHandle(opts: {
+	orderByThrows?: boolean;
+	countGet?: () => unknown;
+	countThrows?: boolean;
+}): DashboardDbHandle {
+	return {
+		exec: () => undefined,
+		close: () => undefined,
+		prepare: (sql: string) => ({
+			all: () => {
+				if (sql.includes("ORDER BY seq") && opts.orderByThrows) throw new Error("boom read");
+				return [];
+			},
+			get: () => {
+				if (sql.includes("COUNT(*)")) {
+					if (opts.countThrows) throw new Error("cannot count");
+					return opts.countGet ? opts.countGet() : { n: 0 };
+				}
+				return undefined;
+			},
+			run: () => undefined,
+		}),
+	};
+}
+
+describe("migration-log probe edges", () => {
+	it("treats a COUNT that returns no row as 'absent' — the (row?.n ?? 0) fallback", () => {
+		// migrationLogTableExists' nullish guard: SQLite's COUNT(*) always yields a row,
+		// so only a misbehaving handle reaches `row` undefined — and it must read as
+		// absent, not throw. Driven through readMigrationLogState, whose ORDER BY read
+		// throws first so the existence probe runs.
+		const state = readMigrationLogState(fakeMigrationHandle({ orderByThrows: true, countGet: () => undefined }));
+		expect(state.kind).toBe("none");
+	});
+
+	it("keeps the newest row per name when an unknown name repeats, and warns once", () => {
+		// latestByName's `seen` branch: a name appearing twice makes the second
+		// iteration compare `row.seq > seen.seq`. Verified via the unknown-name warn,
+		// which also exercises the once-per-process de-dup (`if (has(name)) continue`)
+		// on the second verify.
+		const spy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+		try {
+			return withDashboardDb(() => undefined, { dbPath }).then(async () => {
+				const raw = await rawDb(dbPath);
+				try {
+					const name = "AGENT7_REPEAT_UNKNOWN_DDL";
+					for (const seq of [900, 901]) {
+						raw.prepare(
+							`INSERT INTO schema_migrations (seq, slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+							 VALUES (?, 0, ?, 'applied', 'other/1.0', 0, 0, 'x')`,
+						).run(seq, name);
+					}
+					expect(() => verifyMigrationLog(raw)).not.toThrow();
+					// Second pass: the name is now in the warned set, so the unknown-name
+					// loop hits its `continue`.
+					expect(() => verifyMigrationLog(raw)).not.toThrow();
+				} finally {
+					raw.close();
+				}
+			});
+		} finally {
+			spy.mockRestore();
+		}
+	});
+
+	it("reports drift when the newest APPLIED row repeats, and skips a logged name it does not carry", async () => {
+		// latestAppliedByName's `seen` branch (a name with two applied rows) plus
+		// findDriftedMigrations' `slot < 0` skip for a logged name unknown to this build.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			// A second applied row for a real name, newer and drifted.
+			raw.prepare(
+				`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+				 VALUES (1, 'RECALL_RECEIPTS_DDL', 'applied', 'other/1.0', 0, 0, 'drifted body')`,
+			).run();
+			// An applied row for a name this build has never heard of — slotOf() is -1.
+			raw.prepare(
+				`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+				 VALUES (0, 'AGENT7_FOREIGN_APPLIED_DDL', 'applied', 'other/1.0', 0, 0, 'foreign')`,
+			).run();
+			const drifted = findDriftedMigrations(raw);
+			expect(drifted.map((r) => r.name)).toContain("RECALL_RECEIPTS_DDL");
+			expect(drifted.map((r) => r.name)).not.toContain("AGENT7_FOREIGN_APPLIED_DDL");
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("findDriftedMigrations returns [] when there is no log table at all", async () => {
+		const raw = await rawDb(dbPath);
+		try {
+			expect(findDriftedMigrations(raw)).toEqual([]);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("keeps the highest-seq row per name even when rows arrive newest-first", () => {
+		// latestByName / latestAppliedByName must keep the greatest `seq`, not the last
+		// one iterated — so a handle that hands back a repeated name in DESCENDING seq
+		// order exercises the `row.seq > seen.seq` FALSE arm (keep the one already held)
+		// of both. DDL matches this build's, so nothing drifts and nothing warns.
+		const dupRow = (seq: number): MigrationLogRow => ({
+			seq,
+			slot: 1,
+			name: "RECALL_RECEIPTS_DDL",
+			outcome: "applied",
+			applied_by: "other/1.0",
+			applied_at_ms: 0,
+			duration_ms: 0,
+			ddl: MIGRATIONS[1].ddl,
+		});
+		const rows = [dupRow(10), dupRow(5)];
+		const fake: DashboardDbHandle = {
+			exec: () => undefined,
+			close: () => undefined,
+			prepare: (sql: string) => ({
+				all: () => (sql.includes("ORDER BY seq") ? rows : []),
+				get: () => undefined,
+				run: () => undefined,
+			}),
+		};
+		expect(() => verifyMigrationLog(fake)).not.toThrow();
+		expect(findDriftedMigrations(fake)).toEqual([]);
+	});
+
+	it("readAppliedMigrationNames ignores rows that are neither applied nor baseline", async () => {
+		// The `outcome === 'applied' || outcome === 'baseline'` guard, FALSE arm: a
+		// `failed` row must not count as run, so isSchemaCurrent still sees that name as
+		// missing.
+		await withDashboardDb(() => undefined, { dbPath });
+		const raw = await rawDb(dbPath);
+		try {
+			raw.prepare("DELETE FROM schema_migrations WHERE name = ?").run("TOOL_CALL_TIME_DDL");
+			raw.prepare(
+				`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+				 VALUES (4, 'TOOL_CALL_TIME_DDL', 'failed', 'other/1.0', 0, 0, 'x')`,
+			).run();
+			// The name has only a `failed` row now, so the schema reads as not current.
+			expect(isSchemaCurrent(raw)).toBe(false);
+		} finally {
+			raw.close();
+		}
+	});
+});
+
+describe("verifyMigrationLog unreadable-log warn (once per process, both shapes)", () => {
+	// The once-per-process guard means only ONE of the two ternary arms can run per
+	// module instance, so each is driven against a freshly re-imported module whose
+	// warned-set is empty.
+	async function freshModule(): Promise<typeof import("./DashboardDb.js")> {
+		vi.resetModules();
+		return import("./DashboardDb.js");
+	}
+	function unreadableHandle(tableConfirmed: boolean): DashboardDbHandle {
+		return {
+			exec: () => undefined,
+			close: () => undefined,
+			prepare: (sql: string) => ({
+				all: () => {
+					if (sql.includes("ORDER BY seq")) throw new Error("boom read");
+					return [];
+				},
+				get: () => {
+					if (sql.includes("COUNT(*)")) {
+						if (!tableConfirmed) throw new Error("cannot count");
+						return { n: 1 };
+					}
+					return undefined;
+				},
+				run: () => undefined,
+			}),
+		};
+	}
+
+	afterEach(() => {
+		vi.resetModules();
+	});
+
+	it("warns 'exists but could not be read' when the table is confirmed present", async () => {
+		const mod = await freshModule();
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
+		try {
+			expect(() => mod.verifyMigrationLog(unreadableHandle(true))).not.toThrow();
+		} finally {
+			spy.mockRestore();
+		}
+		expect(lines.filter((l) => l.includes("exists but could not be read"))).toHaveLength(1);
+	});
+
+	it("warns 'could not be queried' when even the existence probe fails", async () => {
+		const mod = await freshModule();
+		const lines: string[] = [];
+		const spy = vi
+			.spyOn(console, "warn")
+			.mockImplementation((...a: unknown[]) => void lines.push(a.map(String).join(" ")));
+		try {
+			expect(() => mod.verifyMigrationLog(unreadableHandle(false))).not.toThrow();
+		} finally {
+			spy.mockRestore();
+		}
+		expect(lines.filter((l) => l.includes("could not be queried for its migration log"))).toHaveLength(1);
+	});
+});
+
+describe("openDb gating and retry", () => {
+	it("throws DashboardRuntimeError when the runtime is below the SQLite floor", async () => {
+		// The `!canUseDashboardDb()` guard at the top of every open. Driven by faking the
+		// running Node version below 22.13 for one call.
+		const realVersions = process.versions;
+		Object.defineProperty(process, "versions", {
+			value: { ...realVersions, node: "18.19.0" },
+			configurable: true,
+		});
+		try {
+			await expect(withReadonlyDashboardDb(() => undefined, { dbPath })).rejects.toBeInstanceOf(
+				DashboardRuntimeError,
+			);
+		} finally {
+			Object.defineProperty(process, "versions", { value: realVersions, configurable: true });
+		}
+	});
+
+	it("retries a locked open with backoff, then gives up after maxAttempts", async () => {
+		// The `SQLITE_BUSY` retry loop: a DatabaseSync that always reports a locked
+		// database exercises the backoff sleep (attempt < maxAttempts) and the final
+		// throw (attempt >= maxAttempts). Mocked node:sqlite, scoped to a fresh module
+		// so the real one keeps serving every other test.
+		vi.resetModules();
+		let attempts = 0;
+		vi.doMock("node:sqlite", () => ({
+			DatabaseSync: class {
+				constructor() {
+					attempts += 1;
+					throw new Error("SQLITE_BUSY: database is locked");
+				}
+			},
+		}));
+		try {
+			const mod = await import("./DashboardDb.js");
+			await expect(
+				mod.withReadonlyDashboardDb(() => undefined, { dbPath, maxAttempts: 2, baseDelayMs: 1 }),
+			).rejects.toThrow(/database is locked/);
+			// One retry (the backoff timer) plus the final attempt.
+			expect(attempts).toBe(2);
+		} finally {
+			vi.doUnmock("node:sqlite");
+			vi.resetModules();
+		}
+	});
+});
+
+describe("isSchemaCurrent / ensureDashboardDbExists", () => {
+	it("falls back to the version stamp when there is no readable log", async () => {
+		// readAppliedMigrationNames returns undefined (no schema_migrations table), so
+		// isSchemaCurrent answers off the version stamp — 0 here, below this build.
+		const raw = await rawDb(dbPath);
+		try {
+			expect(isSchemaCurrent(raw)).toBe(false);
+		} finally {
+			raw.close();
+		}
+	});
+
+	it("counts 'baseline' rows as applied when deciding the schema is current", async () => {
+		// binary-expr for `outcome === 'applied' || outcome === 'baseline'` in
+		// readAppliedMigrationNames: a legacy DB seeds baseline rows on first open, and
+		// isSchemaCurrent must count them.
+		await buildLegacyDb(dbPath, 5);
+		await withDashboardDb(() => undefined, { dbPath });
+		await expect(withReadonlyDashboardDb(isSchemaCurrent, { dbPath })).resolves.toBe(true);
+		const outcomes = await withReadonlyDashboardDb(
+			(db) =>
+				(db.prepare("SELECT DISTINCT outcome FROM schema_migrations").all() as Array<{ outcome: string }>).map(
+					(r) => r.outcome,
+				),
+			{ dbPath },
+		);
+		expect(outcomes).toContain("baseline");
+	});
+
+	it("ensureDashboardDbExists creates a fresh database when none exists", async () => {
+		const fresh = join(dir, "fresh-ensure.db");
+		expect(existsSync(fresh)).toBe(false);
+		await ensureDashboardDbExists({ dbPath: fresh });
+		await expect(withReadonlyDashboardDb(readSchemaVersion, { dbPath: fresh })).resolves.toBe(
+			DASHBOARD_SCHEMA_VERSION,
+		);
+	});
+
+	it("ensureDashboardDbExists returns early when the existing database is already current", async () => {
+		await withDashboardDb(() => undefined, { dbPath });
+		// No throw and no change: the current-schema short-circuit is taken.
+		await expect(ensureDashboardDbExists({ dbPath })).resolves.toBeUndefined();
+		await expect(withReadonlyDashboardDb(readSchemaVersion, { dbPath })).resolves.toBe(DASHBOARD_SCHEMA_VERSION);
+	});
+
+	it("ensureDashboardDbExists migrates an existing but stale database", async () => {
+		// existsSync is true but isSchemaCurrent is false (a legacy pre-log DB at v5), so
+		// it falls through to the writable open that migrates the rest of the way.
+		await buildLegacyDb(dbPath, 5);
+		await ensureDashboardDbExists({ dbPath });
+		await expect(withReadonlyDashboardDb(readSchemaVersion, { dbPath })).resolves.toBe(DASHBOARD_SCHEMA_VERSION);
+	});
+
+	it("ensureDashboardDbExists resolves the machine path when no dbPath is given", async () => {
+		// The `opts.dbPath ?? getDashboardDbPath()` fallback in both ensureDashboardDbExists
+		// and openDb. HOME is redirected to the temp dir so the machine-global path lands
+		// there instead of the developer's real config dir.
+		const realHome = process.env.HOME;
+		process.env.HOME = join(dir, "home");
+		try {
+			await ensureDashboardDbExists();
+			expect(getDashboardDbPath().startsWith(join(dir, "home"))).toBe(true);
+			expect(existsSync(getDashboardDbPath())).toBe(true);
+		} finally {
+			if (realHome === undefined) delete process.env.HOME;
+			else process.env.HOME = realHome;
+		}
+	});
+
+	const itPosix = it.skipIf(process.platform === "win32");
+
+	itPosix("ensureDashboardDbExists returns quietly when an existing file cannot be opened", async () => {
+		// The catch that swallows an unreadable existing database: `existsSync` is true,
+		// but the read-only probe throws (permission denied), so the function returns
+		// without trying to create/migrate — that is the caller's own open to surface.
+		await withDashboardDb(() => undefined, { dbPath });
+		chmodSync(dbPath, 0o000);
+		try {
+			await expect(ensureDashboardDbExists({ dbPath })).resolves.toBeUndefined();
+		} finally {
+			chmodSync(dbPath, 0o600);
 		}
 	});
 });

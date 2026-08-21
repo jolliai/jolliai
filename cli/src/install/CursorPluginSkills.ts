@@ -99,7 +99,9 @@ restarted, so **Developer: Reload Window** or another chat is not enough (measur
  * it, and both read the identical compile-time define, so there is no value to drift:
  * only the expression is duplicated, never a literal.
  */
+/* v8 ignore start -- compile-time ternary: __PKG_VERSION__ is always defined in bundled/test builds */
 const SKILL_VERSION = typeof __PKG_VERSION__ !== "undefined" ? __PKG_VERSION__ : "dev";
+/* v8 ignore stop */
 
 /**
  * The local-agent logins `auth logout` leaves intact, as an English list.

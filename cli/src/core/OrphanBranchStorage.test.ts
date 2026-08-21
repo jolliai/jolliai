@@ -8,6 +8,14 @@ vi.mock("./RepoProfile.js", () => ({
 	readCutoverFence: vi.fn(async () => fenceState.fence),
 }));
 
+// The second witness (D6's shared-identity CAS row). Mocked so its true
+// branch, and both of its own `.catch()` failure paths, can be driven without
+// a real dashboard database.
+const cutoverRowState: { hasRow: boolean } = { hasRow: false };
+vi.mock("../dashboard/CutoverRouter.js", () => ({
+	hasCutoverRow: vi.fn(async () => cutoverRowState.hasRow),
+}));
+
 vi.mock("./GitOps.js", () => ({
 	batchReadFilesFromBranch: vi.fn(),
 	ensureOrphanBranch: vi.fn(),
@@ -17,6 +25,7 @@ vi.mock("./GitOps.js", () => ({
 	writeMultipleFilesToBranch: vi.fn(),
 }));
 
+import { hasCutoverRow } from "../dashboard/CutoverRouter.js";
 import { ORPHAN_BRANCH, setManuallyDisabled } from "../Logger.js";
 import {
 	batchReadFilesFromBranch,
@@ -27,6 +36,7 @@ import {
 	writeMultipleFilesToBranch,
 } from "./GitOps.js";
 import { OrphanBranchFrozenError, OrphanBranchStorage } from "./OrphanBranchStorage.js";
+import { readCutoverFence } from "./RepoProfile.js";
 
 const mockedReadFile = vi.mocked(readFileFromBranch);
 const mockedBatchReadFiles = vi.mocked(batchReadFilesFromBranch);
@@ -157,5 +167,52 @@ describe("cutover fence at write time", () => {
 		} finally {
 			fenceState.fence = null;
 		}
+	});
+});
+
+describe("the second witness (CAS row) at write time", () => {
+	it("refuses an orphan write once the CAS row exists — the branch is retired for this repo", async () => {
+		// The clone-without-a-fence case the second witness exists for: nothing
+		// local says "frozen", but the shared identity's cutover row does.
+		cutoverRowState.hasRow = true;
+		try {
+			const storage = new OrphanBranchStorage("/repo");
+			await expect(storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m")).rejects.toBeInstanceOf(
+				OrphanBranchFrozenError,
+			);
+			expect(writeMultipleFilesToBranch).not.toHaveBeenCalled();
+			expect(ensureOrphanBranch).not.toHaveBeenCalled();
+		} finally {
+			cutoverRowState.hasRow = false;
+		}
+	});
+
+	it("falls back to process.cwd() for both the fence and CAS-row checks when no cwd is given", async () => {
+		const storage = new OrphanBranchStorage();
+
+		await storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m");
+
+		expect(vi.mocked(readCutoverFence)).toHaveBeenCalledWith(process.cwd());
+		expect(vi.mocked(hasCutoverRow)).toHaveBeenCalledWith(process.cwd());
+	});
+
+	it("treats a failed fence read as no fence — quiet and fail-open", async () => {
+		vi.mocked(readCutoverFence).mockRejectedValueOnce(new Error("profile.json unreadable"));
+		const storage = new OrphanBranchStorage("/repo");
+
+		await storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m");
+
+		expect(ensureOrphanBranch).toHaveBeenCalled();
+		expect(writeMultipleFilesToBranch).toHaveBeenCalled();
+	});
+
+	it("treats a failed CAS-row read as no row — quiet and fail-open", async () => {
+		vi.mocked(hasCutoverRow).mockRejectedValueOnce(new Error("dashboard db unreadable"));
+		const storage = new OrphanBranchStorage("/repo");
+
+		await storage.writeFiles([{ path: "summaries/x.json", content: "{}" }], "m");
+
+		expect(ensureOrphanBranch).toHaveBeenCalled();
+		expect(writeMultipleFilesToBranch).toHaveBeenCalled();
 	});
 });

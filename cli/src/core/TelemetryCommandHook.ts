@@ -110,7 +110,13 @@ export function installCommandTelemetryHooks(program: Command): void {
 		const via = resolveInvokedVia(process.env[JOLLI_INVOKED_VIA_ENV]);
 		delete process.env[JOLLI_INVOKED_VIA_ENV];
 		pending = { command, start: Date.now(), via };
+		// Defensive: `String.split` always returns a non-empty array (even for
+		// `""`), so index 0 is never `undefined` for any `command` — the `?? null`
+		// fallback is unreachable in production and exists only to satisfy the
+		// indexed-access type.
+		/* v8 ignore start -- unreachable: split(" ")[0] is never undefined */
 		invokedRootCommand = command.split(" ")[0] ?? null;
+		/* v8 ignore stop */
 	});
 	program.hook("postAction", (_thisCommand, actionCommand) => {
 		const start = pending?.start;

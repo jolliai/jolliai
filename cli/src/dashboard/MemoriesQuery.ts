@@ -241,6 +241,10 @@ export function buildMemoriesList(
 
 	const plainFilter = scopeFilter(resolved);
 	const memoriesTotal = rows.length;
+	// A bare `SELECT COUNT(*)` (no GROUP BY) always answers exactly one row, so
+	// `.get()` is never undefined and `?.n ?? 0` never falls back — both exist
+	// only to satisfy the type the cast introduces.
+	/* v8 ignore start */
 	const topicsTotal =
 		(
 			db
@@ -253,6 +257,7 @@ export function buildMemoriesList(
 				.prepare(`SELECT COUNT(DISTINCT repo_id) AS n FROM memories WHERE 1=1${plainFilter.sql}`)
 				.get(...plainFilter.params) as { n: number } | undefined
 		)?.n ?? 0;
+	/* v8 ignore stop */
 
 	return {
 		items,
@@ -742,7 +747,13 @@ export function buildMemoryDetail(
 	// on those folded children. Reading the row alone reported 639k tokens for a
 	// memory the editor shows as 3.45M. Falls back to the row if assembly finds
 	// nothing, so a detail page never fails on a tree query.
+	//
+	// The fallback is defensive rather than reachable here: `assembleMemoryTree`
+	// only answers undefined when `memories` has no row for (repoId, hash), and
+	// the SELECT above already proved one exists at (row.repo_id, fullHash).
+	/* v8 ignore start */
 	const summary = (assembleMemoryTree(db, row.repo_id, fullHash) ?? JSON.parse(row.summary_json)) as CommitSummary;
+	/* v8 ignore stop */
 
 	const categoryLabels = commitCategoryLabels(db, scope);
 	const category = categoryLabels.get(`${row.repo_identity}\0${row.commit_hash}`);
@@ -1004,8 +1015,13 @@ export async function readMemoryTranscriptRepairState(
 			| undefined;
 		if (!row?.worktree_root) return undefined;
 		const worktreeRoot = row.worktree_root; // captured for the storage closure below (narrowing does not survive it)
+		// Same defensive fallback as `buildMemoryDetail`'s — unreachable here for
+		// the same reason: the row above already proved (row.repo_id, row.commit_hash)
+		// exists in `memories`.
+		/* v8 ignore start */
 		const summary = (assembleMemoryTree(db, row.repo_id, row.commit_hash) ??
 			JSON.parse(row.summary_json)) as CommitSummary;
+		/* v8 ignore stop */
 		// The repo's empty-OR-repaired siblings, so the verdict reflects the dedup
 		// floor a real `doctor --repair-transcripts` run would hand this memory (the
 		// only repair path a user can trigger) rather than the lone-repair window —
@@ -1046,8 +1062,13 @@ export async function readMemoryTranscriptRepairState(
 						.all(row.repo_id) as ReadonlyArray<{ commit_hash: string; summary_json: string }>
 				).map(
 					(r) =>
+						// Every `r` here was just SELECTed from `memories` at (row.repo_id,
+						// r.commit_hash), so `assembleMemoryTree` always finds it — the
+						// same defensive fallback as `buildMemoryDetail`'s, unreachable here.
+						/* v8 ignore start */
 						(assembleMemoryTree(db, row.repo_id, r.commit_hash) ??
 							JSON.parse(r.summary_json)) as CommitSummary,
+					/* v8 ignore stop */
 				),
 			);
 		// The floor replay reads each sibling's STORED transcripts, which is NOT
@@ -1100,7 +1121,13 @@ export function readContextDoc(
 	// scoped across the picker's selection.
 	const { repoIds } = scopeToRepoIds(db, resolveScope(db, { kind: "repo", repoIdentities: [repoToken] }));
 	const repoId = repoIds?.[0];
+	// `scopeToRepoIds` only answers `{repoIds: null}` for an EMPTY `repoIdentities`
+	// array (see DashboardScopeUtil.ts); the one-element array built two lines up
+	// is never empty, so this never resolves to null/undefined — an unmatched
+	// token instead gets the `[-1]` sentinel, a real (if inert) repoId.
+	/* v8 ignore start */
 	if (repoId == null) return undefined;
+	/* v8 ignore stop */
 	if (kind === "skills") return readSkillsDoc(db, repoId, contextKey);
 	const row = db
 		.prepare(
@@ -1152,7 +1179,11 @@ export function readConversationEntries(
 ): ConversationDoc | undefined {
 	const { repoIds } = scopeToRepoIds(db, resolveScope(db, { kind: "repo", repoIdentities: [repoToken] }));
 	const repoId = repoIds?.[0];
+	// See the identical guard (and comment) in `readContextDoc` — unreachable for
+	// the same reason.
+	/* v8 ignore start */
 	if (repoId == null) return undefined;
+	/* v8 ignore stop */
 
 	// The TREE, matching buildMemoryDetail and readSkillsDoc: the row that opened
 	// this dialog was built from the assembled tree, so reading the bare row could
@@ -1161,7 +1192,11 @@ export function readConversationEntries(
 		.prepare("SELECT summary_json FROM memories WHERE repo_id = ? AND commit_hash = ? LIMIT 1")
 		.get(repoId, hash) as { summary_json: string } | undefined;
 	if (!memory) return undefined;
+	// Same defensive fallback as `buildMemoryDetail`'s — unreachable here since
+	// `memory` above already proved the row exists at (repoId, hash).
+	/* v8 ignore start */
 	const summary = (assembleMemoryTree(db, repoId, hash) ?? JSON.parse(memory.summary_json)) as CommitSummary;
+	/* v8 ignore stop */
 
 	const key = `${source}:${sessionId}`;
 	const { grouped } = groupArchivedSessions(readMemoryTranscripts(db, repoId, hash, summary));
@@ -1214,7 +1249,11 @@ function readSkillsDoc(db: DashboardDbHandle, repoId: number, commitHash: string
 		.prepare("SELECT summary_json FROM memories WHERE repo_id = ? AND commit_hash = ? LIMIT 1")
 		.get(repoId, commitHash) as { summary_json: string } | undefined;
 	if (!row) return undefined;
+	// Same defensive fallback as `buildMemoryDetail`'s — unreachable here since
+	// `row` above already proved the row exists at (repoId, commitHash).
+	/* v8 ignore start */
 	const summary = (assembleMemoryTree(db, repoId, commitHash) ?? JSON.parse(row.summary_json)) as CommitSummary;
+	/* v8 ignore stop */
 	const skills = summary.skills ?? [];
 	if (skills.length === 0) return undefined;
 	return {

@@ -72,16 +72,75 @@ vi.mock("../core/LlmClient.js", async (orig) => ({
 	...(await orig<typeof import("../core/LlmClient.js")>()),
 	resolveLlmCredentialSource: vi.fn(() => "local-agent"),
 }));
+// The Settings write/read handlers call these directly. Partial so the real
+// SettingsValidationError class survives (the handlers `instanceof`-check it), and
+// the pure helpers stay real for anyone else; only the effectful entry points are
+// stubbed so the endpoint tests never touch config, git or the network.
+vi.mock("./SettingsMutations.js", async (orig) => {
+	const actual = await orig<typeof import("./SettingsMutations.js")>();
+	return {
+		...actual,
+		applySettings: vi.fn(),
+		setSyncSessions: vi.fn(),
+		countMissingForCwd: vi.fn(),
+		checkLocalFolder: vi.fn(),
+		parseSettingsApplyInput: vi.fn(),
+	};
+});
+// The push-control read/write endpoints. Mocked so no PushControlStore touches disk.
+vi.mock("../core/PushControl.js", () => ({
+	listPushControlRepos: vi.fn(async () => []),
+	setRepoPushDisabledByIdentity: vi.fn(async () => ({ disabled: true })),
+	triggerReenableDrain: vi.fn(),
+}));
+// Sign In opens a real browser and blocks on the OAuth callback — mocked to resolve.
+vi.mock("../auth/Login.js", () => ({ browserLogin: vi.fn(async () => {}) }));
+// Sign Out clears the machine-global auth config — mocked so a test never wipes it.
+// Partial: getJolliUrl (read by the sign-in handler) stays real.
+vi.mock("../auth/AuthConfig.js", async (orig) => ({
+	...(await orig<typeof import("../auth/AuthConfig.js")>()),
+	clearAuthCredentials: vi.fn(async () => {}),
+}));
+// The AI-summary probe spawns a `--version` subprocess — mocked.
+vi.mock("../core/localagent/DetectAgents.js", async (orig) => ({
+	...(await orig<typeof import("../core/localagent/DetectAgents.js")>()),
+	isLocalAgentUsable: vi.fn(async () => true),
+}));
+// Dynamically imported by the generate-missing / migrate / sync-now handlers. Mocked
+// so those routes never spend model budget, re-migrate a real folder, or hit the network.
+vi.mock("../backfill/BackfillEngine.js", () => ({
+	runBackfill: vi.fn(async () => ({ generated: 0, errors: 0, total: 0 })),
+	recentCommitHashes: vi.fn(async () => []),
+}));
+vi.mock("../core/MemoryBankRebuild.js", () => ({
+	rebuildMemoryBank: vi.fn(async () => ({ ok: true })),
+}));
+vi.mock("../commands/SyncCommand.js", () => ({ runSync: vi.fn(async () => 0) }));
+// Partial: resolveAssetsDir stays the REAL implementation (the wiki/graph viewer
+// tests need it), wrapped in vi.fn so one test can force the markdown-renderer
+// fallback to fail.
+vi.mock("../graph/GraphExport.js", async (orig) => {
+	const actual = await orig<typeof import("../graph/GraphExport.js")>();
+	return { ...actual, resolveAssetsDir: vi.fn(actual.resolveAssetsDir) };
+});
 
+import { clearAuthCredentials } from "../auth/AuthConfig.js";
+import { browserLogin } from "../auth/Login.js";
+import { recentCommitHashes, runBackfill } from "../backfill/BackfillEngine.js";
+import { runSync } from "../commands/SyncCommand.js";
 import * as gitOps from "../core/GitOps.js";
 import { resolveLlmCredentialSource } from "../core/LlmClient.js";
+import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
+import { rebuildMemoryBank } from "../core/MemoryBankRebuild.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
+import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
 import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
 import { transcriptRepairState } from "../core/TranscriptRepair.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
 import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
+import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import * as installer from "../install/Installer.js";
 import { withIsolatedHome } from "../testUtils/isolatedHome.js";
 import { withDashboardDb } from "./DashboardDb.js";
@@ -96,10 +155,19 @@ import {
 	type ModelRequest,
 	resolveDashboardAssetsDir,
 	startDashboardServer,
+	withTimeout,
 } from "./DashboardServer.js";
 import { buildJourneys } from "./JourneysQuery.js";
 import * as repoForget from "./RepoForget.js";
 import * as repoRegistry from "./RepoRegistry.js";
+import {
+	applySettings,
+	checkLocalFolder,
+	countMissingForCwd,
+	parseSettingsApplyInput,
+	SettingsValidationError,
+	setSyncSessions,
+} from "./SettingsMutations.js";
 import { applyStatsEvents } from "./StatsWriter.js";
 
 let dir: string;
@@ -3037,5 +3105,781 @@ describe("wiki freshness + rebuild endpoints", () => {
 		expect(res.status).toBe(400);
 		expect(((await res.json()) as { error: string }).error).toMatch(/AI provider/);
 		expect(compileAllRepos).not.toHaveBeenCalled();
+	});
+});
+
+describe("withTimeout", () => {
+	it("resolves with the value when the promise settles in time", async () => {
+		await expect(withTimeout(Promise.resolve(42), 1000, "late")).resolves.toBe(42);
+	});
+
+	it("rejects with the message when the promise never settles", async () => {
+		await expect(withTimeout(new Promise<never>(() => {}), 5, "timed out")).rejects.toThrow("timed out");
+	});
+
+	it("passes an Error rejection through untouched", async () => {
+		const err = new Error("boom");
+		await expect(withTimeout(Promise.reject(err), 1000, "late")).rejects.toBe(err);
+	});
+
+	it("wraps a non-Error rejection in an Error", async () => {
+		await expect(withTimeout(Promise.reject("plain"), 1000, "late")).rejects.toThrow("plain");
+	});
+});
+
+describe("settings, auth and misc endpoints", () => {
+	const TOKEN = "settings-token-0123456789abcdef";
+	const HEADERS = { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" };
+
+	function svr(over: Partial<Parameters<typeof createDashboardServer>[0]> = {}): Server {
+		return testServer({ token: TOKEN, ...over });
+	}
+	const postJson = (port: number, path: string, body: unknown): Promise<Response> =>
+		fetch(`http://127.0.0.1:${port}${path}`, { method: "POST", headers: HEADERS, body: JSON.stringify(body) });
+
+	describe("GET /api/settings/check-folder", () => {
+		it("403s without a valid token", async () => {
+			const port = await listen(svr());
+			expect((await get(port, "/api/settings/check-folder?path=/tmp")).status).toBe(403);
+		});
+
+		it("checks the folder with a token, defaulting a missing path to empty", async () => {
+			vi.mocked(checkLocalFolder).mockResolvedValue("writable" as never);
+			const port = await listen(svr());
+			const withPath = await get(port, "/api/settings/check-folder?path=/tmp", {
+				"X-Jolli-Dashboard-Token": TOKEN,
+			});
+			expect(withPath.status).toBe(200);
+			expect(await withPath.json()).toEqual({ status: "writable" });
+			await get(port, "/api/settings/check-folder", { "X-Jolli-Dashboard-Token": TOKEN });
+			expect(vi.mocked(checkLocalFolder).mock.calls.map((c) => c[0])).toEqual(["/tmp", ""]);
+		});
+	});
+
+	describe("GET /api/settings/push-repos", () => {
+		it("lists the machine-wide push repos, folder omitted when unconfigured", async () => {
+			vi.mocked(listPushControlRepos).mockResolvedValueOnce([]);
+			const port = await listen(svr());
+			const res = await get(port, "/api/settings/push-repos");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ repos: [] });
+			// No localFolder in the test config → the option is dropped (the `?? {}` arm).
+			expect(vi.mocked(listPushControlRepos).mock.calls[0]?.[0]).not.toHaveProperty("localFolder");
+		});
+
+		it("forwards the configured Memory Bank folder", async () => {
+			vi.mocked(listPushControlRepos).mockResolvedValueOnce([]);
+			const configDir = writeMemoryBank(dir, [{ dir: "acme-api" }]);
+			const port = await listen(svr({ configDir }));
+			await get(port, "/api/settings/push-repos");
+			expect(vi.mocked(listPushControlRepos).mock.calls[0]?.[0]).toHaveProperty("localFolder");
+		});
+
+		it("500s when the push-control read fails", async () => {
+			vi.mocked(listPushControlRepos).mockRejectedValueOnce(new Error("locked"));
+			const port = await listen(svr());
+			expect((await get(port, "/api/settings/push-repos")).status).toBe(500);
+		});
+	});
+
+	describe("GET /api/settings/missing-summaries", () => {
+		it("returns the count when the cwd is a project", async () => {
+			vi.mocked(countMissingForCwd).mockResolvedValueOnce({ missing: 5 } as never);
+			const port = await listen(svr());
+			const res = await get(port, "/api/settings/missing-summaries");
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ missing: 5 });
+		});
+
+		it("returns { missing: null } when the cwd is not a project", async () => {
+			vi.mocked(countMissingForCwd).mockResolvedValueOnce(null as never);
+			const port = await listen(svr());
+			expect(await (await get(port, "/api/settings/missing-summaries")).json()).toEqual({ missing: null });
+		});
+
+		it("500s when the count fails", async () => {
+			vi.mocked(countMissingForCwd).mockRejectedValueOnce(new Error("boom"));
+			const port = await listen(svr());
+			expect((await get(port, "/api/settings/missing-summaries")).status).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/apply", () => {
+		it("400s an invalid body via SettingsValidationError from the parser", async () => {
+			vi.mocked(parseSettingsApplyInput).mockImplementationOnce(() => {
+				throw new SettingsValidationError("bad input");
+			});
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/apply", {});
+			expect(res.status).toBe(400);
+			expect((await res.json()) as { error: string }).toMatchObject({ error: "bad input" });
+		});
+
+		it("lets a non-validation parse error reach the outer 500 handler", async () => {
+			vi.mocked(parseSettingsApplyInput).mockImplementationOnce(() => {
+				throw new Error("unexpected");
+			});
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/apply", {})).status).toBe(500);
+		});
+
+		it("applies settings and returns the hook failures", async () => {
+			vi.mocked(parseSettingsApplyInput).mockReturnValueOnce({} as never);
+			vi.mocked(applySettings).mockResolvedValueOnce({ hookFailures: ["h1"] } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/apply", {});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, hookFailures: ["h1"] });
+		});
+
+		it("resolves the config dir globally when none was injected", async () => {
+			vi.mocked(parseSettingsApplyInput).mockReturnValueOnce({} as never);
+			vi.mocked(applySettings).mockResolvedValueOnce({ hookFailures: [] } as never);
+			const port = await listen(svr({ configDir: undefined }));
+			expect((await postJson(port, "/api/settings/apply", {})).status).toBe(200);
+		});
+
+		it("400s when applySettings raises a validation error", async () => {
+			vi.mocked(parseSettingsApplyInput).mockReturnValueOnce({} as never);
+			vi.mocked(applySettings).mockRejectedValueOnce(new SettingsValidationError("nope"));
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/apply", {});
+			expect(res.status).toBe(400);
+			expect((await res.json()) as { error: string }).toMatchObject({ error: "nope" });
+		});
+
+		it("500s when applySettings fails for any other reason", async () => {
+			vi.mocked(parseSettingsApplyInput).mockReturnValueOnce({} as never);
+			vi.mocked(applySettings).mockRejectedValueOnce(new Error("disk"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/apply", {})).status).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/set-push", () => {
+		it("400s without a repoIdentity", async () => {
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/set-push", { disabled: true })).status).toBe(400);
+		});
+
+		it("400s when disabled is not a boolean", async () => {
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/set-push", { repoIdentity: "r1" })).status).toBe(400);
+		});
+
+		it("disables a repo's push", async () => {
+			vi.mocked(setRepoPushDisabledByIdentity).mockResolvedValueOnce({ disabled: true } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/set-push", { repoIdentity: "r1", disabled: true });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, disabled: true });
+			expect(triggerReenableDrain).not.toHaveBeenCalled();
+		});
+
+		it("re-enables the current repo and kicks off its drain, surfacing a corrupt-store recovery", async () => {
+			vi.mocked(setRepoPushDisabledByIdentity).mockResolvedValueOnce({
+				disabled: false,
+				recoveredFromCorrupt: true,
+			} as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/set-push", {
+				repoIdentity: "r1",
+				disabled: false,
+				isCurrentRepo: true,
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toMatchObject({ ok: true, disabled: false, recoveredFromCorrupt: true });
+			expect(triggerReenableDrain).toHaveBeenCalledTimes(1);
+		});
+
+		it("500s when the store write fails", async () => {
+			vi.mocked(setRepoPushDisabledByIdentity).mockRejectedValueOnce(new Error("locked"));
+			const port = await listen(svr());
+			expect(
+				(await postJson(port, "/api/settings/set-push", { repoIdentity: "r1", disabled: true })).status,
+			).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/set-sync-sessions", () => {
+		it("400s when enabled is not a boolean", async () => {
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/set-sync-sessions", {})).status).toBe(400);
+		});
+
+		it("applies the session-statistics switch", async () => {
+			vi.mocked(setSyncSessions).mockResolvedValueOnce({ syncSessions: true } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/set-sync-sessions", { enabled: true });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, syncSessions: true });
+		});
+
+		it("resolves the config dir globally when none was injected", async () => {
+			vi.mocked(setSyncSessions).mockResolvedValueOnce({ syncSessions: false } as never);
+			const port = await listen(svr({ configDir: undefined }));
+			expect((await postJson(port, "/api/settings/set-sync-sessions", { enabled: false })).status).toBe(200);
+		});
+
+		it("500s when the switch write fails", async () => {
+			vi.mocked(setSyncSessions).mockRejectedValueOnce(new Error("boom"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/set-sync-sessions", { enabled: true })).status).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/probe-local-agent", () => {
+		it("400s without a tool", async () => {
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/probe-local-agent", {})).status).toBe(400);
+		});
+
+		it("reports whether the tool is usable", async () => {
+			vi.mocked(isLocalAgentUsable).mockResolvedValueOnce(true);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/probe-local-agent", { tool: "claude-code" });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, usable: true });
+		});
+
+		it("500s when the probe throws", async () => {
+			vi.mocked(isLocalAgentUsable).mockRejectedValueOnce(new Error("spawn failed"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/probe-local-agent", { tool: "claude-code" })).status).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/migrate", () => {
+		it("migrates and returns the result", async () => {
+			vi.mocked(rebuildMemoryBank).mockResolvedValueOnce({ ok: true } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/migrate", {});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toMatchObject({ ok: true });
+		});
+
+		it("400s a failed migrate, surfacing the reason as error", async () => {
+			vi.mocked(rebuildMemoryBank).mockResolvedValueOnce({ ok: false, message: "no memories" } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/migrate", {});
+			expect(res.status).toBe(400);
+			expect((await res.json()) as { error: string }).toMatchObject({ error: "no memories" });
+		});
+
+		it("500s when the migrate throws", async () => {
+			vi.mocked(rebuildMemoryBank).mockRejectedValueOnce(new Error("boom"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/migrate", {})).status).toBe(500);
+		});
+	});
+
+	describe("POST /api/settings/generate-missing", () => {
+		it("backfills the launch repo's missing summaries", async () => {
+			vi.mocked(gitOps.getProjectRootDir).mockResolvedValueOnce("/tmp/repo");
+			vi.mocked(recentCommitHashes).mockResolvedValueOnce(["h1"]);
+			vi.mocked(runBackfill).mockResolvedValueOnce({ generated: 1, errors: 0, total: 1 } as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/generate-missing", {});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, generated: 1, errors: 0, total: 1 });
+		});
+
+		it("400s when the launch cwd is not a git repository", async () => {
+			vi.mocked(gitOps.getProjectRootDir).mockRejectedValueOnce(new Error("not a repo"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/generate-missing", {})).status).toBe(400);
+		});
+
+		it("500s when the backfill throws", async () => {
+			vi.mocked(gitOps.getProjectRootDir).mockResolvedValueOnce("/tmp/repo");
+			vi.mocked(runBackfill).mockRejectedValueOnce(new Error("model down"));
+			const port = await listen(svr());
+			expect((await postJson(port, "/api/settings/generate-missing", {})).status).toBe(500);
+		});
+	});
+
+	describe("auth and sync passthrough routes", () => {
+		it("signs in via the shared browserLogin flow", async () => {
+			vi.mocked(browserLogin).mockResolvedValueOnce(undefined as never);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/signin", {});
+			expect(res.status).toBe(200);
+			expect(browserLogin).toHaveBeenCalledTimes(1);
+		});
+
+		it("signs out by clearing the auth credentials", async () => {
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/signout", {});
+			expect(res.status).toBe(200);
+			expect(clearAuthCredentials).toHaveBeenCalledTimes(1);
+		});
+
+		it("runs a manual sync", async () => {
+			vi.mocked(runSync).mockResolvedValueOnce(0);
+			const port = await listen(svr());
+			const res = await postJson(port, "/api/settings/sync-now", {});
+			expect(res.status).toBe(200);
+			expect(runSync).toHaveBeenCalledTimes(1);
+		});
+	});
+});
+
+describe("enable — registry projection", () => {
+	const TOKEN = "enable-token-0123456789abcdef";
+	const HEADERS = { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" };
+	const enable = (port: number, path: string): Promise<Response> =>
+		fetch(`http://127.0.0.1:${port}/api/repos/enable`, {
+			method: "POST",
+			headers: HEADERS,
+			body: JSON.stringify({ path }),
+		});
+
+	it("400s a path that is not a git repository", async () => {
+		vi.mocked(gitOps.getProjectRootDir).mockRejectedValueOnce(new Error("not a repo"));
+		const port = await listen(testServer({ token: TOKEN, dbPath: join(dir, "enable-notgit.db") }));
+		expect((await enable(port, "/tmp/x")).status).toBe(400);
+	});
+
+	it("projects the registered repo into the repos table", async () => {
+		// A matching registry entry drives the find predicate and the withDashboardDb
+		// projection callback — both are skipped by the empty-registry default.
+		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
+			version: 1,
+			repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: join(dir, "acme"), enabledAt: "t" }],
+		});
+		const port = await listen(testServer({ token: TOKEN, dbPath: join(dir, "enable-project.db") }));
+		const res = await enable(port, "/tmp/acme-api");
+		expect(res.status).toBe(200);
+		expect(await res.json()).toEqual({ ok: true, repoIdentity: "r1" });
+	});
+
+	it("warns when the projection write fails, without failing the enable", async () => {
+		const corrupt = join(dir, "enable-corrupt.db");
+		writeFileSync(corrupt, "this is not a database");
+		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
+			version: 1,
+			repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: join(dir, "acme"), enabledAt: "t" }],
+		});
+		const port = await listen(testServer({ token: TOKEN, dbPath: corrupt }));
+		const res = await enable(port, "/tmp/acme-api");
+		expect(res.status).toBe(200);
+		const body = (await res.json()) as { ok: boolean; repoIdentity: string; warning?: string };
+		expect(body.repoIdentity).toBe("r1");
+		expect(body.warning).toMatch(/out of date/);
+	});
+});
+
+describe("forget — projected-root classification", () => {
+	const TOKEN = "forget-token-0123456789abcdef";
+	const HEADERS = { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" };
+	const FORGOTTEN = {
+		identity: "r1",
+		removedFromRegistry: true,
+		repoRowDeleted: true,
+		childRowsDeleted: 0,
+		pendingEventsDeleted: 0,
+	};
+	const forget = (port: number): Promise<Response> =>
+		fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+			method: "POST",
+			headers: HEADERS,
+			body: JSON.stringify({ repoIdentity: "r1" }),
+		});
+
+	beforeEach(() => {
+		vi.mocked(repoForget.forgetRepo).mockReset();
+		vi.mocked(repoForget.classifyRegistryEntry).mockReset();
+		vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValue({ version: 1, repos: [] });
+	});
+
+	it("treats an identity with no database as dead and forgets it", async () => {
+		// No projected row can exist without a database — the no-db shortcut returns
+		// "dead" rather than the fail-safe "live" branch.
+		vi.mocked(repoForget.forgetRepo).mockResolvedValue(FORGOTTEN);
+		const port = await listen(testServer({ token: TOKEN, dbPath: join(dir, "no-such-forget.db") }));
+		expect((await forget(port)).status).toBe(200);
+	});
+
+	it("treats an identity the database does not project as dead and forgets it", async () => {
+		vi.mocked(repoForget.forgetRepo).mockResolvedValue(FORGOTTEN);
+		const dbPath = join(dir, "forget-empty.db");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(testServer({ token: TOKEN, dbPath }));
+		expect((await forget(port)).status).toBe(200);
+	});
+
+	it("fails safe (409) when the projected-root read throws", async () => {
+		// A read it could not do is not evidence the checkout is gone — the classifier
+		// answers "live", so the row is refused rather than deleted.
+		const corrupt = join(dir, "forget-corrupt.db");
+		writeFileSync(corrupt, "this is not a database");
+		const port = await listen(testServer({ token: TOKEN, dbPath: corrupt }));
+		const res = await forget(port);
+		expect(res.status).toBe(409);
+		expect(repoForget.forgetRepo).not.toHaveBeenCalled();
+	});
+});
+
+describe("read routes carry a detail-repo scope token", () => {
+	it("threads ?detailRepo into the model request", async () => {
+		const seen: Array<string | undefined> = [];
+		const port = await listen(
+			testServer({
+				buildModel: async (req) => {
+					seen.push(req.detailRepoIdentity);
+					return model(req.view);
+				},
+			}),
+		);
+		await get(port, "/memories?hash=abc&detailRepo=repo-x");
+		await get(port, "/memories?hash=abc");
+		expect(seen).toEqual(["repo-x", undefined]);
+	});
+});
+
+describe("outer request-handler error paths", () => {
+	it("ends the response cleanly when serialization throws after the headers are sent", async () => {
+		// sendJson writes the 200 header, then JSON.stringify throws on the BigInt —
+		// the outer catch sees headersSent and just ends the response rather than
+		// trying to write a second header.
+		const port = await listen(
+			testServer({
+				buildModel: async (req) =>
+					req.view === "stats" ? ({ view: "stats", bad: 10n } as never) : model(req.view),
+			}),
+		);
+		const res = await get(port, "/api/model?view=stats");
+		expect(res.status).toBe(200);
+		// The server survives and answers the next request normally.
+		expect((await get(port, "/memories")).status).toBe(200);
+	});
+});
+
+describe("context-viewer parameter handling", () => {
+	it("400s when kind or key is missing", async () => {
+		const configDir = writeMemoryBank(dir, [{ dir: "repoA" }]);
+		const port = await listen(testServer({ configDir }));
+		expect((await get(port, "/context-viewer?repo=r&key=k")).status).toBe(400);
+		expect((await get(port, "/context-viewer?repo=r&kind=plan")).status).toBe(400);
+	});
+
+	it("shows a guidance message when the markdown renderer cannot be found", async () => {
+		// Both marked sources are absent: the test assets carry no vendor/ copy, and
+		// resolveGraphAssetsDir is forced to throw — the route returns a friendly 200
+		// rather than a 500.
+		const dbPath = join(dir, "ctxview-nomarked.db");
+		const configDir = join(dir, "config-ctxview-nomarked");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO context (repo_id, kind, context_key, title, body_md, created_at_ms)
+					 VALUES (?, 'plan', 'p1', 'The plan', '# The plan', 1)`,
+				).run(id);
+			},
+			{ dbPath },
+		);
+		vi.mocked(resolveGraphAssetsDir).mockImplementationOnce(() => {
+			throw new Error("no viz assets");
+		});
+		const port = await listen(testServer({ dbPath, configDir }));
+		const res = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1");
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain("markdown renderer is missing");
+	});
+});
+
+describe("/api/context missing kind or key", () => {
+	it("400s a request missing kind and a request missing key", async () => {
+		const port = await listen(testServer());
+		expect((await get(port, "/api/context?repo=r&key=k")).status).toBe(400);
+		expect((await get(port, "/api/context?repo=r&kind=plan")).status).toBe(400);
+	});
+});
+
+describe("more read-route edges", () => {
+	async function seedRepoRow(dbPath: string): Promise<void> {
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+	}
+
+	it("resolves the dashboard assets lazily for /context-viewer when none is injected", async () => {
+		// No `assetsDir` option → the route falls through to resolveDashboardAssetsDir
+		// (the right arm of `options.assetsDir ?? …`) and still renders the doc.
+		const dbPath = join(dir, "ctxview-lazy.db");
+		const configDir = join(dir, "config-ctxview-lazy");
+		await seedRepoRow(dbPath);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO context (repo_id, kind, context_key, title, body_md, created_at_ms)
+					 VALUES (?, 'plan', 'p1', 'The plan', '# The plan', 1)`,
+				).run(id);
+			},
+			{ dbPath },
+		);
+		const port = await listen(createDashboardServer({ port: 0, dbPath, configDir }));
+		const res = await get(port, "/context-viewer?repo=repo-1&kind=plan&key=p1");
+		expect(res.status).toBe(200);
+		expect(await res.text()).toContain("window.marked.parse");
+	});
+
+	it("serves a found conversation's turns over /api/conversation", async () => {
+		const dbPath = join(dir, "conversation-ok.db");
+		const configDir = join(dir, "config-conv-ok");
+		await seedRepoRow(dbPath);
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memories (repo_id, commit_hash, parent_hash, child_pos, root_hash, depth,
+					                       summary_json, first_seen_ms, written_at_ms, commit_date_ms)
+					 VALUES (?, 'abc', NULL, NULL, 'abc', 0, ?, 1, 1, 1)`,
+				).run(id, JSON.stringify({ commitHash: "abc", topics: [] }));
+				const stored = {
+					sessions: [
+						{
+							sessionId: "s1",
+							source: "claude",
+							entries: [{ role: "user", content: "hello there" }],
+						},
+					],
+				};
+				db.prepare(
+					"INSERT INTO transcripts (repo_id, transcript_id, sessions_blob, written_at_ms) VALUES (?, 't1', ?, 1)",
+				).run(id, deflateSync(Buffer.from(JSON.stringify(stored), "utf8")));
+				db.prepare(
+					"INSERT INTO memory_transcripts (repo_id, commit_hash, transcript_id) VALUES (?, 'abc', 't1')",
+				).run(id);
+			},
+			{ dbPath },
+		);
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/api/conversation?repo=repo-1&hash=abc&source=claude&session=s1");
+		expect(res.status).toBe(200);
+		const doc = (await res.json()) as { entries: Array<{ content: string }> };
+		expect(doc.entries[0]?.content).toBe("hello there");
+	});
+
+	it("500s /api/memories when the dashboard database is invalid", async () => {
+		const dbPath = join(dir, "broken-memories.db");
+		writeFileSync(dbPath, "this is not a database");
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config-broken-mem") }),
+		);
+		expect((await get(port, "/api/memories")).status).toBe(500);
+	});
+});
+
+describe("startDashboardServer without an explicit port", () => {
+	it("binds a preferred candidate and logs later server errors without crashing", async () => {
+		const started = await startDashboardServer({
+			assetsDir,
+			buildModel: async (req) => model(req.view),
+			configDir: dir,
+		});
+		servers.push(started.server);
+		expect(started.port).toBeGreaterThan(0);
+		// The post-listening error handler just logs — emitting an error must not throw.
+		expect(() => started.server.emit("error", new Error("late error"))).not.toThrow();
+	});
+});
+
+describe("machine-global fallbacks (no dbPath, no configDir)", () => {
+	it("serves read + config routes against the machine-global db and config", async () => {
+		const home = join(dir, "mg-home");
+		await withIsolatedHome(home, async () => {
+			await withDashboardDb(() => {});
+			const TOKEN = "mg-token-0123456789abcdef";
+			const port = await listen(createDashboardServer({ port: 0, assetsDir, token: TOKEN }));
+			// defaultModelBuilder with no dbPath (the `{}` ensureDashboardDbExists arm).
+			expect((await get(port, "/api/model?view=stats")).status).toBe(200);
+			expect((await get(port, "/api/memories")).status).toBe(200);
+			expect((await get(port, "/api/journeys?range=30d")).status).toBe(200);
+			// A journey feed with no range and no explicit window falls back to the
+			// default range (the `?? JOURNEYS_DEFAULT_RANGE` arm).
+			expect((await get(port, "/api/journeys")).status).toBe(200);
+			expect((await get(port, "/api/journey?id=x&fromMs=1&toMs=2")).status).toBe(404);
+			expect((await get(port, "/api/context?repo=r&kind=plan&key=k")).status).toBe(404);
+			expect((await get(port, "/api/conversation?repo=r&hash=h&source=claude&session=s")).status).toBe(404);
+			expect((await get(port, "/context-viewer?repo=r&kind=plan&key=k")).status).toBe(404);
+			expect((await get(port, "/api/settings/push-repos")).status).toBe(200);
+			expect((await get(port, "/api/wiki/freshness")).status).toBe(200);
+			// Wiki rebuild with no configured Memory Bank folder → 400 (still runs the
+			// config-dir fallback).
+			const reb = await fetch(`http://127.0.0.1:${port}/api/wiki/rebuild`, {
+				method: "POST",
+				headers: { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" },
+				body: "{}",
+			});
+			expect(reb.status).toBe(400);
+		});
+	});
+
+	it("classifies and forgets a dead identity against the machine-global db", async () => {
+		const home = join(dir, "mg-home-forget");
+		await withIsolatedHome(home, async () => {
+			await withDashboardDb(() => {});
+			const TOKEN = "mg-forget-0123456789abcdef";
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({ version: 1, repos: [] });
+			vi.mocked(repoForget.forgetRepo).mockResolvedValueOnce({
+				identity: "r1",
+				removedFromRegistry: true,
+				repoRowDeleted: true,
+				childRowsDeleted: 0,
+				pendingEventsDeleted: 0,
+			});
+			const port = await listen(createDashboardServer({ port: 0, assetsDir, token: TOKEN }));
+			const res = await fetch(`http://127.0.0.1:${port}/api/repos/forget`, {
+				method: "POST",
+				headers: { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" },
+				body: JSON.stringify({ repoIdentity: "r1" }),
+			});
+			expect(res.status).toBe(200);
+		});
+	});
+
+	it("projects a registered repo against the machine-global db on enable", async () => {
+		const home = join(dir, "mg-home-enable");
+		await withIsolatedHome(home, async () => {
+			await withDashboardDb(() => {});
+			const TOKEN = "mg-enable-0123456789abcdef";
+			vi.mocked(repoRegistry.readRepoRegistry).mockResolvedValueOnce({
+				version: 1,
+				repos: [{ repoIdentity: "r1", repoName: "acme-api", worktreeRoot: join(dir, "acme"), enabledAt: "t" }],
+			});
+			const port = await listen(createDashboardServer({ port: 0, assetsDir, token: TOKEN }));
+			const res = await fetch(`http://127.0.0.1:${port}/api/repos/enable`, {
+				method: "POST",
+				headers: { "X-Jolli-Dashboard-Token": TOKEN, "content-type": "application/json" },
+				body: JSON.stringify({ path: "/tmp/acme-api" }),
+			});
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ ok: true, repoIdentity: "r1" });
+		});
+	});
+});
+
+describe("telemetry beacon — payload shape branches", () => {
+	afterEach(() => {
+		shutdownTelemetry();
+	});
+
+	async function post(port: number, body: unknown): Promise<Response> {
+		return fetch(`http://127.0.0.1:${port}/api/telemetry`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: typeof body === "string" ? body : JSON.stringify(body),
+		});
+	}
+
+	it("drops a beacon whose event is not a string", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		expect((await post(port, { event: 123, properties: {} })).status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+
+	it("treats a non-object properties field as empty and still forwards the event", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		expect((await post(port, { event: "dashboard_opened" })).status).toBe(204);
+		const events = await readTelemetryEvents(dir);
+		expect(events).toHaveLength(1);
+		expect(events[0]).toMatchObject({ eventName: "dashboard_opened", properties: {} });
+	});
+
+	it("drops a well-formed body that is not a JSON object", async () => {
+		initTelemetry({ cwd: dir, installId: "install-1", origin: "https://acme.jolli.ai", config: {}, env: {} });
+		const port = await listen(testServer());
+		expect((await post(port, "42")).status).toBe(204);
+		expect(await readTelemetryEvents(dir)).toEqual([]);
+	});
+});
+
+describe("defaultModelBuilder — reachability and identity edges", () => {
+	async function seedRepo(dbPath: string, root: string): Promise<void> {
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: root,
+						enabledAt: "t",
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+	}
+
+	it("caches each worktree's git identity across standup requests on one server", async () => {
+		const dbPath = join(dir, "identity-cache.db");
+		const configDir = join(dir, "config-identity");
+		await seedRepo(dbPath, "/w/jolli");
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		expect((await get(port, "/api/model?view=standup")).status).toBe(200);
+		// Second request is served from the per-server identity cache — one git read only.
+		expect((await get(port, "/api/model?view=standup")).status).toBe(200);
+		expect(vi.mocked(gitOps.readLocalGitIdentity).mock.calls).toEqual([["/w/jolli"]]);
+	});
+
+	it("tolerates a repo whose reachable-commit read returns nothing", async () => {
+		const dbPath = join(dir, "reach-null.db");
+		const configDir = join(dir, "config-reach-null");
+		await seedRepo(dbPath, "/w/jolli");
+		vi.mocked(gitOps.listReachableCommits).mockResolvedValueOnce(null);
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		expect((await get(port, "/api/model?view=memories")).status).toBe(200);
+	});
+
+	it("builds the settings view from config, not the database", async () => {
+		const dbPath = join(dir, "settings-view.db");
+		const configDir = join(dir, "config-settings-view");
+		await withDashboardDb(() => {}, { dbPath });
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir, token: "sv", serverCwd: process.cwd() }),
+		);
+		const res = await get(port, "/api/model?view=settings", { "X-Jolli-Dashboard-Token": "sv" });
+		expect(res.status).toBe(200);
+		expect(((await res.json()) as DashboardModel).view).toBe("settings");
 	});
 });

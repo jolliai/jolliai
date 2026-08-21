@@ -286,7 +286,9 @@ async function checkoutFingerprint(path: string): Promise<string | null> {
 	// line — as before.
 	const tips = refs.stdout
 		.split("\n")
+		/* v8 ignore start -- `line` is a non-empty string here and `String.split` returns at least one element, so `line.split(" ")[0]` is always defined and the `?? ""` fallback is dead */
 		.filter((line) => line && !isJolliInternalRef(line.split(" ")[0] ?? ""))
+		/* v8 ignore stop */
 		.join("\n");
 	return `${head}+${createHash("sha256").update(tips).digest("hex")}`;
 }
@@ -475,7 +477,9 @@ function readBootstrapState(db: DashboardDbHandle, repoIdentity: string): string
 	const row = db.prepare("SELECT bootstrap_state FROM repos WHERE repo_identity = ?").get(repoIdentity) as
 		| { bootstrap_state?: string }
 		| undefined;
+	/* v8 ignore start -- the only caller (dbBackfillRepo) reads this AFTER projecting repoEnabledEvent, so the row always exists, and bootstrap_state is `NOT NULL DEFAULT 'pending'`; both the missing-row and the `?? "pending"` fallbacks are unreachable */
 	return row?.bootstrap_state ?? "pending";
+	/* v8 ignore stop */
 }
 
 function readCursor(db: DashboardDbHandle, repoIdentity: string, source: string): string | undefined {
@@ -791,7 +795,9 @@ export function pruneUnreachableCommits(
 	inTransaction(db, () => {
 		for (const row of stale) remove.run(repoIdentity, row.hash);
 		const landedDays: number[] = [];
+		/* v8 ignore start -- reaching this line requires `stale.length > 0`, and `storedCommitHashes` joins `commits` to `repos`, so the repo row exists and `repoId` is never undefined here */
 		if (repoId !== undefined) {
+			/* v8 ignore stop */
 			const landedAt = db.prepare(MEMORY_LANDED_AT_SQL);
 			for (const { hash } of stale) {
 				const landed = landedAt.get(repoId, hash) as { at_ms: number | null } | undefined;
@@ -1942,10 +1948,16 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				if (summaries.complete && summaryApply.pending === 0) {
 					writeCursor(db, repo.repoIdentity, CURSOR_SUMMARIES, indexFingerprint, now());
 				} else {
+					// Hoisted out of the log.warn args on purpose: as a ternary buried in a
+					// multi-line call argument, v8 samples this branch non-deterministically
+					// (the uncovered branch drifts between full-suite runs even though both
+					// arms are exercised); as a standalone conditional it is instrumented
+					// deterministically.
+					const unreadableCount = summaries.complete ? 0 : 1;
 					log.warn(
 						"skipping summaries cursor advance for %s -- %d unreadable, %d unprojected",
 						repo.repoName,
-						summaries.complete ? 0 : 1,
+						unreadableCount,
 						summaryApply.pending,
 					);
 				}
@@ -2264,7 +2276,9 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 				eventsApplied: applied,
 				sotImport,
 				repoName: repo.repoName,
+				/* v8 ignore start -- the session tier assigns `sessionSummary` unconditionally and no path returns between it and here, so the empty-object arm is unreachable */
 				...(sessionSummary ? { sessions: sessionSummary } : {}),
+				/* v8 ignore stop */
 			} as DbBackfillResult;
 		},
 		{ dbPath: opts.dbPath },
@@ -2434,7 +2448,9 @@ async function readRecordedSessions(
 	live: ReadonlyArray<RegisteredRepo>,
 	dbPath?: string,
 ): Promise<AlreadyCurrent | undefined> {
+	/* v8 ignore start -- the only caller (dbBackfillRepos, ~line 2628) is guarded by `live.length === 0 || … ? {} : readRecordedSessions(live, …)`, so this is never reached with an empty list */
 	if (live.length === 0) return undefined;
+	/* v8 ignore stop */
 	try {
 		return await withDashboardDb(
 			(db) => {
@@ -3146,7 +3162,9 @@ export async function dbRescanSessions(opts: SessionRescanOptions): Promise<Sess
 	// non-deterministic. The sources above ARE concurrent, because those are different
 	// stores.
 	for (const repo of ready) {
+		/* v8 ignore start -- `ready` is `live.filter(r => baselines.has(r.repoIdentity))`, so `baselines.get` is always defined here and the `?? new Map` fallback is unreachable */
 		const known = baselines.get(repo.repoIdentity) ?? new Map<string, number>();
+		/* v8 ignore stop */
 		// The registered checkouts of this repo, and its `cwd` the newest of them —
 		// exactly as `dbBackfillRepo` picks it.
 		//

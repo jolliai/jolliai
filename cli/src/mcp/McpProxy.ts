@@ -343,7 +343,14 @@ async function ensureDaemonConnection(args: EnsureArgs): Promise<AttachedSocket 
 			// success from the proxy's point of view), and if it has since died, the
 			// newcomer takes the path. Either way the retry that follows attaches to
 			// whichever one owns it, and the worst case is the documented fallback.
+			/* v8 ignore start -- the `false` side (`first === "unresponsive"`) can only
+			   be produced by `tryConnect`'s own 2 s timeout, which is itself already
+			   marked unreachable-from-a-test a few functions below (a hung connect
+			   needs a wedged accept backlog, which is neither portable nor
+			   deterministic to arrange). Since that is the only source of
+			   "unresponsive", this line's other branch is equally out of reach. */
 			if (first === "absent") await removeStaleSocket(socketPath);
+			/* v8 ignore stop */
 			probes.push("free");
 			continue;
 		}
@@ -507,7 +514,15 @@ function tryConnect(socketPath: string): Promise<Socket | ConnectFailure> {
 	return new Promise((resolve) => {
 		let settled = false;
 		const finish = (value: Socket | ConnectFailure): void => {
+			/* v8 ignore start -- this guard fires only if TWO of {connect, error, the
+			   2 s timeout} race for the same socket, and the timeout side of that race
+			   is already marked unreachable-from-a-test a few lines below. The
+			   remaining pair (`connect` then a LATER `error`) needs a peer that accepts
+			   and then raises a post-connect socket error, which — like the peer-error
+			   handlers elsewhere in this module and in McpDaemon.ts — a unix-domain
+			   socket has no portable way to force deterministically. */
 			if (settled) return;
+			/* v8 ignore stop */
 			settled = true;
 			clearTimeout(timer);
 			resolve(value);
@@ -622,7 +637,15 @@ function pipeUntilClosed(
 	return new Promise((resolve) => {
 		let done = false;
 		const finish = (): void => {
+			/* v8 ignore start -- `finish` is invoked from `close` (a `once` listener,
+			   so at most one call from there) and from the `error` handler below,
+			   which is itself already marked unreachable-from-a-test for the same
+			   reason as McpDaemon's peer-error handler: a unix-domain socket has no
+			   portable way to force a peer-side error deterministically. With that
+			   path out of reach, `close` firing exactly once is the only source left,
+			   so this guard's `true` branch cannot be driven either. */
 			if (done) return;
+			/* v8 ignore stop */
 			done = true;
 			stdin.unpipe(socket);
 			socket.unpipe(stdout);

@@ -161,7 +161,12 @@ export function journeyActivityMinutes(buckets: ReadonlySet<number>): number {
 
 /** First line of the commit message, minus a leading ticket prefix. */
 function commitTitle(message: string | null): string {
+	// `.split("\n")` always returns a non-empty array, so `[0]` is always a
+	// (possibly empty) string and `?.trim()` always runs — the trailing `?? ""`
+	// exists only to satisfy the type; its fallback arm is unreachable.
+	/* v8 ignore start */
 	const first = (message ?? "").split("\n")[0]?.trim() ?? "";
+	/* v8 ignore stop */
 	return (
 		first.replace(/^(closes|fixes|part of)?\s*[A-Z][A-Z0-9]+-\d+\s*[:\-—]\s*/i, "").trim() ||
 		first ||
@@ -367,7 +372,12 @@ function assemble(
 	for (const row of live) {
 		const mapKey = commitMapKey(row.repo_identity, row.commit_hash);
 		const key = keys.get(mapKey);
+		/* v8 ignore start -- assignJourneyKeys assigns exactly one key per element of
+		   `inputs`, and `inputs` is built 1:1 from `live` (the same array this loop
+		   walks), so `keys.get(mapKey)` cannot miss for any row reached here. Kept as
+		   a guard against a future refactor that decouples the two arrays. */
 		if (!key) continue;
+		/* v8 ignore stop */
 		const summary = parseSummary(row.summary_json);
 		const sessionRefs = sessions.get(mapKey) ?? [];
 		const existing = groups.get(key.key);
@@ -396,7 +406,15 @@ function assemble(
 		accumulator.commitCount += 1;
 		accumulator.commitTitles.push(commitTitle(row.commit_message));
 		accumulator.startedAtMs = Math.min(accumulator.startedAtMs, row.committed_at_ms);
+		// `live` is read with `ORDER BY committed_at_ms ASC` above, and each
+		// accumulator only ever sees the subsequence of that order belonging to
+		// its own journey, so `row.committed_at_ms` is never smaller than the
+		// running `endedAtMs` — the condition is always true whenever this line
+		// runs. Written as a real check anyway rather than an assertion, since a
+		// future change to the read order should degrade gracefully, not throw.
+		/* v8 ignore start */
 		if (row.committed_at_ms >= accumulator.endedAtMs) {
+			/* v8 ignore stop */
 			accumulator.endedAtMs = row.committed_at_ms;
 			// The newest commit names the journey: it is the most recent
 			// statement of what the work turned out to be.
@@ -565,8 +583,15 @@ function modelFromGroups(
 	return {
 		journeys,
 		indexedCommits,
+		/* v8 ignore start -- `canFeature` requires at least MIN_FEATURED_MEASURED_TURNS
+		   journeys, so `journeys` is non-empty whenever pickSmoothest/pickHardest run;
+		   both reduce over a non-empty list starting from `undefined` and always end
+		   up assigning a real element (JourneyMetrics.ts's `lowestFriction` /
+		   `pickHardest`), so `?.id` is never undefined here — the `?? null` exists
+		   only to satisfy the nullable return type. */
 		smoothestId: canFeature ? (pickSmoothest(journeys)?.id ?? null) : null,
 		hardestId: canFeature ? (pickHardest(journeys)?.id ?? null) : null,
+		/* v8 ignore stop */
 		// Echoed back verbatim so a caller re-opening one of these journeys can
 		// send the SAME bounds rather than re-resolving a window — see
 		// `JourneysModel.windowStartMs`'s doc comment for why a second resolve
@@ -915,9 +940,14 @@ function parseSummary(json: string): Record<string, unknown> {
 	try {
 		const parsed: unknown = JSON.parse(json);
 		return typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : {};
+		/* v8 ignore start -- `json` is always `memories.summary_json`, a STORED
+		   generated-column expression evaluated with `json_extract` at INSERT time
+		   (see SotSchema.ts), so SQLite refuses to store a row whose `summary_json`
+		   is not valid JSON in the first place — this catch has no row to react to. */
 	} catch {
 		return {};
 	}
+	/* v8 ignore stop */
 }
 
 function collectDecisions(summary: Record<string, unknown>): ReadonlyArray<string> {

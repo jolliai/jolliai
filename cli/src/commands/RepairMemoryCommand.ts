@@ -25,7 +25,9 @@ const SUBJECT_WIDTH = 64;
 
 /** First line of a commit message, trimmed to one terminal-friendly column. */
 function oneLine(text: string | null | undefined): string {
+	/* v8 ignore start -- String.split() always yields at least one element and .trim() always a string, so the `[0]?.` short-circuit and the trailing `?? ""` are unreachable; they exist only to satisfy noUncheckedIndexedAccess typing. */
 	const first = (text ?? "").split("\n")[0]?.trim() ?? "";
+	/* v8 ignore stop */
 	if (first.length === 0) return "(no commit message)";
 	return first.length > SUBJECT_WIDTH ? `${first.substring(0, SUBJECT_WIDTH - 1)}…` : first;
 }
