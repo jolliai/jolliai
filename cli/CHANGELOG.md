@@ -1,10 +1,17 @@
 # Changelog
 
-<!-- Last synced commit: b2e68798 | 2026-08-15 -->
+<!-- Last synced commit: b630a5790 | 2026-08-22 -->
 
-## Unreleased
+## 0.99.14
 
-- **`jolli repair-memory` puts a memory back where it belongs** — when an amend, rebase or squash rewrites a commit and its memory does not move with it, the conversations, skills and topics stay mounted under a commit hash your branch no longer has, while the new commit shows nothing. Nothing used to report that. `jolli doctor` now warns when it finds one, and `jolli repair-memory` reattaches it — `--status` first to see what it would do and what it would bring back, `--from/--to` when your reflog is too old to pair the two hashes, `--no-llm` to merge a squash without an AI call. Every memory it is about to overwrite is backed up first, and running it twice is safe.
+- **See which agent did the work** — memories now record which AI tool each conversation, commit, and skill came from — Claude Code, Codex, Cursor, Copilot, Cline, Antigravity, Kimi Code — and the dashboard breaks your work down by agent.
+- **A coaching view of your journeys** — the dashboard's **Journeys** page shows plan-first share, top skill, cost, and recall for the window you pick, with your smoothest and hardest journeys called out.
+- **Skill usage has its own page** — see which agent used which skill, and the **Daily Standup** is now a week-at-a-time view instead of one long list.
+- **`jolli repair-memory` reattaches a lost memory** — when an amend, rebase, or squash rewrites a commit, its memory can end up stuck on the old hash while the new commit shows nothing. `jolli doctor` now flags this, and `jolli repair-memory` puts it back (`--status` to preview first). Safe to run twice, and it backs up anything it replaces.
+- **Pick a model per local agent** — `localAgentModel` now applies per tool, so Claude Code and Codex each keep their own default and choices.
+- **Cleaner conversation history** — empty conversations no longer clutter your archives, conversations that grow after import are picked back up, and Codex transcripts parse more reliably.
+- **SSH host aliases are recognised** — a repo cloned through a `~/.ssh/config` alias now binds to the same identity as one cloned by its real host.
+- Bug fixes.
 
 ## 0.99.13
 

@@ -1,6 +1,14 @@
 # Changelog
 
-<!-- Last synced commit: b2e68798 | 2026-08-15 -->
+<!-- Last synced commit: b630a5790 | 2026-08-22 -->
+
+## 0.99.14
+
+- **See which agent did the work** — memories now record which AI tool each conversation, commit, and skill came from — Claude Code, Codex, Cursor, Copilot, Cline, Antigravity, Kimi Code — and the dashboard breaks your work down by agent.
+- **Pick a model per local agent** — **Settings → AI Summary** now pins the model per tool, so Claude Code and Codex each keep their own default and choices.
+- **Source badges in the dashboard** — references and memories show their source's own label and badge, so it's clear at a glance where each came from.
+- **Cleaner conversation history** — empty conversations no longer show up, and conversations that grow after import are picked back up.
+- Bug fixes.
 
 ## 0.99.13
 
