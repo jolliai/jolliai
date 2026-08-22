@@ -17,7 +17,7 @@ plugins {
 }
 
 group = "ai.jolli"
-version = "0.99.13"
+version = "0.99.14"
 
 repositories {
     mavenCentral()

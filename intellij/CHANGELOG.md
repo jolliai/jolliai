@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.99.14
+
+### Fixes & Improvements
+
+- Bug fixes.
+
+### Performance
+
+- Performance improvements.
+
 ## 0.99.13
 
 ### Changes
