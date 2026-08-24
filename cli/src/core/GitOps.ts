@@ -354,6 +354,25 @@ export async function listReachableCommits(cwd?: string): Promise<ReadonlyArray<
 }
 
 /**
+ * The object id at every local branch tip (`refs/heads/*`), sorted, or null on a
+ * git failure. This is the exact INPUT that {@link listReachableCommits} walks —
+ * `rev-list --branches` starts from these same tips — but read with a cheap
+ * O(branches) ref read instead of an O(history) object walk. So a caller can ask
+ * "could the reachable set have changed since last time?" (identical tips ⇒
+ * identical reachable set) before paying for the full walk. Sorted so a bare
+ * reordering of refs is not seen as a change.
+ */
+export async function listBranchTips(cwd?: string): Promise<ReadonlyArray<string> | null> {
+	const result = await execGit(["for-each-ref", "--format=%(objectname)", "refs/heads"], cwd);
+	if (result.exitCode !== 0) return null;
+	return result.stdout
+		.split("\n")
+		.map((line) => line.trim())
+		.filter((h) => h.length > 0)
+		.sort();
+}
+
+/**
  * The git identity commits made here are attributed to (`user.email` /
  * `user.name`), each field null when unset or unreadable.
  *

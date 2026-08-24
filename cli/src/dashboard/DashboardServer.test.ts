@@ -157,6 +157,7 @@ import {
 	startDashboardServer,
 	withTimeout,
 } from "./DashboardServer.js";
+import { markMemoriesReachability } from "./DbBackfill.js";
 import { buildJourneys } from "./JourneysQuery.js";
 import * as repoForget from "./RepoForget.js";
 import * as repoRegistry from "./RepoRegistry.js";
@@ -2166,11 +2167,11 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(graph.graph?.repos[0]?.graphAvailable).toBe(true);
 	});
 
-	// The Memories view reads git before querying: a rebase leaves rewritten
-	// commits in `memories` forever, so the list is filtered against what is still
-	// reachable. Stats and Standup pay the same cost (see REACHABILITY_VIEWS); the
-	// views outside that set skip it, and it is only paid for still-enabled repos.
-	it("reads reachable commits for the Memories view, and prunes rows that no branch reaches", async () => {
+	// The Memories view filters rows a rebase left behind — but from the
+	// materialised `memories.reachable` column now, not a per-request `git
+	// rev-list`. The async sweep marks the rewritten row unreachable; the list
+	// filters `reachable = 1` in SQL, and no git runs on the read path.
+	it("prunes memory rows the reachability column marks unreachable, with no git on the read path", async () => {
 		const dbPath = join(dir, "memories-reach.db");
 		const configDir = join(dir, "config");
 		await applyStatsEvents(
@@ -2200,6 +2201,8 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 						 VALUES (?, ?, NULL, NULL, ?, 0, ?, 1, 1, 1)`,
 					).run(id, hash, hash, JSON.stringify({ commitHash: hash, topics: [] }));
 				}
+				// The reconcile sweep's answer: only "reachable-hash" is on a branch.
+				markMemoriesReachability(db, "repo-1", new Set(["reachable-hash"]));
 			},
 			{ dbPath },
 		);
@@ -2210,7 +2213,8 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(res.status).toBe(200);
 		const body = (await res.json()) as DashboardModel;
 		expect(body.view).toBe("memories");
-		expect(gitOps.listReachableCommits).toHaveBeenCalledWith("/w/jolli");
+		// Reachability is a column now — the read path pays no `git rev-list`.
+		expect(gitOps.listReachableCommits).not.toHaveBeenCalled();
 		expect((body.memories?.items ?? []).map((item) => item.commitHash)).toEqual(["reachable-hash"]);
 	});
 
@@ -2266,9 +2270,9 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 	});
 
 	// The `/` redirect builds no model at all now — it has one destination, so
-	// there is nothing to read `repos.length` for. The page it lands on still
-	// pays the per-repo `git rev-list` its memory rows are filtered by.
-	it("does no git work for the / redirect, but pays it on the page itself", async () => {
+	// there is nothing to read `repos.length` for. And the page it lands on no
+	// longer pays git either: reachability is the materialised column.
+	it("does no git work for the / redirect, and none on the page either", async () => {
 		const dbPath = join(dir, "root-redirect.db");
 		const configDir = join(dir, "config-root");
 		await applyStatsEvents(
@@ -2295,7 +2299,7 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect(gitOps.listReachableCommits).not.toHaveBeenCalled();
 
 		expect((await get(port, "/memories")).status).toBe(200);
-		expect(gitOps.listReachableCommits).toHaveBeenCalledWith("/w/jolli");
+		expect(gitOps.listReachableCommits).not.toHaveBeenCalled();
 	});
 
 	// The "Load more" fetch. Filtered by the SAME reachability the page render
@@ -2324,8 +2328,8 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get("repo-1") as {
 					id: number;
 				};
-				// `listReachableCommits` is stubbed to return "reachable-hash" only, so
-				// the second row is here to prove the route filters like the page does.
+				// The sweep marks only "reachable-hash" reachable; the second row is here
+				// to prove the route filters `reachable = 1` like the page does.
 				for (const [hash, dateMs] of [
 					["reachable-hash", 2],
 					["rewritten-hash", 1],
@@ -2336,6 +2340,7 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 						 VALUES (?, ?, NULL, NULL, ?, 0, ?, 1, 1, ?)`,
 					).run(id, hash, hash, JSON.stringify({ commitHash: hash, topics: [] }), dateMs);
 				}
+				markMemoriesReachability(db, "repo-1", new Set(["reachable-hash"]));
 			},
 			{ dbPath },
 		);

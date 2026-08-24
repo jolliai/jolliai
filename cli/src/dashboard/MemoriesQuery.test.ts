@@ -6,6 +6,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { transcriptRepairState } from "../core/TranscriptRepair.js";
 import { withDashboardDb } from "./DashboardDb.js";
 import type { DashboardScope } from "./DashboardModel.js";
+import { markMemoriesReachability } from "./DbBackfill.js";
 import {
 	buildMemories,
 	buildMemoriesList,
@@ -482,10 +483,15 @@ describe("MemoriesQuery", () => {
 			// but which git no longer reaches, so it is not in the list being paged
 			// and cannot be a position in it.
 			await seedThree();
-			const reachable = new Map([["repo-1", new Set(["a".repeat(40), "b".repeat(40)])]]);
+			// c is in the table but git no longer reaches it — the async sweep marks
+			// it 0, and `buildMemoriesPage` filters `reachable = 1` in SQL.
+			await withDashboardDb(
+				(db) => markMemoriesReachability(db, "repo-1", new Set(["a".repeat(40), "b".repeat(40)])),
+				{ dbPath },
+			);
 
 			const page = await withDashboardDb(
-				(db) => buildMemoriesPage(db, ALL, { repoIdentity: "repo-1", commitHash: "c".repeat(40) }, reachable),
+				(db) => buildMemoriesPage(db, ALL, { repoIdentity: "repo-1", commitHash: "c".repeat(40) }),
 				{ dbPath },
 			);
 
@@ -1415,7 +1421,7 @@ describe("MemoriesQuery", () => {
 			await seedMemory(dbPath, "repo-2", h2, "in web", { commitDateMs: 2 });
 
 			// The short prefix "abcd1234" matches BOTH repos; detailRepo picks one.
-			const toWeb = await withDashboardDb((db) => buildMemories(db, ALL, "abcd1234", undefined, "acme-web"), {
+			const toWeb = await withDashboardDb((db) => buildMemories(db, ALL, "abcd1234", "acme-web"), {
 				dbPath,
 			});
 			expect(toWeb.selected?.commitHash).toBe(h2);
@@ -1884,10 +1890,9 @@ describe("MemoriesQuery", () => {
 			await seedRepo(dbPath, "repo-1", "acme-api");
 			await seedMemory(dbPath, "repo-1", HASH, "feat: thing");
 
-			const model = await withDashboardDb(
-				(db) => buildMemories(db, ALL, HASH, undefined, undefined, "repaired"),
-				{ dbPath },
-			);
+			const model = await withDashboardDb((db) => buildMemories(db, ALL, HASH, undefined, "repaired"), {
+				dbPath,
+			});
 
 			expect(model.selected?.transcriptRepairState).toBe("repaired");
 		});

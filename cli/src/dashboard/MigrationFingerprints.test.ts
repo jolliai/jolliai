@@ -66,6 +66,14 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// entries and are absent from this list by construction, not by omission.
 	["SESSION_ACTIVITY_DDL", "6b9d168501ee"],
 	["SKILL_INVOCATIONS_DDL", "70871ae1a43f"],
+	// Covering index widening `ix_mt_transcript` with `commit_hash` so
+	// `readSessionAggregates` (JourneysQuery.ts) matches (repo_id, transcript_id)
+	// without a table fetch — see the entry's own file. Coaching page load was ~2.1 s
+	// in this one scan, twice per render; the index makes it ~0.03 s. A pure-SQL
+	// `sqlMigration`, so it carries a fingerprint; its two reachability siblings are
+	// add-column code entries, absent from this list by construction and guarded by
+	// their companion tests instead.
+	["2026-08-25-0000-memory-transcripts-covering-index", "0b4cd41295aa"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

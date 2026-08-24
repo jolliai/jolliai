@@ -210,6 +210,30 @@ describe("withDashboardDb", () => {
 		}
 	});
 
+	it("carries the covering index readSessionAggregates depends on", async () => {
+		// Regression guard for the coaching-page bottleneck (JOLLI-2274). The
+		// baseline `ix_mt_transcript(repo_id, transcript_id)` is the join key but
+		// does NOT cover `commit_hash`, which `readSessionAggregates` also selects —
+		// so the planner drops to a single-column `repo_id=?` search and scans the
+		// whole repo's `memory_transcripts` rows (~2.1 s per scan, twice per render).
+		// COVERING commit_hash is the whole fix; the measured 2.1 s → ~0.03 s plan
+		// win was confirmed on the real populated database (an empty-DB EXPLAIN is
+		// planner-heuristic, not a stable assertion). What we own and pin here is
+		// that the index exists and carries the three columns in order.
+		const indexSql = await withDashboardDb(
+			(db) =>
+				(
+					db
+						.prepare(
+							"SELECT sql FROM sqlite_master WHERE type = 'index' AND name = 'ix_mt_transcript_covering'",
+						)
+						.get() as { sql: string } | undefined
+				)?.sql,
+			{ dbPath },
+		);
+		expect(indexSql).toContain("memory_transcripts(repo_id, transcript_id, commit_hash)");
+	});
+
 	it("does not create the objects the SQLite cutover retired", async () => {
 		// Each of these is a decision, not an omission, so a reappearance should
 		// fail here rather than be discovered later:

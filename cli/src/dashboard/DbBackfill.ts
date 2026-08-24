@@ -837,6 +837,91 @@ export function pruneUnreachableCommits(
 }
 
 /**
+ * Materialise git-reachability onto `memories.reachable` for one repo, so the
+ * coaching / memories feeds can filter in SQL instead of running
+ * `git rev-list --branches` on every read (see {@link MEMORY_REACHABLE_DDL}).
+ *
+ * The counterpart to {@link pruneUnreachableCommits}: that one DELETES the
+ * derived `commits` rows, but a memory's own row is kept by design (a rewritten
+ * commit's memory is a duplicate of the surviving one, retained as content), so
+ * the memory needs its own visibility flag. Both are fed the SAME reachable set
+ * — the union across the repo's worktrees — so the two tiers can never disagree
+ * about what a branch still carries.
+ *
+ * Only rows whose flag actually changes are written, so a settled repo is a pure
+ * read and re-running the sweep touches nothing (the idempotence
+ * {@link dbBackfillRepos} depends on). Returns how many rows flipped. Memories
+ * are few per repo, so the reachable set — which can hold tens of thousands of
+ * hashes — is consulted in JS rather than shipped into SQL as a giant `IN`.
+ */
+export function markMemoriesReachability(
+	db: DashboardDbHandle,
+	repoIdentity: string,
+	reachable: ReadonlySet<string>,
+): number {
+	const repoRow = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(repoIdentity) as
+		| { id?: number }
+		| undefined;
+	const repoId = repoRow?.id;
+	// A repo with no row has no memories to mark; nothing to do.
+	if (repoId === undefined) return 0;
+	const rows = db
+		.prepare("SELECT commit_hash, reachable FROM memories WHERE repo_id = ?")
+		.all(repoId) as ReadonlyArray<{ commit_hash: string; reachable: number }>;
+	const flips: Array<{ hash: string; want: number }> = [];
+	for (const row of rows) {
+		const want = reachable.has(row.commit_hash) ? 1 : 0;
+		if (row.reachable !== want) flips.push({ hash: row.commit_hash, want });
+	}
+	if (flips.length === 0) return 0;
+	const update = db.prepare("UPDATE memories SET reachable = ? WHERE repo_id = ? AND commit_hash = ?");
+	inTransaction(db, () => {
+		for (const flip of flips) update.run(flip.want, repoId, flip.hash);
+	});
+	log.info("marked %d memory reachability flips for %s", flips.length, repoIdentity);
+	return flips.length;
+}
+
+/**
+ * The commit-tier twin of {@link markMemoriesReachability}, feeding the stats and
+ * standup feeds (see {@link COMMIT_REACHABLE_DDL}). Same shape — flip only the
+ * rows that change, idempotent — over `commits` instead of `memories`.
+ *
+ * In a full sweep this runs AFTER {@link pruneUnreachableCommits} has already
+ * DELETED the unreachable rows, so it only heals any stale `0` left on a now-
+ * reachable commit; the reconcile daemon, which does not prune, is what actually
+ * marks a commit orphaned since the last sweep. A commit is one row per
+ * `(repo_id, hash)`, so the update targets exactly one.
+ */
+export function markCommitsReachability(
+	db: DashboardDbHandle,
+	repoIdentity: string,
+	reachable: ReadonlySet<string>,
+): number {
+	const repoRow = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(repoIdentity) as
+		| { id?: number }
+		| undefined;
+	const repoId = repoRow?.id;
+	if (repoId === undefined) return 0;
+	const rows = db.prepare("SELECT hash, reachable FROM commits WHERE repo_id = ?").all(repoId) as ReadonlyArray<{
+		hash: string;
+		reachable: number;
+	}>;
+	const flips: Array<{ hash: string; want: number }> = [];
+	for (const row of rows) {
+		const want = reachable.has(row.hash) ? 1 : 0;
+		if (row.reachable !== want) flips.push({ hash: row.hash, want });
+	}
+	if (flips.length === 0) return 0;
+	const update = db.prepare("UPDATE commits SET reachable = ? WHERE repo_id = ? AND hash = ?");
+	inTransaction(db, () => {
+		for (const flip of flips) update.run(flip.want, repoId, flip.hash);
+	});
+	log.info("marked %d commit reachability flips for %s", flips.length, repoIdentity);
+	return flips.length;
+}
+
+/**
  * The commit rows this repo already has, in the shape {@link unchangedCommitEvent}
  * compares against — one query for the columns, one for the branch sets.
  */
@@ -1911,6 +1996,13 @@ export async function dbBackfillRepo(opts: DbBackfillOptions): Promise<DbBackfil
 					// only the other checkout can reach, and the next pass would re-add them —
 					// a delete/insert cycle on every run.
 					pruneUnreachableCommits(db, repo.repoIdentity, reachable);
+					// The memory tier keeps its rows (a rewritten commit's memory is content,
+					// not a duplicate to drop), so it carries its own reachability flag the
+					// feeds filter on — fed the SAME union set the prune used.
+					markMemoriesReachability(db, repo.repoIdentity, reachable);
+					// The commit tier's flag heals any stale 0 the prune-then-mark leaves;
+					// the daemon reconcile is what marks rows orphaned since the last sweep.
+					markCommitsReachability(db, repo.repoIdentity, reachable);
 					// The cursor rides with the prune, not with the upserts: it is derived from
 					// HEAD plus the ref list, which can resolve fine while `git log` fails, and
 					// advancing it on an incomplete pass makes the NEXT pass skip collection

@@ -75,7 +75,7 @@ function inDb(body: () => void): Promise<void> {
 }
 
 function frictionOf(withFriction: boolean): unknown {
-	return buildJourneys(db, { kind: "all" }, 0, NOW + 2 * DAY, undefined, { withFriction }).journeys[0]?.friction;
+	return buildJourneys(db, { kind: "all" }, 0, NOW + 2 * DAY, { withFriction }).journeys[0]?.friction;
 }
 
 beforeEach(() => {

@@ -61,6 +61,7 @@ import {
 	getWorkingTreeDiffStats,
 	isAncestor,
 	isInsideGitRepo,
+	listBranchTips,
 	listFilesInBranch,
 	listWorktrees,
 	orphanBranchExists,
@@ -547,6 +548,23 @@ describe("GitOps", () => {
 		it("should throw on failure", async () => {
 			mockFailure(128, "fatal: not a git repo");
 			await expect(getCurrentBranch()).rejects.toThrow("Failed to get current branch");
+		});
+	});
+
+	describe("listBranchTips", () => {
+		it("returns the branch tip object ids, sorted, so a reordering is not seen as a change", async () => {
+			mockSuccess("ccc\naaa\nbbb\n");
+			expect(await listBranchTips()).toEqual(["aaa", "bbb", "ccc"]);
+		});
+
+		it("returns null on a git failure so a caller can fail open", async () => {
+			mockFailure(128, "fatal: not a git repo");
+			expect(await listBranchTips()).toBeNull();
+		});
+
+		it("returns an empty array for a repo with no branches", async () => {
+			mockSuccess("\n");
+			expect(await listBranchTips()).toEqual([]);
 		});
 	});
 

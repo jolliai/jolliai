@@ -369,6 +369,24 @@ export const REORDER_OFFSET = 1_000_000;
  */
 
 /*
+ * `MEMORY_TRANSCRIPTS_COVERING_INDEX_DDL` — the constant now lives in
+ * `migrations/2026-08-25-0000-memory-transcripts-covering-index.ts`. Widens the
+ * coaching-join key `ix_mt_transcript(repo_id, transcript_id)` to COVER
+ * `commit_hash` (`ix_mt_transcript_covering`) so `readSessionAggregates` matches
+ * without a table fetch. A pure-SQL `sqlMigration`; see its file for the ~2.1 s →
+ * ~0.03 s measurement.
+ *
+ * `MEMORY_REACHABLE_DDL` / `COMMIT_REACHABLE_DDL` — the constants now live in
+ * `migrations/2026-08-25-0001-memory-reachable.ts` and
+ * `migrations/2026-08-25-0002-commit-reachable.ts`. Materialised git-reachability
+ * columns (`memories.reachable` / `commits.reachable`, `INTEGER NOT NULL DEFAULT 1`)
+ * that move the per-read `git rev-list --branches` off the dashboard read path: the
+ * feeds filter `reachable = 1` in SQL and a backfill sweep + global-daemon reconcile
+ * task maintain the flag asynchronously. Add-column code entries — see each file for
+ * the full design note and the DEFAULT 1 fail-toward-visible rationale.
+ */
+
+/*
  * `MEMORY_SOT_DDL` — NO LONGER A CONSTANT. Its tables (repo_state, memories,
  * memory_topics, commit_aliases, transcripts, memory_transcripts,
  * transcript_sessions, context_kinds, context, plan_progress, topic_pages,

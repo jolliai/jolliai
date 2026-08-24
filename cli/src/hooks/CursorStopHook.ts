@@ -77,7 +77,7 @@
  */
 
 import { existsSync } from "node:fs";
-import { readdir } from "node:fs/promises";
+import { access, readdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, resolve as pathResolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -162,6 +162,12 @@ export function extractStopIdentity(parsed: unknown, env: NodeJS.ProcessEnv): Cu
  *
  * Any I/O failure answers `false` (i.e. `cursor`), matching the IDE-is-the-default shape
  * of every other Cursor surface.
+ *
+ * The bucket probe uses async `access`, never `existsSync`: this runs on Cursor's
+ * synchronous stop hook, and when `CURSOR_INVOKED_AS` is unset (every IDE conversation,
+ * plus any build that stops setting it) the loop touches every `chats/<hash>` bucket —
+ * blocking the event loop on that many sync syscalls per stop. Async keeps the fail-open
+ * hook from stalling on a machine with many cursor-agent chat buckets.
  */
 export async function resolveCursorSource(
 	env: NodeJS.ProcessEnv,
@@ -172,12 +178,22 @@ export async function resolveCursorSource(
 	try {
 		const chatsDir = join(cursorHome, "chats");
 		for (const hash of await readdir(chatsDir)) {
-			if (existsSync(join(chatsDir, hash, sessionId))) return "cursor-cli";
+			if (await pathExists(join(chatsDir, hash, sessionId))) return "cursor-cli";
 		}
 	} catch {
 		// No `chats/` at all is the normal state on an IDE-only machine.
 	}
 	return "cursor";
+}
+
+/** Async existence check, so the stop-hook path never blocks on sync fs I/O. */
+async function pathExists(target: string): Promise<boolean> {
+	try {
+		await access(target);
+		return true;
+	} catch {
+		return false;
+	}
 }
 
 /**

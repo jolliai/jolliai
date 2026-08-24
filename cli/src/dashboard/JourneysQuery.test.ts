@@ -14,6 +14,7 @@ import { deflateSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { DashboardDbHandle } from "./DashboardDb.js";
 import { withDashboardDb } from "./DashboardDb.js";
+import { markMemoriesReachability } from "./DbBackfill.js";
 import {
 	buildJourneyDetail,
 	buildJourneys,
@@ -272,8 +273,11 @@ describe("buildJourneys", () => {
 		inDb(() => {
 			addMemory({ hash: "h1", branch: "solo" });
 			addMemory({ hash: "h2", branch: "solo" });
-			const reachable = new Map([["repo-a", new Set(["h1"])]]);
-			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, reachable);
+			// Reachability now lives on `memories.reachable`, maintained by the async
+			// sweep — here h2 is no longer reachable from any branch. `buildJourneys`
+			// filters it in SQL rather than taking a per-call git set.
+			markMemoriesReachability(db, "repo-a", new Set(["h1"]));
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY);
 			expect(model.indexedCommits).toBe(1);
 			expect(model.journeys[0]?.groupedBy).toBe("commit");
 		}));
@@ -625,7 +629,7 @@ describe("buildJourneys — test-first signal", () => {
 					},
 				],
 			});
-			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, { withTests: true });
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, { withTests: true });
 			expect(model.journeys[0]?.tested?.availability).toBe("measured");
 			// The earliest of the three (2 days back) predates the commit, so test-first.
 			expect(model.journeys[0]?.tested?.testFirst).toBe(true);
@@ -654,7 +658,7 @@ describe("buildJourneys — test-first signal", () => {
 					{ sessionId: "other-source", source: "opencode", entries: [] },
 				],
 			});
-			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, {
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, {
 				withTests: true,
 				withFriction: true,
 			});
@@ -725,7 +729,7 @@ describe("buildJourneys — transcript read dedup and cache sharing", () => {
 				sessions: [{ sessionId: "shared-sess", source: "codex", entries: [{ role: "human", content: "hi" }] }],
 			});
 			linkMemoryTranscript("h2", "cross-journey-t");
-			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, {
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, {
 				withFriction: true,
 			});
 			// Both journeys parsed the exact same session (from the shared cache),
@@ -766,7 +770,7 @@ describe("buildJourneys — longestWaitMinutes sort", () => {
 					},
 				],
 			});
-			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, undefined, { withWaits: true });
+			const model = buildJourneys(db, { kind: "all" }, NOW - 90 * DAY, NOW + DAY, { withWaits: true });
 			// The longer of the two waits (20 min) is what the roster reports.
 			expect(model.journeys[0]?.longestWaitMinutes).toBe(20);
 		}));
@@ -898,7 +902,7 @@ describe("buildJourneys — longestWaitMinutes", () => {
 		inDb(() => {
 			seedWaitingJourney();
 
-			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, undefined, { withWaits: true });
+			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, { withWaits: true });
 
 			expect(model.journeys[0].longestWaitMinutes).toBeGreaterThan(0);
 		}));
@@ -966,7 +970,7 @@ describe("buildJourneys — wait signal isolation regressions", () => {
 			);
 			linkMemoryTranscript("h2", "t1", 2);
 
-			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, undefined, { withWaits: true });
+			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, { withWaits: true });
 			const a = model.journeys.find((j) => j.branch === "solo-a");
 			const b = model.journeys.find((j) => j.branch === "solo-b");
 			expect(a?.longestWaitMinutes).toBe(30);
@@ -989,7 +993,7 @@ describe("buildJourneys — wait signal isolation regressions", () => {
 			addSessionTranscript("t2", "sess1", [{ role: "human", atMs: NOW - DAY + 30 * 60_000 }], 1);
 			linkMemoryTranscript("h2", "t2", 1);
 
-			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, undefined, { withWaits: true });
+			const model = buildJourneys(db, { kind: "all" }, 0, NOW + DAY, { withWaits: true });
 			const journey = model.journeys.find((j) => j.ticket === "JOLLI-9");
 			expect(journey?.longestWaitMinutes).toBe(30);
 		}));

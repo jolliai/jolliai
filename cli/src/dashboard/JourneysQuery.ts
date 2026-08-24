@@ -31,7 +31,6 @@ import type {
 import { scopeFilter, scopeToRepoIds, splitDecisionBullets } from "./DashboardScopeUtil.js";
 import { assignJourneyKeys, commitMapKey, type JourneyCommitInput } from "./JourneyKey.js";
 import { deriveJourneyShape, pickHardest, pickSmoothest } from "./JourneyMetrics.js";
-import { isReachable, type ReachableCommits } from "./MemoriesQuery.js";
 
 const log = createLogger("JourneysQuery");
 
@@ -307,13 +306,7 @@ interface Assembled {
  * @param fromMs inclusive lower bound, epoch-ms
  * @param toMs   EXCLUSIVE upper bound, epoch-ms — matches `ResolvedWindow`
  */
-function assemble(
-	db: DashboardDbHandle,
-	scope: DashboardScope,
-	fromMs: number,
-	toMs: number,
-	reachable: ReachableCommits | undefined,
-): Assembled {
+function assemble(db: DashboardDbHandle, scope: DashboardScope, fromMs: number, toMs: number): Assembled {
 	const resolved = scopeToRepoIds(db, scope);
 	const filter = scopeFilter(resolved, "m.repo_id");
 	const rows = db
@@ -330,6 +323,14 @@ function assemble(
 			  -- superseded revision as its own journey; RepositoriesQuery.ts measured
 			  -- the same bug at ~2.5x inflation.
 			  --
+			  -- reachable = 1: a memory whose commit history was rewritten away is KEPT
+			  -- (it is content) but must not surface as work a branch still carries.
+			  -- That was a per-read git filter (rev-list --branches per repo); it is now
+			  -- a column maintained asynchronously by the backfill sweep and the daemon
+			  -- reconcile task (see MEMORY_REACHABLE_DDL), so the walk is off the read
+			  -- path entirely. DEFAULT 1 means a fresh commit shows until a sweep proves
+			  -- it unreachable.
+			  --
 			  -- The window filter and ORDER BY both use the same COALESCE clock the
 			  -- SELECT list computes: m.commit_date_ms is the AUTHOR date while
 			  -- commits.committed_at_ms is the COMMITTER date (see MemoriesQuery.ts /
@@ -337,16 +338,17 @@ function assemble(
 			  -- grouping on the committer date let a rebased or cherry-picked commit
 			  -- fall outside the window it was then reported as belonging to.
 			  WHERE m.parent_hash IS NULL
+			    AND m.reachable = 1
 			    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) >= ?
 			    AND COALESCE(cm.committed_at_ms, m.commit_date_ms) < ?${filter.sql}
 			  ORDER BY committed_at_ms ASC`,
 		)
 		.all(fromMs, toMs, ...filter.params) as ReadonlyArray<MemoryRow>;
 
-	// Reachability is checked in JS, not SQL — it comes from git. A rewritten
-	// history leaves rows behind forever, and a journey assembled over them
-	// reports work that no branch carries.
-	const live = rows.filter((row) => isReachable(reachable, row.repo_identity, row.commit_hash));
+	// The SQL already dropped unreachable and non-root rows; `live` stays the name
+	// the fold below reads (and `live.length === 0` still short-circuits the two
+	// unscoped session scans for an empty window).
+	const live = rows;
 
 	const inputs: JourneyCommitInput[] = live.map((row) => ({
 		repoIdentity: row.repo_identity,
@@ -482,10 +484,9 @@ export function buildJourneys(
 	scope: DashboardScope,
 	fromMs: number,
 	toMs: number,
-	reachable?: ReachableCommits,
 	options?: { readonly withFriction?: boolean; readonly withTests?: boolean; readonly withWaits?: boolean },
 ): JourneysModel {
-	const { groups, indexedCommits } = assemble(db, scope, fromMs, toMs, reachable);
+	const { groups, indexedCommits } = assemble(db, scope, fromMs, toMs);
 	/* Per-journey turn signals are opt-in: only a caller that renders them pays
 	   the transcript walk. Computed once per accumulator while `groups` is in
 	   scope — and each journey's sessions are read ONCE even when both signals
@@ -902,9 +903,8 @@ export function buildCoachingWindow(
 	scope: DashboardScope,
 	fromMs: number,
 	toMs: number,
-	reachable?: ReachableCommits,
 ): { readonly model: JourneysModel; readonly friction: RosterCell } {
-	const { groups, indexedCommits } = assemble(db, scope, fromMs, toMs, reachable);
+	const { groups, indexedCommits } = assemble(db, scope, fromMs, toMs);
 	const { frictionById, testedById, waitById, cache } = collectWindowSignals(db, groups, true, true, true);
 	const windowSessions: StoredSession[] = [];
 	for (const parsed of cache.values()) windowSessions.push(...parsed);
@@ -919,9 +919,8 @@ export function buildJourneyDetail(
 	scope: DashboardScope,
 	window: { readonly startMs: number; readonly endMs: number },
 	journeyId: string,
-	reachable?: ReachableCommits,
 ): JourneyDetail | undefined {
-	const { groups } = assemble(db, scope, window.startMs, window.endMs, reachable);
+	const { groups } = assemble(db, scope, window.startMs, window.endMs);
 	const accumulator = groups.get(journeyId);
 	if (!accumulator) return undefined;
 	const sessions = readJourneySessions(db, accumulator, new Map());

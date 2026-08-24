@@ -92,7 +92,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
 import { clearAuthCredentials, getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
-import { getProjectRootDir, listReachableCommits, readLocalGitIdentity } from "../core/GitOps.js";
+import { getProjectRootDir, readLocalGitIdentity } from "../core/GitOps.js";
 import { escapeForInlineScript } from "../core/InlineScript.js";
 import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
 import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
@@ -149,7 +149,6 @@ import {
 import { machineTimeZone } from "./LocalDays.js";
 import {
 	buildMemoriesPage,
-	type ReachableCommits,
 	readContextDoc,
 	readConversationEntries,
 	readMemoryTranscriptRepairState,
@@ -545,34 +544,6 @@ export type ModelRequest = Omit<QueryOptions, "timeZone" | "nowMs">;
 export type ModelBuilder = (request: ModelRequest) => Promise<DashboardModel>;
 
 /**
- * Views that filter rewritten-away commits, and therefore pay for one
- * `git rev-list --branches` per repo.
- *
- * `stats` and `memories` join because their per-MEMORY rows are duplicates of the
- * surviving one once a commit is rewritten, not a record of separate work.
- * `standup` joins for a DIFFERENT reason: it is a FIRST-PERSON "what I did" feed
- * whose columns the user pastes as their own standup, so a discrete line naming a
- * commit hash that no longer exists in git is a false claim, and a squashed-away
- * commit keeping `›` enabled onto an empty older window is the same defect one
- * level up. This is the one place standup diverges from the stats heatmap and KPI
- * row, which stay AGGREGATE activity counts — squashed work still happened, so it
- * still counts there.
- *
- * `repositories` used to be here too, for its per-repo memory badge; it went
- * with that page.
- */
-const REACHABILITY_VIEWS: ReadonlySet<DashboardView> = new Set<DashboardView>([
-	"stats",
-	"memories",
-	"standup",
-	// Whether a branch still carries a commit is a question only git can answer.
-	// Without this set, a rewritten-away commit assembles into a journey that
-	// reports work no branch has — `assemble()`'s `isReachable` filter is what
-	// drops it, and it runs entirely on this reachability set.
-	"journeys",
-]);
-
-/**
  * How long one worktree's git identity is trusted. Minutes, not hours: the value
  * only changes when the user reconfigures git, and a stale identity shows the
  * wrong person's commits as their own.
@@ -640,34 +611,6 @@ async function readLocalAuthorIdentity(
 }
 
 /**
- * One `git rev-list --branches` per enabled repo, mapped to {@link ReachableCommits}.
- * Run concurrently — each is a single git subprocess, and repos are typically
- * few (this machine's own dashboard, not a fleet). A repo whose git call fails
- * gets `null` rather than being dropped from the map: `isReachable` treats
- * both the same (fail open), but recording it distinguishes "checked, has no
- * filter" from "never checked" in a debugger, which a dropped entry would not.
- */
-async function readReachableCommitsByRepo(
-	repos: ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-): Promise<ReachableCommits> {
-	const entries = await Promise.all(
-		repos.map(async (r): Promise<readonly [string, ReadonlySet<string> | null]> => {
-			// A `repos` row can legitimately carry an EMPTY worktree_root: a hook
-			// that writes before the registry has been projected gets a placeholder
-			// row from `ensureRepoRow`, which fills the NOT NULL column with `''`.
-			// Node's execFile treats `cwd: ''` as absent and silently runs in the
-			// PARENT process's directory — measured — so the git call would answer
-			// with some other repo's commits and filter every one of this repo's
-			// memories away. No path, no filter.
-			if (!r.worktree_root) return [r.repo_identity, null];
-			const hashes = await listReachableCommits(r.worktree_root);
-			return [r.repo_identity, hashes ? new Set(hashes) : null];
-		}),
-	);
-	return new Map(entries);
-}
-
-/**
  * Builds only data for routes that are part of the released dashboard surface.
  */
 async function defaultModelBuilder(
@@ -717,19 +660,14 @@ async function defaultModelBuilder(
 	};
 	return withReadonlyDashboardDb(
 		async (db) => {
-			// A rebase/reset/squash that rewrites history away leaves the old
-			// commits' rows in `commits` and `memories` forever, since nothing
-			// else notices they dropped off every branch — see `ReachableCommits`.
-			// Every view that renders per-commit rows pays for the check: the
-			// memories tree, and the stats page's Memory Activity feed and captured
-			// counts. Every other view skips it outright.
-			const reachableCommits = REACHABILITY_VIEWS.has(request.view)
-				? await readReachableCommitsByRepo(
-						db
-							.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-							.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-					)
-				: undefined;
+			// A rebase/reset/squash that rewrites history away leaves the old commits'
+			// rows in `commits` and `memories` forever. Reachability used to be asked
+			// of git here (a `rev-list --branches` per repo, on every load), and is now
+			// a materialised `memories.reachable` / `commits.reachable` column the feeds
+			// filter in SQL — maintained asynchronously by the backfill sweep and the
+			// daemon reconcile task (see MEMORY_REACHABLE_DDL / COMMIT_REACHABLE_DDL).
+			// So no view pays git on the read path.
+			//
 			// Standup is a FIRST-PERSON report, unlike every other view: its columns
 			// feed a Copy-as-standup draft the user posts as their own work, so a
 			// shared branch's teammate commits are a false claim rather than noise.
@@ -768,7 +706,6 @@ async function defaultModelBuilder(
 				...(settingsModel ? { settingsModel } : {}),
 				...(knowledgeModel ? { knowledgeModel } : {}),
 				...(graphModel ? { graphModel } : {}),
-				...(reachableCommits ? { reachableCommits } : {}),
 				...(authorIdentity ? { authorIdentity } : {}),
 				...(transcriptRepairState ? { transcriptRepairState } : {}),
 			});
@@ -1114,10 +1051,13 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
  * cross a local-day boundary between the model response and a detail/page fetch.
  *
  * `null` means the caller supplied an invalid value; `undefined` means it supplied
- * none, preserving the current-clock fallback for direct API calls. Leave enough
- * valid-Date headroom for the widest dashboard window and its end boundary. A safe
- * integer can still lie beyond JavaScript's Date range, where resolving a window
- * would otherwise throw and turn a malformed local URL into a 500.
+ * none, preserving the current-clock fallback for direct API calls. An empty value
+ * (`nowMs=` with nothing after it) is deliberately `null`, not `undefined`: it is a
+ * malformed param, and `Number("")` is `0`, so falling back to a silent epoch-0
+ * clock would be worse than a 400. Leave enough valid-Date headroom for the widest
+ * dashboard window and its end boundary. A safe integer can still lie beyond
+ * JavaScript's Date range, where resolving a window would otherwise throw and turn a
+ * malformed local URL into a 500.
  */
 function parseNowMs(url: URL): number | null | undefined {
 	const raw = url.searchParams.get("nowMs");
@@ -1673,20 +1613,12 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			const cursor = afterRepo && afterHash ? { repoIdentity: afterRepo, commitHash: afterHash } : undefined;
 			const scope = parseScope(url);
 			try {
-				// Recomputed per page rather than cached with the page's first
-				// render: reachability is what decides which rows exist at all, so
-				// a stale set would page over memories a rebase already removed.
-				const page = await withReadonlyDashboardDb(
-					async (db) => {
-						const reachable = await readReachableCommitsByRepo(
-							db
-								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-						);
-						return buildMemoriesPage(db, scope, cursor, reachable);
-					},
-					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
-				);
+				// Reachability is a materialised `memories.reachable` column now
+				// (see MEMORY_REACHABLE_DDL), filtered in SQL by `buildMemoriesPage`,
+				// so this page pays no per-request `git rev-list`.
+				const page = await withReadonlyDashboardDb((db) => buildMemoriesPage(db, scope, cursor), {
+					...(options.dbPath ? { dbPath: options.dbPath } : {}),
+				});
 				sendJson(res, 200, page);
 			} catch (err) {
 				log.warn("memories page read failed: %s", errMsg(err));
@@ -1909,11 +1841,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			try {
 				const detail = await withReadonlyDashboardDb(
 					async (db) => {
-						const reachable = await readReachableCommitsByRepo(
-							db
-								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-						);
 						const resolved =
 							explicitWindow ??
 							// Match the Coaching page's own default: with no explicit
@@ -1927,7 +1854,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 								Date.now(),
 								machineTimeZone(),
 							);
-						return buildJourneyDetail(db, scope, resolved, id, reachable);
+						return buildJourneyDetail(db, scope, resolved, id);
 					},
 					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
 				);
@@ -1970,11 +1897,6 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			try {
 				const model = await withReadonlyDashboardDb(
 					async (db) => {
-						const reachable = await readReachableCommitsByRepo(
-							db
-								.prepare("SELECT repo_identity, worktree_root FROM repos WHERE disabled_at IS NULL")
-								.all() as ReadonlyArray<{ repo_identity: string; worktree_root: string }>,
-						);
 						const resolved =
 							explicitWindow ??
 							// Match the Coaching page's own default: with no explicit
@@ -1995,7 +1917,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 						// with, or clicking the pattern opens an empty list. Both
 						// signals ride the one per-journey transcript walk this
 						// surface pays; the roster's page load does not.
-						return buildJourneys(db, scope, resolved.startMs, resolved.endMs, reachable, {
+						return buildJourneys(db, scope, resolved.startMs, resolved.endMs, {
 							withFriction: true,
 							withTests: true,
 						});

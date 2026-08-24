@@ -85,7 +85,7 @@ import {
 	machineTimeZone,
 	startOfLocalDay,
 } from "./LocalDays.js";
-import { buildMemories, isReachable, type ReachableCommits } from "./MemoriesQuery.js";
+import { buildMemories } from "./MemoriesQuery.js";
 import { volumeReachable } from "./RepoForget.js";
 import { type DayPlan, planDays, readRollupSeries, TOKENS_KIND } from "./StatsRollup.js";
 import { MEMORY_LANDING_CTE, readAxisRows, readDatedUsage } from "./StatsSeries.js";
@@ -266,20 +266,10 @@ export interface QueryOptions {
 	 * which of spec §9's three sentences an EMPTY conversations list prints. Read
 	 * by `readMemoryTranscriptRepairState` (it stats the machine-global Claude
 	 * owners ledger, which this synchronous layer cannot do) and threaded in the
-	 * same way {@link reachableCommits} and the three page models below are.
-	 * Absent leaves the client on the plainest wording.
+	 * same way the page models below are. Absent leaves the client on the plainest
+	 * wording.
 	 */
 	readonly transcriptRepairState?: TranscriptRepairState;
-	/**
-	 * The async-read per-repo git reachability sets, keyed by `repo_identity`.
-	 * Absent (or a repo missing from the map) renders every row unfiltered —
-	 * see {@link ReachableCommits}. Read by the memories tree, and by the
-	 * stats/standup commit and memory-card queries: a squashed-away commit is
-	 * gone from git but not from `commits`/`memories`, so without this the
-	 * Memory Activity feed renders one card per pre-squash predecessor and the
-	 * "N of M captured" line counts commits that no longer exist.
-	 */
-	readonly reachableCommits?: ReachableCommits;
 	/**
 	 * Standup view: the local git identity, read async per repo by the server.
 	 * Absent — or present with nothing usable in it — leaves the board
@@ -416,6 +406,13 @@ interface CommitRow {
 	 * `tokens`, which a captured-but-sparse memory can legitimately leave null.
 	 */
 	readonly root_hash: string | null;
+	/**
+	 * `commits.reachable` (0/1) — maintained asynchronously (see COMMIT_REACHABLE_DDL),
+	 * so the callers that DO filter rewritten-away commits (the "captured" count, the
+	 * standup board) read it here instead of a per-request `git rev-list`. The heatmap
+	 * and `totalCommits` deliberately ignore it — squashed work still happened.
+	 */
+	readonly reachable: number;
 }
 
 function commitsInRange(
@@ -447,7 +444,7 @@ function commitsInRange(
 			        COALESCE(m.turns, ma.turns) AS turns, COALESCE(m.tokens, ma.tokens) AS tokens,
 			        COALESCE(m.est_cost_usd, ma.est_cost_usd) AS est_cost_usd,
 			        COALESCE(m.ticket_id, ma.ticket_id) AS ticket_id,
-			        COALESCE(m.root_hash, ma.root_hash) AS root_hash, r.repo_name, r.repo_identity
+			        COALESCE(m.root_hash, ma.root_hash) AS root_hash, r.repo_name, r.repo_identity, c.reachable
 			   FROM commits c JOIN repos r ON r.id = c.repo_id
 			   LEFT JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
 			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
@@ -867,7 +864,6 @@ function buildStats(
 	tier: AdoptionTier,
 	dimension: SeriesDimension,
 	window: ResolvedWindow,
-	reachable?: ReachableCommits,
 ): StatsModel {
 	const tomorrowStart = addLocalDays(nowMs, 1, timeZone);
 	const heatmapStart = addLocalDays(nowMs, -(HEATMAP_DAYS - 1), timeZone);
@@ -945,9 +941,7 @@ function buildStats(
 	// branch of forty squashed predecessors reads as "41 captured" over two
 	// cards.
 	const memoriesCreated =
-		tier === "installed"
-			? undefined
-			: rangeCommits.filter((c) => c.root_hash != null && isReachable(reachable, c.repo_identity, c.hash)).length;
+		tier === "installed" ? undefined : rangeCommits.filter((c) => c.root_hash != null && c.reachable === 1).length;
 	const decisions =
 		tier === "installed" ? undefined : buildDecisionsCard(db, scope, window.startMs, window.endMs, timeZone);
 
@@ -1009,7 +1003,7 @@ function buildStats(
 	// The memory-tier feed. Built unconditionally: an installed-tier repo simply
 	// has no summarized commits, so this comes back empty and the renderer shows
 	// the session list instead.
-	const memoryFeed = buildMemoryCards(db, scope, window, reachable);
+	const memoryFeed = buildMemoryCards(db, scope, window);
 	const concurrency = buildConcurrency(db, window);
 
 	return {
@@ -1066,34 +1060,15 @@ const STANDUP_WINDOW_DAYS = 7;
 export const STANDUP_MAX_OFFSET = 52;
 
 /**
- * How many newest-first rows {@link hasCommitsBefore} pulls while looking for a
- * reachable one. A generous ceiling, not a correctness knob: unreachable rows are
- * only rebase/squash residue, so the first reachable commit is in practice the
- * very newest older row, and a run of this many CONSECUTIVE residue rows sitting
- * ahead of a real older commit does not occur. The bound is what keeps a
- * per-render / per-30s-poll query off a full materialise-and-sort of `commits`,
- * which is machine-global and grows without bound (DbBackfill imports whole
- * histories) and has no single-column `committed_at_ms` index. Were the bound ever
- * exceeded the only cost is `›` disabling one window early — never wrong data.
- */
-const HAS_OLDER_SCAN_LIMIT = 256;
-
-/**
  * Is there a REACHABLE, author-filtered commit strictly before `beforeMs` in
  * scope? Drives `hasOlder`.
  *
- * Reachability is a JS-side set (git, not the DB — see {@link ReachableCommits}),
- * so this cannot be a bare SQL `EXISTS`: a rebased or squashed-away commit keeps
- * its `commits` row forever, and counting it would enable `›` onto a window whose
- * only commits no longer exist in git. Rows are read newest-first, bounded to the
- * first {@link HAS_OLDER_SCAN_LIMIT}; `.some` then returns at the first reachable
- * one — in practice the very newest older commit, since unreachable rows are only
- * rebase/squash residue. The `LIMIT` is load-bearing, not decorative: without it
- * this materialises and sorts the whole `commits` table (no `committed_at_ms`
- * index) on every render and poll, for a single boolean (see that constant for why
- * the bound cannot lose a real answer). When `reachable` is absent (fail-open)
- * `isReachable` accepts the first row, so this collapses back to the old existence
- * check.
+ * A rebased or squashed-away commit keeps its `commits` row forever, and counting
+ * it would enable `›` onto a window whose only commits no longer exist in git —
+ * so this filters `reachable = 1` (the materialised COMMIT_REACHABLE_DDL column,
+ * maintained asynchronously). Because the filter is now in SQL, `LIMIT 1` finds
+ * the first reachable older commit directly, rather than the old bounded newest-
+ * first JS scan; no whole-table materialise, no per-render `git rev-list`.
  *
  * This answers "is there ANY older commit", NOT "is the next window non-empty":
  * paging steps a fixed seven-day calendar week, so a gap in history still lets
@@ -1106,20 +1081,27 @@ function hasCommitsBefore(
 	scope: DashboardScope,
 	beforeMs: number,
 	identity: AuthorIdentity | undefined,
-	reachable: ReachableCommits | undefined,
 ): boolean {
 	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	const author = authorFilter(identity, "c");
-	const rows = db
+	// `reachable = 1` in SQL (see COMMIT_REACHABLE_DDL): "is there an older commit
+	// a branch still carries", the same rewritten-away exclusion this whole feed
+	// applies, without a per-request `git rev-list`. `LIMIT 1` stops at the first
+	// row instead of the old newest-first JS scan of a bounded slice. A repo-scoped
+	// view uses `ix_commits_repo_time(repo_id, committed_at_ms)` for both the filter
+	// and the ordering; the unscoped `{kind:"all"}` view has no `committed_at_ms`-only
+	// index, so the ORDER BY still scans the machine-global `commits` table — bounded
+	// by `LIMIT 1` and no worse than the form it replaced, but not index-ordered.
+	const row = db
 		.prepare(
-			`SELECT c.hash, r.repo_identity
+			`SELECT 1
 			   FROM commits c JOIN repos r ON r.id = c.repo_id
-			  WHERE c.committed_at_ms < ?${filter.sql}${author.sql}
+			  WHERE c.committed_at_ms < ? AND c.reachable = 1${filter.sql}${author.sql}
 			  ORDER BY c.committed_at_ms DESC
-			  LIMIT ${HAS_OLDER_SCAN_LIMIT}`,
+			  LIMIT 1`,
 		)
-		.all(beforeMs, ...filter.params, ...author.params) as ReadonlyArray<{ hash: string; repo_identity: string }>;
-	return rows.some((row) => isReachable(reachable, row.repo_identity, row.hash));
+		.get(beforeMs, ...filter.params, ...author.params);
+	return row !== undefined;
 }
 
 function buildStandup(
@@ -1131,8 +1113,6 @@ function buildStandup(
 	identity: AuthorIdentity | undefined,
 	/** Whole-week paging offset: 0 = window ending today, 1 = the previous seven days, … */
 	offset: number,
-	/** Reachable commit sets, keyed by `repo_identity` — see {@link ReachableCommits}. */
-	reachable: ReachableCommits | undefined,
 ): StandupModel {
 	/* The anchor is the newest day shown. offset pages a whole week at a time, so
 	   the window is always the seven local days ending on the anchor. Clamped to
@@ -1212,7 +1192,7 @@ function buildStandup(
 	   noise — see ReachableCommits. */
 	const byDay = new Map<string, StandupCommit[]>();
 	for (const row of commitsInRange(db, scope, windowStart, windowEnd, identity)) {
-		if (!isReachable(reachable, row.repo_identity, row.hash)) continue;
+		if (row.reachable !== 1) continue;
 		const key = localDayKey(row.committed_at_ms, timeZone);
 		const bucket = byDay.get(key);
 		if (bucket) bucket.push(toStandupCommit(row));
@@ -1249,7 +1229,7 @@ function buildStandup(
 		   (the invariant the containment query was added to hold). The `&&` also skips
 		   that query at the ceiling, where its answer cannot change the result. */
 		hasNewer: safeOffset > 0,
-		hasOlder: safeOffset < STANDUP_MAX_OFFSET && hasCommitsBefore(db, scope, windowStart, identity, reachable),
+		hasOlder: safeOffset < STANDUP_MAX_OFFSET && hasCommitsBefore(db, scope, windowStart, identity),
 		workspaces,
 		...(authoredBy ? { authoredBy } : {}),
 		/* `insights` survives ONLY as the memory-tier flag its PRESENCE carries — the
@@ -1344,12 +1324,7 @@ interface MemoryCardFeed {
  * agrees with the query-time labels built from `memory_topics` (same topics,
  * same tie rule).
  */
-function buildMemoryCards(
-	db: DashboardDbHandle,
-	scope: DashboardScope,
-	window: ResolvedWindow,
-	reachable?: ReachableCommits,
-): MemoryCardFeed {
+function buildMemoryCards(db: DashboardDbHandle, scope: DashboardScope, window: ResolvedWindow): MemoryCardFeed {
 	// `repo_id` belongs to the memory row (`c`), not the joined repo lookup
 	// (`r`).  Using `r.repo_id` only breaks the scoped form of the query; the
 	// catch below then intentionally degrades to an empty feed, which used to
@@ -1377,10 +1352,11 @@ function buildMemoryCards(
 		const keys = db
 			.prepare(
 				`${MEMORY_LANDING_CTE}
-				 SELECT c.commit_hash, ml.live_hash, r.repo_identity
+				 SELECT c.commit_hash, ml.live_hash, r.repo_identity, COALESCE(cl.reachable, 1) AS reachable
 				   FROM memories c
 				   JOIN repos r ON r.id = c.repo_id
 				   JOIN memory_landing ml ON ml.repo_id = c.repo_id AND ml.commit_hash = c.commit_hash
+				   LEFT JOIN commits cl ON cl.repo_id = c.repo_id AND cl.hash = ml.live_hash
 				  WHERE c.parent_hash IS NULL
 				    AND ml.at_ms >= ? AND ml.at_ms < ?${filter.sql}
 				  ORDER BY ml.at_ms DESC`,
@@ -1389,13 +1365,17 @@ function buildMemoryCards(
 			commit_hash: string;
 			live_hash: string;
 			repo_identity: string;
+			reachable: number;
 		}>;
 		// Reachability is asked about `live_hash`, never the memory's own hash: a
 		// rewritten commit's memory stays filed under a hash no ref reaches, so
 		// asking about that one drops from the feed exactly the memories
 		// `memoriesCreated` has just counted through the alias — the two figures
-		// sit in the same card.
-		const eligible = keys.filter((k) => isReachable(reachable, k.repo_identity, k.live_hash));
+		// sit in the same card. `commits.reachable` on the LIVE commit answers it
+		// in SQL (COALESCE fail-open: a live hash with no commit row is a surviving
+		// commit not yet imported, shown until a sweep says otherwise), so no
+		// per-request `git rev-list`.
+		const eligible = keys.filter((k) => k.reachable === 1);
 		const page = eligible.slice(0, MEMORY_CARDS_LIMIT);
 		// Decided HERE, where the un-cut set is still in hand. `cards.length` cannot
 		// answer it: a window holding exactly the limit is complete, and reporting
@@ -3296,16 +3276,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 			case "skills":
 			case "mcps":
 				return {
-					stats: buildStats(
-						db,
-						options.scope,
-						timeZone,
-						nowMs,
-						tier,
-						options.dimension ?? "model",
-						window(),
-						options.reachableCommits,
-					),
+					stats: buildStats(db, options.scope, timeZone, nowMs, tier, options.dimension ?? "model", window()),
 				};
 			case "standup":
 				return {
@@ -3317,7 +3288,6 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 						tier,
 						options.authorIdentity,
 						options.standupOffset ?? 0,
-						options.reachableCommits,
 					),
 				};
 			case "knowledge":
@@ -3336,7 +3306,6 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 						db,
 						options.scope,
 						options.hash,
-						options.reachableCommits,
 						options.detailRepoIdentity,
 						options.transcriptRepairState,
 					),
@@ -3358,14 +3327,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 				);
 				return {
 					coaching: {
-						...buildCoaching(
-							db,
-							options.scope,
-							resolved.startMs,
-							resolved.endMs,
-							timeZone,
-							options.reachableCommits,
-						),
+						...buildCoaching(db, options.scope, resolved.startMs, resolved.endMs, timeZone),
 						// Echoed for the topbar range control, exactly as the stats
 						// payload does it (see `range`/`rangeFrom`/`rangeTo` above).
 						range: resolved.range,

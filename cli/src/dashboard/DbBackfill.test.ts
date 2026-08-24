@@ -149,6 +149,8 @@ import {
 	dbBackfillRepo,
 	dbBackfillRepos,
 	dbRescanSessions,
+	markCommitsReachability,
+	markMemoriesReachability,
 	projectRepoRegistryState,
 	pruneUnreachableCommits,
 } from "./DbBackfill.js";
@@ -674,6 +676,33 @@ describe("pruneUnreachableCommits", () => {
 		// The surviving link belongs to the commit that stayed reachable; the pruned
 		// commit's rows went with it through the foreign key, no trigger involved.
 		expect(links).toEqual([{ commit_id: expect.any(Number) }]);
+	});
+
+	it("markCommitsReachability flips only the changed rows, idempotently", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		// The fixture leaves commits `aaa` and `bbb`, both DEFAULT reachable = 1.
+		// Only `aaa` is on a branch now, so exactly one row flips.
+		const first = await withDashboardDb((db) => markCommitsReachability(db, repo.repoIdentity, new Set(["aaa"])), {
+			dbPath,
+		});
+		expect(first).toBe(1);
+		const rows = await query<{ hash: string; reachable: number }>(
+			"SELECT hash, reachable FROM commits ORDER BY hash",
+		);
+		expect(rows).toEqual([
+			{ hash: "aaa", reachable: 1 },
+			{ hash: "bbb", reachable: 0 },
+		]);
+		// Re-running with the same set touches nothing.
+		const second = await withDashboardDb((db) => markCommitsReachability(db, repo.repoIdentity, new Set(["aaa"])), {
+			dbPath,
+		});
+		expect(second).toBe(0);
+		// An unknown repo has no rows to mark.
+		const none = await withDashboardDb((db) => markCommitsReachability(db, "no-such-repo", new Set(["aaa"])), {
+			dbPath,
+		});
+		expect(none).toBe(0);
 	});
 });
 
@@ -3914,6 +3943,69 @@ describe("DbBackfill — coverage edges", () => {
 			listFiles: async (prefix: string) => (prefix === "summaries/" ? entries : []),
 		} as unknown as StorageProvider;
 	}
+
+	it("markMemoriesReachability flips only the rows that change, and is idempotent", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		await withDashboardDb(
+			(db) => {
+				const id = repoId(db);
+				insertMemory(db, id, "keep");
+				insertMemory(db, id, "gone");
+			},
+			{ dbPath },
+		);
+		const read = () =>
+			withDashboardDb(
+				(db) =>
+					db
+						.prepare("SELECT commit_hash, reachable FROM memories ORDER BY commit_hash")
+						.all() as ReadonlyArray<{
+						commit_hash: string;
+						reachable: number;
+					}>,
+				{ dbPath },
+			);
+		// Default 1 on insert — visible until a sweep proves otherwise.
+		expect(await read()).toEqual([
+			{ commit_hash: "gone", reachable: 1 },
+			{ commit_hash: "keep", reachable: 1 },
+		]);
+		// Only "keep" is reachable, so exactly one row flips.
+		const first = await withDashboardDb(
+			(db) => markMemoriesReachability(db, repo.repoIdentity, new Set(["keep"])),
+			{ dbPath },
+		);
+		expect(first).toBe(1);
+		expect(await read()).toEqual([
+			{ commit_hash: "gone", reachable: 0 },
+			{ commit_hash: "keep", reachable: 1 },
+		]);
+		// Re-running with the same set touches nothing.
+		const second = await withDashboardDb(
+			(db) => markMemoriesReachability(db, repo.repoIdentity, new Set(["keep"])),
+			{ dbPath },
+		);
+		expect(second).toBe(0);
+		// A commit that becomes reachable again flips back — the mark is a mirror of
+		// git, not a one-way tombstone.
+		const revived = await withDashboardDb(
+			(db) => markMemoriesReachability(db, repo.repoIdentity, new Set(["keep", "gone"])),
+			{ dbPath },
+		);
+		expect(revived).toBe(1);
+		expect(await read()).toEqual([
+			{ commit_hash: "gone", reachable: 1 },
+			{ commit_hash: "keep", reachable: 1 },
+		]);
+	});
+
+	it("markMemoriesReachability returns 0 for an unknown repo", async () => {
+		await dbBackfillRepo({ repo, dbPath });
+		const flips = await withDashboardDb((db) => markMemoriesReachability(db, "no-such-repo", new Set(["x"])), {
+			dbPath,
+		});
+		expect(flips).toBe(0);
+	});
 
 	it("drops to catch-up when a single stored memory is absent from the orphan tip", async () => {
 		// unlisted === 1 arms of the two ternaries, plus the listing filter/map callbacks.

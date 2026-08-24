@@ -965,8 +965,12 @@ describe("executeDashboard", () => {
 			return ok;
 		});
 		// Everything else runs to completion; the command then parks on the signal.
-		await vi.waitFor(() => expect(dbBackfillRepos).toHaveBeenCalledTimes(1));
-		await vi.waitFor(() => expect(opportunisticSnapshot).toHaveBeenCalledTimes(1));
+		// Explicit timeout because `vi.waitFor` ignores this suite's 60s `testTimeout`
+		// and defaults to 1000ms — too tight for this deep async chain once the full
+		// suite + coverage starves the event loop (it reaches `dbBackfillRepos` in
+		// ~200ms in isolation). See the `testTimeout` note in vite.config.ts.
+		await vi.waitFor(() => expect(dbBackfillRepos).toHaveBeenCalledTimes(1), { timeout: 10_000 });
+		await vi.waitFor(() => expect(opportunisticSnapshot).toHaveBeenCalledTimes(1), { timeout: 10_000 });
 		expect(returned).toBe(false);
 		release();
 		await expect(run).resolves.toBe(true);

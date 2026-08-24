@@ -17,6 +17,9 @@ import { SKILL_TOKEN_USAGE_DDL } from "./2026-08-19-0001-skill-token-usage.js";
 import { SKILL_INVOCATIONS_DDL } from "./2026-08-19-0002-skill-invocations.js";
 import { SKILL_PLUGIN_DDL } from "./2026-08-19-0003-skill-plugin.js";
 import { SKILL_ORIGIN_ROOT_DDL } from "./2026-08-20-0000-skill-origin-root.js";
+import { MEMORY_TRANSCRIPTS_COVERING_INDEX_DDL } from "./2026-08-25-0000-memory-transcripts-covering-index.js";
+import { MEMORY_REACHABLE_DDL } from "./2026-08-25-0001-memory-reachable.js";
+import { COMMIT_REACHABLE_DDL } from "./2026-08-25-0002-commit-reachable.js";
 import type { DbMigration } from "./MigrationHelpers.js";
 
 export type { DbMigration } from "./MigrationHelpers.js";
@@ -134,6 +137,9 @@ export const MIGRATIONS: ReadonlyArray<DbMigration> = [
 	SKILL_INVOCATIONS_DDL,
 	SKILL_PLUGIN_DDL,
 	SKILL_ORIGIN_ROOT_DDL,
+	MEMORY_TRANSCRIPTS_COVERING_INDEX_DDL,
+	MEMORY_REACHABLE_DDL,
+	COMMIT_REACHABLE_DDL,
 ];
 
 /*

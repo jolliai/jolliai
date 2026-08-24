@@ -27,7 +27,6 @@ import { isRecallMcpToolName } from "./DashboardModel.js";
 import { type ResolvedScope, scopeFilter, scopeToRepoIds } from "./DashboardScopeUtil.js";
 import { buildCoachingWindow, buildJourneys } from "./JourneysQuery.js";
 import { localDayKey, localWeekKey } from "./LocalDays.js";
-import type { ReachableCommits } from "./MemoriesQuery.js";
 
 /**
  * Epoch ms of the earliest captured tool-use row, or `undefined` when none
@@ -358,16 +357,15 @@ export function buildCoaching(
 	fromMs: number,
 	toMs: number,
 	timeZone: string,
-	reachable?: ReachableCommits,
 ): CoachingModel {
 	// Only the WINDOW build pays the transcript walk for test-first (patterns)
 	// and the roster's friction cell — `buildCoachingWindow` assembles the
 	// window ONCE and walks its transcripts ONCE for both, instead of the old
 	// three assembles / two decompressions per render. The prior build feeds
 	// trends, which need no turn signal.
-	const { model, friction } = buildCoachingWindow(db, scope, fromMs, toMs, reachable);
+	const { model, friction } = buildCoachingWindow(db, scope, fromMs, toMs);
 	const priorFrom = fromMs - (toMs - fromMs);
-	const prior = buildJourneys(db, scope, priorFrom, fromMs, reachable);
+	const prior = buildJourneys(db, scope, priorFrom, fromMs);
 	const byId = new Map(model.journeys.map((j) => [j.id, j]));
 	// The skill/recall cells read `session_tool_use` directly (not via a
 	// journey), so they must apply the page's repo scope themselves or they

@@ -24,6 +24,7 @@ import type {
 	ToolUsageRow,
 } from "./DashboardModel.js";
 import { MCP_DETAIL_TOOL_LIMIT, MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
+import { markCommitsReachability } from "./DbBackfill.js";
 
 /** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
 const SH = "Asia/Shanghai";
@@ -846,16 +847,18 @@ describe("buildDashboardModel", () => {
 			{ producerKind: "cli", dbPath },
 		);
 		const model = await withDashboardDb(
-			(db) =>
-				buildDashboardModel(db, {
+			(db) => {
+				// Only c-live remains reachable from a ref; the async sweep marks the
+				// other two unreachable, and standup filters commits.reachable in SQL.
+				markCommitsReachability(db, "repo-1", new Set(["c-live"]));
+				return buildDashboardModel(db, {
 					view: "standup",
 					scope: { kind: "all" },
 					timeZone: "UTC",
 					nowMs,
 					standupOffset: 0,
-					// Only c-live remains reachable from a ref; the other two were rewritten away.
-					reachableCommits: new Map([["repo-1", new Set(["c-live"])]]),
-				}),
+				});
+			},
 			{ dbPath },
 		);
 		const standup = model.standup;
@@ -884,7 +887,6 @@ describe("buildDashboardModel", () => {
 					timeZone: "UTC",
 					nowMs,
 					standupOffset: 0,
-					reachableCommits: new Map([["repo-1", new Set(["c-today", "c-old-live"])]]),
 				}),
 			{ dbPath },
 		);
@@ -915,8 +917,8 @@ describe("buildDashboardModel", () => {
 					timeZone: "UTC",
 					nowMs,
 					standupOffset: STANDUP_MAX_OFFSET,
-					// All reachable: the older commit is real, so only the ceiling can disable `›`.
-					reachableCommits: new Map([["repo-1", new Set(["c-today", "c-furthest", "c-beyond"])]]),
+					// All reachable (the default): the older commit is real, so only the
+					// ceiling can disable `›`.
 				}),
 			{ dbPath },
 		);
@@ -3814,18 +3816,20 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		await seedMemory();
 		await rebaseMem1();
 		const model = await withDashboardDb(
-			(db) =>
-				buildDashboardModel(db, {
+			(db) => {
+				// The memory's own hash is unreachable after the rebase; its live alias
+				// mem1-rebased is what a ref carries. The async commit-reachability sweep
+				// marks that, and the feed filters `commits.reachable` on the LIVE hash in
+				// SQL — dropping the card would lose the very memory the "N of M captured"
+				// line counts through the alias.
+				markCommitsReachability(db, "repo-1", new Set(["mem1-rebased", "mem2"]));
+				return buildDashboardModel(db, {
 					view: "stats",
 					scope: { kind: "all" },
 					timeZone: "UTC",
 					nowMs,
-					// What the server passes for this view: hashes reachable from a ref.
-					// The memory's own hash is not one of them any more — asking about it
-					// instead of the live one drops the very card the "N of M captured"
-					// line beside it has just counted through the alias.
-					reachableCommits: new Map([["repo-1", new Set(["mem1-rebased", "mem2"])]]),
-				}),
+				});
+			},
 			{ dbPath },
 		);
 		expect(model.stats?.memoriesCreated).toBe(2);
@@ -3842,14 +3846,15 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		// `memory_landing.at_ms` precisely so they cannot answer differently.
 		await rebaseMem1(400);
 		const model = await withDashboardDb(
-			(db) =>
-				buildDashboardModel(db, {
+			(db) => {
+				markCommitsReachability(db, "repo-1", new Set(["mem1-rebased", "mem2"]));
+				return buildDashboardModel(db, {
 					view: "stats",
 					scope: { kind: "all" },
 					timeZone: "UTC",
 					nowMs,
-					reachableCommits: new Map([["repo-1", new Set(["mem1-rebased", "mem2"])]]),
-				}),
+				});
+			},
 			{ dbPath },
 		);
 		// The rebased commit's own committer date — mem1 landed today, so it also

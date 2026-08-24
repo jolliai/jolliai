@@ -39,6 +39,7 @@ import {
 	globalSocketDir,
 	globalSocketPath,
 } from "./GlobalDaemonProtocol.js";
+import { reachabilityReconcileTask } from "./ReachabilityReconcileTask.js";
 import { sessionRescanTask } from "./SessionRescanTask.js";
 import { type DaemonTask, startScheduler } from "./TaskScheduler.js";
 
@@ -126,6 +127,7 @@ export function defaultTasks(): ReadonlyArray<DaemonTask> {
 			},
 		},
 		sessionRescanTask(),
+		reachabilityReconcileTask(),
 		{
 			name: "session-sync",
 			tickIntervalMs: SESSION_SYNC_TICK_MS,

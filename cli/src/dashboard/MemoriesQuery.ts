@@ -91,27 +91,14 @@ interface MemoryListRow {
 	readonly repo_name: string;
 }
 
-/**
- * Per repo (keyed by `repo_identity`), the commit hashes still reachable from
- * a local branch tip — or `null` when reachability could not be determined
- * (a git failure), which means "don't filter this repo's rows". A repo
- * missing from the map is treated the same as `null`: fail open rather than
- * hide real memories because the caller never computed a set for it.
- *
- * Needed because a rebase/reset that rewrites history away leaves the old
- * commits' rows sitting in `memories` forever — nothing else in this schema
- * notices they stopped existing on any branch. `commit_branches` cannot answer
- * this instead: an event that omits `branches` leaves the previous set in
- * place, so an empty set means "observed unreachable" only for the producers
- * that always send one.
- */
-export type ReachableCommits = ReadonlyMap<string, ReadonlySet<string> | null>;
-
-/** Shared with the stats/standup builders, which filter the same dead rows. */
-export function isReachable(reachable: ReachableCommits | undefined, repoIdentity: string, hash: string): boolean {
-	const set = reachable?.get(repoIdentity);
-	return set == null || set.has(hash);
-}
+// Reachability is no longer a per-read git set here. A rebase/reset that
+// rewrites history away leaves the old commits' rows in `memories`/`commits`
+// forever, and that "is this commit still on a branch" question is now answered
+// by the materialised `memories.reachable` / `commits.reachable` columns
+// (MEMORY_REACHABLE_DDL / COMMIT_REACHABLE_DDL), maintained asynchronously by the
+// backfill sweep and the daemon reconcile task and filtered in SQL by each feed.
+// The old `ReachableCommits` map and `isReachable` predicate were deleted with
+// the per-request `git rev-list`.
 
 /**
  * The reachable root memories for a scope, newest first — the whole set, before
@@ -142,10 +129,12 @@ export function isReachable(reachable: ReachableCommits | undefined, repoIdentit
 function reachableMemoryRows(
 	db: DashboardDbHandle,
 	resolved: ReturnType<typeof scopeToRepoIds>,
-	reachable?: ReachableCommits,
 ): ReadonlyArray<MemoryListRow> {
 	const listFilter = scopeFilter(resolved, "m.repo_id");
-	const allRows = db
+	// `m.reachable = 1` in SQL: a memory whose commit was rewritten away is kept as
+	// content but not listed as live work. Maintained asynchronously (see
+	// MEMORY_REACHABLE_DDL), so this list pays no per-request `git rev-list`.
+	return db
 		.prepare(
 			`SELECT m.commit_hash, m.branch, m.commit_message, m.ticket_id, m.jolli_doc_id,
 			        COALESCE(cm.committed_at_ms, m.commit_date_ms) AS committed_at_ms,
@@ -154,11 +143,11 @@ function reachableMemoryRows(
 			   JOIN repos r ON r.id = m.repo_id
 			   LEFT JOIN commits cm ON cm.repo_id = m.repo_id AND cm.hash = m.commit_hash
 			  WHERE m.parent_hash IS NULL
+			    AND m.reachable = 1
 				${listFilter.sql}
 			  ORDER BY COALESCE(cm.committed_at_ms, m.commit_date_ms) DESC, m.commit_hash DESC`,
 		)
 		.all(...listFilter.params) as ReadonlyArray<MemoryListRow>;
-	return allRows.filter((row) => isReachable(reachable, row.repo_identity, row.commit_hash));
 }
 
 /**
@@ -190,7 +179,6 @@ export function buildMemoriesPage(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	cursor: MemoriesPageCursor | undefined,
-	reachable?: ReachableCommits,
 ): {
 	readonly items: ReadonlyArray<MemoryListItem>;
 	readonly totalCount: number;
@@ -204,7 +192,7 @@ export function buildMemoriesPage(
 	// Idempotent for the already-resolved scope `buildMemoriesList` receives.
 	const resolvedScope = resolveScope(db, scope);
 	const resolved = scopeToRepoIds(db, resolvedScope);
-	const rows = reachableMemoryRows(db, resolved, reachable);
+	const rows = reachableMemoryRows(db, resolved);
 	const at = cursor
 		? rows.findIndex((row) => row.repo_identity === cursor.repoIdentity && row.commit_hash === cursor.commitHash)
 		: -1;
@@ -230,13 +218,9 @@ export interface MemoriesPageCursor {
 }
 
 /** The tree's first page and the sidebar's vitals — no per-memory detail. */
-export function buildMemoriesList(
-	db: DashboardDbHandle,
-	scope: DashboardScope,
-	reachable?: ReachableCommits,
-): Omit<MemoriesModel, "selected"> {
+export function buildMemoriesList(db: DashboardDbHandle, scope: DashboardScope): Omit<MemoriesModel, "selected"> {
 	const resolved = scopeToRepoIds(db, scope);
-	const rows = reachableMemoryRows(db, resolved, reachable);
+	const rows = reachableMemoryRows(db, resolved);
 	const items = toListItems(db, scope, rows.slice(0, MEMORIES_PAGE_SIZE));
 
 	const plainFilter = scopeFilter(resolved);
@@ -918,11 +902,10 @@ export function buildMemories(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	hash: string | undefined,
-	reachable?: ReachableCommits,
 	detailRepoIdentity?: string,
 	transcriptRepairState?: TranscriptRepairState,
 ): MemoriesModel {
-	const list = buildMemoriesList(db, scope, reachable);
+	const list = buildMemoriesList(db, scope);
 	if (!hash) return list;
 	const selected = buildMemoryDetail(
 		db,

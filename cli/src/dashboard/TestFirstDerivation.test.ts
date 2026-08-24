@@ -74,7 +74,7 @@ function inDb(body: () => void): Promise<void> {
 }
 
 function testedOf(): unknown {
-	return buildJourneys(db, { kind: "all" }, 0, NOW + 2 * DAY, undefined, { withTests: true }).journeys[0]?.tested;
+	return buildJourneys(db, { kind: "all" }, 0, NOW + 2 * DAY, { withTests: true }).journeys[0]?.tested;
 }
 
 beforeEach(() => {
