@@ -30,7 +30,7 @@ security recipe and the dist resolver and will not produce valid output.
 
 ## Step 1 — read the argument, if there is one
 
-This skill takes one optional free-text argument. Recognise exactly three things in
+This skill takes one optional free-text argument. Recognise exactly two things in
 it and ignore the rest:
 
 - **a port** — only when the argument contains a bare run of digits (e.g. `3000`).
@@ -39,8 +39,10 @@ it and ignore the rest:
 - **"url only" / "don't open" / "no browser"** — add `--no-open`, and report the
   URL instead of opening it. Prefer this whenever you know the host has no desktop
   session.
-- **a page name** — `standup`, `memories`, `knowledge` or `graph`. This does not
-  change the command; it changes which path you report in Step 3.
+
+A page name (standup, memories, knowledge, graph) is **not** an argument here — the
+dashboard's own nav switches between those pages once it is open, so there is
+nothing to pass through and nothing extra to report.
 
 ## Step 2 — start it in the BACKGROUND, then wait for its URL
 
@@ -96,17 +98,8 @@ dashboard may still be up and give the PID to stop it — or offer to relaunch w
 
 **`READY <url>`** — the dashboard is up. Unless `--no-open` was used it has
 already opened the user's default browser itself; say so in one line and give the
-URL as well, so they can open it by hand if no window appeared. When the user named
-a page in Step 1, give them that page's URL instead of the bare one, keeping the
-port you just read:
-
-| page | path |
-| --- | --- |
-| stats (default) | `/dashboard` |
-| standup | `/dashboard/standup` |
-| memories | `/memories` |
-| knowledge | `/knowledge` |
-| graph | `/graph` |
+URL as well, so they can open it by hand if no window appeared. Report the bare URL
+as printed — the dashboard's own nav reaches every page from there.
 
 Mention once that it keeps serving in the background after this turn, and that
 `kill <PID>` (the pid echoed above) stops it.
