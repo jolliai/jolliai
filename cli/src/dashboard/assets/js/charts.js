@@ -347,6 +347,12 @@ window.JD = window.JD || {};
 				if (value <= 0) return;
 				var h = (H * value) / max;
 				yCursor -= h;
+				/* `data-series` names the SERIES this rect belongs to (a skill or an MCP
+				   server), so the band's chooser column can highlight the chart alongside
+				   the row it selected — CSS keys on `.sk-band[data-selected]` +
+				   `rect[data-active]` to dim every other series to ~.22 opacity without
+				   redrawing the SVG. Escaped through `JD.esc` because a server or skill
+				   name is user-authored and can carry `"` in the wild. */
 				svg +=
 					'<rect x="' +
 					x.toFixed(2) +
@@ -358,6 +364,8 @@ window.JD = window.JD || {};
 					Math.max(1, h).toFixed(2) +
 					'" fill="' +
 					JD.seriesColor(keyIndex) +
+					'" data-series="' +
+					JD.esc(key) +
 					'"><title>' +
 					JD.esc(point.date + " · " + key + " · " + format(value)) +
 					"</title></rect>";

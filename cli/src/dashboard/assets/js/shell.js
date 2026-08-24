@@ -152,6 +152,7 @@ window.JD = window.JD || {};
 		{ view: "stats", label: "My Dashboard", sub: "individual · local" },
 		{ view: "standup", label: "Daily Standup", sub: "sprint · local" },
 		{ view: "skills", label: "Skills", sub: "usage · per-skill" },
+		{ view: "mcps", label: "MCPs", sub: "captured calls · per-server" },
 		{ view: "journeys", label: "Coaching", sub: "enablement · against your own earlier line", beta: true },
 		{ view: "memories", label: "Memories", sub: "browse · per-commit" },
 		{ view: "knowledge", label: "Knowledge", sub: "wiki · per-repo" },
@@ -167,6 +168,7 @@ window.JD = window.JD || {};
 		stats: "/dashboard",
 		standup: "/dashboard/standup",
 		skills: "/skills",
+		mcps: "/mcps",
 		journeys: "/dashboard/journeys",
 		memories: "/memories",
 		knowledge: "/knowledge",
@@ -218,6 +220,11 @@ window.JD = window.JD || {};
 		   Skills card is a summary of the same data, and this page answers a
 		   different question (one skill's whole history) at a different grain. */
 		{ view: "skills", path: "/skills", label: "Skills" },
+		/* Beside Skills, and above Coaching, because it is the same reading at the same
+		   grain about the other half of what an agent reaches for: the rows from here up
+		   read THIS MACHINE's own activity, while everything below Memories is a per-repo
+		   browser. */
+		{ view: "mcps", path: "/mcps", label: "MCPs" },
 		{ view: "journeys", path: "/dashboard/journeys", label: "Coaching", beta: true },
 		{ view: "memories", path: "/memories", label: "Memories" },
 		/* Knowledge / Graph browse the Memory Bank FOLDER, whose repo set differs
@@ -256,6 +263,13 @@ window.JD = window.JD || {};
 		   replaced a `zap` bolt, which said nothing about skills at all. */
 		puzzle:
 			'<path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/>',
+		/* Lucide `plug` — THE SAME MARK THE MCPs CARD DRAWS (stats.js `mcpCard`), for the
+		   reason `puzzle` above carries: a nav row for the same subject has to wear the
+		   same mark, or the card and the page read as two different features. A plug is
+		   also the honest glyph for what an MCP server is to a session — something the
+		   agent connects to, rather than a part it is built from (`puzzle`) or a place
+		   its work is stored (`database`). */
+		plug: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
 		database:
 			'<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5V19A9 3 0 0 0 21 19V5"/><path d="M3 12A9 3 0 0 0 21 12"/>',
 		book: '<path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>',
@@ -280,6 +294,7 @@ window.JD = window.JD || {};
 			stats: "dashboard",
 			standup: "calendar",
 			skills: "puzzle",
+			mcps: "plug",
 			journeys: "compass",
 			memories: "database",
 			knowledge: "book",
@@ -322,7 +337,7 @@ window.JD = window.JD || {};
 	   removed. Kept as a table rather than collapsed to `true` so a future view
 	   that ignores the scope hides the control instead of lying about it; the
 	   picker hides rather than disables, same as the range control on standup. */
-	var SCOPED_VIEWS = { stats: true, standup: true, skills: true, memories: true, journeys: true };
+	var SCOPED_VIEWS = { stats: true, standup: true, skills: true, mcps: true, memories: true, journeys: true };
 
 	/* Button label for a selection: the repo's name at one, a count past that.
 	   Names past one would either truncate or push the range control off the row,

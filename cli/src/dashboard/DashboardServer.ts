@@ -124,6 +124,7 @@ import {
 } from "./DashboardModel.js";
 import {
 	buildDashboardModel,
+	buildMcpServerDetail,
 	buildSkillDetail,
 	buildToolUsagePage,
 	clearWorktreeExistenceCache,
@@ -216,6 +217,9 @@ export const DASHBOARD_SCRIPT_FILES = [
 	// fetch helpers; nothing in stats.js. Ordered here rather than earlier only to keep
 	// the list reading in nav order.
 	"skills.js",
+	// Same dependencies as skills.js and no dependency ON it: the two pages share their
+	// CSS grammar, not their code.
+	"mcps.js",
 	"standup.js",
 	"memories.js",
 	"journeys.js",
@@ -1106,6 +1110,24 @@ function parseWindow(url: URL): Omit<ModelRequest, "view" | "scope"> {
 }
 
 /**
+ * The page model's clock, carried by follow-up reads so a preset window cannot
+ * cross a local-day boundary between the model response and a detail/page fetch.
+ *
+ * `null` means the caller supplied an invalid value; `undefined` means it supplied
+ * none, preserving the current-clock fallback for direct API calls. Leave enough
+ * valid-Date headroom for the widest dashboard window and its end boundary. A safe
+ * integer can still lie beyond JavaScript's Date range, where resolving a window
+ * would otherwise throw and turn a malformed local URL into a 500.
+ */
+function parseNowMs(url: URL): number | null | undefined {
+	const raw = url.searchParams.get("nowMs");
+	if (raw === null) return undefined;
+	const nowMs = Number(raw);
+	const validThroughWindowEnd = Number.isFinite(new Date(nowMs + 367 * 86_400_000).getTime());
+	return raw.trim() !== "" && nowMs >= 0 && Number.isSafeInteger(nowMs) && validThroughWindowEnd ? nowMs : null;
+}
+
+/**
  * Parses the `fromMs`/`toMs` echo-back pair the two journeys routes share —
  * the SAME window the feed resolved, sent back by the client rather than left
  * for the route to re-derive (see the `/api/journey` handler's comment for why
@@ -1172,6 +1194,7 @@ const VIEW_PATHS: Readonly<Record<string, DashboardView>> = {
 	"/dashboard": "stats",
 	"/dashboard/standup": "standup",
 	"/skills": "skills",
+	"/mcps": "mcps",
 	"/dashboard/journeys": "journeys",
 	"/memories": "memories",
 	"/knowledge": "knowledge",
@@ -1190,6 +1213,7 @@ const VIEW_TOKENS: ReadonlySet<string> = new Set<DashboardView>([
 	"stats",
 	"standup",
 	"skills",
+	"mcps",
 	"memories",
 	"journeys",
 	"knowledge",
@@ -1721,6 +1745,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				}
 				limit = Math.min(Math.max(1, Math.trunc(parsed)), TOOL_USAGE_MAX_LIMIT);
 			}
+			const pageNowMs = parseNowMs(url);
+			if (pageNowMs === null) {
+				sendJson(res, 400, { error: "nowMs must be an epoch-millisecond integer" });
+				return;
+			}
 			// Spelled out rather than spread from `parseWindow`: that helper also
 			// carries the series axis and the Memories view's `hash`/`detailRepo`,
 			// none of which this route has any business receiving.
@@ -1736,6 +1765,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
 							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
 							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),
+							...(pageNowMs !== undefined ? { nowMs: pageNowMs } : {}),
 						}),
 					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
 				);
@@ -1760,6 +1790,11 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				sendJson(res, 400, { error: "name is required" });
 				return;
 			}
+			const detailNowMs = parseNowMs(url);
+			if (detailNowMs === null) {
+				sendJson(res, 400, { error: "nowMs must be an epoch-millisecond integer" });
+				return;
+			}
 			const requestedWindow = parseWindow(url);
 			try {
 				const detail = await withReadonlyDashboardDb(
@@ -1770,6 +1805,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
 							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
 							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),
+							...(detailNowMs !== undefined ? { nowMs: detailNowMs } : {}),
 						}),
 					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
 				);
@@ -1784,6 +1820,54 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("skill detail read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that skill's detail" });
+			}
+			return;
+		}
+
+		// One MCP server's breakdown, for the MCPs page's reading pane — the
+		// server-side twin of `/api/skill-detail` above, and a fetch for the same
+		// reason: the page model carries ONE PAGE of servers and none of the per-tool
+		// or per-session detail.
+		if (url.pathname === "/api/mcp-detail") {
+			// Trimmed for the reason the skill name is: the value rides in a query
+			// string, and a stray space is a server that matches nothing —
+			// indistinguishable, to the reader, from a server with no recorded calls.
+			const server = (url.searchParams.get("server") ?? "").trim();
+			if (server === "") {
+				sendJson(res, 400, { error: "server is required" });
+				return;
+			}
+			const detailNowMs = parseNowMs(url);
+			if (detailNowMs === null) {
+				sendJson(res, 400, { error: "nowMs must be an epoch-millisecond integer" });
+				return;
+			}
+			const requestedWindow = parseWindow(url);
+			try {
+				const detail = await withReadonlyDashboardDb(
+					(db) =>
+						buildMcpServerDetail(db, {
+							scope: parseScope(url),
+							server,
+							...(requestedWindow.range ? { range: requestedWindow.range } : {}),
+							...(requestedWindow.customFrom ? { customFrom: requestedWindow.customFrom } : {}),
+							...(requestedWindow.customTo ? { customTo: requestedWindow.customTo } : {}),
+							...(detailNowMs !== undefined ? { nowMs: detailNowMs } : {}),
+						}),
+					{ ...(options.dbPath ? { dbPath: options.dbPath } : {}) },
+				);
+				// 404 for "no call to that server in this window" — a real answer, and
+				// the one a missing server has. This page never claims to list
+				// CONFIGURED servers, so there is no "registered but silent" state for
+				// this route to distinguish.
+				if (!detail) {
+					sendJson(res, 404, { error: "no recorded calls for that MCP server in this window" });
+					return;
+				}
+				sendJson(res, 200, detail);
+			} catch (err) {
+				log.warn("mcp detail read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that MCP server's detail" });
 			}
 			return;
 		}

@@ -788,18 +788,32 @@ window.JD = window.JD || {};
 			   that gives (the name, which truncates). A bare string was falsy here and
 			   so emitted no slot at all; this keeps that. */
 			var kind = kindOf ? kindOf(row) : null;
-			/* Only the Skills list opens a detail view, so only its rows carry the
-			   affordance. The MCP lists would need their own endpoint and their own
-			   answer to "what is a server's detail", and a row that looks clickable
-			   and does nothing is worse than a row that does not. */
-			var clickable =
-				list === "skill"
-					? ' class="rl-click" tabindex="0" role="button" data-skill="' +
-						JD.esc(row.name) +
-						'" title="Open detail for ' +
-						JD.esc(row.name) +
-						'"'
-					: "";
+			/* TWO of the three lists open a detail view, and the third deliberately does
+			   not: `skill` links into the Skills page and `server` into the MCPs page,
+			   while the MCP TOOL list has no page of its own — a server is what
+			   `/api/mcp-detail` answers about, and a row that looks clickable and does
+			   nothing is worse than a row that does not.
+			 *
+			 * The attribute names the page's own selection parameter (`data-skill` →
+			   `?skill=`, `data-mcp` → `?mcp=`), which is what the binder at the foot of
+			   this file reads back. The server row's own identity is `row.server`, not
+			   `row.name` — `McpServerRow` has no `name` field. */
+			var clickable = "";
+			if (list === "skill") {
+				clickable =
+					' class="rl-click" tabindex="0" role="button" data-skill="' +
+					JD.esc(row.name) +
+					'" title="Open detail for ' +
+					JD.esc(row.name) +
+					'"';
+			} else if (list === "server") {
+				clickable =
+					' class="rl-click" tabindex="0" role="button" data-mcp="' +
+					JD.esc(row.server) +
+					'" title="Open detail for ' +
+					JD.esc(row.server) +
+					'"';
+			}
 			html +=
 				"<li" +
 				clickable +
@@ -1317,7 +1331,13 @@ window.JD = window.JD || {};
 		state.loading = true;
 		state.error = false;
 		JD.renderPage(model);
-		JD.getJson(JD.withParams("/api/tool-usage" + JD.query(model, {}), { list: list, offset: String(rows.length) }))
+		JD.getJson(
+			JD.withParams("/api/tool-usage" + JD.query(model, {}), {
+				list: list,
+				offset: String(rows.length),
+				nowMs: model.generatedAtMs,
+			}),
+		)
 			.then((page) => {
 				/* A 30 s model refresh can finish while this page is in flight. That
 				   refresh replaces the global model and deliberately resets every tool
@@ -1439,7 +1459,12 @@ window.JD = window.JD || {};
 		var spec = TOOL_LISTS[list];
 		var usage = model.stats.toolUsage;
 		return JD.getJson(
-			JD.withParams("/api/tool-usage" + JD.query(model, {}), { list: list, offset: "0", limit: String(width) }),
+			JD.withParams("/api/tool-usage" + JD.query(model, {}), {
+				list: list,
+				offset: "0",
+				limit: String(width),
+				nowMs: model.generatedAtMs,
+			}),
 		)
 			.then((page) => {
 				/* Superseded — a later poll already replaced the model this answer was
@@ -2020,33 +2045,43 @@ window.JD = window.JD || {};
 			button.onclick = () => loadMoreToolRows(model, button.getAttribute("data-toolmore"));
 		});
 
-		/* The Skills rows LINK INTO the Skills page, which has a reading pane of its
-		   own. They used to open a modal over this card — a second renderer of the same
-		   figures, and one that could not be shared or reloaded. `?skill=` is that
-		   page's own selection state, so this navigation and a click over there land on
-		   the identical view.
+		/* The Skills and MCP-server rows LINK INTO their own pages, each of which has a
+		   reading pane. They used to open a modal over this card — a second renderer of
+		   the same figures, and one that could not be shared or reloaded. `?skill=` and
+		   `?mcp=` are those pages' own selection state, so this navigation and a click
+		   over there land on the identical view.
 
 		   Re-bound on every repaint like the button above, because a repaint replaces
 		   the whole of `#app` and takes the old rows' handlers with it.
 
 		   Keyboard as well as pointer: the row carries `role="button"` and a tabindex,
 		   so leaving it click-only would put a focusable control on the page that the
-		   keyboard cannot activate. */
-		document.querySelectorAll("[data-skill]").forEach((row) => {
-			var open = () => {
-				/* Through `JD.viewPath`, never a literal "/skills": that table is the one
-				   place a view's URL is spelled, so the nav row and this link cannot end up
-				   disagreeing about where the page lives. */
-				var query = JD.withParams(JD.query(model, {}), { skill: row.getAttribute("data-skill") });
-				window.location.href = JD.viewPath("skills") + query;
-			};
-			row.onclick = open;
-			row.onkeydown = (event) => {
-				if (event.key === "Enter" || event.key === " ") {
-					event.preventDefault();
-					open();
-				}
-			};
+		   keyboard cannot activate.
+
+		   ONE BINDER, TABLE-DRIVEN, because the two differ only in which attribute
+		   carries the identity and which view receives it — and a second copy of this
+		   loop is a second place for the `JD.viewPath` rule below to be forgotten. */
+		[
+			{ attribute: "data-skill", param: "skill", view: "skills" },
+			{ attribute: "data-mcp", param: "mcp", view: "mcps" },
+		].forEach((link) => {
+			document.querySelectorAll("[" + link.attribute + "]").forEach((row) => {
+				var open = () => {
+					/* Through `JD.viewPath`, never a literal "/skills": that table is the one
+					   place a view's URL is spelled, so the nav row and this link cannot end up
+					   disagreeing about where the page lives. */
+					var params = {};
+					params[link.param] = row.getAttribute(link.attribute);
+					window.location.href = JD.viewPath(link.view) + JD.withParams(JD.query(model, {}), params);
+				};
+				row.onclick = open;
+				row.onkeydown = (event) => {
+					if (event.key === "Enter" || event.key === " ") {
+						event.preventDefault();
+						open();
+					}
+				};
+			});
 		});
 	};
 

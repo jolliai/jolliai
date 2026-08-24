@@ -152,6 +152,7 @@ function model(over: Record<string, unknown> = {}, statsOver: Record<string, unk
 				serverCallsTotal: 0,
 				mcpTools: [],
 				mcpToolsTotal: 0,
+				serverToolsTotal: 0,
 				skillAgents: [],
 				mcpAgents: [],
 				sessionsWithTools: 0,

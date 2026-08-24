@@ -642,6 +642,12 @@ describe("routes", () => {
 		const cases: ReadonlyArray<[string, DashboardModel["view"]]> = [
 			["/dashboard", "stats"],
 			["/dashboard/standup", "standup"],
+			["/skills", "skills"],
+			// The router speaks PATHS and the API speaks view TOKENS, and the two lists
+			// are separate for that reason (see `VIEW_TOKENS`) — so a page reachable at
+			// its path can still be unreachable through `?view=`, silently falling back
+			// to Stats. Every pair belongs in this table.
+			["/mcps", "mcps"],
 			["/memories", "memories"],
 			["/knowledge", "knowledge"],
 			["/graph", "graph"],
@@ -2531,6 +2537,120 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		expect((await get(port, "/api/skill-detail?name=missing")).status).toBe(404);
 	});
 
+	it("serves one MCP server detail and distinguishes a bad name from a silent server", async () => {
+		const dbPath = join(dir, "mcp-detail.db");
+		const configDir = join(dir, "config-mcp-detail");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "linear-session",
+						updatedAtMs: Date.now() - 3_600_000,
+						tools: [
+							{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 4 },
+							{ name: "linear.get_issue", kind: "mcp", server: "linear", calls: 1 },
+						],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		// Trimmed, and the window params are read the same way `/api/skill-detail` reads them.
+		const ok = await get(port, "/api/mcp-detail?server=%20linear%20&range=3m&from=ignored&to=ignored");
+		expect(ok.status).toBe(200);
+		expect(await ok.json()).toMatchObject({
+			server: "linear",
+			sessions: 1,
+			calls: 5,
+			toolCount: 2,
+			tools: [
+				{ name: "list_issues", calls: 4, sessions: 1 },
+				{ name: "get_issue", calls: 1, sessions: 1 },
+			],
+			agents: [{ source: "claude", calls: 5 }],
+			repos: ["jolli"],
+		});
+
+		expect((await get(port, "/api/mcp-detail")).status).toBe(400);
+		expect((await get(port, "/api/mcp-detail?server=%20%20")).status).toBe(400);
+		// A server with no captured call in the window is a 404 — this page never
+		// claims to list CONFIGURED servers, so there is no third state to report.
+		expect((await get(port, "/api/mcp-detail?server=missing")).status).toBe(404);
+	});
+
+	it("anchors tool usage and both detail presets to the page model's clock", async () => {
+		const dbPath = join(dir, "mcp-detail-anchor.db");
+		const configDir = join(dir, "config-mcp-detail-anchor");
+		// 23:59 in Asia/Shanghai, this test process's configured zone. By the time
+		// the route is exercised the real clock is long past this day; without the
+		// anchor a visible `today` row therefore becomes a 404 deterministically.
+		const generatedAtMs = Date.parse("2026-07-30T15:59:00Z");
+		await applyStatsEvents(
+			[
+				{
+					producerKind: "cli",
+					event: {
+						type: "repo.enabled",
+						repoIdentity: "repo-1",
+						repoName: "jolli",
+						worktreeRoot: "/w/jolli",
+						enabledAt: "t",
+					},
+				},
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "linear-before-midnight",
+						updatedAtMs: generatedAtMs - 3_600_000,
+						tools: [
+							{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 1 },
+							{ name: "code-review", kind: "skill", calls: 1 },
+						],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		expect((await get(port, `/api/mcp-detail?server=linear&range=today&nowMs=${generatedAtMs}`)).status).toBe(200);
+		expect((await get(port, `/api/skill-detail?name=code-review&range=today&nowMs=${generatedAtMs}`)).status).toBe(
+			200,
+		);
+		const usage = await get(port, `/api/tool-usage?list=skill&range=today&nowMs=${generatedAtMs}`);
+		expect(usage.status).toBe(200);
+		expect(await usage.json()).toMatchObject({ totalCount: 1, rows: [{ name: "code-review" }] });
+
+		for (const bad of ["", "nope", "-1", "1.5", "8640000000000000", "9007199254740992"]) {
+			for (const path of [
+				`/api/mcp-detail?server=linear&range=today&nowMs=${bad}`,
+				`/api/skill-detail?name=code-review&range=today&nowMs=${bad}`,
+				`/api/tool-usage?list=skill&range=today&nowMs=${bad}`,
+			]) {
+				expect((await get(port, path)).status).toBe(400);
+			}
+		}
+	});
+
 	it("500s dashboard detail reads when the dashboard database is invalid", async () => {
 		const dbPath = join(dir, "broken-tool-reads.db");
 		writeFileSync(dbPath, "this is not a database");
@@ -2540,6 +2660,7 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 
 		expect((await get(port, "/api/tool-usage?list=skill")).status).toBe(500);
 		expect((await get(port, "/api/skill-detail?name=code-review")).status).toBe(500);
+		expect((await get(port, "/api/mcp-detail?server=linear")).status).toBe(500);
 		expect((await get(port, "/api/context?repo=repo-1&kind=plan&key=p1")).status).toBe(500);
 		expect((await get(port, "/api/conversation?repo=repo-1&hash=abc&source=claude&session=s1")).status).toBe(500);
 	});

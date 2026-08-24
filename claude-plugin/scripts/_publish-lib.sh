@@ -46,6 +46,7 @@ PUBLISH_REQUIRED_DIST=(
 	dashboard-assets/js/shell.js
 	dashboard-assets/js/stats.js
 	dashboard-assets/js/skills.js
+	dashboard-assets/js/mcps.js
 	dashboard-assets/js/standup.js
 	dashboard-assets/js/memories.js
 	dashboard-assets/js/journeys.js

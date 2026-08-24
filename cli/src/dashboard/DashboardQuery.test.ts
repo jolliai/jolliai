@@ -23,13 +23,14 @@ import type {
 	StatsModel,
 	ToolUsageRow,
 } from "./DashboardModel.js";
-import { MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
+import { MCP_DETAIL_TOOL_LIMIT, MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 
 /** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
 const SH = "Asia/Shanghai";
 
 import {
 	buildDashboardModel,
+	buildMcpServerDetail,
 	buildSkillDetail,
 	buildToolUsagePage,
 	type QueryOptions,
@@ -2936,6 +2937,438 @@ describe("buildDashboardModel — skill adoption band (skillDays)", () => {
 			{ date: "2026-07-29", bySeries: {} },
 			{ date: "2026-07-30", bySeries: {} },
 		]);
+	});
+});
+
+/**
+ * The MCPs page's band — `skillDays`' twin, through the same `buildDayPoints`.
+ *
+ * Only what DIFFERS from the skills band is tested here; everything the two share
+ * (local-day bucketing, a point per day of the window, the DST cursor) is covered
+ * above and cannot diverge, because there is one implementation.
+ */
+describe("buildDashboardModel — MCP adoption band (serverDays)", () => {
+	let dir: string;
+	let dbPath: string;
+	const nowMs = Date.parse("2026-07-30T12:00:00Z");
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-mcpband-"));
+		dbPath = join(dir, "dashboard.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const repoEvent: StatsEventEnvelope = {
+		producerKind: "cli",
+		event: {
+			type: "repo.enabled",
+			repoIdentity: "repo-1",
+			repoName: "jolli",
+			worktreeRoot: "/w",
+			enabledAt: "t",
+		},
+	};
+
+	const sessionAt = (
+		sessionId: string,
+		callAtMs: number,
+		tools: ReadonlyArray<{ server: string; tool: string }>,
+	): StatsEventEnvelope => ({
+		producerKind: "cli",
+		event: {
+			type: "session.upserted",
+			repoIdentity: "repo-1",
+			source: "claude",
+			sessionId,
+			updatedAtMs: nowMs - 3_600_000,
+			tools: tools.map((t) => ({
+				name: `${t.server}.${t.tool}`,
+				kind: "mcp" as const,
+				server: t.server,
+				calls: 1,
+				lastCallAtMs: callAtMs,
+			})),
+		},
+	});
+
+	const band = async (customFrom: string, customTo: string) =>
+		(
+			await withDashboardDb(
+				(db) =>
+					buildDashboardModel(db, {
+						view: "mcps",
+						scope: { kind: "all" },
+						timeZone: "UTC",
+						nowMs,
+						range: "custom",
+						customFrom,
+						customTo,
+					}),
+				{ dbPath },
+			)
+		).stats?.toolUsage?.serverDays;
+
+	/**
+	 * The one rule the skills band does not need, because a skill has one row per
+	 * session and a SERVER has one per tool it was reached through.
+	 */
+	it("counts a session once per server however many of its tools it called", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionAt("s1", Date.parse("2026-07-29T10:00:00Z"), [
+					{ server: "linear", tool: "list_issues" },
+					{ server: "linear", tool: "get_issue" },
+					{ server: "linear", tool: "comment" },
+					{ server: "github", tool: "list_prs" },
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// Three rows for linear, one session. Counting rows would say 3.
+		expect(await band("2026-07-29", "2026-07-29")).toEqual([
+			{ date: "2026-07-29", bySeries: { linear: 1, github: 1 } },
+		]);
+	});
+
+	it("keys the series by the FOLDED server, so the band and the list agree", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				sessionAt("s1", Date.parse("2026-07-29T10:00:00Z"), [{ server: "jollimemory", tool: "recall" }]),
+				sessionAt("s2", Date.parse("2026-07-29T11:00:00Z"), [
+					{ server: "plugin_jolli_jollimemory", tool: "recall" },
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// ONE series, not two. Keyed on `t.server` the band would draw a bar the
+		// chooser column below it has no row for.
+		expect(await band("2026-07-29", "2026-07-29")).toEqual([{ date: "2026-07-29", bySeries: { jollimemory: 2 } }]);
+	});
+
+	it("leaves out an MCP row that carries no server", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent,
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "s1",
+						updatedAtMs: nowMs - 3_600_000,
+						tools: [
+							{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 1 },
+							// No `server`: the server list's own WHERE drops it, so the band must too.
+							{ name: "mystery", kind: "mcp", calls: 4 },
+						],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "mcps", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		const keys = (model.stats?.toolUsage?.serverDays ?? []).flatMap((point) => Object.keys(point.bySeries));
+		expect([...new Set(keys)]).toEqual(["linear"]);
+		expect(model.stats?.toolUsage?.serversTotal).toBe(1);
+		// The general MCP-tool list keeps the serverless legacy row; the MCP page's
+		// headline counts only tools belonging to one of the servers it can list.
+		expect(model.stats?.toolUsage?.mcpToolsTotal).toBe(2);
+		expect(model.stats?.toolUsage?.serverToolsTotal).toBe(1);
+	});
+
+	it("returns a point per day even with no MCP rows at all", async () => {
+		await applySummaryEvents([repoEvent], { producerKind: "cli", dbPath });
+		expect(await band("2026-07-29", "2026-07-30")).toEqual([
+			{ date: "2026-07-29", bySeries: {} },
+			{ date: "2026-07-30", bySeries: {} },
+		]);
+	});
+});
+
+describe("buildMcpServerDetail", () => {
+	let dir: string;
+	let dbPath: string;
+	const nowMs = Date.parse("2026-07-30T12:00:00Z");
+
+	beforeEach(() => {
+		dir = mkdtempSync(join(tmpdir(), "jolli-mcpdetail-"));
+		dbPath = join(dir, "dashboard.db");
+	});
+
+	afterEach(() => {
+		rmSync(dir, { recursive: true, force: true });
+	});
+
+	const repoEvent = (repoIdentity: string, repoName: string): StatsEventEnvelope => ({
+		producerKind: "cli",
+		event: { type: "repo.enabled", repoIdentity, repoName, worktreeRoot: `/w/${repoName}`, enabledAt: "t" },
+	});
+
+	const session = (
+		sessionId: string,
+		tools: ReadonlyArray<{ name: string; server: string; calls: number; atMs: number }>,
+		options: { source?: "claude" | "codex"; repoIdentity?: string } = {},
+	): StatsEventEnvelope => ({
+		producerKind: "cli",
+		event: {
+			type: "session.upserted",
+			repoIdentity: options.repoIdentity ?? "repo-1",
+			source: options.source ?? "claude",
+			sessionId,
+			updatedAtMs: nowMs - 3_600_000,
+			tools: tools.map((t) => ({
+				name: t.name,
+				kind: "mcp" as const,
+				server: t.server,
+				calls: t.calls,
+				lastCallAtMs: t.atMs,
+			})),
+		},
+	});
+
+	const detail = async (server: string) =>
+		await withDashboardDb(
+			(db) => buildMcpServerDetail(db, { scope: { kind: "all" }, server, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+
+	it("rolls one server up across its tools, sessions, agents and repos", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent("repo-1", "jolli"),
+				repoEvent("repo-2", "course"),
+				session("s1", [
+					{
+						name: "linear.list_issues",
+						server: "linear",
+						calls: 5,
+						atMs: Date.parse("2026-07-28T09:00:00Z"),
+					},
+					{ name: "linear.get_issue", server: "linear", calls: 2, atMs: Date.parse("2026-07-28T10:00:00Z") },
+				]),
+				session(
+					"s2",
+					[
+						{
+							name: "linear.list_issues",
+							server: "linear",
+							calls: 3,
+							atMs: Date.parse("2026-07-29T09:00:00Z"),
+						},
+					],
+					{ source: "codex", repoIdentity: "repo-2" },
+				),
+				// A different server must not leak into any of the four groupings.
+				session("s3", [
+					{ name: "github.list_prs", server: "github", calls: 99, atMs: Date.parse("2026-07-29T09:00:00Z") },
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+
+		const got = await detail("linear");
+		expect(got).toMatchObject({
+			server: "linear",
+			calls: 10,
+			// TWO sessions, not the three tool rows behind them.
+			sessions: 2,
+			toolCount: 2,
+			// The tool name has the server segment stripped; ranked by calls.
+			tools: [
+				{ name: "list_issues", calls: 8, sessions: 2 },
+				{ name: "get_issue", calls: 2, sessions: 1 },
+			],
+			agents: [
+				{ source: "claude", calls: 7 },
+				{ source: "codex", calls: 3 },
+			],
+			// Alphabetical, and from the SESSIONS — an MCP call is archived onto no commit.
+			repos: ["course", "jolli"],
+			firstCallAtMs: Date.parse("2026-07-28T09:00:00Z"),
+			lastCallAtMs: Date.parse("2026-07-29T09:00:00Z"),
+		});
+		// One point per WINDOW DAY, including quiet days. The first session lands on
+		// Jul 28 because its LAST tool call was at 10:00, and both of its tools sum to 7.
+		expect(got?.daySeries.filter((point) => point.sessions > 0 || point.calls > 0)).toEqual([
+			{ date: "2026-07-28", sessions: 1, calls: 7 },
+			{ date: "2026-07-29", sessions: 1, calls: 3 },
+		]);
+		expect(got?.daySeries).toHaveLength(30);
+	});
+
+	it("keeps every session in a busy server's daily trend instead of truncating the oldest one", async () => {
+		const sessions = Array.from({ length: 401 }, (_unused, index) => {
+			const date = index < 201 ? "2026-07-28" : "2026-07-29";
+			return session(`busy-${index}`, [
+				{
+					name: "busy.call",
+					server: "busy",
+					calls: 1,
+					atMs: Date.parse(`${date}T09:00:00Z`) + index,
+				},
+			]);
+		});
+		await applySummaryEvents([repoEvent("repo-1", "jolli"), ...sessions], { producerKind: "cli", dbPath });
+
+		const got = await detail("busy");
+		expect(got).toMatchObject({ sessions: 401, calls: 401 });
+		expect(got?.daySeries.filter((point) => point.sessions > 0 || point.calls > 0)).toEqual([
+			{ date: "2026-07-28", sessions: 201, calls: 201 },
+			{ date: "2026-07-29", sessions: 200, calls: 200 },
+		]);
+		expect(got?.daySeries.reduce((sum, point) => sum + point.sessions, 0)).toBe(401);
+		expect(got?.daySeries.reduce((sum, point) => sum + point.calls, 0)).toBe(401);
+		expect(got?.sessionSeries).toHaveLength(400);
+		expect(got?.sessionSeries[0]?.atMs).toBe(Date.parse("2026-07-28T09:00:00Z") + 1);
+		expect(got?.sessionSeries.at(-1)?.atMs).toBe(Date.parse("2026-07-29T09:00:00Z") + 400);
+	});
+
+	/**
+	 * The tool session counts are per row and do not re-sum, which is what the pane
+	 * prints them without a total for.
+	 */
+	it("counts each tool's sessions independently of the server's own total", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent("repo-1", "jolli"),
+				session("s1", [
+					{ name: "dbhub.query", server: "dbhub", calls: 1, atMs: Date.parse("2026-07-29T09:00:00Z") },
+					{ name: "dbhub.search", server: "dbhub", calls: 1, atMs: Date.parse("2026-07-29T09:00:00Z") },
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		const got = await detail("dbhub");
+		expect(got?.sessions).toBe(1);
+		// 1 + 1 = 2 ≠ 1. Both rows are right; the column is read row by row.
+		expect(got?.tools.map((t) => t.sessions)).toEqual([1, 1]);
+	});
+
+	it("matches the FOLDED server name and strips the folded prefix off its tools", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent("repo-1", "jolli"),
+				session("s1", [
+					{
+						name: "jollimemory.recall",
+						server: "jollimemory",
+						calls: 4,
+						atMs: Date.parse("2026-07-29T09:00:00Z"),
+					},
+				]),
+				session("s2", [
+					{
+						name: "plugin_jolli_jollimemory.recall",
+						server: "plugin_jolli_jollimemory",
+						calls: 6,
+						atMs: Date.parse("2026-07-29T10:00:00Z"),
+					},
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// The list row spells the folded name, so that is what the pane is opened with.
+		// A `t.server = ?` match would 404 on it.
+		const got = await detail("jollimemory");
+		expect(got).toMatchObject({
+			server: "jollimemory",
+			calls: 10,
+			sessions: 2,
+			// One tool, not two: the stored name embeds the server, so both spellings fold.
+			toolCount: 1,
+			tools: [{ name: "recall", calls: 10, sessions: 2 }],
+		});
+		// And the raw spelling is not separately readable — it is not a server.
+		expect(await detail("plugin_jolli_jollimemory")).toBeUndefined();
+	});
+
+	it("caps the tool list while keeping the count exact", async () => {
+		const many = Array.from({ length: MCP_DETAIL_TOOL_LIMIT + 3 }, (_unused, index) => ({
+			name: `wide.tool_${String(index).padStart(2, "0")}`,
+			server: "wide",
+			// Descending, so the cap keeps the busiest and the dropped ones are the quiet tail.
+			calls: 100 - index,
+			atMs: Date.parse("2026-07-29T09:00:00Z"),
+		}));
+		await applySummaryEvents([repoEvent("repo-1", "jolli"), session("s1", many)], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const got = await detail("wide");
+		expect(got?.tools).toHaveLength(MCP_DETAIL_TOOL_LIMIT);
+		// The figure the pane prints, and what its "N busiest of M" note is built from.
+		expect(got?.toolCount).toBe(MCP_DETAIL_TOOL_LIMIT + 3);
+		expect(got?.tools[0]?.name).toBe("tool_00");
+		// Every call still counted, including the ones whose row was dropped.
+		expect(got?.calls).toBe(many.reduce((sum, t) => sum + t.calls, 0));
+	});
+
+	it("answers undefined for a server with no call in the window", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent("repo-1", "jolli"),
+				session("s1", [
+					{
+						name: "linear.list_issues",
+						server: "linear",
+						calls: 1,
+						atMs: Date.parse("2026-06-01T09:00:00Z"),
+					},
+				]),
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		// In the table, outside the week — the route turns this into a 404, which is
+		// the same answer a server nobody has ever called gets.
+		expect(
+			await withDashboardDb(
+				(db) =>
+					buildMcpServerDetail(db, {
+						scope: { kind: "all" },
+						server: "linear",
+						range: "week",
+						timeZone: "UTC",
+						nowMs,
+					}),
+				{ dbPath },
+			),
+		).toBeUndefined();
+		expect(await detail("never-called")).toBeUndefined();
+	});
+
+	it("ignores a skill that shares the server's name", async () => {
+		await applySummaryEvents(
+			[
+				repoEvent("repo-1", "jolli"),
+				{
+					producerKind: "cli",
+					event: {
+						type: "session.upserted",
+						repoIdentity: "repo-1",
+						source: "claude",
+						sessionId: "s1",
+						updatedAtMs: nowMs - 3_600_000,
+						tools: [
+							{ name: "linear.list_issues", kind: "mcp", server: "linear", calls: 2 },
+							// Same bare name, different kind. `(session, name, kind)` is the
+							// primary key precisely because these are two different things.
+							{ name: "linear", kind: "skill", calls: 40 },
+						],
+					},
+				},
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await detail("linear")).toMatchObject({ calls: 2, toolCount: 1 });
 	});
 });
 

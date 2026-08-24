@@ -25,7 +25,7 @@
  * THE ROWS STILL LIVE IN A WINDOW, and it is now the page's ONLY one. The whole view is
  * a fixed frame — the page does not scroll, the two columns are the same height, and the
  * reading pane holds its whole skill without scrolling — so the rows are the one region
- * with a scrollbar. `main.css`'s `.skills-page` header owns that rule and the measurements
+ * with a scrollbar. `main.css`'s `.browser-page` header owns that rule and the measurements
  * behind it; what matters here is that the height comes from a flex chain rather than from
  * anything this file computes. The MEASURED inline cap that used to create the window
  * (`listCapPx`, read off the first page) is gone with it.
@@ -56,7 +56,7 @@
  * ALL THREE CHARTS SHARE ONE TIME AXIS, and they share it by reading the SAME array
  * rather than by each deriving the same bounds. `ToolUsage.skillDays` is the band's own
  * series — one point per LOCAL DAY of the window, emitted whether or not anything ran
- * (`buildSkillDays` walks the window, not the data) — and `windowDays` hands its day
+ * (`buildDayPoints` walks the window, not the data) — and `windowDays` hands its day
  * keys to the pane's two charts as their buckets. So the reader can read straight down
  * the page: the same column is the same day in all three.
  *
@@ -159,7 +159,14 @@
 	   different payload takes ownership, so an old timer cannot wake a stale read. */
 	var restRetryTimer = null;
 
-	/* Which of the pane's two long fixed paragraphs the reader has opened.
+	/* Whether each of the pane's two long fixed paragraphs is open.
+	 *
+	 * BOTH DEFAULT TO OPEN, matching the MCPs pane next door (`mcps.js`) and the mockup. A
+	 * first-time reader needs to see what the page is claiming without a click, and the
+	 * caveat is the stronger case of the two: it qualifies the four figures directly above
+	 * it, so folded to a single line it is met only once the reader has already believed
+	 * the number it limits — the very failure `inferredCaveatHtml` places it there to
+	 * avoid. A click still collapses either back.
 	 *
 	 * MODULE STATE, not DOM state, because every path in this file repaints the WHOLE pane
 	 * — a row click, that row's detail landing, the tail of the list arriving, a refresh —
@@ -168,10 +175,10 @@
 	 * reads back off the event target.
 	 *
 	 * DELIBERATELY NOT PER SKILL. The two paragraphs are FIXED text (the inferred caveat
-	 * and the basis line say the same thing on every skill), so "I have read this one" is a
-	 * fact about the reader, not about the row — resetting it per selection would make them
-	 * re-open the same sentence on every skill they looked at. */
-	var openProse = { "sk-caveat": false, "sk-basis": false };
+	 * and the basis line say the same thing on every skill), so a collapse is a fact about
+	 * the reader, not about the row — resetting it per selection would make them re-close
+	 * the same sentence on every skill they looked at. */
+	var openProse = { "sk-caveat": true, "sk-basis": true };
 
 	/* Whether "the address names no skill" has already been answered for this page
 	   load — see the header. Nav is a full page reload, so this starts false on every
@@ -267,10 +274,51 @@
 		return rows[0].name;
 	}
 
+	/**
+	 * Extracted from `renderSkills` so the row-click handler can trigger a new detail
+	 * fetch without going through the full render (which would tear the whole frame
+	 * down). `seq` is bumped here so a click that lands its detail late is invalidated
+	 * by a newer click the same way — the staleness rule is identical whether the fetch
+	 * was started by a render or by a selection change. */
+	function fetchDetail(app, model) {
+		var selected = state.paneName;
+		if (!selected) return;
+		var mine = ++seq;
+		JD.getJson(
+			JD.withParams("/api/skill-detail" + JD.query(model, {}), {
+				name: selected,
+				nowMs: model.generatedAtMs,
+			}),
+		)
+			.then(
+				(detail) => {
+					if (mine !== seq || state.paneName !== selected) return false;
+					state.pane = detail;
+					return true;
+				},
+				/* THE TWO-CALLBACK FORM, never a trailing `.catch`, and the repaint moved out
+				   of both: this handler must see the REQUEST's failure and nothing else.
+				   While the repaint sat inside the success callback, a throw from ANY chart
+				   in the pane landed here instead — and `paneErrorText` reads a missing
+				   `status` as "nothing reached a server", so a `ReferenceError` in a tick
+				   title was reported to the reader as a dashboard that had stopped, while it
+				   was answering fine. A render fault is now unhandled and reaches the
+				   console, which is where a bug in this file belongs. */
+				(err) => {
+					if (mine !== seq || state.paneName !== selected) return false;
+					state.paneError = paneErrorText(err);
+					return true;
+				},
+			)
+			.then((changed) => {
+				/* `drawPane`, NOT `draw`: the detail landing changes only the reading pane. */
+				if (changed) drawPane(app, model);
+			});
+	}
+
 	function renderSkills(model) {
 		var app = document.getElementById("app");
 		if (!app) return;
-		var mine = ++seq;
 		if (renderedModel !== model) {
 			cancelRowsRetry();
 			renderedModel = model;
@@ -301,32 +349,7 @@
 		draw(app, model);
 
 		if (needsRest) fetchRows(app, model);
-
-		if (!selected) return;
-		JD.getJson(JD.withParams("/api/skill-detail" + JD.query(model, {}), { name: selected }))
-			.then(
-				(detail) => {
-					if (mine !== seq || state.paneName !== selected) return false;
-					state.pane = detail;
-					return true;
-				},
-				/* THE TWO-CALLBACK FORM, never a trailing `.catch`, and the repaint moved out
-				   of both: this handler must see the REQUEST's failure and nothing else.
-				   While the repaint sat inside the success callback, a throw from ANY chart
-				   in the pane landed here instead — and `paneErrorText` reads a missing
-				   `status` as "nothing reached a server", so a `ReferenceError` in a tick
-				   title was reported to the reader as a dashboard that had stopped, while it
-				   was answering fine. A render fault is now unhandled and reaches the
-				   console, which is where a bug in this file belongs. */
-				(err) => {
-					if (mine !== seq || state.paneName !== selected) return false;
-					state.paneError = paneErrorText(err);
-					return true;
-				},
-			)
-			.then((changed) => {
-				if (changed) draw(app, model);
-			});
+		fetchDetail(app, model);
 	}
 
 	/**
@@ -398,6 +421,7 @@
 					list: "skill",
 					offset: String(offset),
 					limit: String(total - offset),
+					nowMs: model.generatedAtMs,
 				}),
 			).then((page) => {
 				if (renderedModel !== model) return { rows: rows, total: total };
@@ -482,15 +506,16 @@
 	/**
 	 * What to tell the reader when the detail could not be loaded.
 	 *
-	 * The two failures need OPPOSITE advice, and they used to be reported as one:
+	 * These failures need different advice, and they used to be reported as one:
 	 *
 	 *   - **No `status`** — `fetch` itself rejected, so nothing reached a server. Its
 	 *     message is the browser's own "Failed to fetch", which said nothing about a
 	 *     server having gone away and read as "HTTP Failed to fetch" once a caller
 	 *     labelled it. The dashboard is not running any more; start it again.
-	 *   - **A `status`** — a server answered and refused. A build predating this route
-	 *     404s exactly as a skill with no calls in the window does, and only the first
-	 *     of those is fixed by restarting.
+	 *   - **404** — the dashboard answered that this skill has no calls in the window.
+	 *     That is normal for a shared link opened under a different time range.
+	 *   - **Another `status`** — a server answered and refused; bringing that server up
+	 *     to date may help.
 	 *
 	 * `status` rather than a message pattern, because the message is a browser string
 	 * on one path and a server's `error` field on the other — neither is ours to match on.
@@ -503,6 +528,7 @@
 	 * as the two shared a handler.
 	 */
 	function paneErrorText(err) {
+		if (err && err.status === 404) return "No captured calls for this skill in this window.";
 		if (err && typeof err.status === "number") {
 			return (
 				"Could not load this skill — the dashboard answered " +
@@ -609,17 +635,113 @@
 		if (row.scrollIntoView) row.scrollIntoView({ block: "center" });
 	}
 
+	/**
+	 * Rewrites ONLY the reading pane, leaving the band chart's SVG, the row column and its
+	 * scroll offset untouched. Used when the detail fetch lands for the currently selected
+	 * skill — at that point nothing above the pane has changed, and rebuilding the band and
+	 * the list was where the visible flicker came from on every row click (the SVG was torn
+	 * down and re-rasterised for a state it never left). Falls back to the full `draw` when
+	 * the pane node is missing (a shape only reachable if the frame was never rendered on
+	 * this page — nothing does that today, but the fallback is what keeps this helper safe
+	 * to add without auditing every future caller). Prose handlers are re-bound because the
+	 * clamped paragraphs live inside the pane and their listeners rode the old nodes down. */
+	function drawPane(app, model) {
+		var pane = app.querySelector(".sk-pane");
+		if (!pane) {
+			draw(app, model);
+			return;
+		}
+		var usage = (model.stats && model.stats.toolUsage) || {};
+		pane.innerHTML = paneHtml(usage, model.timeZone);
+		bindProse(app);
+	}
+
+	/**
+	 * Marks the bar rects that match the current selection with `data-active` so the CSS
+	 * rule in `main.css` keeps them at full opacity while the others fade — the visual half
+	 * of the chart/list linking. Rewritten on every band render and on every selection
+	 * change, so the invariant "at most one series has `data-active` at a time" is enforced
+	 * by iteration rather than by tracking which rect had it before. Cheap: a 30-day band
+	 * with five series holds ~150 rects. */
+	function applyBandActive(app) {
+		var name = state.paneName || "";
+		var rects = app.querySelectorAll(".sk-band .sk-bandbars rect[data-series]");
+		Array.prototype.forEach.call(rects, (rect) => {
+			if (name && rect.getAttribute("data-series") === name) rect.setAttribute("data-active", "");
+			else rect.removeAttribute("data-active");
+		});
+	}
+
+	/**
+	 * Redraws ONLY the `.sk-band` element (chart + legend), leaving the nav column and the
+	 * pane in place. Used from the selection click handler because the band's kept-set can
+	 * shift with the selection (a skill outside the top four swaps into the fourth slot),
+	 * so the SVG itself has to be regenerated — a pure attribute toggle would leave that
+	 * case wrong. Re-binds selection because the legend buttons ride the new band, and
+	 * calls `applyBandActive` so the freshly-rendered rects come up with the highlight
+	 * already applied. `<template>` unwrap because `outerHTML` on the target node would
+	 * lose the reference to the newly-inserted `.sk-band`. */
+	function drawBand(app, model) {
+		var band = app.querySelector(".sk-band");
+		if (!band) return;
+		var usage = (model.stats && model.stats.toolUsage) || {};
+		var host = document.createElement("div");
+		host.innerHTML = bandHtml(usage);
+		var next = host.firstChild;
+		band.replaceWith(next);
+		applyBandActive(app);
+		bindSelection(app, model);
+	}
+
+	/** Restores keyboard focus after `drawBand` replaces the legend buttons. Names are
+	 *  compared as attributes instead of interpolated into selectors because skill names
+	 *  are user-authored. If deselection drops an out-of-band legend, its list row is the
+	 *  stable fallback. */
+	function restoreSelectionFocus(app, name) {
+		var legend = null;
+		var row = null;
+		Array.prototype.forEach.call(app.querySelectorAll("[data-skill]"), (element) => {
+			if (element.getAttribute("data-skill") !== name) return;
+			if (element.classList && element.classList.contains("sk-legend")) legend = element;
+			else if (element.classList && element.classList.contains("sk-row")) row = element;
+		});
+		var target = legend || row;
+		if (target && target.focus) target.focus();
+	}
+
+	/**
+	 * The selection-only repaint. Called from the row-click handler in place of the old
+	 * full `renderSkills(model)` — same visible outcome without tearing down the whole
+	 * `.browser-page` section, which is what made the row click flash every SVG in the
+	 * frame. Three targeted updates: `aria-current` on the list rows (a plain attribute
+	 * toggle, no DOM churn), `drawBand` for the chart and its legend (their kept-set can
+	 * shift with the selection), and `drawPane` for the reading pane. The detail fetch is
+	 * started separately by the click handler through `fetchDetail`. */
+	function updateSelection(app, model, focusedLegendName) {
+		var name = state.paneName;
+		Array.prototype.forEach.call(app.querySelectorAll(".sk-row"), (row) => {
+			if (row.getAttribute("data-skill") === name) row.setAttribute("aria-current", "true");
+			else row.removeAttribute("aria-current");
+		});
+		revealSelectedRow(app, app.querySelector(".sk-list"));
+		drawBand(app, model);
+		drawPane(app, model);
+		if (focusedLegendName !== null) restoreSelectionFocus(app, focusedLegendName);
+	}
+
 	function draw(app, model) {
 		var usage = (model.stats && model.stats.toolUsage) || {};
 		var rows = visibleRows(model);
 		/* THE ROWS' OFFSET IS CARRIED ACROSS BY HAND, because the write below replaces the
 		   node that holds it — and only that node scrolls, so this is the whole of it.
 		 *
-		 * Every path here repaints the WHOLE page — a row click, that row's detail landing
-		 * moments later, the tail of the list arriving, an explicit refresh — so without this the
-		 * column snapped back to its first row on all four. Clicking the 18th skill
-		 * scrolled the list away from the row that was just clicked, which also takes the
-		 * `aria-current` row off screen; and a refresh did it unprompted, mid-read.
+		 * Every path here that reaches THIS function repaints the WHOLE page — a row click,
+		 * the tail of the list arriving, an explicit refresh — so without this the column
+		 * snapped back to its first row on each of them. Clicking the 18th skill scrolled the
+		 * list away from the row that was just clicked, which also takes the `aria-current`
+		 * row off screen; and a refresh did it unprompted, mid-read. The FOURTH path that used
+		 * to reach here — the detail fetch landing — now goes through `drawPane` above, which
+		 * leaves the list node in place and so needs no carry-across at all.
 		 *
 		 * A whole-page repaint is what this view is built on (`renderSkills` re-reads the
 		 * address on every render), so restoring the offset is the fix that fits it —
@@ -628,7 +750,12 @@
 		var previous = app.querySelector(".sk-list");
 		var offset = previous ? previous.scrollTop : 0;
 		app.innerHTML =
-			'<section class="skills-page">' +
+			/* `browser-page` is the FRAME, shared with the MCPs page — `main.css`'s
+			   "Skills and MCPs pages" block owns it and explains why it is named after
+			   the shape rather than after either page. No `skills-page` beside it: this
+			   page has no rule of its own, and a class no stylesheet matches is a hook
+			   the next reader has to prove is dead. */
+			'<section class="browser-page">' +
 			bandHtml(usage) +
 			'<aside class="sk-nav" aria-label="Skills browser">' +
 			navHeadHtml(usage) +
@@ -659,6 +786,7 @@
 		}
 		bindSelection(app, model);
 		bindProse(app);
+		applyBandActive(app);
 	}
 
 	// ── The band ────────────────────────────────────────────────────────────────
@@ -674,18 +802,28 @@
 	 */
 	function bandHtml(usage) {
 		var series = usage.skillDays || [];
-		var head =
-			'<div class="sk-band"><div class="sk-nav-head" style="padding:0 0 10px;border-bottom:0">' +
-			"<b>All skills, day by day</b> · sessions that reached for each skill · " +
-			"a session using several skills counts once per skill</div>";
 
-		var totals = {};
+		var totals = Object.create(null);
 		series.forEach((point) => {
 			Object.keys(point.bySeries || {}).forEach((name) => {
 				totals[name] = (totals[name] || 0) + point.bySeries[name];
 			});
 		});
 		var names = Object.keys(totals);
+		var selected = state.paneName && totals[state.paneName] !== undefined ? state.paneName : null;
+		/* `data-selected` on the band is what the CSS keys off to dim non-active rects in
+		   the SVG — the highlight that links the chart to the chooser row so a click reads
+		   at both ends. Empty when nothing is selected, so the `:not([data-selected=""])`
+		   guard in `main.css` keeps every rect at full opacity for the default view.
+		   Computed BEFORE the head is written because the attribute has to sit on the
+		   `.sk-band` open tag, not on a nested element. */
+		var head =
+			'<div class="sk-band" data-selected="' +
+			(selected ? JD.esc(selected) : "") +
+			'"><div class="sk-nav-head" style="padding:0 0 10px;border-bottom:0">' +
+			"<b>All skills, day by day</b> · sessions that reached for each skill · " +
+			"a session using several skills counts once per skill</div>";
+
 		/* THE EMPTY TEST IS "no series", NOT "no points". `skillDays` carries one point
 		   per day of the window whether or not anything ran, so it is never empty once
 		   a window exists — a `series.length` test (what the week buckets needed, since
@@ -694,36 +832,41 @@
 		if (names.length === 0) {
 			return head + '<div class="empty-note">No skill invocations recorded in this window.</div></div>';
 		}
-		var selected = state.paneName && totals[state.paneName] !== undefined ? state.paneName : null;
 		var ranked = names.slice().sort((a, b) => totals[b] - totals[a] || (a < b ? -1 : a > b ? 1 : 0));
 		var kept = ranked.slice(0, BAND_SERIES);
 		if (selected && kept.indexOf(selected) === -1) kept = kept.slice(0, BAND_SERIES - 1).concat([selected]);
-		var keptSet = {};
+		var keptSet = Object.create(null);
 		kept.forEach((name) => {
 			keptSet[name] = true;
 		});
 
+		var otherKey = "Other";
+		while (otherKey in totals) otherKey += " ";
 		var rolled = series.map((point) => {
-			var bySeries = {};
+			var bySeries = Object.create(null);
 			var other = 0;
 			Object.keys(point.bySeries || {}).forEach((name) => {
 				if (keptSet[name]) bySeries[name] = point.bySeries[name];
 				else other += point.bySeries[name];
 			});
-			bySeries.Other = other;
+			bySeries[otherKey] = other;
 			return { date: point.date, bySeries: bySeries };
 		});
-		var keys = kept.concat(["Other"]);
-		var otherTotal = names.reduce((sum, name) => sum + (keptSet[name] ? 0 : totals[name]), 0);
+		var keys = kept.concat([otherKey]);
+		var otherNames = names.filter((name) => !keptSet[name]);
+		var otherTotal = otherNames.reduce((sum, name) => sum + totals[name], 0);
+		var otherLabel = "Other (" + otherNames.length + (otherNames.length === 1 ? " skill)" : " skills)");
 
 		var legend = keys
 			.map((key, index) => {
-				var value = key === "Other" ? otherTotal : totals[key];
+				var value = key === otherKey ? otherTotal : totals[key];
+				var label = key === otherKey ? otherLabel : key;
 				var body =
-					'<i style="background:' + JD.seriesColor(index) + '"></i><b>' + JD.esc(key) + "</b> " + value;
+					'<i style="background:' + JD.seriesColor(index) + '"></i><b>' + JD.esc(label) + "</b> " + value;
 				/* Other is a span, not a button: an aggregate of several skills is not a
 				   subject a reader can open. */
-				if (key === "Other") return '<span class="sk-legend' + (selected ? " sk-dim" : "") + '">' + body + "</span>";
+				if (key === otherKey)
+					return '<span class="sk-legend' + (selected ? " sk-dim" : "") + '">' + body + "</span>";
 				return (
 					'<button type="button" class="sk-legend' +
 					(selected && key !== selected ? " sk-dim" : "") +
@@ -1036,12 +1179,15 @@
 	}
 
 	/**
-	 * One of the pane's two long fixed paragraphs, shown as a single line until clicked.
+	 * One of the pane's two long fixed paragraphs, shown in full and collapsible to a single
+	 * line with a click.
 	 *
-	 * WHY THESE TWO AND NOTHING ELSE: they are ~4 lines each and 82px of the pane's height
-	 * budget between them (measured), and they are the only blocks here whose text is FIXED
-	 * rather than a measurement. Clamping a data row would destroy a count; clamping these
-	 * hides a qualifier one click brings back. `main.css`'s `.sk-clamp` owns the visual side.
+	 * WHY ONLY THESE TWO MAY BE COLLAPSED AT ALL: they are ~4 lines each and 82px of the
+	 * pane's height budget between them (measured), and they are the only blocks here whose
+	 * text is FIXED rather than a measurement. Clamping a data row would destroy a count;
+	 * clamping these hides a qualifier one click brings back. They still START open (see
+	 * `openProse`) — the height is the reader's to reclaim, not this pane's to take on their
+	 * behalf. `main.css`'s `.sk-clamp` owns the visual side.
 	 *
 	 * TEXT ONLY, NEVER MARKUP. The whole string is repeated into `title` (so a pointer user
 	 * gets it without clicking) and `JD.esc` there would mangle any tags — so callers pass
@@ -1073,12 +1219,20 @@
 	}
 
 	function line(label, value, swatch) {
+		/* `title="value"` on the span: the value cell is `white-space: nowrap` + `overflow:
+		   hidden` in `.sk-facts` (see `main.css`), so a long value ("the agent and you" at
+		   100px in a 100px column) truncates without any way to read the full string —
+		   hover was the missing recovery. Title is the same string the cell shows, so
+		   short values that fit still show their tooltip, matching every other truncatable
+		   row on this page. */
 		return (
 			'<div class="sk-line">' +
 			(swatch ? '<i style="background:' + swatch + '"></i>' : "") +
 			"<b>" +
 			JD.esc(label) +
-			"</b><span>" +
+			'</b><span title="' +
+			JD.esc(value) +
+			'">' +
 			JD.esc(value) +
 			"</span></div>"
 		);
@@ -1107,7 +1261,7 @@
 	/**
 	 * The window's local days, taken from the BAND'S OWN series.
 	 *
-	 * Not recomputed from the range: `buildSkillDays` walks the window with
+	 * Not recomputed from the range: `buildDayPoints` walks the window with
 	 * `addLocalDays` precisely because a fixed 86,400,000 skips or repeats a bucket on
 	 * a DST day, and a client-side second implementation of that would disagree with
 	 * the band exactly on those days, silently. Reading its keys makes the three charts
@@ -1169,7 +1323,7 @@
 		var counts = buckets.map(() => 0);
 		points.forEach((point) => {
 			/* A point outside the window is dropped, never clamped onto an edge bucket —
-			   `buildSkillDays` states the same rule for the same reason: the SQL filters on
+			   `buildDayPoints` states the same rule for the same reason: the SQL filters on
 			   epoch bounds while these buckets are local day keys, so the only points this
 			   can reject are the boundary's own rounding, and filing one under a day it did
 			   not happen on would be worse than leaving it out. */
@@ -1451,6 +1605,12 @@
 		Array.prototype.forEach.call(app.querySelectorAll("[data-skill]"), (element) => {
 			element.onclick = () => {
 				var name = element.getAttribute("data-skill");
+				var focusedLegendName =
+					document.activeElement === element &&
+					element.classList &&
+					element.classList.contains("sk-legend")
+						? name
+						: null;
 				var next = state.paneName === name ? null : name;
 				/* The reader has now answered "which skill" themselves, so the default pick
 				   must not run again — otherwise the click that closes the pane re-opens the
@@ -1460,7 +1620,14 @@
 				state.paneName = next;
 				state.pane = null;
 				state.paneError = null;
-				renderSkills(model);
+				/* Targeted repaint plus the detail refetch — NOT `renderSkills(model)`,
+				   which would tear down the whole `.browser-page` section on every click
+				   (the visible flicker readers reported, plus the loss of the nav column's
+				   scroll position). `updateSelection` walks the band, list highlights and
+				   pane; `fetchDetail` starts the new detail request whose `.then` calls
+				   `drawPane` a second time when it lands. */
+				updateSelection(app, model, focusedLegendName);
+				fetchDetail(app, model);
 			};
 		});
 	}

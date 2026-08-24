@@ -43,6 +43,8 @@ import type {
 	HeatmapCell,
 	HourBucket,
 	KnowledgeModel,
+	McpServerDayPoint,
+	McpServerDetail,
 	McpServerRow,
 	MemoryCard,
 	RecentSession,
@@ -93,6 +95,7 @@ const log = createLogger("DashboardQuery");
 
 import {
 	isRecallMcpToolName,
+	MCP_DETAIL_TOOL_LIMIT,
 	MEMORY_CARD_MAJOR_LINES,
 	MEMORY_CARDS_LIMIT,
 	RECALL_MCP_TOOL_NAME,
@@ -1636,13 +1639,26 @@ function sortAgents<T extends ToolUsageAgentShare>(agents: ReadonlyArray<T>): T[
  * three lists, their totals, the per-row agent splits and the recall row must
  * all be answering about the same set of rows, and `scopeToRepoIds` is a lookup
  * this section would otherwise repeat six times.
+ *
+ * Runs `resolveScope` first, so a `?repo=<repoName>` token from `JD.repoToken`
+ * — the short name a UI link carries when it is globally unique — is looked up
+ * in the `repos` table and folded onto its identity before `scopeToRepoIds`
+ * matches. Without this, the skill-detail / mcp-detail / tool-usage routes
+ * receive the same short-name token every other route does, `scopeToRepoIds`
+ * finds nothing (it only compares `repo_identity`) and returns `[-1]`, so the
+ * detail pane reports "no captured calls" for a repo that is actually the
+ * majority of the data. The other routes reach this state through
+ * `buildDashboardModel` / `MemoriesQuery`, which each already `resolveScope`
+ * up front; folding it in here is what closes that gap for the shared WHERE.
+ * `resolveScope` is an identity map on `{kind:"all"}` and on tokens already
+ * spelled as identities, so it costs nothing where the bug did not fire.
  */
 function toolUsageWhere(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	window: ResolvedWindow,
 ): { sql: string; params: unknown[] } {
-	const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
+	const filter = scopeFilter(scopeToRepoIds(db, resolveScope(db, scope)), "s.repo_id");
 	return {
 		sql: `${TOOL_CALL_TIME_SQL} >= ? AND ${TOOL_CALL_TIME_SQL} < ?${filter.sql}`,
 		params: [window.startMs, window.endMs, ...filter.params],
@@ -2155,11 +2171,26 @@ const SKILL_INVOCATION_ROWS_LIMIT = 50;
 const SKILL_SESSION_SERIES_LIMIT = 400;
 
 /**
- * Folds `(skill, session, call time)` rows into the stacked-bar series, one point
+ * Session points returned for an MCP server's per-session chart.
+ *
+ * The daily series remains exact over the whole window; only the one-rectangle-per-
+ * session chart is bounded. The retained points are the most recent ones and are
+ * returned oldest first within that retained set.
+ */
+const MCP_SESSION_SERIES_LIMIT = 400;
+
+/**
+ * Folds `(series, session, call time)` rows into the stacked-bar series, one point
  * per LOCAL day of the window.
  *
+ * TWO CALLERS, ONE FUNCTION: the Skills band keys its series by skill name, the MCPs
+ * band by folded server name (`ToolUsage.skillDays` / `ToolUsage.serverDays`). Both
+ * bands are the same chart of the same table asking the same question — which sessions
+ * reached for each thing, day by day — so a second implementation could only differ
+ * from this one by being wrong on a DST day or a boundary row.
+ *
  * The window is walked rather than the data: every day between its bounds is emitted,
- * whether or not a skill ran. The chart lays bars out by index, so a dropped day would
+ * whether or not anything ran. The chart lays bars out by index, so a dropped day would
  * silently compress the axis and make a week-long gap look like a busy stretch. Walking
  * the window is also what bounds the result — `resolveWindow` already clamps a custom
  * range to {@link MAX_CUSTOM_DAYS}, so the retired week-bucket cap has no work left.
@@ -2169,17 +2200,18 @@ const SKILL_SESSION_SERIES_LIMIT = 400;
  * heatmap and the token series draw. A day key from `localDayKey` is the same key those
  * use, so `Aug 6` means one thing across the whole page.
  *
- * Sessions are counted through a Set rather than by counting rows. `session_tool_use`
- * is keyed `(session, tool, kind)`, so one row per (session, skill) is what the table
- * guarantees today and counting rows would agree — but the figure this feeds is defined
- * as "sessions that reached for the skill", and spelling that as a de-duplication keeps
- * it right if a row ever splits.
+ * Sessions are counted through a Set rather than by counting rows, and for the MCP
+ * caller that is load-bearing rather than defensive. `session_tool_use` is keyed
+ * `(session, tool, kind)`, so a skill really does have one row per (session, skill) and
+ * counting rows would agree — but a SERVER has one row per tool it was reached through,
+ * so a session that called three of a server's tools arrives here three times and must
+ * still count once.
  *
  * `addLocalDays` steps the cursor, never a fixed 86_400_000: a 23- or 25-hour DST day
  * would otherwise skip or repeat a bucket.
  */
-function buildSkillDays(
-	rows: ReadonlyArray<{ tool_name: string; session_event_id: string; at_ms: number }>,
+function buildDayPoints(
+	rows: ReadonlyArray<{ series: string; session_event_id: string; at_ms: number }>,
 	window: ResolvedWindow,
 	timeZone: string,
 ): SkillDayPoint[] {
@@ -2195,14 +2227,41 @@ function buildSkillDays(
 		// worse than omitting it.
 		const bucket = byDay.get(localDayKey(row.at_ms, timeZone));
 		if (!bucket) continue;
-		const sessions = bucket.get(row.tool_name) ?? new Set<string>();
+		const sessions = bucket.get(row.series) ?? new Set<string>();
 		sessions.add(row.session_event_id);
-		bucket.set(row.tool_name, sessions);
+		bucket.set(row.series, sessions);
 	}
-	return [...byDay.entries()].map(([date, skills]) => ({
+	return [...byDay.entries()].map(([date, series]) => ({
 		date,
-		bySeries: Object.fromEntries([...skills.entries()].map(([skill, sessions]) => [skill, sessions.size])),
+		bySeries: Object.fromEntries([...series.entries()].map(([key, sessions]) => [key, sessions.size])),
 	}));
+}
+
+/**
+ * One server's per-session rows folded into the complete local-day window.
+ *
+ * The SQL has already reduced every session to the instant of its LAST call to the
+ * server and the sum of its calls. Bucketing stays in JS for the dashboard's single
+ * time-zone rule, and walks the window so quiet days remain visible. The maximum custom
+ * range is 366 days, which bounds the returned array without truncating the sessions
+ * behind its totals.
+ */
+function buildMcpDetailDays(
+	rows: ReadonlyArray<{ at_ms: number; calls: number }>,
+	window: ResolvedWindow,
+	timeZone: string,
+): McpServerDayPoint[] {
+	const byDay = new Map<string, { sessions: number; calls: number }>();
+	for (let dayStart = window.startMs; dayStart < window.endMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
+		byDay.set(localDayKey(dayStart, timeZone), { sessions: 0, calls: 0 });
+	}
+	for (const row of rows) {
+		const bucket = byDay.get(localDayKey(row.at_ms, timeZone));
+		if (!bucket) continue;
+		bucket.sessions += 1;
+		bucket.calls += row.calls;
+	}
+	return [...byDay.entries()].map(([date, totals]) => ({ date, ...totals }));
 }
 
 /** The four token columns plus the coverage counters, shared by both roll-ups. */
@@ -2605,6 +2664,187 @@ export function buildSkillDetail(db: DashboardDbHandle, opts: SkillDetailOptions
 	};
 }
 
+/** What one `/api/mcp-detail` request names: a server, and the window to read it over. */
+export interface McpServerDetailOptions {
+	readonly scope: DashboardScope;
+	/** The FOLDED server name, as a list row spells it — see {@link SERVER_KEY_SQL}. */
+	readonly server: string;
+	readonly range?: DashboardRange;
+	readonly customFrom?: string;
+	readonly customTo?: string;
+	readonly timeZone?: string;
+	readonly nowMs?: number;
+}
+
+/**
+ * One MCP server's whole story over the window — per tool, per session, per agent.
+ *
+ * FOUR QUERIES OVER ONE SET OF ROWS, and unlike {@link buildSkillDetail} none of them
+ * is separated to dodge a fan-out: there is nothing to join out to. An MCP call has no
+ * per-invocation table (`skill_invocations` has no MCP counterpart) and is never
+ * archived onto a commit, so every figure on this page comes from `session_tool_use`
+ * joined to `sessions`, grouped four different ways. They are separate statements
+ * because they group differently, not because a join would multiply anything.
+ *
+ * THE SERVER IS MATCHED THROUGH `SERVER_KEY_SQL`, never `t.server = ?`. A server
+ * registered through a host's plugin manifest is stored under a `plugin_…` prefix, so
+ * an equality test would answer 404 for exactly the row the reader clicked (the list
+ * shows the folded name) — and where both spellings exist it would report half the
+ * calls with nothing saying so.
+ *
+ * Returns undefined when the window holds no call to that server, which the route
+ * turns into a 404 — the same contract `buildSkillDetail` has.
+ */
+export function buildMcpServerDetail(db: DashboardDbHandle, opts: McpServerDetailOptions): McpServerDetail | undefined {
+	const timeZone = opts.timeZone ?? machineTimeZone();
+	const window = resolveWindow(opts.range, opts.customFrom, opts.customTo, opts.nowMs ?? Date.now(), timeZone);
+	const where = toolUsageWhere(db, opts.scope, window);
+	// `kind = 'mcp'` plus a non-null server, matching `serverRowsPage` exactly: a row
+	// the list could not show must not be readable here either.
+	const scopedSql = `${where.sql} AND t.kind = 'mcp' AND t.server IS NOT NULL AND ${SERVER_KEY_SQL} = ?`;
+	const scoped = [...where.params, opts.server];
+
+	const total = db
+		.prepare(
+			// `tool_count` counts the FOLDED tool key for the reason `serverRowsPage`
+			// states: the stored name embeds the server, so a server reached under two
+			// registrations carries two spellings of each of its tools.
+			`SELECT COUNT(DISTINCT t.session_event_id) AS session_count,
+			        COALESCE(SUM(t.calls), 0) AS call_count,
+			        COUNT(DISTINCT ${TOOL_KEY_SQL}) AS tool_count,
+			        MIN(${TOOL_CALL_TIME_SQL}) AS first_call_at_ms,
+			        MAX(${TOOL_CALL_TIME_SQL}) AS last_call_at_ms
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${scopedSql}`,
+		)
+		.get(...scoped) as
+		| {
+				session_count: number;
+				call_count: number;
+				tool_count: number;
+				first_call_at_ms: number | null;
+				last_call_at_ms: number | null;
+		  }
+		| undefined;
+	// An aggregate always returns a row, so `session_count` is what says "not here" —
+	// never the row's absence.
+	if (!total || total.session_count === 0) return undefined;
+
+	// One row per tool, ranked by the figure the row PRINTS. `MCP_DETAIL_TOOL_LIMIT + 1`
+	// is not asked for: `toolCount` above is the honest total, so the pane can say what
+	// a capped list is hiding without a probe row.
+	const toolRows = db
+		.prepare(
+			`SELECT ${TOOL_KEY_SQL} AS tool_name,
+			        COALESCE(SUM(t.calls), 0) AS call_count,
+			        COUNT(DISTINCT t.session_event_id) AS session_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${scopedSql}
+			  GROUP BY ${TOOL_KEY_SQL}
+			  ORDER BY call_count DESC, session_count DESC, tool_name ASC
+			  LIMIT ?`,
+		)
+		.all(...scoped, MCP_DETAIL_TOOL_LIMIT) as ReadonlyArray<{
+		tool_name: string;
+		call_count: number;
+		session_count: number;
+	}>;
+
+	const agentRows = db
+		.prepare(
+			// CALLS only, never sessions — `ToolUsageAgentShare` carries the rule: a
+			// per-source session count does not survive being re-summed at this grouping.
+			`SELECT s.source, COALESCE(SUM(t.calls), 0) AS call_count
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${scopedSql}
+			  GROUP BY s.source`,
+		)
+		.all(...scoped) as ReadonlyArray<{ source: string; call_count: number }>;
+
+	const repoRows = db
+		.prepare(
+			`SELECT DISTINCT r.repo_name
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE ${scopedSql}
+			  ORDER BY r.repo_name`,
+		)
+		.all(...scoped) as ReadonlyArray<{ repo_name: string }>;
+
+	// One row per SESSION before it is folded into local days below. Grouped rather
+	// than listed: a session reaches a server through as many rows as it called tools,
+	// and the chart's bar is that session's whole traffic to the server. The time is
+	// the LATEST of those rows — see `McpServerDetail.firstCallAtMs` on the grain.
+	const seriesRows = db
+		.prepare(
+			`SELECT t.session_event_id,
+			        MAX(${TOOL_CALL_TIME_SQL}) AS at_ms,
+			        COALESCE(SUM(t.calls), 0) AS calls
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${scopedSql}
+			  GROUP BY t.session_event_id`,
+		)
+		.all(...scoped) as ReadonlyArray<{ session_event_id: string; at_ms: number; calls: number }>;
+	const retainedSeriesRows = [...seriesRows]
+		.sort(
+			(a, b) =>
+				b.at_ms - a.at_ms ||
+				(a.session_event_id < b.session_event_id ? 1 : a.session_event_id > b.session_event_id ? -1 : 0),
+		)
+		.slice(0, MCP_SESSION_SERIES_LIMIT)
+		.sort(
+			(a, b) =>
+				a.at_ms - b.at_ms ||
+				(a.session_event_id < b.session_event_id ? -1 : a.session_event_id > b.session_event_id ? 1 : 0),
+		);
+
+	return {
+		server: opts.server,
+		sessions: total.session_count,
+		calls: total.call_count,
+		toolCount: total.tool_count,
+		tools: toolRows.map((row) => ({
+			name: stripServerPrefix(row.tool_name, opts.server),
+			calls: row.call_count,
+			sessions: row.session_count,
+		})),
+		agents: sortAgents(agentRows.map((row) => ({ source: row.source, calls: row.call_count }))),
+		daySeries: buildMcpDetailDays(seriesRows, window, timeZone),
+		// `seriesRows` above remains complete for the exact daily roll-up. Only the
+		// one-bar-per-session chart is capped, oldest first within the retained recent set.
+		sessionSeries: retainedSeriesRows.map((row) => ({ atMs: row.at_ms, calls: row.calls })),
+		...(total.first_call_at_ms !== null ? { firstCallAtMs: total.first_call_at_ms } : {}),
+		...(total.last_call_at_ms !== null ? { lastCallAtMs: total.last_call_at_ms } : {}),
+		repos: repoRows.map((row) => row.repo_name),
+	};
+}
+
+/**
+ * `dbhub.execute_sql` → `execute_sql`, for a tool of the named server.
+ *
+ * ANCHORED ON THE SERVER NAME, not on the first `.`: a server whose own name contains
+ * one (a hostname-shaped registration) would otherwise have its tool reported as the
+ * remainder after that first dot, which is neither the tool nor anything else. The
+ * prefix is what `parseToolUse` joined, so removing exactly it is the inverse.
+ *
+ * The prefix SHOULD always be there and the fallback is still not dead code. Both
+ * arguments come through the same `plugin_…` fold, and it removes a prefix of the
+ * stored `<server>.<tool>` — so a server folded to `chrome-devtools` has its tools
+ * folded to `chrome-devtools.<tool>`, matching by construction. What the fallback
+ * covers is a row that reached the table by some other route than `parseToolUse`
+ * joining those two halves. There, printing the stored name is honest and slicing at a
+ * dot that means nothing is not.
+ */
+function stripServerPrefix(toolName: string, server: string): string {
+	const prefix = `${server}.`;
+	return toolName.startsWith(prefix) ? toolName.slice(prefix.length) : toolName;
+}
+
 /**
  * Skills, MCP servers and the tool mix over the window, each row carrying the
  * agents that produced it — the FIRST page of each of the three lists, plus the
@@ -2634,6 +2874,19 @@ function buildToolUsage(
 	const skillTotals = toolListTotals(db, where, "skill");
 	const serverTotals = toolListTotals(db, where, "server");
 	const mcpToolTotals = toolListTotals(db, where, "tool");
+	const serverToolsTotal =
+		(
+			db
+				.prepare(
+					`SELECT COUNT(DISTINCT ${TOOL_KEY_SQL}) AS tool_count
+				   FROM session_tool_use t
+				   JOIN sessions s ON s.event_id = t.session_event_id
+				  WHERE ${where.sql}
+				    AND t.kind = 'mcp'
+				    AND t.server IS NOT NULL`,
+				)
+				.get(...where.params) as { tool_count: number } | undefined
+		)?.tool_count ?? 0;
 	const skills = toolNameRowsPage(db, where, "skill", 0, TOOL_ROWS_LIMIT);
 	const mcpTools = toolNameRowsPage(db, where, "tool", 0, TOOL_ROWS_LIMIT);
 	const servers = serverRowsPage(db, where, 0, TOOL_ROWS_LIMIT);
@@ -2669,18 +2922,31 @@ function buildToolUsage(
 
 	// Adoption per skill per local day, over EVERY skill in the window rather than the
 	// first page — see `ToolUsage.skillDays`. Unaggregated on purpose: the bucket is a
-	// LOCAL calendar day, which only `buildSkillDays` can compute (see this file's
+	// LOCAL calendar day, which only `buildDayPoints` can compute (see this file's
 	// header on why SQLite's `localtime` is never used), so grouping here would have to
 	// group by a boundary the rest of the page does not share. The call-time expression
 	// is the one the rankings use, so a row's bar and its rank agree about when it ran.
 	const dayRows = db
 		.prepare(
-			`SELECT t.tool_name, t.session_event_id, ${TOOL_CALL_TIME_SQL} AS at_ms
+			`SELECT t.tool_name AS series, t.session_event_id, ${TOOL_CALL_TIME_SQL} AS at_ms
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			  WHERE ${where.sql} AND t.kind = 'skill'`,
 		)
-		.all(...where.params) as ReadonlyArray<{ tool_name: string; session_event_id: string; at_ms: number }>;
+		.all(...where.params) as ReadonlyArray<{ series: string; session_event_id: string; at_ms: number }>;
+
+	// The same series for the MCPs band, keyed by FOLDED server rather than by
+	// `t.server` — `SERVER_KEY_SQL` is what makes a plugin-prefixed registration one
+	// series here and one row in the list beside it. `server IS NOT NULL` matches the
+	// server list's own WHERE, so the band cannot carry a bar the chooser has no row for.
+	const serverDayRows = db
+		.prepare(
+			`SELECT ${SERVER_KEY_SQL} AS series, t.session_event_id, ${TOOL_CALL_TIME_SQL} AS at_ms
+			   FROM session_tool_use t
+			   JOIN sessions s ON s.event_id = t.session_event_id
+			  WHERE ${where.sql} AND t.kind = 'mcp' AND t.server IS NOT NULL`,
+		)
+		.all(...where.params) as ReadonlyArray<{ series: string; session_event_id: string; at_ms: number }>;
 
 	// Coverage from the FULL session population, never from the join above — and
 	// windowed by the SESSION's own time OR by any call it made, which is the
@@ -2738,13 +3004,15 @@ function buildToolUsage(
 		skills,
 		skillsTotal: skillTotals.totalCount,
 		skillCallsTotal: skillTotals.callsTotal,
-		skillDays: buildSkillDays(dayRows, window, timeZone),
+		skillDays: buildDayPoints(dayRows, window, timeZone),
 		mcpTools,
 		mcpToolsTotal: mcpToolTotals.totalCount,
+		serverToolsTotal,
 		recallCalls,
 		servers,
 		serversTotal: serverTotals.totalCount,
 		serverCallsTotal: serverTotals.callsTotal,
+		serverDays: buildDayPoints(serverDayRows, window, timeZone),
 		skillAgents: agentTotals("skill"),
 		mcpAgents: agentTotals("mcp"),
 		sessionsWithTools: sessionRows.reduce((sum, row) => sum + row.with_tools, 0),
@@ -3013,10 +3281,10 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		"stats" | "standup" | "memories" | "knowledge" | "graph" | "settings" | "coaching"
 	> => {
 		switch (options.view) {
-			// Skills reads `stats.toolUsage` and nothing else, so it shares this payload
-			// rather than declaring one of its own — which is also what lets its list and
-			// the Stats card's Skills card agree by construction instead of by two queries
-			// that have to be kept in step.
+			// Skills and MCPs read `stats.toolUsage` and nothing else, so they share this
+			// payload rather than declaring one of their own — which is also what lets each
+			// page's list agree with its Stats card by construction instead of by two
+			// queries that have to be kept in step.
 			//
 			// It does pay for the whole of `buildStats` (the feed, the activity series, the
 			// token dimensions) to read one field of it. Accepted for now: the alternative
@@ -3026,6 +3294,7 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 			// query over `session_tool_use`.
 			case "stats":
 			case "skills":
+			case "mcps":
 				return {
 					stats: buildStats(
 						db,

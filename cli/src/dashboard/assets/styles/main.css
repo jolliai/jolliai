@@ -1867,10 +1867,28 @@ body {
 .jd .wiki-freshness .wiki-dismiss:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
 
-/* ══ Skills page ══════════════════════════════════════════════════════════════
+/* ══ Skills and MCPs pages ════════════════════════════════════════════════════
    A chart band across the top, then a chooser column and a reading pane — the
    same grammar Memories uses, so the two pages are navigated the same way.
    `.mem-*` above is the reference for every chrome value here.
+
+   TWO PAGES, ONE BLOCK, and `.browser-page` is what says so. Skills and MCPs are the
+   same frame around the same three regions, differing only in what their rows and
+   sections hold (`assets/js/skills.js` and `assets/js/mcps.js`), so the frame class is
+   named after the SHAPE rather than after either page. The `.sk-*` prefix below is
+   shared for the same reason and keeps its name: it predates the second page, and
+   renaming forty classes to say what this one line already says would be churn.
+   Only the two page-specific hooks are separate — `.mcp-page` narrows the third
+   column and adds the tool list, both at the end of this block.
+
+   Every height budget below was derived against the SKILLS pane, and the MCPs pane is
+   held inside it by a cap of its OWN rather than by being smaller in general. Most of it
+   is a subset — no cost figures, no outcome strip, no inferred caveat — but its tool
+   list is the one section whose length belongs to the SERVER, and a real 12-tool
+   registration overran the pane by 10px before it was capped. So `MCP_DETAIL_TOOL_LIMIT`
+   is a height budget in disguise and carries that measurement; at the top end the two
+   panes are within a few pixels of each other rather than one sitting comfortably inside
+   the other. Re-derive both if either pane grows a section.
 
    THE WRAP'S 1200px CAP STAYS HERE, which is where this page parts from
    `.memories-page`. Releasing it is what a full-bleed browser needs, and this page
@@ -1949,13 +1967,13 @@ body {
    nothing) — and the chart already reaches ~900px inside the cap, because the band spans
    BOTH columns and never shared the width with the list. Not enough to trade the page's
    alignment with every other view for. Revisit it if the pane's own caps ever come off. */
-/* `#app`, NOT `.grid`: main.js sets `#app.className = view.grid ? "grid" : ""`, and
-   `skills` is declared `grid: false` in shell.js — so `#app` carries NO class here and
-   the `.grid:has(.skills-page)` rule this replaces never matched anything. It was inert
-   for as long as it shipped (harmless while the page was `display: block` by default,
-   and a silent no-op the moment the flex chain below started depending on it). */
-.jd:has(.skills-page) { height: 100vh; overflow: hidden; }
-.jd .main:has(.skills-page) {
+/* `#app`, NOT `.grid`: main.js sets `#app.className = view.grid ? "grid" : ""`, and both
+   `skills` and `mcps` are declared `grid: false` there — so `#app` carries NO class here
+   and the `.grid:has(…)` rule this replaces never matched anything. It was inert for as
+   long as it shipped (harmless while the page was `display: block` by default, and a
+   silent no-op the moment the flex chain below started depending on it). */
+.jd:has(.browser-page) { height: 100vh; overflow: hidden; }
+.jd .main:has(.browser-page) {
 	padding-bottom: 0; display: flex; flex-direction: column; height: 100vh; min-height: 0;
 }
 /* Deliberately NOT hidden the way Knowledge hides its own: this note is empty on this
@@ -1967,12 +1985,26 @@ body {
    below it, and this frame has nothing. It comes out of the SAME vertical budget as
    everything else (see the chart's `clamp()`), so the 12px is 33px of chart width; that
    trade is why it is 12 and not the 20 that would mirror the padding above. */
-.jd .wrap:has(.skills-page) {
+/* `width: 100%` is what pins the layout at every pane state — MEASURED THE HARD
+   WAY. `.wrap` is a flex item in `.main`'s flex column with `margin: 0 auto`,
+   so with no explicit width it takes its `max-content` inline size. That size
+   is the grid inside — `344px + 6px + max-content of .sk-pane` — so an EMPTY
+   pane (the "Select a skill…" state) demands only ~430px, an OPEN pane demands
+   ~800px, and the whole page shrinks and re-centres by ~350px between the two.
+   `minmax(0, 1fr)` on the pane's grid track sets a MIN of 0 but does not force
+   growth; the container has to be sized first for `1fr` to have anything to
+   distribute. Pinning `.wrap` to `100%` (capped by its `max-width: 1200px`)
+   fixes the container width first, and `1fr` then hands the pane whatever the
+   nav column did not take — same 800-odd px whether the pane is empty or full.
+   Auto margins keep centering the wrap between the 1200px cap and the window
+   because `width: 100%` still yields to `max-width`. */
+.jd .wrap:has(.browser-page) {
+	width: 100%;
 	flex: 1; min-height: 0; display: flex; flex-direction: column; padding-bottom: 12px;
 }
-.jd #app:has(.skills-page) { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.jd #app:has(.browser-page) { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
-.jd .skills-page {
+.jd .browser-page {
 	display: grid; grid-template-columns: 344px minmax(0, 1fr); gap: 6px;
 	/* The band takes its own height; the columns take everything left. `minmax(0, 1fr)`
 	   rather than `1fr` so the row can be SHORTER than its content — a bare `1fr` floors
@@ -2070,6 +2102,16 @@ body {
 /* `display: block` drops the inline baseline gap under the SVG; the pinned height is the
    whole point of the change above. */
 .jd .sk-bandbars { display: block; width: 100%; height: var(--sk-band-plot-h); }
+/* HIGHLIGHT ON THE CHART, keyed off `data-selected` on `.sk-band`. When a row in the
+   chooser column is selected, every rect fades to a recessed ~.22, and the ones tagged
+   `data-active` (added by JS after render, matching the selection) come back to full
+   opacity. Two rules rather than a JS repaint of the SVG: the bars stay in place across
+   selection changes, so the transition below actually reads as an animation instead of a
+   flash of the whole chart being torn down. Same recessed rule the legend's `.sk-dim`
+   uses, one level up in the DOM. */
+.jd .sk-bandbars rect[data-series] { transition: opacity .18s ease; }
+.jd .sk-band[data-selected]:not([data-selected=""]) .sk-bandbars rect[data-series] { opacity: .22; }
+.jd .sk-band[data-selected]:not([data-selected=""]) .sk-bandbars rect[data-active] { opacity: 1; }
 /* The key, stacked in that spare width. INSIDE THIS BAND THE RAMP MEANS SKILL,
    while everywhere else on the dashboard it means agent — which is why the key sits
    against the chart rather than at the page edge. A colour may not be read across
@@ -2145,9 +2187,15 @@ body {
  * to know this region scrolls before the footnote at its end is reachable at all. It is
  * on `.sk-list` itself now precisely because there is no longer an uncapped state for it
  * to be absent in. */
+/* `scrollbar-gutter: stable` reserves the scrollbar's width even when the list
+   fits without scrolling, so the rows do not shift by ~10px when the tail of
+   the list arrives (or when the reader switches to the MCPs page, whose list
+   is usually much shorter than Skills'). Without it the row column's inner
+   edge jitters between the two pages, and against a fixed 344px outer width
+   that shift also moves every row's ellipsis in and out. */
 .jd .sk-list {
 	min-width: 0; min-height: 0; flex: 1; padding: 8px 14px;
-	overflow-y: auto;
+	overflow-y: auto; scrollbar-gutter: stable;
 	scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--muted) 42%, transparent) transparent;
 }
 .jd .sk-list::-webkit-scrollbar { width: 10px; }
@@ -2223,8 +2271,13 @@ body {
    overflow at 1280x817. Trimming 20/28 to 16/20 buys 12px and covers every width; the
    alternative was raising the height constant, which would have cost EVERY window 22px of
    chart to fix one width. */
+/* `scrollbar-gutter: stable` reserves the scrollbar's space at every state, so
+   the two-column reading in `.sk-panebody` does not reflow when the pane goes
+   from empty ("Select a skill…") to full detail — the width the reader is
+   halfway through would otherwise shift by ~10px the instant the fetch lands.
+   Same rule as `.sk-list` above; both are the fallback for the same reason. */
 .jd .sk-pane {
-	min-width: 0; min-height: 0; overflow-y: auto;
+	min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable;
 	border: 1px solid var(--border); border-radius: 10px; padding: 16px 24px 20px; background: var(--page);
 }
 /* TWO COLUMNS, PINNED — not `repeat(auto-fit, minmax(300px, 1fr))`, which made the pane's
@@ -2272,6 +2325,14 @@ body {
 .jd .sk-facts { display: grid; grid-template-columns: 1fr 1fr; gap: 0 18px; }
 .jd .sk-facts .sk-line { min-width: 0; }
 .jd .sk-facts .sk-line span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* `nowrap` + `flex: none` on the LABEL, so a wide value cannot squeeze `Entered by`
+   or `First used` into two lines — the value has `overflow: hidden` + ellipsis and
+   is the side that CAN give (its truncation now recovers on hover via `title`).
+   Before this rule, in a 171px flex row, a 102px value left the 63px label 61px of
+   room and it wrapped to "Entered\nby". `.sk-line b` is `<b>`, whose default is
+   `inline`, so the flex-item defaults apply the moment `.sk-line` becomes a flex
+   parent — no display change needed for either rule to take effect. */
+.jd .sk-facts .sk-line b { white-space: nowrap; flex: none; }
 
 /* The pane's two bar charts. Bars rather than `JD.spark`: a polyline interpolates
    BETWEEN points and every series here is discrete, so bars claim exactly what the
@@ -2326,12 +2387,18 @@ body {
 	font-size: 11px; line-height: 1.5; color: var(--ink-2);
 }
 
-/* THE TWO LONG FIXED PARAGRAPHS, COLLAPSED TO ONE LINE. `.sk-caveat` and `.sk-basis` are
-   ~4 lines each and 82px of the pane's budget between them (measured) — the second largest
-   saving after the section chrome, and the cheapest, because these two are the only blocks
-   in the pane whose text is FIXED rather than a measurement. Clamping a data row would
+/* THE LONG FIXED PARAGRAPHS, COLLAPSIBLE TO ONE LINE. `.sk-caveat` and `.sk-basis` are
+   ~4 lines each and 82px of the skills pane's budget between them (measured) — the second
+   largest saving after the section chrome, and the cheapest, because these are the only
+   blocks in a pane whose text is FIXED rather than a measurement. Clamping a data row would
    destroy a count; clamping these hides a qualifier the reader can bring back with a click.
    Chosen over a `title` tooltip on its own, which no touch device can reach.
+ *
+ * THE RULES BELOW ARE THE COLLAPSED STATE, AND NEITHER PANE STARTS THERE. `openProse` in
+ * `skills.js` and `mcps.js` renders `aria-expanded="true"` on first paint, so a reader meets
+ * every one of these paragraphs whole; the clamp is what a click puts them into. Keep the
+ * bare selector as the collapsed half — the markup names the open state explicitly, so
+ * inverting these two rules would leave a pane with no way to spell "folded".
  *
  * `-webkit-line-clamp` needs `display: -webkit-box`, so the open state has to restore
  * `display: block` as well as releasing the clamp — dropping the clamp alone leaves the
@@ -2365,6 +2432,40 @@ body {
 	margin-top: 10px; max-width: 560px;
 	font-size: 11px; line-height: 1.5; color: var(--ink-2);
 }
+
+/* ── The MCPs page's own two hooks ───────────────────────────────────────────────────
+   Everything above is shared with Skills (see this block's header). These two are not,
+   and both are here because the MCPs page's columns carry a different KIND of number. */
+
+/* The third column is a TOOL COUNT, not a token figure. Skills gives it 76px because
+   `206.0k` has to fit; a server's tool count is one or two digits, so the width goes to
+   the name instead — which is where it is needed, since a server registered through a
+   plugin manifest carries a long prefix. Both selectors are overridden together, or the
+   header would drift from the rows it labels. */
+.jd .mcp-page .sk-cols,
+.jd .mcp-page .sk-row { grid-template-columns: minmax(0, 1fr) 52px 50px; }
+
+/* The pane's tool list. Its own grid rather than `.sk-line`, because a tool row carries
+   TWO figures (calls and sessions) where every `.sk-line` in this pane carries one — and
+   `.sk-line` pushes its single value to the far edge with `margin-left: auto`, which two
+   values cannot share. Baseline-aligned so the name and both numbers sit on one line
+   even when the name is in the mono face. */
+.jd .mcp-tools { display: grid; gap: 6px; margin-top: 4px; }
+.jd .mcp-tool {
+	display: grid; grid-template-columns: minmax(0, 1fr) 44px 56px; gap: 10px;
+	align-items: baseline; font-size: 12px;
+}
+/* `min-width: 0` is what lets the name truncate — a grid item's automatic minimum is its
+   content, so without it a long tool name widens the column and pushes the numbers off
+   (the same rule `.sk-name` carries). The full name stays reachable in its `title`. */
+.jd .mcp-tool b {
+	min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+	font-weight: 600; color: var(--ink);
+}
+.jd .mcp-tool span { text-align: right; color: var(--ink-2); font-variant-numeric: tabular-nums; }
+/* The session count is the quieter of the two figures: calls is what the list is ranked
+   by and what the row is read for, so the second number recedes rather than competing. */
+.jd .mcp-tool .mcp-tool-sess { font-size: 11px; }
 
 /* ── THE SHORT-WINDOW BUDGET ────────────────────────────────────────────────────────
    Two rules that only make sense together: on a window this short the band's chart has
@@ -2416,13 +2517,13 @@ body {
    while 0 reads as a card welded to the window's edge. */
 @media (max-height: 816px) {
 	.jd .sk-band { padding: 10px 20px 8px; }
-	.jd .wrap:has(.skills-page) { padding-bottom: 8px; }
+	.jd .wrap:has(.browser-page) { padding-bottom: 8px; }
 }
 
 /* No wrap-padding overrides at either breakpoint: the wrap keeps its own 24px and
    its cap is already inert below 1200px, so there is nothing left to reclaim. */
 @media (max-width: 1180px) {
-	.jd .skills-page { grid-template-columns: 320px minmax(0, 1fr); }
+	.jd .browser-page { grid-template-columns: 320px minmax(0, 1fr); }
 }
 @media (max-width: 899px) {
 	/* THE WHOLE FIXED FRAME COMES OFF HERE, not just the second column. Once the columns
@@ -2437,11 +2538,11 @@ body {
 	 * `.sk-list`'s cap needs no `!important` any more: it used to be an inline pixel value
 	   written by `listOpenTag`, which nothing but `!important` outranks, and the flex chain
 	   replaced it with a stylesheet rule this block can simply override. */
-	.jd:has(.skills-page) { height: auto; overflow: visible; }
-	.jd .main:has(.skills-page) { display: block; height: auto; padding-bottom: 48px; }
-	.jd .wrap:has(.skills-page) { display: block; flex: none; }
-	.jd #app:has(.skills-page) { display: block; flex: none; }
-	.jd .skills-page {
+	.jd:has(.browser-page) { height: auto; overflow: visible; }
+	.jd .main:has(.browser-page) { display: block; height: auto; padding-bottom: 48px; }
+	.jd .wrap:has(.browser-page) { display: block; flex: none; }
+	.jd #app:has(.browser-page) { display: block; flex: none; }
+	.jd .browser-page {
 		grid-template-columns: minmax(0, 1fr); grid-template-rows: none;
 		flex: none; align-items: start;
 	}

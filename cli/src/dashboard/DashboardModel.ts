@@ -407,6 +407,7 @@ export type DashboardView =
 	| "stats"
 	| "standup"
 	| "skills"
+	| "mcps"
 	| "journeys"
 	| "memories"
 	| "knowledge"
@@ -1923,6 +1924,153 @@ export interface SkillDetail {
 	readonly bodyChars?: number;
 }
 
+/** One tool of a server, over the window — a row of the detail view's tool list. */
+export interface McpServerToolRow {
+	/**
+	 * The tool's own name, with the server segment ALREADY STRIPPED — `execute_sql`,
+	 * not `dbhub.execute_sql`.
+	 *
+	 * Stripped here rather than in the client because the split is a property of how
+	 * `parseToolUse` wrote the row (`<server>.<tool>`, and the server half may itself
+	 * carry a host's `plugin_…` registration prefix), which is this layer's knowledge.
+	 * A client slicing at the first `.` would be doing schema archaeology, and would be
+	 * wrong for a server whose own name contains one.
+	 */
+	readonly name: string;
+	/** Calls of this tool in the window. */
+	readonly calls: number;
+	/**
+	 * Distinct sessions that called it — EXACT for this row, and deliberately not
+	 * summable across rows. A session that called three of a server's tools counts in
+	 * all three, so these do not add up to {@link McpServerDetail.sessions}; a surface
+	 * printing them must not total the column.
+	 */
+	readonly sessions: number;
+}
+
+/** One local calendar day of a server's detail charts. */
+export interface McpServerDayPoint {
+	/** The local calendar day, `YYYY-MM-DD`. */
+	readonly date: string;
+	/** Distinct sessions whose last recorded call to this server falls on this day. */
+	readonly sessions: number;
+	/** Calls made by those sessions, summed over the server's tools. */
+	readonly calls: number;
+}
+
+/** One session's whole traffic to a server, oldest first. */
+export interface McpServerSessionPoint {
+	/** Epoch-ms of the session's LAST recorded call to this server (a floor for its first). */
+	readonly atMs: number;
+	/** Sum of calls that session made across this server's tools. */
+	readonly calls: number;
+}
+
+/**
+ * Everything the MCP detail view shows — the answer to `/api/mcp-detail`.
+ *
+ * Scoped to the same window and repo selection as the row it was opened from, so the
+ * figures here agree with the list beside it. Modelled on {@link SkillDetail}, and the
+ * differences are the record's rather than the page's:
+ *
+ *   - **No outcomes, no entry paths, no arguments and no token figures.** `skill_invocations`
+ *     gives a skill a per-invocation record; MCP has no such table, so a call's result,
+ *     its arguments and its cost are not merely unrendered here — they were never
+ *     written. The page says so in words rather than drawing an empty section.
+ *   - **No commit list.** A skill's usage is archived onto a commit as `SkillCommitRef`;
+ *     an MCP call is not archived anywhere, so there is nothing to join.
+ *   - **{@link tools} exists instead**, which a skill has no counterpart for: a server is
+ *     a namespace of tools, and which of them the reader actually reaches for is the
+ *     question this page is opened to answer.
+ *
+ * Absent when the window holds no call to that server, which the route turns into a 404.
+ */
+export interface McpServerDetail {
+	/** The folded server name, as {@link McpServerRow.server} spells it. */
+	readonly server: string;
+	/** Distinct sessions that called ANY of its tools — exact, not a bound. */
+	readonly sessions: number;
+	readonly calls: number;
+	/** Distinct tools of this server actually called — the length {@link tools} would have uncapped. */
+	readonly toolCount: number;
+	/**
+	 * Its tools, busiest first, capped at {@link MCP_DETAIL_TOOL_LIMIT}.
+	 *
+	 * {@link toolCount} is the honest total and travels beside it, so a capped list can
+	 * say what it is not showing. Ranked by calls, matching the row the reader clicked
+	 * (`TOOL_LIST_ORDER.server`), so "busiest" means the same thing in both columns.
+	 */
+	readonly tools: ReadonlyArray<McpServerToolRow>;
+	/** Which agents called it, most calls first — same shape and rule as {@link McpServerRow.agents}. */
+	readonly agents: ReadonlyArray<ToolUsageAgentShare>;
+	/**
+	 * One point per LOCAL DAY in the window, oldest first — what BOTH charts read.
+	 *
+	 * Empty days are present with zeroes, so neither chart compresses a quiet gap. The
+	 * window itself is capped at 366 days, which bounds this payload without dropping
+	 * older sessions and silently changing the shape of a busy server's trend.
+	 *
+	 * A session is filed under the local day of its LAST recorded call to this server,
+	 * matching {@link ToolUsage.serverDays}; `session_tool_use` has no per-call MCP table
+	 * from which a finer split could be reconstructed.
+	 */
+	readonly daySeries: ReadonlyArray<McpServerDayPoint>;
+	/**
+	 * One point per SESSION that called this server in the window, oldest first within
+	 * the retained recent set — what the "Calls per session" chart draws.
+	 *
+	 * The X axis is session index in arrival order, not a time axis: the record holds one
+	 * instant per (session, tool) and it is the last call, so an even-time-spacing chart
+	 * would misrepresent the record. `atMs` rides along so tooltips and the two axis
+	 * endpoints can name the sessions by date. `calls` is the sum over this server's
+	 * tools within one session, matching how {@link daySeries} sums a day. This series
+	 * is capped at 400 points; {@link sessions} and {@link daySeries} remain exact.
+	 */
+	readonly sessionSeries: ReadonlyArray<McpServerSessionPoint>;
+	/**
+	 * Earliest call recorded in the window — a FLOOR, not the first call.
+	 *
+	 * `session_tool_use` stores one instant per (session, tool) and it is the LAST call,
+	 * so the earliest such instant is "the last call of the earliest session", which is
+	 * at or after the true first call. Measured on a real database, the two agree at day
+	 * resolution for 140 of 141 (session, server) pairs — the spread inside one pair
+	 * averages 8.7 minutes — so a date is a fair thing to print while a time would not
+	 * be. Nothing can be backfilled to improve it: adding a `first_call_at_ms` column
+	 * would only sharpen rows written after it shipped.
+	 */
+	readonly firstCallAtMs?: number;
+	/** Latest call recorded in the window. Exact, unlike {@link firstCallAtMs}. */
+	readonly lastCallAtMs?: number;
+	/**
+	 * Repositories it was called in, by name, alphabetically.
+	 *
+	 * From the SESSIONS, the only place it could come from — an MCP call is never
+	 * archived onto a commit, so there is no second answer to reconcile with.
+	 */
+	readonly repos: ReadonlyArray<string>;
+}
+
+/**
+ * Tools listed in one server's detail view.
+ *
+ * A HEIGHT BUDGET, not a paging decision — this list is the MCP pane's one section
+ * whose length is a property of the SERVER rather than of the record's own ceilings, so
+ * it is what decides whether the pane fits its fixed frame (`main.css`'s browser-page
+ * block owns that frame and the 579px the pane gets at 1440x900).
+ *
+ * MEASURED, at that viewport: a tool row is 14.5px plus a 6px gap, the rest of the pane
+ * comes to 343px, and the truncation note below the list costs another 20px. So 10 rows
+ * plus the note is 569px and clears the budget, while the 12 rows a real
+ * `chrome-devtools` registration produced came to 589px and summoned the pane's fallback
+ * scrollbar — which `.sk-pane` documents as a fallback rather than the design.
+ *
+ * Re-derive it the same way if the pane grows a section: stub the widest server, then
+ * raise this until `.sk-pane`'s `scrollHeight` exceeds its `clientHeight`, and step back
+ * one. Raising it without measuring trades a section the reader can see for a scrollbar
+ * they have to discover.
+ */
+export const MCP_DETAIL_TOOL_LIMIT = 10;
+
 /**
  * How many rows ONE PAGE of a skill / server / MCP-tool list carries.
  *
@@ -2117,12 +2265,45 @@ export interface ToolUsage {
 	/** Every MCP call in the window that carries a server, including rows past the first page. */
 	readonly serverCallsTotal: number;
 	/**
+	 * Day-by-day adoption for the MCPs page's stacked band, oldest first — the
+	 * server-side twin of {@link skillDays}, and the same shape for the same reason.
+	 *
+	 * Every rule stated on `skillDays` holds here unchanged: one point per LOCAL day of
+	 * the window including days nothing ran (the chart lays bars out by index, so a
+	 * dropped day compresses the axis), every server in the window rather than
+	 * {@link servers}' first page, and the unit is a SERVER-SESSION — a session that
+	 * called two servers counts once in each series, so a bar's total is not distinct
+	 * sessions.
+	 *
+	 * **The series key is the FOLDED server name**, the same one {@link McpServerRow.server}
+	 * carries, so a server reached under both a bare and a plugin-prefixed registration is
+	 * one series here and one row there. Keyed any other way the band would draw two
+	 * series the list below it presents as one.
+	 *
+	 * A session is filed under ONE day — the day of its last recorded call to that server,
+	 * since `session_tool_use` keeps a single timestamp per (session, tool). Measured on a
+	 * real database: 1 of 141 (session, server) pairs spanned more than one local day, so
+	 * the cost here is smaller than the 5-of-68 `skillDays` records. There is no per-call
+	 * table for MCP the way `skill_invocations` is one for skills, so this is not a choice
+	 * between two grains — it is the only grain the record holds.
+	 */
+	readonly serverDays: ReadonlyArray<SkillDayPoint>;
+	/**
 	 * Individual MCP tools (name already `server.tool`), busiest first — the "by
 	 * tool" split of `servers`, same rule, and ONE PAGE like the other two.
 	 */
 	readonly mcpTools: ReadonlyArray<ToolUsageRow>;
 	/** Distinct MCP tools called in the window — the paging total behind `mcpTools`. */
 	readonly mcpToolsTotal: number;
+	/**
+	 * Distinct MCP tools that belong to a named server — the whole-window total shown
+	 * on the MCPs page beside {@link serversTotal}.
+	 *
+	 * Kept separate from {@link mcpToolsTotal}: the general "by tool" list also admits
+	 * legacy MCP rows whose `server` is null, while the MCPs page's server chooser and
+	 * its headline deliberately do not.
+	 */
+	readonly serverToolsTotal: number;
 	/**
 	 * The recall feature's own row (`jollimemory.recall`), from its OWN query
 	 * rather than out of `mcpTools` — recall can rank outside the first page of

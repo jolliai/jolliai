@@ -74,6 +74,7 @@ interface Harness {
  */
 const ROW_PITCH = 50;
 const ROW_HEIGHT = 40;
+const GENERATED_AT_MS = Date.parse("2026-07-30T12:00:00Z");
 
 function loadHarness(rowCounts: Record<string, number> = {}): Harness {
 	const fetched: string[] = [];
@@ -224,7 +225,7 @@ function model(toolUsageOver: Record<string, unknown> = {}): unknown {
 		schemaVersion: 1,
 		view: "stats",
 		tier: "memory",
-		generatedAtMs: Date.parse("2026-07-30T12:00:00Z"),
+		generatedAtMs: GENERATED_AT_MS,
 		timeZone: "UTC",
 		scope: { kind: "all" },
 		// One enrolled repo, because `renderStats` short-circuits an empty registry
@@ -261,6 +262,7 @@ function model(toolUsageOver: Record<string, unknown> = {}): unknown {
 				serverCallsTotal: 375,
 				mcpTools: Array.from({ length: TOOL_ROWS_LIMIT }, (_, i) => ({ ...skillRow(i), kind: "mcp" })),
 				mcpToolsTotal: 42,
+				serverToolsTotal: 41,
 				skillAgents: [{ source: "claude", sessions: 4, calls: 200 }],
 				mcpAgents: [{ source: "claude", sessions: 4, calls: 375 }],
 				sessionsWithTools: 4,
@@ -442,7 +444,9 @@ describe("tool-usage lists — fetching a page", () => {
 		// The window params ride along because the rows are an aggregate OVER a
 		// window: paging with a different one would append rows counted from a
 		// different set.
-		expect(h.fetched).toEqual([`/api/tool-usage?range=month&dimension=model&list=skill&offset=${TOOL_ROWS_LIMIT}`]);
+		expect(h.fetched).toEqual([
+			`/api/tool-usage?range=month&dimension=model&list=skill&offset=${TOOL_ROWS_LIMIT}&nowMs=${GENERATED_AT_MS}`,
+		]);
 	});
 
 	it("appends the page and moves the footer, keeping the card's other rows", async () => {
@@ -667,7 +671,9 @@ describe("tool-usage lists — carrying an expansion across the 30 s poll", () =
 		// screen and never a click count: a page that came back holding a row already
 		// loaded is deduped, and from then on a counter asks for more rows than are
 		// displayed, which reads as "changed" forever.
-		expect(h.fetched).toEqual([`/api/tool-usage?range=month&dimension=model&list=skill&offset=0&limit=${GROWN}`]);
+		expect(h.fetched).toEqual([
+			`/api/tool-usage?range=month&dimension=model&list=skill&offset=0&limit=${GROWN}&nowMs=${GENERATED_AT_MS}`,
+		]);
 		// Nothing moved, so the poll left the card exactly as the reader had it. Before
 		// this, `/api/model`'s first page silently replaced it every 30 s.
 		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
@@ -742,7 +748,9 @@ describe("tool-usage lists — carrying an expansion across the 30 s poll", () =
 
 		// One request, for the clicked list only. The three lists are independent in
 		// the payload, so paging one must not re-read — or reset — another.
-		expect(h.fetched).toEqual([`/api/tool-usage?range=month&dimension=model&list=skill&offset=${TOOL_ROWS_LIMIT}`]);
+		expect(h.fetched).toEqual([
+			`/api/tool-usage?range=month&dimension=model&list=skill&offset=${TOOL_ROWS_LIMIT}&nowMs=${GENERATED_AT_MS}`,
+		]);
 		expect(h.html()).toContain(`Showing ${GROWN} of ${SKILLS_TOTAL} skills`);
 		expect(h.html()).toContain(`Showing ${GROWN} of ${SERVERS_TOTAL} servers`);
 		// And the untouched card does not move. A Show more ends in a whole-page

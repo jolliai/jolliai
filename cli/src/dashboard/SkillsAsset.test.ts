@@ -42,6 +42,15 @@ interface FakeRow {
 	readonly scrollIntoViewCalls: Array<Record<string, unknown> | undefined>;
 }
 
+interface FakeClickable {
+	onclick?: () => void;
+	getAttribute: (name: string) => string | null;
+	setAttribute: (name: string, value: string) => void;
+	removeAttribute: (name: string) => void;
+	classList: { contains: (name: string) => boolean };
+	focus: () => void;
+}
+
 interface Harness {
 	readonly requests: string[];
 	readonly list: FakeList;
@@ -50,6 +59,10 @@ interface Harness {
 	render: (model: unknown) => void;
 	/** Rewrites `?skill=`, standing in for a click or an arrival from the Stats card. */
 	selectSkill: (name: string | null) => void;
+	/** Activates a keyboard-focused legend and returns the focus state after repaint. */
+	clickFocusedLegend: (name: string) => void;
+	focusedSelection: () => { name: string | null; legend: boolean; replaced: boolean };
+	useTargetedDom: () => void;
 	/** Shrinks the browser window, for the half of the reveal the panel cannot see. */
 	setViewportHeight: (height: number) => void;
 	/** Advances the page-owned retry clock without waiting in real time. */
@@ -74,10 +87,12 @@ const row = (i: number): SkillRow => ({
  * the window.
  */
 const WINDOW_DAYS = ["2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02", "2026-01-03"];
+const GENERATED_AT_MS = Date.parse("2026-01-03T12:00:00Z");
 
-function model(rows: ReadonlyArray<SkillRow>, total: number): unknown {
+function model(rows: ReadonlyArray<SkillRow>, total: number, usageOver: Record<string, unknown> = {}): unknown {
 	return {
 		view: "skills",
+		generatedAtMs: GENERATED_AT_MS,
 		timeZone: "Asia/Shanghai",
 		stats: {
 			toolUsage: {
@@ -88,6 +103,7 @@ function model(rows: ReadonlyArray<SkillRow>, total: number): unknown {
 				sessionsWithTools: total,
 				sessionsInWindow: total,
 				skillDays: WINDOW_DAYS.map((date) => ({ date, bySeries: { skill000: 1 } })),
+				...usageOver,
 			},
 		},
 	};
@@ -157,6 +173,16 @@ function loadHarness(): Harness {
 		},
 	};
 	const listNode = Object.assign(list, { getBoundingClientRect: () => list.rect });
+	let selectionNodes: FakeClickable[] = [];
+	let clickedNode: FakeClickable | null = null;
+	let targetedDom = false;
+	let targetedBandHtml = "";
+	const bandNode = {
+		replaceWith: (next: { readonly html?: string }) => {
+			targetedBandHtml = next.html ?? "";
+		},
+	};
+	const paneNode = { innerHTML: "" };
 	const app = {
 		get innerHTML() {
 			return html;
@@ -170,16 +196,63 @@ function loadHarness(): Harness {
 		},
 		querySelector: (selector: string) => {
 			if (selector === ".sk-list") return listNode;
+			if (selector === ".sk-band") return targetedDom ? bandNode : null;
+			if (selector === ".sk-pane") return targetedDom ? paneNode : null;
 			/* Present only when a row really carries the marker — `listHtml` writes it for
 			   the selected skill alone, so a selection whose row is still in the unfetched
 			   tail finds nothing here, exactly as in a browser. */
 			if (selector === '.sk-row[aria-current="true"]')
-				return html.includes('aria-current="true"') ? rowNode : null;
+				return html.includes('aria-current="true"') ||
+					selectionNodes.some(
+						(node) => node.classList.contains("sk-row") && node.getAttribute("aria-current") === "true",
+					)
+					? rowNode
+					: null;
 			return null;
 		},
-		querySelectorAll: () => [] as ReadonlyArray<never>,
+		querySelectorAll: (selector: string): FakeClickable[] => {
+			if (selector === ".sk-row") return selectionNodes.filter((node) => node.classList.contains("sk-row"));
+			if (selector !== "[data-skill]") return [];
+			const selectionHtml = targetedBandHtml
+				? targetedBandHtml + html.slice(Math.max(0, html.indexOf("<aside")))
+				: html;
+			selectionNodes = Array.from(
+				selectionHtml.matchAll(/<button\b[^>]*data-skill="([^"]+)"[^>]*>/g),
+				(match) => {
+					const tag = match[0];
+					const classes = /class="([^"]*)"/.exec(tag)?.[1]?.split(/\s+/) ?? [];
+					const attributes = new Map<string, string>([["data-skill", match[1] as string]]);
+					if (tag.includes('aria-current="true"')) attributes.set("aria-current", "true");
+					const node: FakeClickable = {
+						getAttribute: (name) => attributes.get(name) ?? null,
+						setAttribute: (name, value) => attributes.set(name, value),
+						removeAttribute: (name) => attributes.delete(name),
+						classList: { contains: (name) => classes.includes(name) },
+						focus: () => {
+							document.activeElement = node;
+						},
+					};
+					return node;
+				},
+			);
+			return selectionNodes;
+		},
 	};
-	const document = { getElementById: (id: string) => (id === "app" ? app : null) };
+	const document = {
+		activeElement: null as FakeClickable | null,
+		getElementById: (id: string) => (id === "app" ? app : null),
+		createElement: (_tag: string) => {
+			let content = "";
+			return {
+				set innerHTML(next: string) {
+					content = next;
+				},
+				get firstChild() {
+					return { html: content };
+				},
+			};
+		},
+	};
 	const window = {
 		JD: {} as Record<string, unknown>,
 		location: new URL("http://127.0.0.1/skills"),
@@ -267,6 +340,24 @@ function loadHarness(): Harness {
 			else url.searchParams.delete("skill");
 			window.location = url;
 		},
+		clickFocusedLegend: (name: string) => {
+			const node = selectionNodes.find(
+				(candidate) =>
+					candidate.classList.contains("sk-legend") && candidate.getAttribute("data-skill") === name,
+			);
+			if (!node?.onclick) throw new Error(`no wired skill legend for ${name}`);
+			clickedNode = node;
+			document.activeElement = node;
+			node.onclick();
+		},
+		focusedSelection: () => ({
+			name: document.activeElement?.getAttribute("data-skill") ?? null,
+			legend: document.activeElement?.classList.contains("sk-legend") ?? false,
+			replaced: document.activeElement !== null && document.activeElement !== clickedNode,
+		}),
+		useTargetedDom: () => {
+			targetedDom = true;
+		},
 		setViewportHeight: (height: number) => {
 			window.innerHeight = height;
 		},
@@ -288,6 +379,37 @@ describe("Skills page asset", () => {
 		expect(h.html()).toContain("Jan 1");
 		expect(h.html()).toContain("outcome not recorded");
 		expect(h.html()).not.toContain("Could not reach the dashboard server");
+		expect(h.requests[0]).toBe(`/api/skill-detail?range=month&name=skill000&nowMs=${GENERATED_AT_MS}`);
+	});
+
+	it("keeps prototype-shaped and real Other skill names distinct from the roll-up", () => {
+		const names = ["Other", "__proto__", "constructor", "b", "c"];
+		const rows = names.map((name, index) => ({ ...row(index), name }));
+		const bySeries = Object.fromEntries(names.map((name, index) => [name, 10 - index * 2]));
+		const h = loadHarness();
+		h.render(model(rows, rows.length, { skillDays: [{ date: "2026-01-03", bySeries }] }));
+		const html = h.html();
+
+		for (const name of ["Other", "__proto__", "constructor"]) {
+			expect(html).toContain(`data-skill="${name}"`);
+		}
+		expect(html).toContain('data-keys="Other,__proto__,constructor,b,Other "');
+		expect(html).toContain("<b>Other (1 skill)</b> 2");
+		expect(html).not.toContain("<b>Other </b>");
+	});
+
+	it("describes a 404 as an empty window instead of a stale dashboard", async () => {
+		const h = loadHarness();
+		h.respondWith((path) =>
+			path.startsWith("/api/skill-detail")
+				? Promise.reject({ status: 404 })
+				: Promise.resolve({ list: "skill", rows: [] }),
+		);
+		h.render(model([row(0)], 1));
+		await settle();
+
+		expect(h.html()).toContain("No captured calls for this skill in this window.");
+		expect(h.html()).not.toContain("restart it");
 	});
 
 	it("draws both pane charts over the band's window days rather than their own data's extent", async () => {
@@ -318,8 +440,8 @@ describe("Skills page asset", () => {
 		expect(html.split("<span>Jan 3</span>").length - 1).toBe(2);
 		/* The record's dates stay the DATA's — `Jan 1` is on no axis here. That split is
 		   the honest version of what used to be spelled as two disagreeing axes. */
-		expect(html).toContain("<b>First used</b><span>Jan 1</span>");
-		expect(html).toContain("<b>Last used</b><span>Jan 2</span>");
+		expect(html).toContain('<b>First used</b><span title="Jan 1">Jan 1</span>');
+		expect(html).toContain('<b>Last used</b><span title="Jan 2">Jan 2</span>');
 	});
 
 	it("falls back to the skill's own days when the payload carried no band series", async () => {
@@ -337,7 +459,8 @@ describe("Skills page asset", () => {
 		expect(html).toContain("<title>2026-01-01=1 session</title>");
 		expect(html).toContain("<title>2026-01-02=1 session</title>");
 		expect(html).not.toContain("<title>2025-12-30=");
-		expect(html.split("<span>Jan 1</span>").length - 1).toBe(3);
+		expect(html.split('<span title="Jan 1">Jan 1</span>').length - 1).toBe(1);
+		expect(html.split("<span>Jan 1</span>").length - 1).toBe(2);
 	});
 
 	it("says how many sessions attributed no spend, so an empty day in the cost chart reads", async () => {
@@ -698,6 +821,44 @@ describe("Skills page asset", () => {
 		   comes with it. */
 		expect(h.html()).toContain('aria-current="true"');
 		expect(h.currentRow.scrollIntoViewCalls).toEqual([{ block: "center" }]);
+	});
+
+	it("reveals a legend selection and restores keyboard focus after its targeted repaint", () => {
+		const h = loadHarness();
+		const rows = [row(0), row(1)];
+		h.render(
+			model(rows, rows.length, {
+				skillDays: [{ date: "2026-01-03", bySeries: { skill000: 2, skill001: 1 } }],
+			}),
+		);
+		h.currentRow.scrollIntoViewCalls.length = 0;
+		h.useTargetedDom();
+
+		h.clickFocusedLegend("skill001");
+
+		expect(h.currentRow.scrollIntoViewCalls).toEqual([{ block: "center" }]);
+		expect(h.focusedSelection()).toEqual({ name: "skill001", legend: true, replaced: true });
+	});
+
+	it("moves focus to the list row when deselection removes an out-of-band legend", () => {
+		const rows = Array.from({ length: 5 }, (_, index) => row(index));
+		const h = loadHarness();
+		h.selectSkill("skill004");
+		h.render(
+			model(rows, rows.length, {
+				skillDays: [
+					{
+						date: "2026-01-03",
+						bySeries: { skill000: 5, skill001: 4, skill002: 3, skill003: 2, skill004: 1 },
+					},
+				],
+			}),
+		);
+		h.useTargetedDom();
+
+		h.clickFocusedLegend("skill004");
+
+		expect(h.focusedSelection()).toEqual({ name: "skill004", legend: false, replaced: true });
 	});
 
 	it("does not move the column for a row that is already on screen", async () => {

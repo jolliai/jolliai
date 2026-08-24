@@ -6,8 +6,10 @@
 		stats: { render: (model) => window.JD.renderStats(model), grid: true },
 		standup: { render: (model) => window.JD.renderStandup(model), grid: false },
 		/* Page mode, not the card grid: the list is one full-height column, the same
-		   shape the browser pages below use. */
+		   shape the browser pages below use. `mcps` is the same page for MCP servers —
+		   both render `.browser-page`, which `main.css` sizes as a fixed frame. */
 		skills: { render: (model) => window.JD.renderSkills(model), grid: false },
+		mcps: { render: (model) => window.JD.renderMcps(model), grid: false },
 		journeys: { render: (model) => window.JD.renderCoaching(model), grid: false },
 		memories: { render: (model) => window.JD.renderMemories(model), grid: false },
 		knowledge: { render: (model) => window.JD.renderKnowledge(model), grid: false },
