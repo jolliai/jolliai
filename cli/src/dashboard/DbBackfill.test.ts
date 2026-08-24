@@ -4192,30 +4192,30 @@ describe("DbBackfill — coverage edges", () => {
 
 	it("uses the machine dashboard path when dbBackfillRepos gets no dbPath", async () => {
 		// The `rest.dbPath ? { dbPath } : {}` empty arms and `?? getDashboardDbPath()`.
-		const realHome = process.env.HOME;
-		process.env.HOME = join(dir, "home-repos");
-		try {
+		//
+		// ⚠ `withIsolatedHome`, and the path asserted before the call — see the note on
+		// the same pattern in `DashboardDb.test.ts`. A hand-rolled `process.env.HOME = …`
+		// is a no-op on win32, and this case in particular BOOTSTRAPS a database and
+		// registers a repo, so it wrote a permanent dead row into the developer's real
+		// `dashboard-repos.json` on every Windows run.
+		const home = join(dir, "home-repos");
+		await withIsolatedHome(home, async () => {
+			expect(getDashboardDbPath().startsWith(home)).toBe(true);
 			const results = await dbBackfillRepos([repo], {});
 			expect(results[0].mode).toBe("bootstrapped");
 			expect(existsSync(getDashboardDbPath())).toBe(true);
-		} finally {
-			if (realHome === undefined) delete process.env.HOME;
-			else process.env.HOME = realHome;
-		}
+		});
 	});
 
 	it("projects paused repos against the machine path when given no dbPath", async () => {
 		// The paused-repos `rest.dbPath ? { dbPath } : {}` empty arm.
 		vi.mocked(readManualDisableFlagSync).mockReturnValue(true);
-		const realHome = process.env.HOME;
-		process.env.HOME = join(dir, "home-paused");
-		try {
+		const home = join(dir, "home-paused");
+		await withIsolatedHome(home, async () => {
+			expect(getDashboardDbPath().startsWith(home)).toBe(true);
 			const results = await dbBackfillRepos([repo], {});
 			expect(results[0].mode).toBe("disabled");
-		} finally {
-			if (realHome === undefined) delete process.env.HOME;
-			else process.env.HOME = realHome;
-		}
+		});
 	});
 
 	it("reports paused repos as skipped when their projection open fails", async () => {
@@ -4235,15 +4235,16 @@ describe("DbBackfill — coverage edges", () => {
 
 	it("uses the machine dashboard path when dbRescanSessions gets no dbPath", async () => {
 		// dbRescanSessions' `opts.dbPath ? { dbPath } : {}` and `opts.dbPath ?? getDashboardDbPath()`.
-		const realHome = process.env.HOME;
-		process.env.HOME = join(dir, "home-rescan");
-		try {
+		//
+		// The `no-database` expectation is only meaningful while the home really is
+		// scratch: against a developer's real home the machine database exists, so the
+		// hand-rolled redirect this replaces made the assertion depend on the platform.
+		const home = join(dir, "home-rescan");
+		await withIsolatedHome(home, async () => {
+			expect(getDashboardDbPath().startsWith(home)).toBe(true);
 			const result = await dbRescanSessions({ repos: [repo], emitted: new Map() });
 			expect(result.idleReason).toBe("no-database");
-		} finally {
-			if (realHome === undefined) delete process.env.HOME;
-			else process.env.HOME = realHome;
-		}
+		});
 	});
 
 	it("backfillStoredActivity: writes buckets, skipping bad, source-less and covered rows", async () => {

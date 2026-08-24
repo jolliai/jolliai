@@ -615,8 +615,9 @@ export async function probeCutoverDrift(
 	// open runs `migrateDashboardDb`, so a probe — a diagnostic — would migrate
 	// the schema as a side effect of being asked a question. (A NEWER format is
 	// not one of the cases this tolerates: there is no version gate, so such a
-	// file opens and writes normally — see `DASHBOARD_SCHEMA_VERSION`.) An absent
-	// or unreadable database has no cutover record, which is "no drift to report".
+	// file opens and writes normally — see the compatibility note at the top of
+	// `DashboardDb.ts`.) An absent or unreadable database has no cutover record,
+	// which is "no drift to report".
 	let record: CutoverRecord | null;
 	try {
 		record = await withReadonlyDashboardDb((db) => {
@@ -1202,7 +1203,8 @@ export async function runCutover(cwd: string, opts: CutoverOptions = {}): Promis
 				// enable`) holds SQLite's writer lock past `busy_timeout`, and a
 				// migration entry can fail on a damaged file. (A schema-ahead file is
 				// NOT one of these: there is no version gate, so a newer format opens
-				// and writes normally — see `DASHBOARD_SCHEMA_VERSION`.) This was the ONE post-fence
+				// and writes normally — see the compatibility note at the top of
+				// `DashboardDb.ts`.) This was the ONE post-fence
 				// step with no error handling, which defeats the policy the lock
 				// timeout and the null-row check below both spell out: after the
 				// fence is up, every exit must be a CutoverOutcome carrying the

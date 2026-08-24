@@ -45,8 +45,8 @@
  * is made of.
  *
  * Stored in `repo_state`, key `cutover-blocked` — a per-repo `(repo_id, key,
- * value)` row whose `key` carries no constraint, so adding one is an INSERT and
- * `DASHBOARD_SCHEMA_VERSION` does not move (same reasoning as
+ * value)` row whose `key` carries no constraint, so adding one is a plain INSERT
+ * and needs no schema migration at all (same reasoning as
  * {@link ../dashboard/ImportState.IMPORT_STATE_KEY}). Deliberately NOT a
  * `profile.json` field: that file is a cross-language, cross-version surface
  * (IntelliJ's `RepoProfileBridge` deserialises it directly, and older CLI builds

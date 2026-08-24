@@ -37,7 +37,7 @@
 
 import { createLogger, errMsg } from "../Logger.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
-import { DASHBOARD_SCHEMA_VERSION, inTransaction, readSchemaVersion } from "./DashboardDb.js";
+import { dbHasUnknownMigrations, inTransaction } from "./DashboardDb.js";
 import type { DashboardScope, SeriesDimension } from "./DashboardModel.js";
 import { scopeFilter, scopeToRepoIds } from "./DashboardScopeUtil.js";
 import { addLocalDays, dayKeyToMidnight, localDayKey, machineTimeZone, startOfLocalDay } from "./LocalDays.js";
@@ -554,15 +554,21 @@ export function forgetRollupDays(db: DashboardDbHandle, atMs: ReadonlyArray<numb
 export function buildRollupQuietly(db: DashboardDbHandle, opts: BuildRollupOptions = {}): void {
 	try {
 		// A build older than the file does not maintain this cache. Nothing here
-		// refuses such a build anymore (see `DASHBOARD_SCHEMA_VERSION`), and that is
-		// right for the source tables — but the cache is different: its expiry test
-		// reads the write stamps of every source table, and a build that does not
-		// know a table added since cannot see that table change. It would settle a
-		// day that is already incomplete and then keep answering with it. Declining
-		// to write costs a recomputation per render; writing costs a wrong number
-		// with no signal. The current build that next writes rebuilds the day.
-		if (readSchemaVersion(db) > DASHBOARD_SCHEMA_VERSION) {
-			log.info("stats rollup skipped: database schema is newer than this build");
+		// refuses such a build — that is right for the source tables — but the cache
+		// is different: its expiry test reads the write stamps of every source table,
+		// and a build that does not know a table added since cannot see that table
+		// change. It would settle a day that is already incomplete and then keep
+		// answering with it. Declining to write costs a recomputation per render;
+		// writing costs a wrong number with no signal. The current build that next
+		// writes rebuilds the day.
+		//
+		// The question is "has a newer build written here", and it is now asked of the
+		// migration log by name rather than of a version number. The number could only
+		// answer by proxy: it moved with DDL, so it missed a newer build whose change
+		// added no columns, and fired for one whose additions this build can read
+		// perfectly well.
+		if (dbHasUnknownMigrations(db)) {
+			log.info("stats rollup skipped: the database carries migrations this build does not know");
 			return;
 		}
 		buildRollup(db, opts);

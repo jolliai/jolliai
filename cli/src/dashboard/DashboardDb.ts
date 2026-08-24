@@ -30,138 +30,59 @@ import { JOLLI_CLIENT_HEADER } from "../core/ClientHeader.js";
 import { getGlobalConfigDir } from "../core/SessionTracker.js";
 import { classifyScanError } from "../core/SqliteHelpers.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
-import {
-	ACTIVITY_DDL,
-	EVENT_FAILED_KIND_DDL,
-	MEMORY_SOT_DDL,
-	RECALL_RECEIPTS_DDL,
-	REPOS_DELETE_ALLOWED_DDL,
-	SCHEMA_MIGRATIONS_DDL,
-	SESSION_ACTIVITY_DDL,
-	SESSION_USAGE_EVENTS_DDL,
-	SKILL_CONTEXT_KIND_DDL,
-	SKILL_INVOCATIONS_DDL,
-	SKILL_ORIGIN_ROOT_DDL,
-	SKILL_PLUGIN_DDL,
-	SKILL_TOKEN_USAGE_DDL,
-	STATS_DAILY_DAY_INDEX_DDL,
-	STATS_DAILY_DDL,
-	SYNC_KEYSET_INDEX_DDL,
-	SYNC_STAMP_DDL,
-	SYNC_STAMP_INDEX_DDL,
-	SYNC_STAMP_NULL_BACKFILL_DDL,
-	TOOL_CALL_TIME_DDL,
-} from "./SotSchema.js";
+import { MIGRATIONS } from "./migrations/index.js";
+import type { DbMigration } from "./migrations/MigrationHelpers.js";
 
 const log = createLogger("DashboardDb");
 
 /**
- * Current schema version. Migrations are **append-only**: bump this, add the
- * `ALTER TABLE` / `CREATE TABLE` in {@link MIGRATIONS}, and never rewrite or
- * drop an existing column. The CLI, the VS Code extension and the IntelliJ
- * plugin ship independently against this one file, so an older build must stay
- * able to `SELECT` the columns it knows about after a newer build has migrated
- * up.
+ * NOTE ON VERSIONS, because their absence here is a decision.
  *
- * Equal to `MIGRATIONS.length`, one per entry. Entry 0 is the whole schema as
- * it first landed; entry 1 adds `recall_receipts`; entry 2 registers `skill` as
- * the fourth `context` kind; entry 3 adds `events_raw.failed_kind` so an event
- * parked by an older build that did not know its type can be un-parked by one
- * that does; entry 4 adds `session_tool_use.last_call_at_ms`; entry 5 adds the
- * `schema_migrations` log; entry 6 drops the `repos_no_delete` trigger;
- * entry 7 is the session-statistics sync, whose seven DDL constants are
- * concatenated into ONE entry rather than appended one per step: the per-row
- * sync stamps that let an outbound sync select what changed, the
- * `session_usage_events` table (one row per model response, because a session's
- * cumulative total under a single timestamp cannot be split across the days the
- * conversation actually spanned), the `stats_daily` rollup cache plus the
- * `commits.written_at_ms` that detects a stale day, the stamp and keyset indexes
- * those two need, and the backfill that gives every stamp a number; entry 8 adds
- * `session_activity`.
+ * **This database has no schema version number, and adding one back is a review
+ * blocker.** Whether a migration has run is asked of the `schema_migrations` log, by
+ * NAME, and of nothing else. `DASHBOARD_SCHEMA_VERSION` existed until it was removed
+ * along with the `schema_version` write, the format-ahead warning, and
+ * `isSchemaCurrent`'s version fallback.
  *
- * Entry 7 is ONE entry because the intermediate versions its steps produced
- * (8 through 13 of that branch's own development) exist on no database anybody
- * will ever ship or receive, and a version the release cannot reach is
- * bookkeeping nobody can act on. That merge is only legal because the feature has
- * not shipped; once it has, the append-only rule below takes over and the next
- * feature's steps must each be their own entry. The cost of getting this wrong is
- * concrete and was measured here: `buildRollupQuietly` stops maintaining the
- * daily cache the moment the file's number exceeds the build's, so five of those
- * seven steps — three index entries, an ALTER and a backfill, none of which can
- * introduce a table an older build cannot see — would each have disabled that
- * cache on every older build for nothing.
+ * Two things went wrong while it existed, and both are structural rather than bad
+ * luck. A hand-maintained integer that had to equal `MIGRATIONS.length` made two
+ * branches appending one migration each collide on a number neither of them cared
+ * about. And it invited comparisons that look like compatibility checks but are not:
+ * the number moves only with DDL, so it misses the change that actually corrupts
+ * data (a new required field inside `summary_json`, a re-encoded TEXT column) while
+ * faithfully blocking additive upgrades that are harmless. Wrong in both directions.
  *
- * Entry 8 (`session_activity`) is what the collision below produced: it and the
- * session-statistics sync were two unreleased branches that each appended an
- * "entry 7", and the merge kept BOTH — the sync as 7, session_activity as 8 —
- * exactly because the log is keyed by NAME, not by position.
+ * This module also does NOT decide whether a database may be used: no compatibility
+ * floor, no gate, no "the file is newer than me" error. A writable open succeeds
+ * whatever the file contains. Refusing costs more than it protects — six kinds of
+ * process open this file, five of them long-lived (one `jolli mcp` per AI-host
+ * session, `ide-bridge-serve`, `jolli daemon`, the dashboard server, the VS Code
+ * extension host) — and compatibility is a relationship between the shipped
+ * artifacts anyway: the CLI and the four plugins are built from this tree and
+ * released on one version line, and the backend already gates per surface.
  *
- * **The number no longer decides anything, and that is what makes appending
- * safe.** It was once the whole key — the loop ran `MIGRATIONS.slice(from)` — so
- * two unreleased branches appending DIFFERENT entries under the same one
- * collided on the machine-global database: whichever ran first stamped it, and
- * the second build then saw `stored >= claimed`, ran nothing, and failed at
- * query time with `no such table`, which reads like a code bug. That is why the
- * log below is keyed by NAME. A branch that appends an entry the file has never
- * seen now gets it applied whatever the stamp says, so the only remaining job of
- * this number is migration bookkeeping.
+ * What replaced the number, where something was genuinely needed:
  *
- * Bumping it is NOT a cross-surface event any more, and that is the one thing
- * worth knowing about it: nothing refuses a database over this number (see the
- * compatibility note below), so an appended entry costs an upgrade to nobody. It
- * is a hand-maintained literal that MUST equal `MIGRATIONS.length` — appending a
- * migration means bumping this by one, and `DashboardDb.test.ts` pins the two
- * together so two branches that each append one collide loudly in CI rather than
- * silently on disk. (It cannot be written as `= MIGRATIONS.length` in place: that
- * array is declared further down this file, so the reference would hit the
- * temporal dead zone at module load.)
+ *  - "has a newer build touched this file?" → {@link verifyMigrationLog}'s
+ *    unknown-name warning, which answers it from the log itself.
+ *  - "should the rollup cache be maintained?" → {@link dbHasUnknownMigrations}.
+ *  - "is the schema current?" → {@link isSchemaCurrent}, from the log alone.
  *
- * Nothing has shipped yet, so entry 0 could in principle
- * have absorbed the new table — it deliberately does not, because dev
- * databases (including the one every developer on this repo is using) are
- * already at version 1, and editing entry 0 reaches only databases created
- * afterwards. A second entry reaches both. Earlier dev-only detours on the
- * recall storage — a standalone table, then a timestamp column on it, then
- * folding the detail into `session_tool_use.metadata_json` — predate any
- * on-disk version and stayed collapsed into entry 0 rather than carried as
- * dead upgrade steps. Once a release exists, the append-only rule becomes a
- * hard contract: a breaking change is handled by re-running bootstrap from the
- * sources of truth, never by rewriting an entry, and never by deleting the
- * user's database (other processes may hold the file open, and the memory half
- * is the only copy there is).
- */
-export const DASHBOARD_SCHEMA_VERSION = 13;
-
-/**
- * NOTE ON COMPATIBILITY, because its absence here is a decision.
+ * **Nothing reads the `schema_version` key any more either, and `readSchemaVersion`
+ * is gone.** It survived for one job — a database predating the log table has nothing
+ * else to say what ran, so its leftover stamp seeded `baseline` rows for entries
+ * `0..stamp-1`, which were then skipped. That job was retired because the inference
+ * behind it was false: the named entries and the log table shipped in the SAME release
+ * (0.99.12), so any database carrying a stamp was built by the earlier NUMBERED list,
+ * whose position N is not this list's entry N. The mapping could only be a guess, and
+ * a wrong guess SKIPS an entry — the one failure mode this whole file is shaped to
+ * prevent, arriving as `no such table` on a machine nobody can inspect.
  *
- * This module does NOT decide whether a database may be used: no compatibility
- * floor, no version gate, no "the file is newer than me" error. A writable open
- * succeeds whatever the file says. Three reasons, in the order they were learned:
- *
- *  - **The format number cannot answer the question.** It moves only with DDL, so
- *    it misses the change that actually corrupts data (a new required field inside
- *    `summary_json`, a re-encoded TEXT column) while faithfully blocking the
- *    additive upgrades that are harmless. Wrong in both directions.
- *  - **Refusing costs more than it protects.** Six kinds of process open this
- *    file, five of them long-lived (one `jolli mcp` per AI-host session,
- *    `ide-bridge-serve`, `jolli daemon`, the dashboard server, the VS Code
- *    extension host). A version gate stopped every one of them on every additive
- *    bump — measured here: 5 MCP servers + the dashboard + the extension host all
- *    reporting the same error, for a change that added two tables and five
- *    nullable columns.
- *  - **Compatibility is a relationship between the shipped artifacts.** The CLI
- *    and the four plugins are built from this source tree and released on one
- *    version line, and the backend already gates per surface on its product
- *    version. A hard incompatibility belongs there — stated in the numbers a user
- *    installed and can update — not in a number only this file knows.
- *
- * A compatibility-floor key (`min_compatible_version`, then
- * `min_compatible_release`) was implemented and removed; see the plan's revision
- * log. What remains is tolerance plus one log line: additive columns read back as
- * their defaults, unknown tables are never touched, and {@link withDashboardDb}
- * warns ONCE PER PROCESS when the file's format is ahead of this build, so that
- * "this surface could not see everything" is at least visible afterwards.
+ * {@link migrateDashboardDb} now replays every entry on such a database. That is safe
+ * for the reason the skipping was not: re-runnability is enforced, twice, in
+ * `DashboardDb.test.ts`. The `baseline` outcome remains in {@link MigrationOutcome}
+ * and is still READ as "done" — 0.99.12 and 0.99.13 wrote those rows, and demoting
+ * them would replay their entries on every open for ever — but nothing writes it.
  */
 
 /**
@@ -288,163 +209,26 @@ export const BUSY_TIMEOUT_BY_ROLE: Readonly<Record<string, number>> = {
 	vscode: 400,
 };
 
+export { LEGACY_MIGRATION_NAMES, MIGRATIONS } from "./migrations/index.js";
 /**
- * One migration: a permanent name and the statements to run.
- *
- * There is deliberately no `breaking` flag. One existed while the database still
- * decided compatibility for itself; with that gate gone it had no consumer, and a
- * declaration nothing reads is worse than none — it reads as a guarantee. A change
- * that older builds cannot tolerate is handled where compatibility actually lives:
- * the release line shared by the CLI and the plugins. See the compatibility note
- * above `DASHBOARD_SCHEMA_VERSION`.
+ * `DbMigration`, {@link sqlMigration} and {@link addColumnIfMissing} now live in
+ * `migrations/MigrationHelpers.ts`, and {@link MIGRATIONS} / {@link
+ * LEGACY_MIGRATION_NAMES} in `migrations/index.ts` — one file per entry, each named
+ * after its own permanent `name`. Re-exported here so every existing import of
+ * `from "./DashboardDb.js"` keeps working unchanged. See `migrations/index.ts`'s
+ * docblock for the list-wide rules (append-only, name is identity, never edit a
+ * committed entry) and each entry's own file for why it exists.
  */
-export interface Migration {
-	/**
-	 * IDENTITY. The exported DDL constant's name, verbatim, and PERMANENT: it is
-	 * what the log is keyed by, so renaming one makes it look like it never ran,
-	 * which re-runs it into `duplicate column`. Positions may move; names may not.
-	 */
-	readonly name: string;
-	readonly ddl: string;
-}
+export type { DbMigration } from "./migrations/MigrationHelpers.js";
+export { addColumnIfMissing, sqlMigration } from "./migrations/MigrationHelpers.js";
 
-/**
- * Append-only migration list. Index 0 takes an empty database to schema
- * version 1; each later entry takes version N to N+1. Never edit an entry that
- * has shipped — add a new one.
- *
- * Entries are identified by `name`, not by position: the loop applies whichever
- * names the file's log does not already carry. That is what makes two branches
- * appending a migration each a non-event after the merge — both entries are in
- * the array, so both get applied — where position-as-identity let the
- * second-merged one be skipped forever with the file stamped as complete.
- *
- * Order is still the execution order, and it is still only protected socially:
- * APPEND, never insert into the middle and never reorder. Inserting an entry
- * ahead of ones a database has already applied would run it out of order (a
- * column added before its table exists).
- *
- * Entry 0 is the schema as it first landed — the intermediate shapes it went
- * through (including a couple of dev-only detours on the Recall card's storage
- * — see `DASHBOARD_SCHEMA_VERSION`'s doc comment) were this branch's own
- * development history, not a compatibility contract with anyone's installed
- * database, and were collapsed into it rather than carried as dead upgrade
- * steps. Entry 1 adds `recall_receipts` as a real migration: by then dev
- * databases existed at version 1, and only an appended entry reaches those as
- * well as fresh ones. Entry 2 registers the `skill` context kind for the same
- * reason. Entry 4 gives `session_tool_use` the call's own timestamp — an
- * additive NULLABLE column precisely because the rows already on disk cannot be
- * backfilled (the transcripts they were read from may be gone), so they keep
- * being read under the old session-time fallback rather than dropping out of
- * every window for want of a value.
- *
- * Entry 8 adds `session_activity`, with `recorded_at_ms` NOT NULL from the
- * start. Carrying the column in the CREATE rather than appending it later is the
- * whole reason it can be NOT NULL: SQLite's `ADD COLUMN` takes only a CONSTANT
- * default, and the value is a wall-clock instant. That is entry 4's
- * `last_call_at_ms` shape, whose permanent `NULLIF` handling at every read site
- * is the price of having had no choice — here there was one, so it was taken.
- *
- * A dev machine that ran an EARLIER draft of this entry has the table under the
- * same name, so the name key reads it as applied and does not replay it. If the
- * draft's shape differed, that is drift rather than a missing table:
- * {@link findDriftedMigrations} reports it and `jolli doctor --schema-log` lists
- * it, and the repair is the operator's — `DROP TABLE session_activity`, then
- * `jolli doctor --mark-migration` or a stamp the entry can replay under. Nothing
- * here self-heals a column, and nothing should: replaying DDL over a table whose
- * contents this build cannot vouch for is how a half-migrated file is made.
- *
- * There is no entry normalising a stored `0` in `last_call_at_ms`, and that
- * absence is a decision: the writers cannot produce one, and the reader treats
- * one as absent (`TOOL_CALL_TIME_SQL`'s `NULLIF`), which is permanent where a
- * migration entry runs once. See the note in `SotSchema.ts` where that entry
- * used to be.
- *
- * Exported for tests: they execute entries directly to build a database at a
- * chosen version rather than hand-rolling copies of the DDL, which would drift.
+/*
+ * `readSchemaVersion` used to sit here — the last reader of the `schema_version` key.
+ * It is deleted rather than deprecated; see the note at the top of this file for why
+ * its one caller (seeding `baseline` rows on a pre-log database) was retired, and do
+ * not re-add it. The key itself may still be present in old databases' `schema_meta`,
+ * unread by anything.
  */
-export const MIGRATIONS: ReadonlyArray<Migration> = [
-	{
-		name: "BASELINE_DDL",
-		ddl:
-			ACTIVITY_DDL +
-			`
--- Policy: repo rows are NEVER deleted — disable = set disabled_at. Every table
--- references repos(id) with default NO ACTION (not CASCADE), so a stray DELETE
--- errors instead of silently wiping a repo's memories; this trigger catches even
--- the zero-data case.
---
--- This is the ONE trigger the no-triggers rule keeps, and the reasons it does
--- not fall under that rule are worth stating: it encodes no business rule that
--- could change (repo rows stay forever by design), it has no ordering
--- relationship with any other trigger, and what it prevents is not a wrong value
--- but the irreversible loss of every memory belonging to a repo. Replacing it
--- with "the code does not write DELETE, and a test pins that" would trade an
--- engine-enforced guarantee for a convention.
-CREATE TRIGGER repos_no_delete BEFORE DELETE ON repos
-BEGIN SELECT RAISE(ABORT, 'repos are never deleted: set disabled_at instead'); END;
-` +
-			MEMORY_SOT_DDL,
-	},
-	{ name: "RECALL_RECEIPTS_DDL", ddl: RECALL_RECEIPTS_DDL },
-	{ name: "SKILL_CONTEXT_KIND_DDL", ddl: SKILL_CONTEXT_KIND_DDL },
-	{ name: "EVENT_FAILED_KIND_DDL", ddl: EVENT_FAILED_KIND_DDL },
-	{ name: "TOOL_CALL_TIME_DDL", ddl: TOOL_CALL_TIME_DDL },
-	{ name: "SCHEMA_MIGRATIONS_DDL", ddl: SCHEMA_MIGRATIONS_DDL },
-	{ name: "REPOS_DELETE_ALLOWED_DDL", ddl: REPOS_DELETE_ALLOWED_DDL },
-	{
-		// The seven steps the session-statistics sync was developed in, in the order
-		// they were written, concatenated verbatim. Concatenated rather than rewritten
-		// so this entry is provably the same statement sequence a machine that took
-		// the granular path already ran — see `DASHBOARD_SCHEMA_VERSION` for why they
-		// are one entry, and note the redundancy that proves the point: `STATS_DAILY_DDL`
-		// already creates the `(tz, day)` index inline, so the index constant after it
-		// is a second `CREATE INDEX IF NOT EXISTS` over the same object. It stays,
-		// because "identical to what already ran" is worth more here than tidiness.
-		//
-		// ⚠ Nothing here may be a DATA cleanup, and the reason is measured. A schema
-		// step is idempotent or guarded, so a database that already ran this entry is
-		// already in the target state; a DELETE has to EXECUTE to mean anything, and
-		// the log is keyed by NAME — so a database with an `applied` row for this name
-		// skips it in silence. Appending one was tried: on a real database it left
-		// 10,631 junk rows and 550 stale cache rows untouched and the page bit-for-bit
-		// unfixed, and there is no repair either, because forcing a re-run dies on
-		// `duplicate column name: written_at_ms` at the first ALTER while
-		// `--mark-migration` just re-establishes the skip. While this entry is
-		// unreleased the affected databases are developers' own, so such data is
-		// cleared by hand instead.
-		name: "SESSION_STATS_SYNC_DDL",
-		ddl:
-			SYNC_STAMP_DDL +
-			SESSION_USAGE_EVENTS_DDL +
-			STATS_DAILY_DDL +
-			STATS_DAILY_DAY_INDEX_DDL +
-			SYNC_STAMP_INDEX_DDL +
-			SYNC_KEYSET_INDEX_DDL +
-			SYNC_STAMP_NULL_BACKFILL_DDL,
-	},
-	{ name: "SESSION_ACTIVITY_DDL", ddl: SESSION_ACTIVITY_DDL },
-	{ name: "SKILL_TOKEN_USAGE_DDL", ddl: SKILL_TOKEN_USAGE_DDL },
-	{ name: "SKILL_INVOCATIONS_DDL", ddl: SKILL_INVOCATIONS_DDL },
-	{ name: "SKILL_PLUGIN_DDL", ddl: SKILL_PLUGIN_DDL },
-	{ name: "SKILL_ORIGIN_ROOT_DDL", ddl: SKILL_ORIGIN_ROOT_DDL },
-];
-
-/** Reads the stored schema version, treating a fresh DB as 0. */
-export function readSchemaVersion(db: DashboardDbHandle): number {
-	try {
-		const row = db.prepare("SELECT value FROM schema_meta WHERE key = 'schema_version'").get() as
-			| { value?: string }
-			| undefined;
-		const parsed = Number.parseInt(row?.value ?? "", 10);
-		return Number.isFinite(parsed) ? parsed : 0;
-	} catch {
-		// `no such table: schema_meta` — an empty database. Every other failure
-		// mode here (corrupt, permission) resurfaces on the first migration
-		// statement with a far better message than we could produce.
-		return 0;
-	}
-}
 
 /** What happened to one migration on one attempt. See `SCHEMA_MIGRATIONS_DDL`. */
 export type MigrationOutcome = "applied" | "failed" | "skipped" | "baseline";
@@ -466,8 +250,9 @@ export interface MigrationLogRow {
  *
  *  - `rows` — the log, in `seq` order. An EMPTY array is a real answer: "this
  *    database has been logging and recorded nothing".
- *  - `none` — no such table. The only state in which the version stamp may be
- *    believed about which entries ran.
+ *  - `none` — no such table: a database from before entry 5, or a fresh file. It is
+ *    NOT a licence to consult the version stamp instead — nothing does any more, and
+ *    `migrateDashboardDb` answers this state by replaying every entry.
  *  - `unreadable` — the read failed. Emphatically NOT `none`: collapsing the two
  *    makes a BROKEN log report as "this database predates the log", which is
  *    precisely the diagnosis this table exists to make possible. `tableConfirmed`
@@ -567,37 +352,30 @@ function latestByName(rows: ReadonlyArray<MigrationLogRow>): Map<string, Migrati
 	return latest;
 }
 
-/**
- * The newest **`applied`** row per name — the only row that says what DDL this
- * file's schema was actually built from, and therefore the one a drift check must
- * compare against.
- *
- * Deliberately not `latestByName` filtered afterwards: a later non-applied row for
- * the same name HIDES the applied one, and that sequence is reachable rather than
- * theoretical. An older build applies drifted DDL (`applied`, DDL X); a later
- * writer that stale-reads the name as missing — or steps over it for any other
- * reason — appends `skipped` under DDL Y. Filtering the newest row would then find
- * a non-applied outcome, skip the name, and go quiet: from that point on neither
- * the runtime warning nor `jolli doctor --schema-log` mentions a schema that still
- * differs. The whole point of the log is that the newest row cannot erase an
- * earlier observation.
- *
- * `--mark-migration`'s repair is unaffected: it APPENDS an `applied` row carrying
- * this build's DDL, so it is the newest applied row and still clears the warning.
+/*
+ * `latestAppliedByName` used to sit here — the newest `applied` row per name, which
+ * was the row the content drift check compared against. It went with that check; the
+ * unknown-name warning keys off `latestByName` instead, because "has another build
+ * touched this file" is answered just as well by a `failed`, `skipped` or `baseline`
+ * row as by an `applied` one.
  */
-function latestAppliedByName(rows: ReadonlyArray<MigrationLogRow>): Map<string, MigrationLogRow> {
-	const latest = new Map<string, MigrationLogRow>();
-	for (const row of rows) {
-		if (row.outcome !== "applied") continue;
-		const seen = latest.get(row.name);
-		if (!seen || row.seq > seen.seq) latest.set(row.name, row);
-	}
-	return latest;
-}
 
 /** Names this build knows, in slot order. */
 function slotOf(name: string): number {
 	return MIGRATIONS.findIndex((m) => m.name === name);
+}
+
+/**
+ * What the log's `ddl` column holds for an entry: its SQL, or `""` when it has none.
+ *
+ * The empty string is load-bearing rather than a placeholder. It is what makes a
+ * code entry invisible to the drift check (it always equals itself) instead of
+ * making every code entry report drift against a body that was never SQL. The cost
+ * — those entries have no fingerprint — is paid by the companion-test rule in
+ * `MigrationFingerprints.test.ts`.
+ */
+function loggedSqlOf(m: DbMigration): string {
+	return m.sql ?? "";
 }
 
 /** Names already warned about this process, so a git hook does not spam the log. */
@@ -616,50 +394,38 @@ const warnedDriftedMigrations = new Set<string>();
 const UNREADABLE_LOG_WARN_KEY = "\0unreadable-log";
 
 /**
- * Reports every logged `applied` row whose stored DDL is not the DDL this build
- * carries under that name — content drift, which under a name key is the ONLY way
- * two builds can disagree about a slot (colliding on a position is no longer
- * possible).
+ * Warns when the log records a migration this build does not recognize by NAME —
+ * the one drift signal that survives now that the byte-level content check is
+ * gone (see the note at the end of this function for why it was removed).
  *
  * ⚠ It WARNS. It does not throw, and re-introducing a throw here would put back
- * the behaviour the version gate was removed for, in a shape that is if anything
- * sharper:
+ * the behaviour the version gate was removed for: this file is opened by six
+ * kinds of process across independently-released surfaces, and refusing one
+ * because another build's name is unfamiliar stops it doing anything at all.
  *
- *  - **It is over-sensitive to harmless edits.** The comparison is byte-exact, and
- *    the DDL is mostly prose: 64% of the baseline entry is SQL comments (22,967 of
- *    35,673 characters — measured). Re-wrapping one comment would have made every
- *    database on earth refuse writes.
- *  - **CI already catches the real thing, earlier and better.**
- *    `MigrationFingerprints.test.ts` fails on an edit to a shipped entry's DDL on
- *    the author's machine, before it can ship. A runtime throw only repeats that
- *    finding on a USER's machine, where the only remaining moves were a doctor
- *    command or deleting the one copy of their session/recall history.
- *  - **It cannot see what actually breaks data.** A semantic change arrives as an
- *    APPENDED entry, which matches its own DDL perfectly and drifts nothing.
+ * So the value here is diagnostic: the log plus this line answer "has a build I
+ * do not know written here?", which is the question that used to take a dozen
+ * rounds of git archaeology. Acted on by `jolli doctor --schema-log`, which lists
+ * the unrecognized names.
  *
- * So the value here is diagnostic: the log plus this line answer "this database
- * was built by a different build than the one reading it", which is the question
- * that used to take a dozen rounds of git archaeology. Acted on by
- * `jolli doctor --schema-log`, which lists the drifted names.
+ * Runs on EVERY writable open, including the ones that migrate nothing — an
+ * unfamiliar name can show up on a database this build otherwise has nothing
+ * left to migrate. One SELECT, once per name per process
+ * (`warnedDriftedMigrations` de-dupes across opens).
  *
- * Runs on EVERY writable open, including the ones that migrate nothing: drift is
- * precisely the state where the version stamp says "finished" and the content
- * disagrees. One SELECT, once per name per process.
+ * Two deliberate silences:
  *
- * Three deliberate silences:
+ *  - No log table at all → nothing to check. The entry that CREATES that table is
+ *    itself in the list, so the first run on any existing database reaches this
+ *    before the table exists.
+ *  - Log present but unreadable → warned ONCE (`UNREADABLE_LOG_WARN_KEY`), not
+ *    silently skipped: the table is there and this build cannot read it, which is
+ *    a fault worth surfacing even though every check below it is then vacuous.
  *
- *  - No log table at all → nothing to check. Entry 5 CREATES that table, so the
- *    first run on any existing database reaches this before the table exists.
- *  - A name with no `applied` row → pass. Databases that predate the log have rows
- *    for nothing, so this check cannot reach backwards; only forwards. Seeded
- *    `baseline` rows are also skipped — they are a guess by construction, so
- *    comparing against them would report drift that was never observed. Note this
- *    is "no applied row ANYWHERE", not "the newest row is not applied" — a later
- *    `skipped` / `failed` row must not bury an earlier observation.
- *  - A logged name this build does not have → also a warn. It means another build
- *    (very likely from an unmerged branch) has touched this file, which is the most
- *    useful clue available, and the file may legitimately be shared by two builds
- *    in rotation.
+ * The unknown-name check itself keys off the newest row of ANY outcome, not just
+ * `applied` — a `failed` or `skipped` row answers "has another build touched this
+ * file" just as well, and a later non-applied row must not bury an earlier one's
+ * evidence.
  */
 export function verifyMigrationLog(db: DashboardDbHandle): void {
 	const state = readMigrationLogState(db);
@@ -697,21 +463,27 @@ export function verifyMigrationLog(db: DashboardDbHandle): void {
 			JOLLI_CLIENT_HEADER,
 		);
 	}
-	// Drift keys off the newest APPLIED row — see `latestAppliedByName`.
-	for (const [name, row] of latestAppliedByName(rows)) {
-		if (!known.has(name)) continue;
-		if (warnedDriftedMigrations.has(name)) continue;
-		if (row.ddl === MIGRATIONS[slotOf(name)].ddl) continue;
-		warnedDriftedMigrations.add(name);
-		log.warn(
-			"migration %s (slot %d) was applied by %s on %s with DIFFERENT DDL than this build (%s) carries — run `jolli doctor --schema-log` to see the log",
-			name,
-			row.slot,
-			row.applied_by,
-			new Date(row.applied_at_ms).toISOString().slice(0, 10),
-			JOLLI_CLIENT_HEADER,
-		);
-	}
+	// A CONTENT check used to follow: byte-compare each logged `ddl` against this
+	// build's, and warn on a difference. It is gone, and re-adding one is a review
+	// blocker.
+	//
+	// It answered the same question as the loop above — "has a build I do not know
+	// written here?" — and the loop above answers it from NAMES, which cannot be wrong
+	// about our own edits. The byte compare could: making every entry re-runnable
+	// rewrote six shipped entries (`IF NOT EXISTS`, `OR IGNORE`) and turned two more
+	// into code entries. Semantically identical on an empty database, and yet measured
+	// against 0.99.13, six of its seven entries would have reported drift on first
+	// upgrade — on every machine, for a change that altered nothing. A warning that
+	// fires for everyone is not a signal, and the alternative was a hand-kept ledger of
+	// historical hashes, which cannot exist for a body that has not shipped yet.
+	//
+	// What the content check added over the name check was one case: the same name
+	// carrying different bytes. Inside this repo CI already makes that impossible
+	// (`MigrationFingerprints.test.ts` SHA-pins every `sql` entry). Across branches it
+	// is a developer's own machine, which is repaired by hand — the product does not
+	// carry that repair. `ddl` is still STORED, so the bytes another build applied can
+	// be read out with `sqlite3` when a real question arises; nothing compares them
+	// automatically.
 }
 
 /** Injection seams for {@link migrateDashboardDb}. Production passes nothing. */
@@ -733,26 +505,35 @@ export interface MigrateOptions {
  * entry therefore merge without incident, where the version-driven loop stepped
  * past the second one forever and left no trace of having done so.
  *
- * `schema_version` survives for two jobs, NEITHER of which is a compatibility
- * decision — there is no gate, no floor, and no version at which this function or
- * {@link withDashboardDb} refuses a file (see the note above
- * {@link DASHBOARD_SCHEMA_VERSION}). It is (1) the only evidence available about a
- * database that predates the log, so it seeds the `baseline` rows below, and (2) the
- * input to the format-ahead warn-once line.
+ * **`schema_version` is not read here at all any more, and a database that predates
+ * the log simply has every entry replayed.** It used to seed `baseline` rows: the
+ * stamp was treated as evidence of what ran, so entries `0..stamp-1` were marked done
+ * and SKIPPED. That was a guess in the one direction that cannot be checked, and it
+ * was wrong about its own premise — the named entries and this log table arrived in
+ * the SAME release (0.99.12), so a database carrying a stamp was built by the earlier
+ * NUMBERED migration list, whose contents at position N are not this list's entry N.
+ * Skipping on that mapping is how an object goes missing on exactly the machines that
+ * cannot be inspected, and the failure looks like `no such table` months later.
  *
- * Each entry runs inside its own IMMEDIATE transaction **with its log row and the
- * version bump**, so a crash mid-entry rolls back cleanly — including the claim that
- * it ran — and the next open retries. A FAILED entry's row is written after the
- * rollback, outside the transaction, or it would roll back with the change it
- * describes; that trace is often the only evidence there is, since most
- * `withDashboardDb` callers deliberately swallow the exception rather than fail a
- * producer. (A busy timeout on `BEGIN IMMEDIATE` itself throws from OUTSIDE that
- * try, so a contended writer never records a `failed` row for an entry it did not
- * attempt.)
+ * Replaying instead is safe because every entry is re-runnable — enforced two ways in
+ * `DashboardDb.test.ts`: each entry run twice on a fresh database, and the whole list
+ * replayed over seeded rows with every row compared by value. So the entries a legacy
+ * database already satisfies are no-ops, and the ones its stamp would have wrongly
+ * skipped are applied. There is no gate, no floor and no version at which this
+ * function or {@link withDashboardDb} refuses a file — see the note at the top of this
+ * file.
  *
- * The stamp is written as `MAX(stored, slot + 1)`, never as `slot + 1`: under a name
- * key an entry can legitimately be applied to a file already past it (the self-heal
- * case), and stamping downwards would re-run everything after it.
+ * The cost is one extra pass of guarded DDL, once, on a pre-0.99.12 database. What it
+ * buys is the removal of the last place a version number decided anything.
+ *
+ * Each entry runs inside its own IMMEDIATE transaction **with its log row**, so a
+ * crash mid-entry rolls back cleanly — including the claim that it ran — and the next
+ * open retries. A FAILED entry's row is written after the rollback, outside the
+ * transaction, or it would roll back with the change it describes; that trace is
+ * often the only evidence there is, since most `withDashboardDb` callers deliberately
+ * swallow the exception rather than fail a producer. (A busy timeout on
+ * `BEGIN IMMEDIATE` itself throws from OUTSIDE that try, so a contended writer never
+ * records a `failed` row for an entry it did not attempt.)
  *
  * `foreign_keys` is toggled OUTSIDE the transaction because inside one the
  * pragma is a silent no-op (measured). The current baseline does NOT need it —
@@ -773,35 +554,31 @@ export interface MigrateOptions {
 export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions = {}): void {
 	const now = opts.now ?? Date.now;
 	const appliedBy = opts.appliedBy ?? JOLLI_CLIENT_HEADER;
-	const from = readSchemaVersion(db);
 	const logState = readMigrationLogState(db);
 	const done = new Set<string>();
-	// Seed rows for a database that predates the log. The version stamp is the
-	// only evidence of what ran, so the names come from THIS build's list at those
-	// positions — which is a guess, and can be wrong exactly where the position
-	// key was wrong. They are marked `baseline` rather than `applied` so the log
-	// says which of its own rows are observations and which are inference.
-	let pendingBaseline: ReadonlyArray<{ slot: number; name: string; ddl: string }> = [];
 	if (logState.kind === "rows") {
+		// The log is the ONLY evidence consulted. `baseline` still counts as done: this
+		// function no longer WRITES that outcome, but 0.99.12/0.99.13 did, and treating
+		// those rows as anything else would replay their entries on every open for ever.
 		for (const row of logState.rows)
 			if (row.outcome === "applied" || row.outcome === "baseline") done.add(row.name);
+	} else if (logState.kind === "none") {
+		// A database from before the log table existed. Nothing is skipped — see the
+		// docblock for why the version stamp cannot be believed about which entries ran.
+		// Every entry is re-runnable, so the ones it already satisfies cost a no-op.
+		log.info("no migration log in this database — replaying every entry (all are re-runnable)");
 	} else {
-		const known = Math.min(from, MIGRATIONS.length);
-		const seeds = MIGRATIONS.slice(0, known).map((m, slot) => ({ slot, name: m.name, ddl: m.ddl }));
-		for (const entry of seeds) done.add(entry.name);
-		// An UNREADABLE log falls in with the pre-log case for control flow — the
-		// version stamp is again the only usable evidence, and every insert below is
-		// gated on the table reading back, so nothing here throws over it — but it
-		// gets NO seed rows: writing inference into a table whose shape this build
-		// cannot read is how a half-written log gets manufactured.
-		if (logState.kind === "none") pendingBaseline = seeds;
-		else
-			log.warn(
-				logState.tableConfirmed
-					? "the schema_migrations table exists but could not be read (%s) — migrating from the version stamp and recording nothing"
-					: "the database could not be queried for its migration log (%s) — migrating from the version stamp and recording nothing",
-				logState.reason,
-			);
+		// UNREADABLE is not the same as absent, and neither is a reason to skip: with no
+		// usable log this pass cannot know what ran, so it replays too. Every insert
+		// below is gated on the table reading back, so nothing here throws over it — but
+		// nothing gets RECORDED either, which is the honest outcome for a log this build
+		// cannot read.
+		log.warn(
+			logState.tableConfirmed
+				? "the schema_migrations table exists but could not be read (%s) — replaying every entry and recording nothing"
+				: "the database could not be queried for its migration log (%s) — replaying every entry and recording nothing",
+			logState.reason,
+		);
 	}
 	const todo = MIGRATIONS.map((m, slot) => ({ m, slot })).filter(({ m }) => !done.has(m.name));
 	if (todo.length === 0) return;
@@ -809,22 +586,21 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 	const deferredRows: LogRowInput[] = [];
 
 	/**
-	 * Write the rows this pass has been holding because the entries they record ran
-	 * before the log table existed — version-stamp baselines first (inference), then
-	 * this pass's own `applied` rows (observation) — and clear both. Must run the
-	 * instant the log becomes writable, whether THIS pass created the table (the
-	 * applied branch) or a racing writer did and this pass is now skipping over its
-	 * entries. The skip that returned without flushing was the bug: a racer can apply
-	 * and record EVERY remaining entry, so a skip may be the last time this pass ever
-	 * holds a writable log — and the dropped `applied` rows then left those slots
-	 * absent from the log, so the next open re-ran their DDL and died on a duplicate
-	 * object, permanently. Idempotent when nothing is held.
+	 * Write the `applied` rows this pass has been holding because the entries they
+	 * record ran before the log table existed, and clear them. Must run the instant the
+	 * log becomes writable, whether THIS pass created the table (the applied branch) or
+	 * a racing writer did and this pass is now skipping over its entries. The skip that
+	 * returned without flushing was the bug: a racer can apply and record EVERY
+	 * remaining entry, so a skip may be the last time this pass ever holds a writable
+	 * log — and the dropped `applied` rows then left those slots absent from the log, so
+	 * the next open re-ran their DDL and died on a duplicate object, permanently.
+	 * Idempotent when nothing is held.
+	 *
+	 * It used to flush a second, earlier group: `baseline` rows inferred from the
+	 * version stamp. Those are gone with the inference — every row this function writes
+	 * is now an observation of an entry this pass watched run.
 	 */
 	const flushHeldRows = (): void => {
-		for (const seed of pendingBaseline) {
-			insertLogRow(db, { ...seed, outcome: "baseline", appliedBy, atMs: now(), durationMs: 0 });
-		}
-		pendingBaseline = [];
 		for (const held of deferredRows) insertLogRow(db, held);
 		deferredRows.length = 0;
 	};
@@ -835,8 +611,8 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 			const startedAt = now();
 			db.exec("BEGIN IMMEDIATE");
 			try {
-				// Re-read INSIDE the write lock: two writers opening around a version
-				// bump (CLI hook + extension tick — a supported concurrency mode) both
+				// Re-read INSIDE the write lock: two writers opening at the same moment
+				// (CLI hook + extension tick — a supported concurrency mode) both
 				// decided what to run before either had run anything; the loser's BEGIN
 				// IMMEDIATE parks it until the winner commits, and replaying the
 				// winner's entry then dies on `duplicate column name` — an error the
@@ -861,18 +637,19 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 						appliedBy,
 						atMs: now(),
 						durationMs: 0,
-						ddl: m.ddl,
+						ddl: loggedSqlOf(m),
 					});
 					db.exec("COMMIT");
 					continue;
 				}
-				if (!locked && readSchemaVersion(db) > slot) {
-					// Same fence for a database whose log table does not exist yet — the
-					// version stamp is all there is, and there is nowhere to record it.
-					db.exec("COMMIT");
-					continue;
-				}
-				db.exec(m.ddl);
+				// There used to be a second fence here for a database whose log table does
+				// not exist yet — `!locked && readSchemaVersion(db) > slot`. It is gone,
+				// and what removed it is every entry now being re-runnable: the failure it
+				// prevented was a racing writer REPLAYING an entry into `table already
+				// exists`, and a replay is now a sequence of statements that do nothing.
+				// Its own log line was also indistinguishable from a real fault, since an
+				// unreadable log reached it as "nothing to consult, skip".
+				m.run(db);
 				const row: LogRowInput = {
 					slot,
 					name: m.name,
@@ -880,31 +657,27 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 					appliedBy,
 					atMs: now(),
 					durationMs: now() - startedAt,
-					ddl: m.ddl,
+					ddl: loggedSqlOf(m),
 				};
 				// The table the log lives in is created by an entry IN this list, so on a
 				// fresh database the first entries run before there is anywhere to record
 				// them. Their rows are held and written by the entry that creates the
 				// table — inside its transaction, ahead of its own row, so `seq` order
-				// still reads as history. They stay `applied` (this pass watched them
-				// run) while the version-stamp seeds stay `baseline` (inference).
+				// still reads as history. They stay `applied` (this pass watched them run).
 				//
-				// If the creating entry then FAILS, the held rows go with it — and that
-				// is recoverable rather than lost: the file is left at a version with no
-				// log table, which the next pass reads as a pre-log database and seeds
-				// from the stamp. The only cost is that those rows come back as
-				// inference, which is the honest description of what is then known.
+				// If the creating entry then FAILS, the held rows go with it — and that is
+				// recoverable rather than lost: the file is left with no log table, which
+				// the next pass reads as `kind: "none"` and replays every entry from
+				// scratch (see the top of this function) rather than seeding anything from
+				// a version stamp — there is no stamp left to read. The only cost is one
+				// extra pass of guarded DDL over the entries this attempt already applied,
+				// which rule ② makes a no-op.
 				if (readMigrationLog(db)) {
 					flushHeldRows();
 					insertLogRow(db, row);
 				} else {
 					deferredRows.push(row);
 				}
-				// MAX, not `slot + 1`: under a name key an entry can be applied to a
-				// file that is already past it (the self-heal case), and stamping the
-				// version down would re-run everything after it.
-				const stamped = Math.max(readSchemaVersion(db), slot + 1);
-				writeSchemaMeta(db, "schema_version", String(stamped));
 				db.exec("COMMIT");
 			} catch (err) {
 				try {
@@ -918,9 +691,10 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 					// database is re-opened on every git-hook commit, and an append-per-open
 					// grew the log without bound — each `failed` row stores the entry's full
 					// DDL verbatim (~35 KB), and `verifyMigrationLog` / `migrateDashboardDb`
-					// re-read the whole table on every open. A failed row is diagnostic, not
-					// evidence a later pass reads (drift keys off `applied` rows), so the newest
-					// attempt is all that is useful; the delete bounds the table to one such row.
+					// re-read the whole table on every open. Collapsing repeats to the newest
+					// loses nothing the unknown-name check needs: it reads the newest row per
+					// name whatever its outcome, and this name still has exactly one row after
+					// the delete — only the DUPLICATES are gone, not the name's only evidence.
 					db.prepare("DELETE FROM schema_migrations WHERE name = ? AND outcome = 'failed'").run(m.name);
 					insertLogRow(db, {
 						slot,
@@ -929,7 +703,7 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 						appliedBy,
 						atMs: now(),
 						durationMs: now() - startedAt,
-						ddl: m.ddl,
+						ddl: loggedSqlOf(m),
 					});
 				} catch (logErr) {
 					// The log table may not exist yet (a failure at or before entry 5).
@@ -942,36 +716,33 @@ export function migrateDashboardDb(db: DashboardDbHandle, opts: MigrateOptions =
 	} finally {
 		db.exec("PRAGMA foreign_keys = ON");
 	}
-	log.info(
-		"dashboard schema migrated %d → %d (%s)",
-		from,
-		readSchemaVersion(db),
-		todo.map(({ m }) => m.name).join(", "),
-	);
-}
-
-/** Upserts one `schema_meta` key. Parameterised — never string-interpolated. */
-function writeSchemaMeta(db: DashboardDbHandle, key: string, value: string): void {
-	db.prepare(
-		`INSERT INTO schema_meta (key, value) VALUES (?, ?)
-		 ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-	).run(key, value);
+	// Names, not numbers: there is no version to report any more, and the names are
+	// what `doctor --schema-log` and every bug report speak in.
+	log.info("dashboard schema migrated: %s", todo.map(({ m }) => m.name).join(", "));
 }
 
 /**
- * Repair action behind `jolli doctor`: append an `applied` row carrying THIS
- * build's DDL for `name`, which is what clears a drift error or adopts a
- * migration applied by other means.
+ * Repair action behind `jolli doctor --mark-migration`: append an `applied` row
+ * carrying THIS build's SQL for `name`, so the migration pass and
+ * {@link isSchemaCurrent} see it as done.
  *
- * An append rather than an UPDATE, because the log is the evidence: the row that
- * disagreed stays visible, and the newest APPLIED row is what the check reads
- * (see {@link latestAppliedByName} for why the qualifier matters). Without this
- * the only way out of a false positive would be deleting the database, and what
- * that costs — other processes may hold the file open, and the memory half is the
- * only copy there is — is why this escape hatch exists at all. Flyway's `repair`
- * and Liquibase's `clearCheckSums` are the same escape hatch.
+ * For the one state a name key cannot fix alone: the log lost its row for an
+ * entry whose objects are already there (a wiped `schema_migrations` table, a
+ * hand-restored backup). It is NOT a way to silence a name this build does not
+ * know — {@link slotOf} rejects those — and it does nothing about drift: the
+ * runtime byte-compare that this repair once cleared a warning for was removed
+ * (see the note at the end of `verifyMigrationLog`), so there is no drift error
+ * left to clear.
  *
- * Returns false for a name this build does not carry — there is no DDL to accept.
+ * An append rather than an UPDATE, because the log is a log: any earlier row for
+ * this name — `failed`, `skipped`, whatever bytes it carried — stays visible in
+ * `seq` order rather than being erased. Without this escape hatch the only way
+ * out of a lost row would be deleting the database, and what that costs — other
+ * processes may hold the file open, and the memory half is the only copy there is
+ * — is why it exists at all. Flyway's `repair` and Liquibase's `clearCheckSums`
+ * are the same escape hatch.
+ *
+ * Returns false for a name this build does not carry — there is nothing to accept.
  */
 export function recordMigrationAsApplied(db: DashboardDbHandle, name: string, opts: MigrateOptions = {}): boolean {
 	const slot = slotOf(name);
@@ -989,64 +760,49 @@ export function recordMigrationAsApplied(db: DashboardDbHandle, name: string, op
 		appliedBy: opts.appliedBy ?? JOLLI_CLIENT_HEADER,
 		atMs: (opts.now ?? Date.now)(),
 		durationMs: 0,
-		ddl: MIGRATIONS[slot].ddl,
+		ddl: loggedSqlOf(MIGRATIONS[slot]),
 	});
 	return true;
 }
 
-/**
- * Every migration whose stored DDL disagrees with this build's — the drifted names
- * that `jolli doctor --schema-log` calls out at the end of its listing.
- *
- * Reported, never repaired: the blanket `--accept-schema-ddl` this used to feed was
- * removed with the version gate, because drift no longer blocks anything and an
- * "accept" would write a row that changes nothing.
+/*
+ * `findDriftedMigrations` used to sit here, feeding `jolli doctor --schema-log`'s
+ * "applied by a different build" listing. It is gone with the content check that
+ * produced it — see the note at the end of `verifyMigrationLog` for why comparing
+ * bytes could not tell our own equivalent rewrite from another build's work.
  */
-export function findDriftedMigrations(db: DashboardDbHandle): ReadonlyArray<MigrationLogRow> {
-	const rows = readMigrationLog(db);
-	if (!rows) return [];
-	const drifted: MigrationLogRow[] = [];
-	for (const [name, row] of latestAppliedByName(rows)) {
-		const slot = slotOf(name);
-		if (slot < 0) continue;
-		if (row.ddl !== MIGRATIONS[slot].ddl) drifted.push(row);
-	}
-	return drifted;
-}
 
 /**
- * Format number this process has already warned about, so a git hook logs at most
- * one line no matter how many times it opens the file.
- */
-let warnedAheadVersion = 0;
-
-/**
- * The one thing left of the old version gate: a single log line when the file's
- * format is ahead of this build.
+ * Whether the log records a migration this build has never heard of.
  *
- * NOT a user-facing prompt, and deliberately not an error. Reads were never
- * version-gated, so a stale surface has always been able to render a page off a
- * newer file — silently, with every table and column added since invisible to it.
- * This line is what makes that visible AFTERWARDS, to whoever is reading the log
- * while working out why a number looked wrong. Whether to update is a question for
- * the release channel, not for this warning to nag about.
+ * The honest form of the question "has a newer build written to this file?", and the
+ * replacement for comparing a version number — which could only ever answer it by
+ * proxy, and answered it wrongly in both directions (see the note at the top of this
+ * file). A name is evidence; a number was a guess.
  *
- * Once per process per version: `withDashboardDb` is on the git-hook path.
+ * `false` when the log cannot be read at all. That is deliberate: the callers use
+ * this to decline OPTIONAL work (maintaining a derived cache), so an unreadable log
+ * must not make them skip work they can perfectly well do — and a database with a
+ * broken log has louder problems being reported elsewhere.
  */
-function warnFormatAheadOnce(found: number): void {
-	if (warnedAheadVersion === found) return;
-	warnedAheadVersion = found;
-	// Names the surface, because six kinds of process share one `debug.log` and the
-	// format numbers alone cannot say which of them could not see the data. This is
-	// the one thing the deleted staleness layer did that still earns its keep, and it
-	// costs one interpolation of a constant already used for `applied_by`.
-	log.warn(
-		"database is at format v%d, this build (%s) reads v%d — data written by newer builds is not visible here",
-		found,
-		JOLLI_CLIENT_HEADER,
-		DASHBOARD_SCHEMA_VERSION,
-	);
+export function dbHasUnknownMigrations(db: DashboardDbHandle): boolean {
+	const done = readAppliedMigrationNames(db);
+	if (!done) return false;
+	const known = new Set(MIGRATIONS.map((m) => m.name));
+	for (const name of done) if (!known.has(name)) return true;
+	return false;
 }
+
+/*
+ * `warnFormatAheadOnce` / `warnedAheadVersion` used to live here: one log line when
+ * the file's format number was ahead of this build's. Both are gone with the number.
+ *
+ * The question they answered — "did a newer build write data this surface cannot
+ * see?" — is now answered from the log instead, by `verifyMigrationLog`'s
+ * unknown-name warning, which says WHICH migration and WHICH surface applied it
+ * rather than comparing two integers. `dbHasUnknownMigrations` is the same fact in
+ * predicate form, for callers that act on it.
+ */
 
 /**
  * Creates the config directory owner-only.
@@ -1145,14 +901,11 @@ export async function withDashboardDb<T>(
 ): Promise<T> {
 	const db = await openDb(false, opts);
 	try {
-		// A newer format is NOT a compatibility question and is never refused — see
-		// the compatibility note above `DASHBOARD_SCHEMA_VERSION`. It only means this
-		// build cannot see everything in the file, which is worth one log line.
-		const found = readSchemaVersion(db);
-		if (found > DASHBOARD_SCHEMA_VERSION) warnFormatAheadOnce(found);
 		// Before migrating, and also when nothing needs migrating — see
 		// `verifyMigrationLog`, and note it must tolerate the log table's absence
-		// because the entry that creates it is itself in the list.
+		// because the entry that creates it is itself in the list. It is also what
+		// reports "a newer build has written here", which a version comparison used
+		// to do less precisely.
 		verifyMigrationLog(db);
 		migrateDashboardDb(db);
 		// Await INSIDE the try: an async callback must finish with the handle
@@ -1189,23 +942,27 @@ export async function withRepairDashboardDb<T>(
  * True when this build has nothing left to migrate on `db` — the predicate a
  * READ-ONLY caller uses to decide it may skip a writable (migrating) open.
  *
- * Under the name key the version stamp alone is NOT that predicate: an entry can be
- * missing by NAME while the stamp is already at or past this build's version — a
- * migration that landed on another branch under a number this build also reached by
- * a different route. `found >= DASHBOARD_SCHEMA_VERSION` therefore answers "is the
- * stamp current", which is no longer the same question as "is everything applied".
- * So when the log is READABLE, ask the log: every migration name must carry an
- * `applied`/`baseline` row. Only when the log predates this feature (`none`) or
- * cannot be read does the version stamp stand in — no name-keyed merge could have
- * happened before the log existed, and an unreadable log is not a question a
- * read-only caller can answer, so it defers to the writable open, which then
- * migrates from the stamp (a no-op when the stamp is current) and surfaces any real
- * fault itself.
+ * Asked of the log and nothing else: every migration name must carry an
+ * `applied`/`baseline` row. There used to be a fallback comparing the version stamp,
+ * and it answered a DIFFERENT question — "is the stamp current" rather than "is
+ * everything applied" — which under a name key can disagree: an entry may be missing
+ * by name while the stamp is already past its position, because the stamp was reached
+ * by a different route on another branch.
+ *
+ * No log to read → `false`, deferring to the writable open. That is the safe
+ * direction: the writable open migrates (a no-op when there is nothing to do) and
+ * surfaces any real fault itself, whereas guessing `true` here would leave a database
+ * unmigrated with nothing reporting it.
+ *
+ * ⚠ Deliberately does NOT read the `ddl` column. `defaultModelBuilder` calls
+ * `ensureDashboardDbExists` on EVERY `/api/model` — once per page load and once per
+ * 30 s poll for as long as the tab is open — and the first entry's SQL alone is
+ * ~35 KB. `readAppliedMigrationNames` exists to keep this to two columns.
  */
 export function isSchemaCurrent(db: DashboardDbHandle): boolean {
 	const done = readAppliedMigrationNames(db);
-	if (done) return MIGRATIONS.every((m) => done.has(m.name));
-	return readSchemaVersion(db) >= DASHBOARD_SCHEMA_VERSION;
+	if (!done) return false;
+	return MIGRATIONS.every((m) => done.has(m.name));
 }
 
 /**
@@ -1222,8 +979,9 @@ export function isSchemaCurrent(db: DashboardDbHandle): boolean {
  * to look at two columns.
  *
  * Collapses `none` and `unreadable` into one `undefined`, which the full read
- * deliberately does not: this caller answers BOTH by deferring to the version
- * stamp (see {@link isSchemaCurrent}), so it needs no `migrationLogTableExists`
+ * deliberately does not: this caller answers BOTH the same way — {@link
+ * isSchemaCurrent} just returns `false` and defers to the writable open, there is
+ * no version stamp left to fall back on — so it needs no `migrationLogTableExists`
  * probe to tell them apart — one query, not two. A caller that must report the
  * difference is exactly the caller that should use `readMigrationLogState`.
  */
@@ -1264,15 +1022,16 @@ function readAppliedMigrationNames(db: DashboardDbHandle): ReadonlySet<string> |
  * first query for a table this build expects fails outright. Existence is the
  * wrong question — "is it current?" is the question.
  *
- * A schema NEWER than this build needs no writable open either: `isSchemaCurrent`
+ * A schema written by a NEWER build needs no writable open either: `isSchemaCurrent`
  * finds every name this build carries already applied and short-circuits. Nothing
- * refuses a newer file — `withDashboardDb` only WARNS once (see the compatibility
- * note on `DASHBOARD_SCHEMA_VERSION`); the old version-reject behaviour is gone.
+ * refuses such a file — `verifyMigrationLog` names the unknown migrations in the log
+ * and the open proceeds.
  *
- * The short-circuit is `isSchemaCurrent`, NOT `found >= DASHBOARD_SCHEMA_VERSION`:
- * under the name key a file can sit at the current stamp with a named migration
- * still missing, and gating on the stamp would skip the one writable open that
- * would apply it — reopening the read-only 500 this function exists to prevent.
+ * The short-circuit asks the log by name. It used to be able to fall back to a
+ * version stamp, which answers a different question: a file can sit at the current
+ * stamp with a named migration still missing, and gating on the stamp would skip the
+ * one writable open that would apply it — reopening the read-only 500 this function
+ * exists to prevent.
  */
 export async function ensureDashboardDbExists(opts: OpenDashboardDbOptions = {}): Promise<void> {
 	const dbPath = opts.dbPath ?? getDashboardDbPath();

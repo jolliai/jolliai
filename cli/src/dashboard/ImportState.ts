@@ -18,7 +18,7 @@
  *   could only ever disagree with it.
  * - **Not a schema change.** `repo_state` is `(repo_id, key TEXT, value TEXT)`
  *   with no constraint on `key`; its own DDL comment says adding a marker is
- *   an INSERT. `DASHBOARD_SCHEMA_VERSION` does not move.
+ *   an INSERT, needing no migration at all.
  *
  * Naming: everything here says "import" because the persisted key does. The
  * USER-facing vocabulary is "migration" — see {@link describeImportState}.
@@ -191,7 +191,7 @@ export async function readImportState(
 			// NO version or compatibility check, deliberately: this row is plain JSON
 			// in `repo_state` and a newer format does not make it unreadable. Reporting
 			// `unavailable` over a version number hid a migration verdict the user can
-			// act on. See the compatibility note above `DASHBOARD_SCHEMA_VERSION`.
+			// act on. See the compatibility note at the top of `DashboardDb.ts`.
 			const { identity } = await resolveRepoIdentityForCwd(cwd);
 			const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
 				| { id: number }

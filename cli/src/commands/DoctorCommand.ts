@@ -43,10 +43,9 @@ import type { GlobalDaemonHello } from "../daemon/GlobalDaemonProtocol.js";
 import { backupHealthCheck } from "../dashboard/Backup.js";
 import {
 	canUseDashboardDb,
-	findDriftedMigrations,
 	getDashboardDbPath,
 	inTransaction,
-	type MigrationLogRow,
+	MIGRATIONS,
 	type MigrationLogState,
 	readMigrationLogState,
 	recordMigrationAsApplied,
@@ -923,12 +922,15 @@ export async function runRecover(fromPath?: string, force?: boolean): Promise<vo
  * normal, non-faulty state, and a readonly open of a missing file throws like any
  * other failure — so the file check is the only thing that tells the two apart.
  *
- * The drifted list rides along on `rows` so the whole report comes out of ONE open.
- * Two opens could disagree (the second one failing left the drift section silently
- * absent, which reads as "no drift").
+ * A `drifted` list used to ride along on `rows`, listing entries whose stored DDL
+ * differed byte-for-byte from this build's. That check is gone — it could not tell
+ * this project's own equivalent rewrite from another build's work, and would have
+ * fired on every existing install after the idempotency pass. The report keeps the
+ * unknown-NAME signal instead, which `verifyMigrationLog` raises at runtime and which
+ * this listing shows as rows whose names this build does not carry.
  */
 type SchemaLogRead =
-	| (Extract<MigrationLogState, { kind: "rows" }> & { readonly drifted: ReadonlyArray<MigrationLogRow> })
+	| Extract<MigrationLogState, { kind: "rows" }>
 	| Exclude<MigrationLogState, { kind: "rows" }>
 	| { readonly kind: "open-failed"; readonly reason: string }
 	| { readonly kind: "sidecars-only" };
@@ -936,10 +938,7 @@ type SchemaLogRead =
 /** Reads the log, mapping an open/read failure to `open-failed` rather than `none`. */
 async function readSchemaLogState(): Promise<SchemaLogRead> {
 	try {
-		return await withReadonlyDashboardDb((db): SchemaLogRead => {
-			const state = readMigrationLogState(db);
-			return state.kind === "rows" ? { ...state, drifted: findDriftedMigrations(db) } : state;
-		});
+		return await withReadonlyDashboardDb((db): SchemaLogRead => readMigrationLogState(db));
 	} catch (err) {
 		// A failed open has THREE shapes, and only the file combination tells them
 		// apart — `existsSync` on the `.db` alone cannot (see DbDetection): an
@@ -1046,6 +1045,19 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 			return;
 		}
 		console.log(`\nRecorded ${action.mark} as applied.`);
+		if (MIGRATIONS.some((m) => m.name === action.mark && m.sql === undefined)) {
+			// Marking a code entry is heavier than marking a SQL one, and the difference
+			// is invisible from the command line. A SQL entry only ever creates schema
+			// objects, so claiming it ran when it did is harmless; a code entry may be
+			// there to fill gaps a stale database has — `SESSION_STATS_SYNC_DDL`
+			// (`applySessionStatsSchema`) is exactly that, backfilling columns a pre-log
+			// build left nullable and unfilled — and this permanently stops it doing so.
+			console.log(
+				`  ⚠ ${action.mark} is a code migration — this permanently skips it, including\n` +
+					"    any objects it would have added. Only do this once you have confirmed the\n" +
+					"    schema is already complete and it was just the log row that went missing.",
+			);
+		}
 	}
 	const state = await readSchemaLogState();
 	// The database itself could not be opened, or could not answer at all. Reported as
@@ -1081,8 +1093,9 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 		console.error(
 			`\nMigration log: PRESENT BUT UNREADABLE — ${state.reason}\n` +
 				"  The schema_migrations table is in the schema and this build cannot query it.\n" +
-				"  Writes still work: the migration pass falls back to the schema_version stamp\n" +
-				"  and records nothing, so drift verification is skipped until the table is fixed.",
+				"  Writes still work: with no readable log the migration pass replays every entry\n" +
+				"  (all are re-runnable) and records nothing, so drift verification is skipped\n" +
+				"  until the table is fixed.",
 		);
 		process.exitCode = 1;
 		return;
@@ -1091,19 +1104,29 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 		console.log("\nMigration log: none — this database predates the log (or does not exist yet).");
 		return;
 	}
+	// Entries this build runs as code rather than SQL. They are worth marking because
+	// they are the ones no fingerprint covers: the log stores `sql ?? ""` for them, so
+	// the drift column below can never have anything to say about their contents.
+	const codeEntries = new Set(MIGRATIONS.filter((m) => m.sql === undefined).map((m) => m.name));
 	console.log("\nMigration log (oldest first):");
 	for (const row of state.rows) {
 		const when = new Date(row.applied_at_ms).toISOString().replace("T", " ").slice(0, 19);
+		const kind = codeEntries.has(row.name) ? "  [code]" : "";
 		console.log(
 			`  ${String(row.seq).padStart(3)}  slot ${row.slot}  ${row.outcome.padEnd(8)}  ${when}  ` +
-				`${row.applied_by}  ${row.name}  (${row.duration_ms} ms)`,
+				`${row.applied_by}  ${row.name}  (${row.duration_ms} ms)${kind}`,
 		);
 	}
-	const drifted = state.drifted;
-	if (drifted.length > 0) {
+	// Names this build does not carry — the surviving "another build wrote here"
+	// signal, and the one that cannot be wrong about our own edits. It replaces a
+	// byte-compare that would have fired on every install after the idempotency pass.
+	const unknown = state.rows.filter((row) => !MIGRATIONS.some((m) => m.name === row.name));
+	if (unknown.length > 0) {
+		const names = [...new Set(unknown.map((r) => r.name))].join(", ");
 		console.log(
-			`\n  ⚠ Applied by a different build than this one: ${drifted.map((r) => r.name).join(", ")}\n` +
-				"    The database keeps working; this is a diagnostic, not a fault.",
+			`\n  ⚠ Recorded here but unknown to this build: ${names}\n` +
+				"    Another build — very likely from an unmerged branch — has opened this database.\n" +
+				"    It keeps working; this is a diagnostic, not a fault.",
 		);
 	}
 }

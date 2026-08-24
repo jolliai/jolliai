@@ -15,6 +15,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
+import { toForwardSlash } from "../core/PathUtils.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 
@@ -22,9 +23,21 @@ const HERE = dirname(fileURLToPath(import.meta.url));
  * Files that may name `duration_ms`, each for a reason that is not "a journey's
  * duration". Bidirectional: an entry that no longer matches fails the test, so
  * the list can only shrink.
+ *
+ * Keys are forward-slash relative paths from this file's directory (via {@link
+ * toForwardSlash}) so a nested match — `migrations/` holds one file per
+ * dashboard migration — compares the same on Windows as everywhere else this
+ * suite runs.
  */
 const ALLOWED = new Map<string, string>([
-	["SotSchema.ts", "declares the column, and the unrelated schema_migrations.duration_ms"],
+	[
+		"migrations/2026-08-12-0000-baseline.ts",
+		"declares the column — the sessions table DDL that used to be SotSchema.ts's ACTIVITY_DDL",
+	],
+	[
+		"migrations/2026-08-12-0005-schema-migrations.ts",
+		"the unrelated schema_migrations.duration_ms — used to be SotSchema.ts's SCHEMA_MIGRATIONS_DDL",
+	],
 	["DashboardDb.ts", "schema_migrations bookkeeping — how long a migration took"],
 	["StatsWriter.ts", "writes the column"],
 	["DbBackfill.ts", "writes and backfills the column"],
@@ -53,7 +66,7 @@ describe("duration has one definition", () => {
 	it("no dashboard source outside the allowlist uses sessions.duration_ms", () => {
 		const offenders = sourceFiles(HERE)
 			.filter((file) => /\bduration_ms\b/u.test(stripComments(readFileSync(file, "utf8"))))
-			.map((file) => file.slice(HERE.length + 1))
+			.map((file) => toForwardSlash(file.slice(HERE.length + 1)))
 			.filter((name) => !ALLOWED.has(name));
 
 		expect(offenders).toEqual([]);
@@ -63,7 +76,7 @@ describe("duration has one definition", () => {
 		const using = new Set(
 			sourceFiles(HERE)
 				.filter((file) => /\bduration_ms\b/u.test(stripComments(readFileSync(file, "utf8"))))
-				.map((file) => file.slice(HERE.length + 1)),
+				.map((file) => toForwardSlash(file.slice(HERE.length + 1))),
 		);
 		const stale = [...ALLOWED.keys()].filter((name) => !using.has(name));
 

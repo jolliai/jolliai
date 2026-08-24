@@ -1,94 +1,180 @@
 /**
- * MigrationFingerprints — the development-time guard that makes an edit to
- * already-shipped DDL fail HERE rather than on a user's machine.
+ * MigrationFingerprints — the development-time guard that makes an edit to an
+ * already-committed migration fail HERE rather than on someone else's machine.
  *
- * A writable open compares each logged migration's stored DDL against the constant
- * this build carries and REPORTS any divergence (`findDriftedMigrations`, listed by
- * `jolli doctor --schema-log`) — it does NOT refuse the database. The refuse-on-drift
- * behaviour was removed with the version gate: ~64% of the baseline entry is SQL
- * comments, so re-wrapping one must not lock every existing user out. Entry 0 is the
- * sharpest case — ~37 KB of baseline every database on earth has applied — where an
- * edit is now "reported as drift", never "old databases refuse".
+ * The rule it enforces: **a committed migration is never edited, not even an
+ * unreleased one.** Ship a new entry for any delta. That is not a style preference —
+ * `SESSION_STATS_SYNC_DDL` was edited in place while unreleased, and databases that
+ * had logged the name under the older SQL skipped the newer SQL for ever, ending up
+ * without `stats_daily` or `commits.written_at_ms` while their log said the migration
+ * had run. The log is keyed by name; it cannot notice that the bytes moved.
  *
- * Reporting is right for the USER, but a silent DDL edit is still a bug the AUTHOR
- * should never ship — and that loud stop belongs in CI, not in an install. So the
- * content of each entry is
- * pinned here: change a DDL constant without updating its fingerprint and this
- * test fails, in the same shape and for the same reason as
- * `SkillInstaller.test.ts`'s body fingerprints.
+ * At runtime nothing compares the bytes any more — that content check (once
+ * `findDriftedMigrations`, listed by `jolli doctor --schema-log`) was removed
+ * because it could not tell this project's own equivalent rewrite from a foreign
+ * build's; see the note at the end of `verifyMigrationLog` in `DashboardDb.ts`. What
+ * survives there is a NAME check — a warning when a logged migration is unknown to
+ * this build — which cannot be wrong about our own edits but also cannot catch this
+ * specific failure (the same name, different bytes, both known to this build). That
+ * is right for the user and useless for the author, so the loud stop lives here.
  *
- * When an edit is genuinely intended, the honest move is almost always to APPEND
- * a new entry instead. Updating a fingerprint below is for a case where nothing
- * has the old bytes yet.
+ * ⚠ Fingerprints only reach entries carrying `sql`. A code entry logs `""` and so
+ * compares equal to itself for ever — `requires a companion test` below is the whole
+ * of their protection, which is why those tests must assert every object the entry
+ * creates rather than "it did not throw".
  */
 
 import { createHash } from "node:crypto";
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { DASHBOARD_SCHEMA_VERSION, MIGRATIONS } from "./DashboardDb.js";
+import { LEGACY_MIGRATION_NAMES, MIGRATIONS } from "./DashboardDb.js";
 
-const fingerprint = (ddl: string): string => createHash("sha256").update(ddl).digest("hex").slice(0, 12);
+const fingerprint = (sql: string): string => createHash("sha256").update(sql).digest("hex").slice(0, 12);
 
 /**
- * Name → content fingerprint, in slot order.
+ * Name → content fingerprint, for every entry that carries `sql`, in array order.
  *
- * The NAMES are the load-bearing half: a name is a permanent identifier, since
- * the log is keyed by it — rename one and every database reads it as never
- * applied, re-runs it, and dies on `duplicate column`. So this list may GROW and
- * may never lose or rename an entry. (Rails carries the same constraint on its
- * timestamped filenames.)
+ * The NAMES are the load-bearing half: a name is a permanent identifier, since the
+ * log is keyed by it — rename one and every database reads it as never applied,
+ * re-runs it, and (before the idempotency pass) died on `duplicate column`. So this
+ * list may GROW and may never lose or rename an entry. Rails carries the same
+ * constraint on its timestamped filenames.
+ *
+ * ⚠ These fingerprints were recomputed ONCE, by the pass that made every statement
+ * re-runnable: `CREATE` gained `IF NOT EXISTS`, the two `context_kinds` seeds gained
+ * `OR IGNORE`. That edit was semantically identical on an empty database — which is the
+ * only reason it was allowed — and the pass covers every entry that existed before it
+ * landed, INCLUDING the two that arrived on `main` mid-flight. That is one pass, not a
+ * precedent for a second: an entry committed after it may never be edited. Databases
+ * that recorded any of these under the older bytes report them as drifted, correctly.
+ * See the AGENTS.md rule.
  */
 const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
-	["BASELINE_DDL", "88fc66f6dfcd"],
-	["RECALL_RECEIPTS_DDL", "3319838df5a4"],
-	["SKILL_CONTEXT_KIND_DDL", "fcded137e861"],
-	["EVENT_FAILED_KIND_DDL", "a7cdc1abee65"],
-	["TOOL_CALL_TIME_DDL", "6393ea338cd8"],
-	["SCHEMA_MIGRATIONS_DDL", "151c9e7a7af7"],
+	["BASELINE_DDL", "789d9527779e"],
+	["RECALL_RECEIPTS_DDL", "891be7ac4377"],
+	["SKILL_CONTEXT_KIND_DDL", "a3099c0f4f47"],
+	["SCHEMA_MIGRATIONS_DDL", "4f649feb69b3"],
+	// Unchanged by the idempotency pass, and the one entry that proves the pass was
+	// only about re-runnability: its whole body is `DROP TRIGGER IF EXISTS`, which was
+	// already safe to run twice.
 	["REPOS_DELETE_ALLOWED_DDL", "52561786c1b7"],
-	// The seven unreleased steps the session-statistics sync was developed in,
-	// merged into one entry before shipping — see `DASHBOARD_SCHEMA_VERSION`. That
-	// is legal exactly once, while nothing has the old bytes: a machine that ran an
-	// intermediate build of this branch has the seven old names in its log and no
-	// row for this one, so it re-runs the entry and dies on `duplicate column` at
-	// the first ALTER. `jolli doctor --mark-migration SESSION_STATS_SYNC_DDL` is
-	// the documented repair, and it is the reason no further merge may happen after
-	// the first release.
-	["SESSION_STATS_SYNC_DDL", "e0c166639049"],
-	["SESSION_ACTIVITY_DDL", "67be18551dae"],
-	["SKILL_TOKEN_USAGE_DDL", "7956cb682d2e"],
-	["SKILL_INVOCATIONS_DDL", "c81c934c4192"],
-	["SKILL_PLUGIN_DDL", "f34c01168b54"],
-	["SKILL_ORIGIN_ROOT_DDL", "cc117422f8f8"],
+	// Arrived on `main` while the idempotency pass was in flight on this branch, so they
+	// belong to the SAME pre-idempotency population as the four above and were finished
+	// the same way: `IF NOT EXISTS` added in place. Their add-column siblings
+	// (`SKILL_TOKEN_USAGE_DDL`, `SKILL_PLUGIN_DDL`) could not be, so those are code
+	// entries and are absent from this list by construction, not by omission.
+	["SESSION_ACTIVITY_DDL", "6b9d168501ee"],
+	["SKILL_INVOCATIONS_DDL", "70871ae1a43f"],
 ];
 
-describe("migration fingerprints", () => {
-	it("has one expectation per entry, in slot order", () => {
-		// Slot order matters even though identity does not depend on it: order is
-		// still the execution order, and it is protected socially — APPEND only,
-		// never insert into the middle, or an entry runs against a database that has
-		// already applied its successors.
-		expect(MIGRATIONS.map((m) => m.name)).toEqual(EXPECTED.map(([name]) => name));
-		expect(MIGRATIONS).toHaveLength(EXPECTED.length);
+/** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */
+const TIMESTAMPED_NAME = /^\d{4}-\d{2}-\d{2}-\d{4}-[a-z0-9-]+$/;
+
+describe("migration names", () => {
+	it("keeps the legacy entries first, in their original order", () => {
+		// Their names are frozen and their positions are the execution order every
+		// existing database already took. A new entry goes after them, never among
+		// them.
+		expect(MIGRATIONS.slice(0, LEGACY_MIGRATION_NAMES.length).map((m) => m.name)).toEqual(LEGACY_MIGRATION_NAMES);
 	});
 
-	for (const [index, [name, want]] of EXPECTED.entries()) {
-		it(`${name} (slot ${index}) still carries the DDL it shipped with`, () => {
-			// If this fails: you edited DDL that databases in the wild have already
-			// applied, and every one of them will now refuse to open. Append a new
-			// entry instead — or, if truly nothing has these bytes yet, update the
-			// fingerprint deliberately in the same change.
-			expect(fingerprint(MIGRATIONS[index].ddl)).toBe(want);
+	it("timestamps every entry appended after the legacy ones", () => {
+		// The legacy names predate this convention and cannot be renamed, so the format
+		// is required only from the first appended entry onward.
+		for (const m of MIGRATIONS.slice(LEGACY_MIGRATION_NAMES.length)) {
+			expect(m.name, `${m.name} must be YYYY-MM-DD-HHMM-<subject>`).toMatch(TIMESTAMPED_NAME);
+		}
+	});
+
+	it("has no duplicate names", () => {
+		// A duplicate would make the log ambiguous about which entry it recorded, and
+		// the second one would be skipped for ever as "already applied".
+		const names = MIGRATIONS.map((m) => m.name);
+		expect(new Set(names).size).toBe(names.length);
+	});
+
+	it("appends in ascending timestamp order", () => {
+		// Array order is the execution order and timestamps do NOT sort it — this keeps
+		// the two from telling different stories. A back-dated entry appended at the end
+		// would execute last while reading as if it came first.
+		const stamps = MIGRATIONS.slice(LEGACY_MIGRATION_NAMES.length).map((m) => m.name.slice(0, 15));
+		expect(stamps).toEqual([...stamps].sort());
+	});
+});
+
+describe("migration fingerprints", () => {
+	it("has one expectation per sql-carrying entry, in array order", () => {
+		const withSql = MIGRATIONS.filter((m) => m.sql !== undefined).map((m) => m.name);
+		expect(withSql).toEqual(EXPECTED.map(([name]) => name));
+	});
+
+	for (const [name, want] of EXPECTED) {
+		it(`${name} still carries the SQL it was committed with`, () => {
+			// If this fails: you edited a migration that databases have already applied.
+			// Append a new entry instead — with its OWN body, never a second name pointing
+			// at this entry's function.
+			const entry = MIGRATIONS.find((m) => m.name === name);
+			expect(fingerprint(entry?.sql ?? "")).toBe(want);
 		});
 	}
-
-	it("keeps the version equal to the entry count", () => {
-		expect(DASHBOARD_SCHEMA_VERSION).toBe(MIGRATIONS.length);
-	});
 
 	it("interpolates nothing at runtime, which is what makes a byte compare exact", () => {
 		// The drift check compares stored text to these constants verbatim and has no
 		// checksum column to fall back on. A template hole would make the same
 		// migration hash differently per process and turn the check into noise.
-		for (const m of MIGRATIONS) expect(m.ddl).not.toMatch(/\$\{/);
+		for (const m of MIGRATIONS) expect(m.sql ?? "").not.toMatch(/\$\{/);
+	});
+});
+
+describe("code migrations", () => {
+	/**
+	 * The only guard a `sql`-less entry has.
+	 *
+	 * Fingerprints cannot see them: the log stores `sql ?? ""`, so a code entry
+	 * compares equal to itself no matter what its `run` does. Requiring the name to
+	 * appear in SOME `migrations/*.test.ts` file is what stops one being added — or
+	 * later quietly rewritten — with nothing asserting what it produces.
+	 *
+	 * Every entry now lives in its own file under `migrations/`, named by its real
+	 * introduction date rather than by its `name` (see `migrations/index.ts`'s
+	 * docblock), so the companion test cannot be found by building a path from
+	 * `name` — it is found the same way a human would, by searching every test file
+	 * in that directory. It must live under `migrations/`, never in
+	 * `DashboardDb.test.ts`, which covers the engine (`migrateDashboardDb`,
+	 * `verifyMigrationLog`, …) rather than any one entry's content.
+	 */
+	it("requires a companion test for every entry without sql", () => {
+		const migrationsDir = join(import.meta.dirname, "migrations");
+		const testFiles = readdirSync(migrationsDir).filter((f) => f.endsWith(".test.ts"));
+		expect(testFiles.length).toBeGreaterThan(0);
+		const combined = testFiles.map((f) => readFileSync(join(migrationsDir, f), "utf8")).join("\n");
+		const codeEntries = MIGRATIONS.filter((m) => m.sql === undefined).map((m) => m.name);
+		expect(codeEntries.length).toBeGreaterThan(0);
+		for (const name of codeEntries) {
+			expect(combined, `${name} has no companion test under migrations/*.test.ts`).toContain(name);
+		}
+	});
+
+	/**
+	 * No two entries may run the same body.
+	 *
+	 * A migration is one delta; two names pointing at one function are the same script
+	 * twice, and the array then executes it twice on every fresh database. That is what
+	 * a `2026-08-19-0000-session-stats-heal` entry did — it shared
+	 * `applySessionStatsSchema` with `SESSION_STATS_SYNC_DDL` — and it was removed. This
+	 * is what stops the shape coming back.
+	 *
+	 * `run` is compared by IDENTITY, which catches the case that actually occurs (two
+	 * entries handed the same function). Two separately-written bodies that happen to
+	 * be equivalent are not caught, and are not the problem: they are two scripts.
+	 */
+	it("gives every entry its own body", () => {
+		const seen = new Map<unknown, string>();
+		for (const m of MIGRATIONS) {
+			const first = seen.get(m.run);
+			expect(first, `${m.name} runs the same function as ${first} — one body, two names`).toBeUndefined();
+			seen.set(m.run, m.name);
+		}
 	});
 });

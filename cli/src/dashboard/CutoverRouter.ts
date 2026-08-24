@@ -141,8 +141,8 @@ async function readCutoverRow(cwd: string, dbPath: string): Promise<DbAnswer> {
 			// correctly (the `cutover` row is plain JSON in `repo_state`), and
 			// answering "cannot ask" instead used to route a cut-over repo's writes
 			// back onto its frozen orphan branch — the exact loss the protocol exists
-			// to prevent. Compatibility is a release-line concern; see the note above
-			// `DASHBOARD_SCHEMA_VERSION`.
+			// to prevent. Compatibility is a release-line concern; see the note at the
+			// top of `DashboardDb.ts`.
 			const identity = await cachedIdentity(cwd);
 			const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as
 				| { id: number }

@@ -1,0 +1,158 @@
+# GENERATED FILE — do not edit by hand.
+#
+# What `MIGRATIONS` in DashboardDb.ts builds on a fresh database: every schema
+# object with its SQL normalized (full-line `--` comments stripped, whitespace
+# collapsed), then every table that has rows — on a fresh database, exactly the
+# seed data the migrations insert.
+#
+# This is the only place the CURRENT shape of the database is written down: the
+# DDL constants are frozen at the shape they shipped with, so a column added by a
+# later entry appears in no CREATE statement anywhere in the source.
+#
+# Regenerate deliberately, and read the diff — it is the review artifact:
+#   JOLLI_UPDATE_SCHEMA_SNAPSHOT=1 npx vitest run src/dashboard/SchemaSnapshot.test.ts
+
+# ── objects ─────────────────────────────────────────────────────────────────
+INDEX ix_activity_bucket ON session_activity
+    CREATE INDEX ix_activity_bucket ON session_activity(bucket_ms)
+INDEX ix_activity_recorded ON session_activity
+    CREATE INDEX ix_activity_recorded ON session_activity(recorded_at_ms)
+INDEX ix_cb_branch ON commit_branches
+    CREATE INDEX ix_cb_branch ON commit_branches(branch_id, commit_id)
+INDEX ix_commit_files_path ON commit_files
+    CREATE INDEX ix_commit_files_path ON commit_files(path)
+INDEX ix_commits_branch ON commits
+    CREATE INDEX ix_commits_branch ON commits(branch)
+INDEX ix_commits_repo_time ON commits
+    CREATE INDEX ix_commits_repo_time ON commits(repo_id, committed_at_ms)
+INDEX ix_commits_written ON commits
+    CREATE INDEX ix_commits_written ON commits(written_at_ms)
+INDEX ix_events_pending ON events_raw
+    CREATE INDEX ix_events_pending ON events_raw(projection_status, seq)
+INDEX ix_mem_branch ON memories
+    CREATE INDEX ix_mem_branch ON memories(repo_id, branch, commit_date_ms)
+INDEX ix_mem_date ON memories
+    CREATE INDEX ix_mem_date ON memories(repo_id, commit_date_ms)
+INDEX ix_mem_root ON memories
+    CREATE INDEX ix_mem_root ON memories(repo_id, root_hash)
+INDEX ix_mem_ticket ON memories
+    CREATE INDEX ix_mem_ticket ON memories(repo_id, ticket_id)
+INDEX ix_mem_written ON memories
+    CREATE INDEX ix_mem_written ON memories(written_at_ms)
+INDEX ix_mt_transcript ON memory_transcripts
+    CREATE INDEX ix_mt_transcript ON memory_transcripts(repo_id, transcript_id)
+INDEX ix_mtopic_category ON memory_topics
+    CREATE INDEX ix_mtopic_category ON memory_topics(repo_id, category)
+INDEX ix_recall_receipts_keyset ON recall_receipts
+    CREATE INDEX ix_recall_receipts_keyset ON recall_receipts(updated_at_ms, receipt_id)
+INDEX ix_recall_receipts_repo_at ON recall_receipts
+    CREATE INDEX ix_recall_receipts_repo_at ON recall_receipts(repo_id, at_ms)
+INDEX ix_recall_receipts_sync ON recall_receipts
+    CREATE INDEX ix_recall_receipts_sync ON recall_receipts(updated_at_ms)
+INDEX ix_schema_migrations_name ON schema_migrations
+    CREATE INDEX ix_schema_migrations_name ON schema_migrations(name, seq)
+INDEX ix_sessions_keyset ON sessions
+    CREATE INDEX ix_sessions_keyset ON sessions(written_at_ms, event_id)
+INDEX ix_sessions_repo_time ON sessions
+    CREATE INDEX ix_sessions_repo_time ON sessions(repo_id, updated_at_ms)
+INDEX ix_sessions_source ON sessions
+    CREATE INDEX ix_sessions_source ON sessions(source)
+INDEX ix_sessions_time ON sessions
+    CREATE INDEX ix_sessions_time ON sessions(updated_at_ms)
+INDEX ix_sessions_written ON sessions
+    CREATE INDEX ix_sessions_written ON sessions(written_at_ms)
+INDEX ix_si_skill_time ON skill_invocations
+    CREATE INDEX ix_si_skill_time ON skill_invocations(skill_name, at_ms)
+INDEX ix_smu_keyset ON session_model_usage
+    CREATE INDEX ix_smu_keyset ON session_model_usage(updated_at_ms, session_event_id, model)
+INDEX ix_smu_model ON session_model_usage
+    CREATE INDEX ix_smu_model ON session_model_usage(model)
+INDEX ix_smu_sync ON session_model_usage
+    CREATE INDEX ix_smu_sync ON session_model_usage(updated_at_ms)
+INDEX ix_stats_daily_day ON stats_daily
+    CREATE INDEX ix_stats_daily_day ON stats_daily(tz, day)
+INDEX ix_stu_keyset ON session_tool_use
+    CREATE INDEX ix_stu_keyset ON session_tool_use(updated_at_ms, session_event_id, tool_name, kind)
+INDEX ix_stu_kind ON session_tool_use
+    CREATE INDEX ix_stu_kind ON session_tool_use(kind)
+INDEX ix_stu_server ON session_tool_use
+    CREATE INDEX ix_stu_server ON session_tool_use(server)
+INDEX ix_stu_sync ON session_tool_use
+    CREATE INDEX ix_stu_sync ON session_tool_use(updated_at_ms)
+INDEX ix_sue_at ON session_usage_events
+    CREATE INDEX ix_sue_at ON session_usage_events(responded_at_ms)
+INDEX ix_sue_sync ON session_usage_events
+    CREATE INDEX ix_sue_sync ON session_usage_events(updated_at_ms)
+INDEX ix_ts_session ON transcript_sessions
+    CREATE INDEX ix_ts_session ON transcript_sessions(repo_id, session_id, source)
+INDEX ix_tsr_ref ON topic_source_refs
+    CREATE INDEX ix_tsr_ref ON topic_source_refs(repo_id, ref_type, ref_id)
+TABLE branches
+    CREATE TABLE branches ( id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), name TEXT NOT NULL, UNIQUE (repo_id, name) ) STRICT
+TABLE commit_aliases
+    CREATE TABLE commit_aliases ( repo_id INTEGER NOT NULL, old_hash TEXT NOT NULL, target_hash TEXT NOT NULL, created_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, old_hash), FOREIGN KEY (repo_id, target_hash) REFERENCES memories(repo_id, commit_hash) ON DELETE CASCADE ) STRICT
+TABLE commit_branches
+    CREATE TABLE commit_branches ( commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE, branch_id INTEGER NOT NULL REFERENCES branches(id) ON DELETE CASCADE, PRIMARY KEY (commit_id, branch_id) ) STRICT, WITHOUT ROWID
+TABLE commit_files
+    CREATE TABLE commit_files ( commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE, path TEXT NOT NULL, insertions INTEGER, deletions INTEGER, PRIMARY KEY (commit_id, path) ) STRICT, WITHOUT ROWID
+TABLE commits
+    CREATE TABLE commits ( id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, repo_id INTEGER NOT NULL REFERENCES repos(id), hash TEXT NOT NULL, branch TEXT, message TEXT, author_name TEXT, author_email TEXT, committed_at_ms INTEGER NOT NULL, files_changed INTEGER, insertions INTEGER, deletions INTEGER, written_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (repo_id, hash) ) STRICT
+TABLE context
+    CREATE TABLE context ( id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), kind TEXT NOT NULL REFERENCES context_kinds(kind), context_key TEXT NOT NULL, source TEXT, native_id TEXT, tool_name TEXT, referenced_at TEXT, original_slug TEXT, branch TEXT, title TEXT, url TEXT, body_md TEXT NOT NULL, created_at_ms INTEGER NOT NULL, updated_at_ms INTEGER, plan_key TEXT GENERATED ALWAYS AS (CASE WHEN kind = 'plan' THEN context_key END) STORED, UNIQUE (repo_id, kind, context_key), UNIQUE (repo_id, plan_key), CHECK ((source IS NOT NULL) = (kind = 'reference')), CHECK ((native_id IS NOT NULL) = (kind = 'reference')), CHECK ((referenced_at IS NOT NULL) = (kind = 'reference')), CHECK (tool_name IS NULL OR kind = 'reference'), CHECK (url IS NULL OR kind = 'reference'), CHECK (original_slug IS NULL OR kind = 'plan'), CHECK (branch IS NULL OR kind IN ('plan','note')) ) STRICT
+TABLE context_kinds
+    CREATE TABLE context_kinds (kind TEXT PRIMARY KEY) STRICT
+TABLE events_raw
+    CREATE TABLE events_raw ( seq INTEGER PRIMARY KEY AUTOINCREMENT, event_id TEXT, repo_identity TEXT, type TEXT NOT NULL, schema_version INTEGER NOT NULL, producer_kind TEXT, producer_version TEXT, occurred_at TEXT, received_at TEXT NOT NULL, data_json TEXT NOT NULL, projection_status TEXT NOT NULL DEFAULT 'pending', claimed_at_ms INTEGER, attempts INTEGER NOT NULL DEFAULT 0 , failed_kind TEXT) STRICT
+TABLE ingest_cursors
+    CREATE TABLE ingest_cursors ( repo_id INTEGER NOT NULL REFERENCES repos(id), source TEXT NOT NULL, cursor TEXT NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, source) ) STRICT
+TABLE memories
+    CREATE TABLE memories ( repo_id INTEGER NOT NULL REFERENCES repos(id), commit_hash TEXT NOT NULL, parent_hash TEXT, child_pos INTEGER, root_hash TEXT NOT NULL, depth INTEGER NOT NULL DEFAULT 0, summary_json TEXT NOT NULL, tree_hash TEXT, index_diff_stats_json TEXT, first_seen_ms INTEGER NOT NULL, written_at_ms INTEGER NOT NULL, commit_date_ms INTEGER NOT NULL, branch TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.branch')) STORED, commit_message TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.commitMessage')) STORED, commit_type TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.commitType')) STORED, commit_date TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.commitDate')) VIRTUAL, commit_author TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.commitAuthor')) VIRTUAL, generated_at TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.generatedAt')) VIRTUAL, recap TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.recap')) VIRTUAL, ticket_id TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.ticketId')) VIRTUAL, jolli_doc_id TEXT GENERATED ALWAYS AS (json_extract(summary_json,'$.jolliDocId')) VIRTUAL, turns INTEGER GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.conversationTurns')='integer' THEN json_extract(summary_json,'$.conversationTurns') END) VIRTUAL, tokens INTEGER GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.conversationTokens')='integer' THEN json_extract(summary_json,'$.conversationTokens') END) VIRTUAL, est_cost_usd REAL GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.estimatedCostUsd') IN ('integer','real') THEN json_extract(summary_json,'$.estimatedCostUsd') END) VIRTUAL, files_changed INTEGER GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.diffStats.filesChanged')='integer' THEN json_extract(summary_json,'$.diffStats.filesChanged') END) VIRTUAL, insertions INTEGER GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.diffStats.insertions')='integer' THEN json_extract(summary_json,'$.diffStats.insertions') END) VIRTUAL, deletions INTEGER GENERATED ALWAYS AS (CASE WHEN json_type(summary_json,'$.diffStats.deletions')='integer' THEN json_extract(summary_json,'$.diffStats.deletions') END) VIRTUAL, PRIMARY KEY (repo_id, commit_hash), UNIQUE (repo_id, parent_hash, child_pos), CHECK ((parent_hash IS NULL) = (child_pos IS NULL)), CHECK (child_pos IS NULL OR child_pos >= 0), CHECK (child_pos IS NULL OR child_pos < 2000000), FOREIGN KEY (repo_id, parent_hash) REFERENCES memories(repo_id, commit_hash) ON DELETE CASCADE ) STRICT
+TABLE memory_topics
+    CREATE TABLE memory_topics ( repo_id INTEGER NOT NULL, commit_hash TEXT NOT NULL, pos INTEGER NOT NULL, -- topics[] index; ordering is restored from it category TEXT, -- TopicCategory; NULL when the model omitted it importance TEXT, -- 'major' | 'minor' title TEXT NOT NULL, PRIMARY KEY (repo_id, commit_hash, pos), CHECK (pos >= 0), FOREIGN KEY (repo_id, commit_hash) REFERENCES memories(repo_id, commit_hash) ON DELETE CASCADE ) STRICT
+TABLE memory_transcripts
+    CREATE TABLE memory_transcripts ( repo_id INTEGER NOT NULL, commit_hash TEXT NOT NULL, transcript_id TEXT NOT NULL, PRIMARY KEY (repo_id, commit_hash, transcript_id), FOREIGN KEY (repo_id, commit_hash) REFERENCES memories(repo_id, commit_hash) ON DELETE CASCADE, FOREIGN KEY (repo_id, transcript_id) REFERENCES transcripts(repo_id, transcript_id) ON DELETE CASCADE ) STRICT
+TABLE plan_progress
+    CREATE TABLE plan_progress ( repo_id INTEGER NOT NULL, plan_slug TEXT NOT NULL, artifact_json TEXT NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, plan_slug), FOREIGN KEY (repo_id, plan_slug) REFERENCES context(repo_id, plan_key) ON UPDATE CASCADE ON DELETE CASCADE ) STRICT
+TABLE recall_receipts
+    CREATE TABLE recall_receipts ( receipt_id TEXT PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), at_ms INTEGER NOT NULL, surface TEXT NOT NULL, session_id TEXT, hit INTEGER NOT NULL, commit_count INTEGER NOT NULL DEFAULT 0, commits_json TEXT , updated_at_ms INTEGER NOT NULL DEFAULT 0) STRICT
+TABLE repo_state
+    CREATE TABLE repo_state ( repo_id INTEGER NOT NULL REFERENCES repos(id), key TEXT NOT NULL, value TEXT NOT NULL, PRIMARY KEY (repo_id, key) ) STRICT
+TABLE repos
+    CREATE TABLE repos ( id INTEGER PRIMARY KEY, repo_identity TEXT NOT NULL UNIQUE, repo_name TEXT NOT NULL, worktree_root TEXT NOT NULL, remote_url TEXT, enabled_at TEXT NOT NULL, disabled_at TEXT, last_ingested_at TEXT, bootstrap_state TEXT NOT NULL DEFAULT 'pending' ) STRICT
+TABLE schema_meta
+    CREATE TABLE schema_meta (key TEXT PRIMARY KEY, value TEXT) STRICT
+TABLE schema_migrations
+    CREATE TABLE schema_migrations ( seq INTEGER PRIMARY KEY AUTOINCREMENT, slot INTEGER NOT NULL, name TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('applied','failed','skipped','baseline')), applied_by TEXT NOT NULL, applied_at_ms INTEGER NOT NULL, duration_ms INTEGER NOT NULL, ddl TEXT NOT NULL ) STRICT
+TABLE session_activity
+    CREATE TABLE session_activity ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, bucket_ms INTEGER NOT NULL, recorded_at_ms INTEGER NOT NULL, PRIMARY KEY (session_event_id, bucket_ms) ) STRICT
+TABLE session_model_usage
+    CREATE TABLE session_model_usage ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, updated_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_event_id, model) ) STRICT
+TABLE session_tool_use
+    CREATE TABLE session_tool_use ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, tool_name TEXT NOT NULL, kind TEXT NOT NULL, server TEXT, calls INTEGER NOT NULL DEFAULT 0, last_call_at_ms INTEGER, updated_at_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER, usage_confidence TEXT, plugin TEXT, origin_root TEXT, PRIMARY KEY (session_event_id, tool_name, kind) ) STRICT
+TABLE session_usage_events
+    CREATE TABLE session_usage_events ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, dedup_key TEXT NOT NULL, responded_at_ms INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (session_event_id, dedup_key) ) STRICT, WITHOUT ROWID
+TABLE sessions
+    CREATE TABLE sessions ( event_id TEXT PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), source TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, started_at_ms INTEGER, updated_at_ms INTEGER NOT NULL, message_count INTEGER, duration_ms INTEGER, model TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, token_coverage TEXT NOT NULL DEFAULT 'sessions-only', prices_as_of TEXT, written_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (repo_id, source, session_id) ) STRICT
+TABLE skill_invocations
+    CREATE TABLE skill_invocations ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, skill_name TEXT NOT NULL, at_ms INTEGER NOT NULL, ok INTEGER NOT NULL, ok_confidence TEXT NOT NULL, detection TEXT, entry_path TEXT, args TEXT, body_chars INTEGER, PRIMARY KEY (session_event_id, skill_name, at_ms) ) STRICT
+TABLE stats_daily
+    CREATE TABLE stats_daily ( repo_id INTEGER NOT NULL, tz TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, series_key TEXT NOT NULL, value REAL NOT NULL, cost_usd REAL NOT NULL DEFAULT 0, built_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, tz, day, kind, series_key) ) STRICT, WITHOUT ROWID
+TABLE topic_pages
+    CREATE TABLE topic_pages ( repo_id INTEGER NOT NULL REFERENCES repos(id), stable_slug TEXT NOT NULL, title TEXT NOT NULL, summary TEXT, content_md TEXT NOT NULL, related_branches_json TEXT NOT NULL DEFAULT '[]', last_updated_at TEXT NOT NULL, payload_version INTEGER NOT NULL DEFAULT 1, PRIMARY KEY (repo_id, stable_slug) ) STRICT
+TABLE topic_processed_sources
+    CREATE TABLE topic_processed_sources ( repo_id INTEGER NOT NULL REFERENCES repos(id), source_type TEXT NOT NULL CHECK (source_type IN ('summary','plan','note','userfile')), source_id TEXT NOT NULL, PRIMARY KEY (repo_id, source_type, source_id) ) STRICT
+TABLE topic_source_refs
+    CREATE TABLE topic_source_refs ( repo_id INTEGER NOT NULL, stable_slug TEXT NOT NULL, pos INTEGER NOT NULL, ref_type TEXT NOT NULL CHECK (ref_type IN ('summary','plan','note','userfile')), ref_id TEXT NOT NULL, ts TEXT NOT NULL, branch TEXT, PRIMARY KEY (repo_id, stable_slug, ref_type, ref_id), UNIQUE (repo_id, stable_slug, pos), CHECK (pos >= 0), FOREIGN KEY (repo_id, stable_slug) REFERENCES topic_pages(repo_id, stable_slug) ON DELETE CASCADE ) STRICT
+TABLE transcript_sessions
+    CREATE TABLE transcript_sessions ( repo_id INTEGER NOT NULL, transcript_id TEXT NOT NULL, session_id TEXT NOT NULL, source TEXT, PRIMARY KEY (repo_id, transcript_id, session_id), FOREIGN KEY (repo_id, transcript_id) REFERENCES transcripts(repo_id, transcript_id) ON DELETE CASCADE ) STRICT
+TABLE transcripts
+    CREATE TABLE transcripts ( repo_id INTEGER NOT NULL REFERENCES repos(id), transcript_id TEXT NOT NULL, sessions_blob BLOB NOT NULL, written_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, transcript_id) ) STRICT
+TABLE worktree_status
+    CREATE TABLE worktree_status ( repo_id INTEGER NOT NULL REFERENCES repos(id), branch_key TEXT NOT NULL DEFAULT '', branch TEXT, files_changed INTEGER, insertions INTEGER, deletions INTEGER, observed_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, branch_key) ) STRICT
+
+# ── seed rows ───────────────────────────────────────────────────────────────
+context_kinds (4 rows)
+    {"kind":"note"}
+    {"kind":"plan"}
+    {"kind":"reference"}
+    {"kind":"skill"}

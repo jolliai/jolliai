@@ -949,8 +949,11 @@ describe("doctor --schema-log", () => {
 			expect(listing).toContain("BASELINE_DDL");
 			expect(listing).toContain("applied");
 
-			// Drift is REPORTED, not repaired: it no longer blocks anything, so there is
-			// nothing to unblock and no `--accept-schema-ddl`.
+			// A name this build does not carry IS reported — the surviving "another build
+			// wrote here" signal, and the one that cannot be wrong about our own edits.
+			// Changing an entry's BYTES is deliberately no longer reported: that check
+			// could not tell this project's own equivalent rewrite from a foreign build,
+			// and would have fired on every existing install after the idempotency pass.
 			await withRepairDashboardDb((db) => {
 				db.prepare("UPDATE schema_migrations SET ddl = 'from an unmerged branch' WHERE name = ?").run(
 					"RECALL_RECEIPTS_DDL",
@@ -958,8 +961,27 @@ describe("doctor --schema-log", () => {
 			});
 			logs.length = 0;
 			await runSchemaLog({});
-			expect(logs.join("\n")).toContain("Applied by a different build than this one: RECALL_RECEIPTS_DDL");
+			expect(logs.join("\n")).not.toContain("Recorded here but unknown to this build");
+
+			await withRepairDashboardDb((db) => {
+				db.prepare("UPDATE schema_migrations SET name = ? WHERE name = ?").run(
+					"2026-09-01-0000-from-another-branch",
+					"RECALL_RECEIPTS_DDL",
+				);
+			});
+			logs.length = 0;
+			await runSchemaLog({});
+			expect(logs.join("\n")).toContain(
+				"Recorded here but unknown to this build: 2026-09-01-0000-from-another-branch",
+			);
 			expect(logs.join("\n")).toContain("not a fault");
+			// Put it back, so the repair assertions below see the log they expect.
+			await withRepairDashboardDb((db) => {
+				db.prepare("UPDATE schema_migrations SET name = ? WHERE name = ?").run(
+					"RECALL_RECEIPTS_DDL",
+					"2026-09-01-0000-from-another-branch",
+				);
+			});
 
 			// The one repair left: record a name whose log row went missing, and refuse
 			// a name this build does not carry.

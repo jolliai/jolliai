@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DASHBOARD_SCHEMA_VERSION, withDashboardDb } from "./DashboardDb.js";
+import { withDashboardDb } from "./DashboardDb.js";
 import type { SeriesDimension, StatsEventEnvelope } from "./DashboardModel.js";
 import { buildDashboardModel } from "./DashboardQuery.js";
 import {
@@ -131,12 +131,17 @@ describe("stats rollup", () => {
 		expect(available.has("2026-07-29")).toBe(true);
 	});
 
-	it("a build older than the file does not settle any day", async () => {
-		// Nothing refuses an ahead-of-build database anymore, but the CACHE is a
-		// different question from the source tables: the expiry test reads every
-		// source table's write stamp, and a build that does not know a table added
-		// since cannot see it change — it would settle an already-incomplete day
-		// and keep serving it. Declining costs a recomputation per render.
+	it("a build that does not know every migration in the file settles no day", async () => {
+		// Nothing refuses such a database, but the CACHE is a different question from
+		// the source tables: the expiry test reads every source table's write stamp, and
+		// a build that does not know a table added since cannot see it change — it would
+		// settle an already-incomplete day and keep serving it. Declining costs a
+		// recomputation per render.
+		//
+		// The condition is "the log names a migration I do not have", not "the version
+		// number is higher". The number moved only with DDL, so it missed a newer build
+		// whose change added no columns and fired for one whose additions this build
+		// reads perfectly well.
 		await applyStatsEvents(
 			[
 				session("s1", day("2026-07-28", 23), [
@@ -148,18 +153,21 @@ describe("stats rollup", () => {
 		await withDashboardDb((db) => db.exec("DELETE FROM stats_daily"), { dbPath });
 		await withDashboardDb(
 			(db) => {
-				db.exec("UPDATE schema_meta SET value = '999' WHERE key = 'schema_version'");
+				db.prepare(
+					`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+					 VALUES (99, '2099-01-01-0000-from-the-future', 'applied', 'cli/99.0.0', 0, 0, '')`,
+				).run();
 				buildRollupQuietly(db, { now: () => NOW, timeZone: UTC });
 			},
 			{ dbPath },
 		);
 		expect(await rollupRows()).toEqual([]);
 
-		// And the current build settles it on the next write, so the only cost was
-		// the delay.
+		// And a build that DOES know every migration settles it on the next write, so
+		// the only cost was the delay.
 		await withDashboardDb(
 			(db) => {
-				db.exec(`UPDATE schema_meta SET value = '${DASHBOARD_SCHEMA_VERSION}' WHERE key = 'schema_version'`);
+				db.prepare("DELETE FROM schema_migrations WHERE name = '2099-01-01-0000-from-the-future'").run();
 				buildRollupQuietly(db, { now: () => NOW, timeZone: UTC });
 			},
 			{ dbPath },
