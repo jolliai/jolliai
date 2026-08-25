@@ -974,7 +974,14 @@ describe("doctor --schema-log", () => {
 			expect(logs.join("\n")).toContain(
 				"Recorded here but unknown to this build: 2026-09-01-0000-from-another-branch",
 			);
-			expect(logs.join("\n")).toContain("not a fault");
+			// The report must name the CONSEQUENCE, not just the fact. The same
+			// predicate gates `buildRollupQuietly`, so an unknown name means the daily
+			// stats cache is never written and every render recomputes its full
+			// window — which is usually why someone is reading this list at all. It
+			// used to say only "not a fault", which is true of the data and wrong
+			// about the performance.
+			expect(logs.join("\n")).toContain("DAILY STATS CACHE IS OFF");
+			expect(logs.join("\n")).toContain("Reads and writes keep working");
 			// Put it back, so the repair assertions below see the log they expect.
 			await withRepairDashboardDb((db) => {
 				db.prepare("UPDATE schema_migrations SET name = ? WHERE name = ?").run(

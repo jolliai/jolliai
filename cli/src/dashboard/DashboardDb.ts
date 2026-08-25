@@ -32,6 +32,7 @@ import { classifyScanError } from "../core/SqliteHelpers.js";
 import { createLogger, errMsg, isEnoent } from "../Logger.js";
 import { MIGRATIONS } from "./migrations/index.js";
 import type { DbMigration } from "./migrations/MigrationHelpers.js";
+import { instrumentDashboardDb } from "./SlowQueryLog.js";
 
 const log = createLogger("DashboardDb");
 
@@ -178,7 +179,16 @@ export interface OpenDashboardDbOptions {
  */
 const WRITE_PRAGMAS = ["PRAGMA journal_mode = WAL", "PRAGMA foreign_keys = ON"] as const;
 
-/** Read-only connections cannot set `journal_mode`; the writer already did. */
+/**
+ * Read-only connections cannot set `journal_mode`; the writer already did.
+ *
+ * No `cache_size` here, and that is a measured decision rather than an omission.
+ * SQLite's page cache is per CONNECTION and every render opens its own, so a
+ * larger one looked like free speed. Measured on a real 194 MB database once the
+ * analytic queries were index-driven, `-32000` (32 MB) was not faster than the
+ * 2 MB default and trended slightly slower: median 283 ms against 252 ms for the
+ * stats build. Re-add it only with a measurement attached.
+ */
 const READ_PRAGMAS = ["PRAGMA foreign_keys = ON"] as const;
 
 /**
@@ -869,7 +879,16 @@ async function openDb(readOnly: boolean, opts: OpenDashboardDbOptions): Promise<
 			db.exec(`PRAGMA busy_timeout = ${opts.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS}`);
 			// After the open: the file exists only now (see restrictDbFilesToOwner).
 			if (!readOnly) restrictDbFilesToOwner(dbPath);
-			return db;
+			// Slow-statement logging goes on HERE rather than at each call site,
+			// because this is the one place every dashboard read and write passes
+			// through — the server's renders, the hooks' `StatsWriter` batches, the
+			// backfill sweep and the migrations alike. Wrapping after the pragmas is
+			// deliberate: those are the open's own cost, not a query anyone can act
+			// on, and timing them would put a `PRAGMA busy_timeout` line in the log
+			// of every contended open. On by default at 200 ms; a run with
+			// `JOLLI_SLOW_SQL_MS=off` gets the handle back unwrapped, so switching it
+			// off leaves no indirection at all.
+			return instrumentDashboardDb(db, { role: readOnly ? "ro" : "rw" });
 		} catch (err) {
 			// Close the half-open handle before retrying, or each attempt leaks a
 			// file descriptor and (on Windows) keeps the file locked against the
@@ -954,10 +973,17 @@ export async function withRepairDashboardDb<T>(
  * surfaces any real fault itself, whereas guessing `true` here would leave a database
  * unmigrated with nothing reporting it.
  *
- * ⚠ Deliberately does NOT read the `ddl` column. `defaultModelBuilder` calls
- * `ensureDashboardDbExists` on EVERY `/api/model` — once per page load and once per
- * 30 s poll for as long as the tab is open — and the first entry's SQL alone is
- * ~35 KB. `readAppliedMigrationNames` exists to keep this to two columns.
+ * ⚠ Deliberately does NOT read the `ddl` column, which stores each migration's
+ * entire source text — the first entry's SQL alone is ~35 KB — to answer a
+ * question about NAMES. `readAppliedMigrationNames` exists to keep this to two
+ * columns. That was written when this read was on the dashboard's hot path
+ * (`defaultModelBuilder` called {@link ensureDashboardDbExists} on every
+ * `/api/model`, so once per page load and once per 30 s poll per open tab); that
+ * call is gone — see `readWithRecovery` in `DashboardServer.ts`, which pays it
+ * only when a read-only open actually fails — so today the only callers are
+ * `jolli dashboard`'s startup and that recovery. The two-column SELECT stays
+ * regardless: it is the right read for the question, and it is the next caller,
+ * not this one, that would pay for widening it.
  */
 export function isSchemaCurrent(db: DashboardDbHandle): boolean {
 	const done = readAppliedMigrationNames(db);
@@ -972,11 +998,12 @@ export function isSchemaCurrent(db: DashboardDbHandle): boolean {
  * Its own SELECT rather than a projection over {@link readMigrationLogState},
  * and the reason is the `ddl` column: it stores each migration's entire source
  * text — the baseline entry alone is ~35 KB — while this answers a question
- * about NAMES. That read is on the dashboard's hot path, not a startup one:
- * `defaultModelBuilder` calls {@link ensureDashboardDbExists} on EVERY
- * `/api/model`, so once per page load and once per 30 s poll for as long as the
- * tab is open. Pulling every migration's DDL there moved tens of KB per request
- * to look at two columns.
+ * about NAMES. It was measured on the dashboard's hot path: `defaultModelBuilder`
+ * used to call {@link ensureDashboardDbExists} on EVERY `/api/model`, so once per
+ * page load and once per 30 s poll for as long as a tab was open, and pulling
+ * every migration's DDL there moved tens of KB per request to look at two
+ * columns. That call has since moved off the read path (see `readWithRecovery` in
+ * `DashboardServer.ts`), which changes who pays, not whether the read is right.
  *
  * Collapses `none` and `unreadable` into one `undefined`, which the full read
  * deliberately does not: this caller answers BOTH the same way — {@link

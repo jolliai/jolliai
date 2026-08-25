@@ -456,47 +456,65 @@ function commitsInRange(
 }
 
 /**
- * Insights derived at query time from the memory's own topics — the summary
+ * Decisions derived at query time from the memory's own topics — the summary
  * schema has no `insights` field; what the retired commit_insights rows held
- * was ALWAYS this derivation (each topic's `decisions` and `todo`, in topic
- * order), performed at event-build time. Doing it in SQL keeps the rule in
- * one place and means a regenerated memory can never leave stale insights
- * behind. `ord` preserves the old idx ordering: topic position x2, decisions
- * before todo. addressed_to was never populated by the live deriver and stays
- * NULL. Legacy v3 memories whose root carries no topics degrade to no
- * insights — same as the old event path when the root display set was empty.
+ * was ALWAYS this derivation (each topic's `decisions`, in topic order),
+ * performed at event-build time. Doing it in SQL keeps the rule in one place and
+ * means a regenerated memory can never leave stale insights behind. `ord`
+ * preserves the old idx ordering, topic position x2. Legacy v3 memories whose
+ * root carries no topics degrade to no decisions — same as the old event path
+ * when the root display set was empty.
  *
- * `topic_title` carries the OWNING topic's title alongside the insight text.
+ * `topic_title` carries the OWNING topic's title alongside the decision text.
  * The Decisions card renders that title and nothing else (see
  * {@link buildDecisionsCard}), so it has to travel with the row: the `text` a
- * decision row holds is the whole `decisions` block, which is prose and has no
- * title in it to recover. Both branches select it so the column exists whatever
- * `kind` a consumer filters to.
+ * row holds is the whole `decisions` block, which is prose and has no title in
+ * it to recover.
  *
- * **Both branches filter `m.parent_hash IS NULL`** — the same "current
- * generation" rule {@link buildSeries} states at length, for the same reason and
- * with the same trap. `memories` holds one row per GENERATION, so a branch
- * amended or squashed four times keeps its predecessors' topics, and every
- * consumer of this CTE joins `commits`, which retains the predecessors' rows.
- * Unfiltered, one decision is counted once per rewrite — directly beside
- * `memoriesCreated`, which filters the same history out via `isReachable`.
+ * **`m.parent_hash IS NULL`** — the same "current generation" rule
+ * {@link buildSeries} states at length, for the same reason and with the same
+ * trap. `memories` holds one row per GENERATION, so a branch amended or squashed
+ * four times keeps its predecessors' topics, and every consumer of this CTE
+ * joins `commits`, which retains the predecessors' rows. Unfiltered, one
+ * decision is counted once per rewrite — directly beside `memoriesCreated`,
+ * which filters the same history out via `isReachable`.
+ *
+ * ## Why there is no `todo` branch, and no `kind` column
+ *
+ * There was, and it was dead work on EVERY call. This CTE emitted a second
+ * `UNION ALL` arm deriving each topic's `todo` text, and both of its two
+ * consumers then wrote `WHERE i.kind = 'decision'` — so the arm cost a full scan
+ * of `memories` plus a `json_each` parse of every `summary_json` (194 rows /
+ * 3.3 MB on a real database), produced rows, and had them thrown away.
+ *
+ * The `todo` rows fed the standup board's Risks/Blockers/Questions column, which
+ * was removed in JOLLI-2200/2201 because nothing produces the other kinds (see
+ * {@link ./DashboardModel.ts}'s `CommitInsightKind`). That removal stopped the
+ * SERVER sending them — `standup.insights` survives as a memory-tier flag whose
+ * presence alone is read — but stopped one layer short of the derivation, which
+ * kept running. Measured on a real database, dropping the arm takes
+ * `buildDecisionsCard` from **113 ms to 5 ms** for a byte-identical 219-row
+ * result, and `decisionCountsFor` from 2 ms to under 1 ms.
+ *
+ * `kind` went with it: a column that can only hold `'decision'` invites a filter
+ * that reads like a choice and is not one. Both consumers now select decisions
+ * because that is all this derivation makes.
+ *
+ * ⚠ `CommitInsightKind` and `StandupInsight` are deliberately NOT narrowed to
+ * match. They are kept so a real insight column "can return here without a wire
+ * change" (their own docstrings), and restoring a derivation arm here is far
+ * cheaper than restoring a deleted wire type. Adding one back means a second
+ * CTE, not a `kind` column on this one — a consumer that needs both should say
+ * which it wants at the point it asks.
  */
-const TOPIC_INSIGHTS_CTE = `WITH topic_insights AS (
-	SELECT m.repo_id, m.commit_hash, 'decision' AS kind,
+const TOPIC_DECISIONS_CTE = `WITH topic_decisions AS (
+	SELECT m.repo_id, m.commit_hash,
 	       TRIM(json_extract(t.value, '$.decisions')) AS text,
 	       TRIM(COALESCE(json_extract(t.value, '$.title'), '')) AS topic_title,
-	       NULL AS addressed_to, t.key * 2 AS ord
+	       t.key * 2 AS ord
 	  FROM memories m, json_each(m.summary_json, '$.topics') t
 	 WHERE m.parent_hash IS NULL
 	   AND TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
-	UNION ALL
-	SELECT m.repo_id, m.commit_hash, 'todo' AS kind,
-	       TRIM(json_extract(t.value, '$.todo')) AS text,
-	       TRIM(COALESCE(json_extract(t.value, '$.title'), '')) AS topic_title,
-	       NULL AS addressed_to, t.key * 2 + 1 AS ord
-	  FROM memories m, json_each(m.summary_json, '$.topics') t
-	 WHERE m.parent_hash IS NULL
-	   AND TRIM(COALESCE(json_extract(t.value, '$.todo'), '')) <> ''
 )`;
 
 const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_tokens + row.cached_tokens;
@@ -775,8 +793,7 @@ function decisionTitle(topicTitle: string | null, text: string): string {
 
 /**
  * Decisions mined from commit memories in the window — the standalone
- * Decisions card. Reuses {@link TOPIC_INSIGHTS_CTE}'s `decision` rows (the same
- * source the Standup page's insight list reads) rather than re-deriving the
+ * Decisions card. Reuses {@link TOPIC_DECISIONS_CTE} rather than re-deriving the
  * `json_each` walk a second time.
  *
  * `latest` carries the topic TITLE, not the decision text: the card shows one
@@ -805,15 +822,15 @@ function buildDecisionsCard(
 	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
 	const rows = db
 		.prepare(
-			`${TOPIC_INSIGHTS_CTE}
+			`${TOPIC_DECISIONS_CTE}
 			 SELECT i.text, i.topic_title, i.commit_hash, c.committed_at_ms, r.repo_name, r.repo_identity
 			   FROM commits c
 			   JOIN repos r ON r.id = c.repo_id
 			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
 			   -- See commitsInRange: a rewritten commit's decisions are still filed
 			   -- under the pre-rewrite hash, reachable only through the alias.
-			   JOIN topic_insights i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
-			  WHERE i.kind = 'decision' AND c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
+			   JOIN topic_decisions i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
+			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
 			  -- i.ord because one commit contributes several decision rows sharing its
 			  -- timestamp, so the date alone does not pick a first row — and rows[0]
 			  -- here IS the card (its one line and its one deep link).
@@ -1467,7 +1484,7 @@ function buildMemoryCards(db: DashboardDbHandle, scope: DashboardScope, window: 
 /**
  * Decisions recorded per memory card, keyed `repoIdentity\0commitHash`.
  *
- * Counts {@link TOPIC_INSIGHTS_CTE} rows — one per topic that recorded any
+ * Counts {@link TOPIC_DECISIONS_CTE} rows — one per topic that recorded any
  * decision — which is EXACTLY what `buildDecisionsCard`'s `keptCount` counts,
  * and that figure is rendered as "N decisions" directly above this list. A
  * per-bullet count (`splitDecisionBullets`) would be defensible on its own and
@@ -1479,7 +1496,7 @@ function buildMemoryCards(db: DashboardDbHandle, scope: DashboardScope, window: 
  *
  * No `commit_aliases` join, unlike the Decisions card: that one enters from the
  * `commits` side, where a rewritten commit's insights are filed under the
- * pre-rewrite hash. `topic_insights` is derived FROM `memories`, and these cards
+ * pre-rewrite hash. `topic_decisions` is derived FROM `memories`, and these cards
  * are selected from `memories` too, so both sides already name the same hash.
  */
 function decisionCountsFor(
@@ -1491,11 +1508,11 @@ function decisionCountsFor(
 	const holes = page.map(() => "?").join(",");
 	const rows = db
 		.prepare(
-			`${TOPIC_INSIGHTS_CTE}
+			`${TOPIC_DECISIONS_CTE}
 			 SELECT r.repo_identity, i.commit_hash, COUNT(*) AS n
-			   FROM topic_insights i
+			   FROM topic_decisions i
 			   JOIN repos r ON r.id = i.repo_id
-			  WHERE i.kind = 'decision' AND i.commit_hash IN (${holes})${filter.sql}
+			  WHERE i.commit_hash IN (${holes})${filter.sql}
 			  GROUP BY r.repo_identity, i.commit_hash`,
 		)
 		.all(...page.map((k) => k.commit_hash), ...filter.params) as ReadonlyArray<{

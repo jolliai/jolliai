@@ -213,14 +213,25 @@ export interface WorktreeStatusEvent {
 /**
  * Insight kinds mined from a commit's memory (the standup board's buckets).
  *
- * Only `decision` and `todo` are PRODUCIBLE: `TOPIC_INSIGHTS_CTE` in
- * `DashboardQuery.ts` derives insights from each memory topic's own
- * `decisions`/`todo` text and emits those two literals, so nothing can carry the
- * other three. They stay in the union because they are what a summarizer taught
- * to record risks would emit, and because `StandupAsset.test.ts` builds them to
- * assert the UI renders nothing for them — the standup board's Risks column was
- * removed for exactly this reason. Anything reading a `blocker`/`question`/
- * `gotcha` off a live model is reading a value the pipeline cannot produce yet.
+ * NONE of these is producible today, and `decision` is the only one that ever
+ * was on this path. `TOPIC_DECISIONS_CTE` in `DashboardQuery.ts` derives rows
+ * from each memory topic's own `decisions` text, and it feeds the Decisions
+ * card — which carries the text directly and has no `kind` at all. So no live
+ * model has ever carried a `blocker` / `question` / `gotcha`, and none carries a
+ * `todo` any more either.
+ *
+ * `todo` was real once: it was the second arm of that CTE, filling the standup
+ * board's Risks/Blockers/Questions column. The column was removed in
+ * JOLLI-2200/2201 because nothing produces the other kinds, the server then
+ * stopped SENDING the rows, and the derivation was finally dropped when it was
+ * measured still costing a full `memories` scan per call for rows both consumers
+ * discarded (see that CTE's docstring).
+ *
+ * The union keeps all five deliberately. They are what a summarizer taught to
+ * record risks would emit, `StandupAsset.test.ts` builds them to assert the UI
+ * renders nothing for them, and {@link StandupInsight} is kept for the same
+ * reason — so an insight column can return without a wire change. Restoring a
+ * derivation is a new CTE; restoring a deleted wire type is not.
  */
 export type CommitInsightKind = "decision" | "blocker" | "question" | "todo" | "gotcha";
 

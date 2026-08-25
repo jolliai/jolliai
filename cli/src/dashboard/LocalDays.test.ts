@@ -177,3 +177,58 @@ describe("local-day engine — zones whose local midnight is skipped", () => {
 		);
 	}
 });
+
+/**
+ * `localDayKey` answers from a one-entry-per-zone memo whose stored interval is
+ * derived by `localMidnight` / `addLocalDays`. The dangerous failure mode is an
+ * interval that is too WIDE, because that returns the previous day's key for an
+ * instant belonging to the next one — and it is already caught above: writing
+ * `fromMs + 86_400_000` instead of `addLocalDays(fromMs, 1, …)` reds the
+ * 23-hour-day case and both gap-midnight walks (measured). These cases exist to
+ * name the memo directly and to cover the two things those do not: the access
+ * pattern a single slot is WORST at, and every instant of a 25-hour day rather
+ * than just its boundaries.
+ *
+ * The oracle is a second, independent `Intl` formatter using `format` rather than
+ * `formatToParts`, so it shares no code with the implementation under test.
+ */
+describe("localDayKey memoisation", () => {
+	const oracle = (ms: number, timeZone: string) =>
+		new Intl.DateTimeFormat("en-CA", { timeZone, year: "numeric", month: "2-digit", day: "2-digit" }).format(ms);
+
+	const spans = [
+		// 23-hour day (DST starts 02:00 → 03:00).
+		{ zone: LA, label: "spring-forward", from: "2026-03-07T00:00:00Z" },
+		// 25-hour day, whose repeated hour must land inside the interval it belongs to.
+		{ zone: LA, label: "fall-back", from: "2026-10-31T00:00:00Z" },
+		// A day whose local midnight does not exist at all, so `fromMs` comes from
+		// `firstInstantOfLocalDay` rather than from the arithmetic.
+		{ zone: "Africa/Cairo", label: "skipped midnight", from: "2027-04-24T00:00:00Z" },
+	];
+
+	const QUARTER_HOUR = 900_000;
+	const STEPS = 3 * 96; // three local days at 15-minute resolution
+
+	for (const { zone, label, from } of spans) {
+		const start = Date.parse(from);
+		const instants = Array.from({ length: STEPS }, (_, i) => start + i * QUARTER_HOUR);
+
+		it(`${zone} (${label}): every instant matches an independent formatter, walking forward`, () => {
+			// Forward order is the hit-heavy path: one miss per day boundary, then ~96
+			// hits off the stored interval.
+			for (const ms of instants) expect(localDayKey(ms, zone), new Date(ms).toISOString()).toBe(oracle(ms, zone));
+		});
+
+		it(`${zone} (${label}): every instant matches when the order defeats the single slot`, () => {
+			// Alternating between the ends of the span makes almost every call a miss —
+			// the pattern the memo's docstring warns is ~9x slower than no memo. It must
+			// still be exactly right, since a wrong answer here would be a wrong day on
+			// a chart rather than a slow one.
+			for (let i = 0; i < instants.length / 2; i++) {
+				for (const ms of [instants[i], instants[instants.length - 1 - i]] as ReadonlyArray<number>) {
+					expect(localDayKey(ms, zone), new Date(ms).toISOString()).toBe(oracle(ms, zone));
+				}
+			}
+		});
+	}
+});

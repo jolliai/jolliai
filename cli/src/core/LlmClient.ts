@@ -91,14 +91,23 @@ const LLM_PROXY_PATH = "/api/push/llm/complete";
 
 /**
  * End-to-end timeout for proxy LLM calls (covers connect + headers + body).
- * The backend invokes Anthropic non-streaming inside this request, so 180s is
- * generous for a full LLM round-trip while bounding how long a stuck request
- * can hold the QueueWorker file lock. Historically moved in lockstep with
- * `DIRECT_FETCH_TIMEOUT_MS`, but that rationale no longer holds: the direct
- * path now streams by default and its non-streaming budget governs only
- * trivially-small calls, whereas this proxy budget governs ALL proxy calls
- * (which have no streaming escape). They happen to share 180s today but should
- * be evaluated independently. Exported so a regression test can pin the value.
+ *
+ * This is the ONLY wall-clock limit on a proxied call now. The backend streams
+ * from Anthropic and writes keep-alive whitespace while it waits, so the load
+ * balancer's 60s idle timeout — which used to cut every slow completion short
+ * with an unparseable HTML 504 — no longer applies. `AbortSignal.timeout` covers
+ * the whole exchange, so a response whose headers arrived early (keep-alive does
+ * exactly that) still dies here if the body never finishes.
+ *
+ * 180s also bounds how long a stuck request can hold the QueueWorker file lock,
+ * which is per-repo and held for the whole drain: raising this makes every other
+ * hook in that repo wait longer. Raise it only against measured backend latency,
+ * not on a hunch. Historically moved in lockstep with `DIRECT_FETCH_TIMEOUT_MS`,
+ * but that rationale no longer holds: the direct path now streams by default and
+ * its non-streaming budget governs only trivially-small calls, whereas this proxy
+ * budget governs ALL proxy calls (which have no streaming escape). They happen to
+ * share 180s today but should be evaluated independently. Exported so a
+ * regression test can pin the value.
  */
 export const PROXY_FETCH_TIMEOUT_MS = 180_000;
 
@@ -1143,7 +1152,10 @@ async function callProxy(
 		);
 		throw err;
 	}
-	const elapsed = Date.now() - startTime;
+	// Headers only. The backend may send them long before the body: while it waits
+	// on Anthropic it writes keep-alive whitespace, and the first frame flushes the
+	// status line. So this is "time to first byte", NOT the call's duration.
+	const headersMs = Date.now() - startTime;
 
 	if (!response.ok) {
 		const errorBody = await response.text();
@@ -1151,9 +1163,44 @@ async function callProxy(
 		throw new Error(`LLM proxy request failed with status ${response.status}: ${errorBody.substring(0, 200)}`);
 	}
 
-	const result = (await response.json()) as Record<string, unknown>;
+	// JSON.parse skips the keep-alive whitespace that may precede the object, so the
+	// body needs no special handling — but it does have to be read before the call
+	// counts as finished, and reading it is now its own failure surface.
+	let result: Record<string, unknown>;
+	try {
+		result = (await response.json()) as Record<string, unknown>;
+	} catch (err) {
+		// A failure mode that barely existed before the backend started writing
+		// keep-alive bytes: the status line can now arrive tens of seconds ahead of
+		// the body, so whatever goes wrong afterwards surfaces HERE and not on the
+		// fetch above. Two causes, told apart by the clocks: the backend hit its own
+		// deadline or upstream error after committing to a 200 and destroyed the
+		// socket (elapsed well under our timeout), or our own AbortSignal fired after
+		// the headers had landed (elapsed ≈ the timeout). Deliberately not recovered
+		// — a truncated body has no completion in it — but it must be diagnosable,
+		// otherwise the caller just sees a bare "terminated".
+		const elapsedMs = Date.now() - startTime;
+		const message = err instanceof Error ? err.message : String(err);
+		const cause = err instanceof Error ? formatCause((err as { cause?: unknown }).cause) : "(non-error)";
+		log.error(
+			"Proxy LLM body read failed: action=%s url=%s elapsedMs=%d headersMs=%d prematureClose=%s error=%s cause=%s",
+			options.action,
+			url,
+			elapsedMs,
+			headersMs,
+			String(isPrematureClose(err)),
+			message,
+			cause,
+		);
+		throw err;
+	}
+	const elapsed = Date.now() - startTime;
 
-	log.info("Proxy LLM response: action=%s latency=%dms", options.action, elapsed);
+	// Both numbers, because they answer different questions: `latency` is what the
+	// call actually cost, `headers` is when the backend committed to a 200. On a
+	// slow call `headers` pins to the backend's keep-alive delay, and a `latency`
+	// far above it is normal, not a stall.
+	log.info("Proxy LLM response: action=%s latency=%dms headers=%dms", options.action, elapsed, headersMs);
 
 	/* v8 ignore start -- defensive: proxy response always includes token counts, ?? 0 is a safety net */
 	return {

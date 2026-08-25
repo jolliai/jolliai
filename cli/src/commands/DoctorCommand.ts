@@ -1123,10 +1123,22 @@ export async function runSchemaLog(action: { mark?: string }): Promise<void> {
 	const unknown = state.rows.filter((row) => !MIGRATIONS.some((m) => m.name === row.name));
 	if (unknown.length > 0) {
 		const names = [...new Set(unknown.map((r) => r.name))].join(", ");
+		// The consequence line is not decoration, and "this is a diagnostic, not a
+		// fault" — what this said before — was measurably too weak. The same
+		// predicate gates `buildRollupQuietly`, so an unknown name here means the
+		// daily stats cache is never written and every dashboard render recomputes
+		// its whole window, permanently. Measured on a real machine whose database
+		// had been opened by two released CLIs: `stats_daily` held 0 rows and the
+		// stats page cost seconds. Whoever reads this list is usually reading it
+		// because a page is slow, so the connection has to be stated here.
 		console.log(
 			`\n  ⚠ Recorded here but unknown to this build: ${names}\n` +
-				"    Another build — very likely from an unmerged branch — has opened this database.\n" +
-				"    It keeps working; this is a diagnostic, not a fault.",
+				"    Another build — very likely from an unmerged branch, or a released CLI this\n" +
+				"    one predates — has opened this database.\n" +
+				"    Reads and writes keep working, but the DAILY STATS CACHE IS OFF while this\n" +
+				"    holds: nothing settles into `stats_daily`, so every dashboard render\n" +
+				"    recomputes its full window. Running a build that knows every name above\n" +
+				"    turns it back on by itself.",
 		);
 	}
 }

@@ -68,19 +68,71 @@ import { scopeFilter, scopeToRepoIds } from "./DashboardScopeUtil.js";
  * ⚠ The two arms must use EXACTLY this predicate and its negation. They are
  * complements, which is what makes the union neither double-count nor drop: a
  * third spelling on either side re-opens one of the two failures.
+ *
+ * ## Why this is a CTE join and not the correlated subquery it reads as
+ *
+ * The rule above was first written literally — `EXISTS (…) AND (SELECT SUM(…) …)
+ * >= …`, both correlated on `s.event_id`. That is one correlated AGGREGATE per
+ * candidate row, and SQLite cannot cache it across rows, so the SUM is re-run
+ * once for every row the window admits. Measured on a real 194 MB database over
+ * a 30-day window (11,380 rows out of a 12,306-row table):
+ *
+ *   - plain join, no cover test ......................  19 ms
+ *   - + the `EXISTS` half only .......................  23 ms
+ *   - + the correlated `SUM(…) >= …` half ............ 1008 ms   ← the whole cost
+ *   - the CTE below, byte-identical result set .......  23 ms
+ *
+ * Both readers here run the test, so a stats render paid it twice: ~2.6 s of a
+ * ~3.4 s build. `GROUP BY session_event_id` computes every session's total ONCE
+ * and the arms join it — the same question, asked in the order the planner can
+ * answer cheaply.
+ *
+ * The equivalence is exact, for a reason worth stating rather than checking case
+ * by case: a `GROUP BY` emits a row for a session **iff** that session has at
+ * least one event row, which is precisely the `EXISTS` half, and that row's
+ * `tot` is precisely the SUM half. So the covered arm is an INNER join (no row ⇒
+ * no match ⇒ not covered, so the zero-token session the `EXISTS` half was added
+ * for still falls to the fallback), and the uncovered arm is the LEFT join plus
+ * `cov.id IS NULL OR cov.tot < …` — De Morgan on the same two terms. The
+ * `COALESCE(…, 0)` is dropped deliberately: it existed to turn "no rows" into 0,
+ * and "no rows" is now `cov.id IS NULL`; the columns are NOT NULL, so a grouped
+ * SUM over ≥1 row can never be NULL.
+ *
+ * ⚠ The three fragments below are a MATCHED SET derived from one CTE. Spelling
+ * either arm's join by hand is the hazard this docstring already warns about,
+ * one layer down: an `INNER JOIN` with the comparison moved to `WHERE` still
+ * reads right and still partitions correctly, but a `LEFT JOIN` whose filter
+ * forgets `cov.id IS NULL` silently drops every session with no event rows at
+ * all — which, for every non-Claude source, is all of them.
+ *
+ * `MATERIALIZED` is not decoration: without it the planner may inline the CTE
+ * into each arm of the `UNION ALL` and re-run the aggregate per arm.
  */
-const EVENTS_COVER_SESSION = `EXISTS (SELECT 1 FROM session_usage_events e0
-	                                   WHERE e0.session_event_id = s.event_id)
-	                         AND (SELECT COALESCE(SUM(e2.input_tokens + e2.output_tokens + e2.cached_tokens), 0)
-	                                FROM session_usage_events e2
-	                               WHERE e2.session_event_id = s.event_id)
-	                             >= s.input_tokens + s.output_tokens + s.cached_tokens`;
+const SESSION_USAGE_COVER_CTE = `WITH session_usage_cover AS MATERIALIZED (
+	         SELECT session_event_id AS id,
+	                SUM(input_tokens + output_tokens + cached_tokens) AS tot
+	           FROM session_usage_events
+	          GROUP BY session_event_id
+	     )`;
 
-/** The events arm's guard: count these rows only when they are the whole story. */
-const HAS_DATED_USAGE = `(${EVENTS_COVER_SESSION})`;
+/**
+ * The events arm's guard: count these rows only when they are the whole story.
+ * A FROM-clause fragment, not a WHERE predicate — it must sit with the joins.
+ */
+const HAS_DATED_USAGE = `JOIN session_usage_cover cov
+	                          ON cov.id = s.event_id
+	                         AND cov.tot >= s.input_tokens + s.output_tokens + s.cached_tokens`;
+
+/**
+ * The fallback arm's join — the outer half of the same pair. Pairs with
+ * {@link NO_DATED_USAGE_FILTER}, which carries the negation; both are required,
+ * and the filter belongs in that arm's `WHERE`.
+ */
+const NO_DATED_USAGE_JOIN = `LEFT JOIN session_usage_cover cov ON cov.id = s.event_id`;
 
 /** The fallback arm's guard — the exact negation, never a separate spelling. */
-const NO_DATED_USAGE = `NOT (${EVENTS_COVER_SESSION})`;
+const NO_DATED_USAGE_FILTER = `(cov.id IS NULL
+	                            OR cov.tot < s.input_tokens + s.output_tokens + s.cached_tokens)`;
 
 /**
  * The two joins the landing rule needs, for a query whose `memories` is aliased
@@ -200,7 +252,7 @@ const MEMORY_FOR_COMMIT = `m.commit_hash = c.hash
  * Token segments placed on the day they were actually spent.
  *
  * The same UNION the spend axes use, kept in one place because the guard on the
- * fallback side is the easy half to forget: without {@link NO_DATED_USAGE}
+ * fallback side is the easy half to forget: without {@link NO_DATED_USAGE_FILTER}
  * every Claude session is counted twice, once as its responses and once as its
  * total.
  */
@@ -221,15 +273,18 @@ export function readDatedUsage(
 	const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 	return db
 		.prepare(
-			`SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, e.input_tokens AS input,
+			`${SESSION_USAGE_COVER_CTE}
+			SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, e.input_tokens AS input,
 			        e.output_tokens AS output, e.cached_tokens AS cached
 			   FROM session_usage_events e JOIN sessions s ON s.event_id = e.session_event_id
-			  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql} AND ${HAS_DATED_USAGE}
+			   ${HAS_DATED_USAGE}
+			  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql}
 			 UNION ALL
 			SELECT s.repo_id, s.updated_at_ms AS bucket_at_ms, s.input_tokens AS input,
 			        s.output_tokens AS output, s.cached_tokens AS cached
 			   FROM sessions s
-			  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE}`,
+			   ${NO_DATED_USAGE_JOIN}
+			  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE_FILTER}`,
 		)
 		.all(fromMs, toMs, ...filter.params, fromMs, toMs, ...filter.params) as DatedUsageRow[];
 }
@@ -262,17 +317,20 @@ export function readAxisRows(
 		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 		return db
 			.prepare(
-				`SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, e.model AS key,
+				`${SESSION_USAGE_COVER_CTE}
+				SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, e.model AS key,
 				        e.input_tokens + e.output_tokens + e.cached_tokens AS tokens,
 				        COALESCE(e.est_cost_usd, 0) AS cost
 				   FROM session_usage_events e JOIN sessions s ON s.event_id = e.session_event_id
-				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql} AND ${HAS_DATED_USAGE}
+				   ${HAS_DATED_USAGE}
+				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql}
 				 UNION ALL
 				SELECT s.repo_id, s.updated_at_ms AS bucket_at_ms, u.model AS key,
 				        u.input_tokens + u.output_tokens + u.cached_tokens AS tokens,
 				        COALESCE(u.est_cost_usd, 0) AS cost
 				   FROM session_model_usage u JOIN sessions s ON s.event_id = u.session_event_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE}`,
+				   ${NO_DATED_USAGE_JOIN}
+				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE_FILTER}`,
 			)
 			.all(fromMs, toMs, ...filter.params, fromMs, toMs, ...filter.params) as AxisRow[];
 	}
@@ -280,17 +338,20 @@ export function readAxisRows(
 		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 		return db
 			.prepare(
-				`SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, s.source AS key,
+				`${SESSION_USAGE_COVER_CTE}
+				SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, s.source AS key,
 				        e.input_tokens + e.output_tokens + e.cached_tokens AS tokens,
 				        COALESCE(e.est_cost_usd, 0) AS cost
 				   FROM session_usage_events e JOIN sessions s ON s.event_id = e.session_event_id
-				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql} AND ${HAS_DATED_USAGE}
+				   ${HAS_DATED_USAGE}
+				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql}
 				 UNION ALL
 				SELECT s.repo_id, s.updated_at_ms AS bucket_at_ms, s.source AS key,
 				        s.input_tokens + s.output_tokens + s.cached_tokens AS tokens,
 				        COALESCE(s.est_cost_usd, 0) AS cost
 				   FROM sessions s
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE}`,
+				   ${NO_DATED_USAGE_JOIN}
+				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE_FILTER}`,
 			)
 			.all(fromMs, toMs, ...filter.params, fromMs, toMs, ...filter.params) as AxisRow[];
 	}
@@ -298,19 +359,22 @@ export function readAxisRows(
 		const filter = scopeFilter(scopeToRepoIds(db, scope), "s.repo_id");
 		return db
 			.prepare(
-				`SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, r.repo_name AS key,
+				`${SESSION_USAGE_COVER_CTE}
+				SELECT s.repo_id, e.responded_at_ms AS bucket_at_ms, r.repo_name AS key,
 				        e.input_tokens + e.output_tokens + e.cached_tokens AS tokens,
 				        COALESCE(e.est_cost_usd, 0) AS cost
 				   FROM session_usage_events e
 				   JOIN sessions s ON s.event_id = e.session_event_id
 				   JOIN repos r ON r.id = s.repo_id
-				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql} AND ${HAS_DATED_USAGE}
+				   ${HAS_DATED_USAGE}
+				  WHERE e.responded_at_ms >= ? AND e.responded_at_ms < ?${filter.sql}
 				 UNION ALL
 				SELECT s.repo_id, s.updated_at_ms AS bucket_at_ms, r.repo_name AS key,
 				        s.input_tokens + s.output_tokens + s.cached_tokens AS tokens,
 				        COALESCE(s.est_cost_usd, 0) AS cost
 				   FROM sessions s JOIN repos r ON r.id = s.repo_id
-				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE}`,
+				   ${NO_DATED_USAGE_JOIN}
+				  WHERE s.updated_at_ms >= ? AND s.updated_at_ms < ?${filter.sql} AND ${NO_DATED_USAGE_FILTER}`,
 			)
 			.all(fromMs, toMs, ...filter.params, fromMs, toMs, ...filter.params) as AxisRow[];
 	}

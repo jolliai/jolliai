@@ -1085,6 +1085,61 @@ describe("LlmClient", () => {
 			);
 		});
 
+		it("parses a response body that the backend prefixed with keep-alive whitespace", async () => {
+			// The backend writes newlines while it waits on Anthropic so the load
+			// balancer does not drop the idle socket at 60s. A real Response is used
+			// here rather than a mocked `json()` — the whole point is that the actual
+			// parser tolerates the prefix, which a stubbed `json()` would not prove.
+			fetchSpy.mockResolvedValueOnce(
+				new Response('\n\n\n{"text":"kept alive","inputTokens":11,"outputTokens":22}', {
+					status: 200,
+					headers: { "content-type": "application/json" },
+				}),
+			);
+
+			const result = await callLlm({
+				action: "commit-message",
+				params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+				jolliApiKey: "sk-jol-test.secret",
+			});
+
+			expect(result.text).toBe("kept alive");
+			expect(result.inputTokens).toBe(11);
+			expect(result.outputTokens).toBe(22);
+		});
+
+		it("reports a body that dies after the headers, instead of a bare transport error", async () => {
+			// Keep-alive splits the response in two: the status line can land tens of
+			// seconds before the body. So a backend that fails after committing to a
+			// 200 destroys the socket, and that surfaces on the body read — not on the
+			// fetch. The call must still reject (a truncated body has no completion in
+			// it), but with a log that names the phase.
+			const body = new ReadableStream({
+				start(controller) {
+					controller.enqueue(new TextEncoder().encode("\n\n"));
+					controller.error(Object.assign(new Error("terminated"), { code: "ERR_STREAM_PREMATURE_CLOSE" }));
+				},
+			});
+			fetchSpy.mockResolvedValueOnce(
+				new Response(body, { status: 200, headers: { "content-type": "application/json" } }),
+			);
+
+			await expect(
+				callLlm({
+					action: "commit-message",
+					params: { branch: "main", fileList: "src/foo.ts", stagedDiff: "diff" },
+					jolliApiKey: "sk-jol-test.secret",
+				}),
+			).rejects.toThrow();
+
+			// Match the format string only: asserting the argument list would break the
+			// moment a field is added to that log line.
+			const logged = mockLogError.mock.calls.some((call) =>
+				String(call[0]).includes("Proxy LLM body read failed"),
+			);
+			expect(logged).toBe(true);
+		});
+
 		it("throws when proxy returns error", async () => {
 			fetchSpy.mockResolvedValueOnce({
 				ok: false,

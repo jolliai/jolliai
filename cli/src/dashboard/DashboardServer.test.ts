@@ -143,7 +143,7 @@ import { getAggregateWikiFreshness } from "../core/WikiFreshness.js";
 import { resolveAssetsDir as resolveGraphAssetsDir } from "../graph/GraphExport.js";
 import * as installer from "../install/Installer.js";
 import { withIsolatedHome } from "../testUtils/isolatedHome.js";
-import { withDashboardDb } from "./DashboardDb.js";
+import { withDashboardDb, withReadonlyDashboardDb } from "./DashboardDb.js";
 import { type DashboardModel, type DashboardScope, type DashboardView, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
 import {
 	assembleDashboardHtml,
@@ -404,7 +404,14 @@ describe("navigation", () => {
 		expect(res.status).toBe(200);
 		const html = await res.text();
 		expect(html).toContain("window.__JOLLI_DASHBOARD__");
-		expect(html).toContain("body{color:red}"); // inlined CSS
+		// The stylesheet is LINKED, not inlined — and the link resolves. Asserting
+		// the tag alone would pass for a URL nothing serves, which is the one way
+		// this can break: the page would render unstyled with a 404 in the console.
+		const href = /<link rel="stylesheet" href="([^"]+)"/.exec(html)?.[1];
+		expect(href).toMatch(/^\/assets\/main-[0-9a-f]{8}\.css$/);
+		const css = await get(port, href as string);
+		expect(css.status).toBe(200);
+		expect(await css.text()).toContain("body{color:red}");
 		// Nothing is set on the client: no cookie, so nothing to go stale.
 		expect(res.headers.get("set-cookie")).toBeNull();
 	});
@@ -1236,6 +1243,20 @@ describe("routes", () => {
 	});
 });
 
+/**
+ * Where `main.js`'s tag starts — the "app scripts begin here" marker the inline
+ * data blocks must precede.
+ *
+ * ⚠ Not `indexOf("/assets/main-")`: the stylesheet is `main-<hash>.css` and it
+ * sits in the `<head>`, so the loose match finds it first and every ordering
+ * assertion silently compares against the wrong element.
+ */
+function mainScriptAt(html: string): number {
+	const at = html.search(/<script src="\/assets\/main-[0-9a-f]{8}\.js"/);
+	expect(at, "main.js script tag").toBeGreaterThan(-1);
+	return at;
+}
+
 describe("assembleDashboardHtml", () => {
 	it("throws on a template missing its markers", () => {
 		writeFileSync(join(assetsDir, "index.html"), "<html><body>no markers</body></html>");
@@ -1257,8 +1278,10 @@ describe("assembleDashboardHtml", () => {
 		const html = assembleDashboardHtml(assetsDir, JSON.stringify({ title: "<!--<script>" }));
 		expect(html).not.toContain("<!--");
 		// The model block still closes: the app scripts after it stay real tags.
-		expect(html).toContain("/* main.js */");
-		expect(html.indexOf("window.__JOLLI_DASHBOARD__")).toBeLessThan(html.indexOf("/* main.js */"));
+		// Asserted against the LINKED script now that the bodies are external — the
+		// property under test is the tokenizer state, not where the code lives.
+		expect(html).toMatch(/<script src="\/assets\/main-[0-9a-f]{8}\.js"><\/script>/);
+		expect(html.indexOf("window.__JOLLI_DASHBOARD__")).toBeLessThan(mainScriptAt(html));
 	});
 
 	// The agent-name half of `JD.sourceBadge`. Inlined from the CLI's own map so
@@ -1268,7 +1291,7 @@ describe("assembleDashboardHtml", () => {
 	it("inlines the transcript source labels ahead of the app scripts", () => {
 		const html = assembleDashboardHtml(assetsDir, "{}");
 		expect(html).toContain(`window.__JOLLI_SOURCE_LABELS__ = ${JSON.stringify(TRANSCRIPT_SOURCE_LABELS)}`);
-		expect(html.indexOf("__JOLLI_SOURCE_LABELS__")).toBeLessThan(html.indexOf("/* main.js */"));
+		expect(html.indexOf("__JOLLI_SOURCE_LABELS__")).toBeLessThan(mainScriptAt(html));
 	});
 
 	// Unlike the token, which is omitted when absent: a page without the labels
@@ -1289,7 +1312,138 @@ describe("assembleDashboardHtml", () => {
 		expect(html).toContain(
 			`window.__JOLLI_SOURCE_META__ = ${JSON.stringify({ meta: SOURCE_META, neutral: NEUTRAL_SOURCE_COLOR })}`,
 		);
-		expect(html.indexOf("__JOLLI_SOURCE_META__")).toBeLessThan(html.indexOf("/* main.js */"));
+		expect(html.indexOf("__JOLLI_SOURCE_META__")).toBeLessThan(mainScriptAt(html));
+	});
+});
+
+describe("hashed asset routes", () => {
+	/** The CSS URL the page links, which is also a key in the served map. */
+	const cssUrlFrom = (html: string): string => {
+		const href = /<link rel="stylesheet" href="([^"]+)"/.exec(html)?.[1];
+		expect(href, "stylesheet link").toBeTruthy();
+		return href as string;
+	};
+
+	it("serves every URL the page links, and 404s anything else under /assets/", async () => {
+		// The page is only as good as its links. Asserting the tags without
+		// fetching them would pass for a bundle that renders a document full of
+		// 404s — unstyled, and with no JavaScript at all.
+		const port = await listen(testServer());
+		const html = await (await get(port, "/dashboard")).text();
+		const urls = [cssUrlFrom(html), ...[...html.matchAll(/<script src="([^"]+)"/g)].map((m) => m[1] as string)];
+		expect(urls.length).toBe(DASHBOARD_SCRIPT_FILES.length + 1);
+		for (const url of urls) {
+			expect((await get(port, url)).status, url).toBe(200);
+		}
+		expect((await get(port, "/assets/nope-00000000.js")).status).toBe(404);
+	});
+
+	it("answers by exact path, so a traversal is just a miss", async () => {
+		// There is no filesystem join on this route at all — the map built at
+		// startup IS the allowlist — so these are 404s rather than reads. Asserted
+		// because the absence of a join is exactly the kind of thing a later
+		// "improvement" re-introduces.
+		const port = await listen(testServer());
+		for (const path of [
+			"/assets/../../../../etc/passwd",
+			"/assets/..%2f..%2fetc%2fpasswd",
+			"/assets/js/main.js",
+			"/assets/",
+		]) {
+			expect((await get(port, path)).status, path).toBe(404);
+		}
+	});
+
+	it("caches immutably and revalidates on a strong validator", async () => {
+		// `immutable` for a year is only correct because the URL names the content:
+		// an upgrade changes the bytes, so it changes the URL, so a cached copy can
+		// never be served for new content.
+		const port = await listen(testServer());
+		const html = await (await get(port, "/dashboard")).text();
+		const url = cssUrlFrom(html);
+
+		const first = await get(port, url);
+		expect(first.headers.get("cache-control")).toBe("public, max-age=31536000, immutable");
+		const etag = first.headers.get("etag");
+		expect(etag).toMatch(/^"[0-9a-f]{8}"$/);
+
+		const revalidated = await get(port, url, { "If-None-Match": etag as string });
+		expect(revalidated.status).toBe(304);
+		expect(await revalidated.text()).toBe("");
+	});
+
+	it("gzips an asset for a client that takes it, and not for one that does not", async () => {
+		const port = await listen(testServer());
+		const html = await (await get(port, "/dashboard")).text();
+		const url = cssUrlFrom(html);
+
+		const zipped = await get(port, url, { "Accept-Encoding": "gzip" });
+		// `fetch` decodes transparently, so the header is what proves it — and the
+		// body must still come out identical after decoding.
+		expect(zipped.headers.get("content-encoding")).toBe("gzip");
+		expect(zipped.headers.get("vary")).toBe("Accept-Encoding");
+		expect(await zipped.text()).toContain("body{color:red}");
+
+		const plain = await get(port, url, { "Accept-Encoding": "identity" });
+		expect(plain.headers.get("content-encoding")).toBeNull();
+		expect(await plain.text()).toContain("body{color:red}");
+	});
+
+	it("reads the q-values, so `gzip;q=0` is a refusal and `*` is a yes", async () => {
+		// The substring test this replaced answered yes to both `gzip` and
+		// `gzip;q=0` — and the second is a client saying it CANNOT decode gzip
+		// (RFC 9110 §12.5.3), so it got a body it had refused. No browser sends
+		// either form; the clients that do are curl, proxies and health checkers.
+		const port = await listen(testServer());
+		const url = cssUrlFrom(await (await get(port, "/dashboard")).text());
+
+		for (const [accept, encoded] of [
+			["gzip;q=0", false],
+			["gzip;q=0.0", false],
+			["gzip;q=0.5", true],
+			["*", true],
+			["*;q=0", false],
+			// An explicit entry outranks the wildcard, whichever way each points.
+			["*;q=0, gzip", true],
+			["gzip;q=0, *", false],
+			["deflate, gzip;q=0", false],
+		] as ReadonlyArray<[string, boolean]>) {
+			const res = await get(port, url, { "Accept-Encoding": accept });
+			expect(res.headers.get("content-encoding"), accept).toBe(encoded ? "gzip" : null);
+			expect(await res.text(), accept).toContain("body{color:red}");
+		}
+	});
+
+	it("keeps the document out of the cache while its assets stay in it", async () => {
+		// The document carries the model and the mutation token, both per request;
+		// the assets carry neither. Serving them under one policy is what the split
+		// exists to avoid.
+		const port = await listen(testServer());
+		const page = await get(port, "/dashboard");
+		expect(page.headers.get("cache-control")).toBe("no-store");
+		const url = cssUrlFrom(await page.text());
+		expect((await get(port, url)).headers.get("cache-control")).toContain("immutable");
+	});
+
+	it("gzips /api/model, which the stats page re-fetches every 30s", async () => {
+		const port = await listen(
+			testServer({
+				// Big enough to clear the compress-it-at-all floor.
+				buildModel: async (req) => ({ ...model(req.view), filler: "x".repeat(4096) }) as never,
+			}),
+		);
+		const res = await get(port, "/api/model?view=stats", { "Accept-Encoding": "gzip" });
+		expect(res.headers.get("content-encoding")).toBe("gzip");
+		expect(((await res.json()) as DashboardModel).view).toBe("stats");
+	});
+
+	it("leaves a small payload uncompressed", async () => {
+		// Below the floor gzip's framing plus the CPU cost buys nothing, and most
+		// JSON this server sends is a small view model.
+		const port = await listen(testServer());
+		const res = await get(port, "/api/model?view=standup", { "Accept-Encoding": "gzip" });
+		expect(res.headers.get("content-encoding")).toBeNull();
+		expect(((await res.json()) as DashboardModel).view).toBe("standup");
 	});
 });
 
@@ -1968,6 +2122,95 @@ describe("defaultModelBuilder (no injected buildModel)", () => {
 		const retired = await get(port, "/api/model?view=repositories");
 		expect(retired.status).toBe(200);
 		expect(((await retired.json()) as DashboardModel).view).toBe("stats");
+	});
+
+	it("recreates a database that is missing at request time, and still renders", async () => {
+		// The render path no longer runs `ensureDashboardDbExists` ahead of every
+		// read — that was a WRITABLE open on every 30 s poll, to pre-empt a case
+		// that happens approximately never. The recovery it bought is kept, moved
+		// to the moment the read-only open actually fails: without it the request
+		// 500s as plain text, and a page with no scripts on it never polls again,
+		// so the browser cannot come back on its own.
+		//
+		// Asserted on a path that was never created, which is also the shape of a
+		// database wiped under a running server.
+		const dbPath = join(dir, "vanished", "dashboard.db");
+		const configDir = join(dir, "vanished-config");
+		expect(existsSync(dbPath)).toBe(false);
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/api/model?view=stats");
+
+		expect(res.status).toBe(200);
+		expect(((await res.json()) as DashboardModel).view).toBe("stats");
+		expect(existsSync(dbPath)).toBe(true);
+	});
+
+	it("recreates a schema for a database file that has none", async () => {
+		// The same recovery, arriving under a different error code. SQLite opens a
+		// zero-length file as a valid EMPTY database, so this one gets past the open
+		// and fails at the first query with `no such table` — `classifyScanError`
+		// calls that `schema`, not `permission`. It is the second half of the case the
+		// test above covers (a wipe or a `doctor` mid-restore), so narrowing the
+		// recovery to `permission` alone left exactly this shape answering the
+		// scriptless 500 the recovery exists to prevent.
+		const dbPath = join(dir, "empty.db");
+		const configDir = join(dir, "empty-config");
+		writeFileSync(dbPath, "");
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/api/model?view=stats");
+
+		expect(res.status).toBe(200);
+		expect(((await res.json()) as DashboardModel).view).toBe("stats");
+		expect(readFileSync(dbPath).length).toBeGreaterThan(0);
+	});
+
+	it("does not answer a broken query by re-running migrations", async () => {
+		// The `catch` covers the whole read, not just the open, so `classifyScanError`
+		// answers `schema` both for a database with no tables and for a query naming a
+		// table THIS BUILD got wrong. A complete migration log with a table missing
+		// under it is the second shape, and what this pins is the outcome: the real
+		// failure reaches the caller and the file is left exactly as it was.
+		//
+		// ⚠ It does NOT pin `readWithRecovery`'s `schemaIsComplete` guard, and that is
+		// worth knowing before trusting it as one. Without the guard the recovery still
+		// writes nothing here — `ensureDashboardDbExists` finds the log complete and
+		// short-circuits before its writable open — so both paths end in this same 500
+		// with the table still gone. What the guard buys is not visible from out here:
+		// an honest log line, and not rebuilding the whole model a second time to fail
+		// the same way. Measured by removing it: this case stays green.
+		const dbPath = join(dir, "dropped.db");
+		const configDir = join(dir, "dropped-config");
+		await withDashboardDb((db) => db.exec("DROP TABLE sessions"), { dbPath });
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/api/model?view=stats");
+
+		expect(res.status).toBe(500);
+		// Read-only on purpose: a writable open here would migrate and recreate the
+		// table itself, and the assertion would pass whatever the server had done.
+		const tables = await withReadonlyDashboardDb(
+			(db) => db.prepare("SELECT name FROM sqlite_master WHERE name = 'sessions'").all(),
+			{ dbPath },
+		);
+		expect(tables).toEqual([]);
+	});
+
+	it("does not answer a corrupt database by writing a schema over it", async () => {
+		// The recovery covers `permission` (SQLITE_CANTOPEN) and `schema` (a file with
+		// no tables in it). A `corrupt` or `locked` file is a different problem, and
+		// creating a schema on top of one would be destructive — so it must surface as
+		// the 500 it is.
+		const dbPath = join(dir, "corrupt.db");
+		const configDir = join(dir, "corrupt-config");
+		writeFileSync(dbPath, "this is not a sqlite database, not even close");
+
+		const port = await listen(createDashboardServer({ port: 0, assetsDir, dbPath, configDir }));
+		const res = await get(port, "/api/model?view=stats");
+
+		expect(res.status).toBe(500);
+		expect(readFileSync(dbPath, "utf8")).toBe("this is not a sqlite database, not even close");
 	});
 
 	// The optional sidebar rows come from config, and they are read on EVERY view
@@ -3664,10 +3907,14 @@ describe("read routes carry a detail-repo scope token", () => {
 });
 
 describe("outer request-handler error paths", () => {
-	it("ends the response cleanly when serialization throws after the headers are sent", async () => {
-		// sendJson writes the 200 header, then JSON.stringify throws on the BigInt —
-		// the outer catch sees headersSent and just ends the response rather than
-		// trying to write a second header.
+	it("500s when serialization throws, and survives it", async () => {
+		// This used to answer 200-then-nothing: `sendJson` wrote the header first and
+		// `JSON.stringify` threw on the BigInt afterwards, so the outer catch saw
+		// `headersSent` and could only end a response it had already promised was a
+		// success. `/api/model` now serialises BEFORE writing the header (it has to —
+		// gzip needs the bytes to know the length), so the throw arrives while a real
+		// status can still be sent. A client that asked for JSON and got half a 200
+		// has no way to tell that from an empty model.
 		const port = await listen(
 			testServer({
 				buildModel: async (req) =>
@@ -3675,7 +3922,7 @@ describe("outer request-handler error paths", () => {
 			}),
 		);
 		const res = await get(port, "/api/model?view=stats");
-		expect(res.status).toBe(200);
+		expect(res.status).toBe(500);
 		// The server survives and answers the next request normally.
 		expect((await get(port, "/memories")).status).toBe(200);
 	});

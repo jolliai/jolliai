@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { withDashboardDb } from "./DashboardDb.js";
 import type { SeriesDimension, StatsEventEnvelope } from "./DashboardModel.js";
 import { buildDashboardModel } from "./DashboardQuery.js";
@@ -173,6 +173,41 @@ describe("stats rollup", () => {
 			{ dbPath },
 		);
 		expect((await rollupRows()).length).toBeGreaterThan(0);
+	});
+
+	it("reports the cache being off without writing to a terminal", async () => {
+		// The `quietly` in the name is load-bearing, and `info` is what keeps it
+		// true: `warn` reaches stderr regardless of `setSilentConsole`, and this
+		// branch is NOT dashboard-only — `ProducerHooks.safeApply` passes no
+		// `skipRollup`, so every producer arrives here. A `warn` would therefore
+		// print on every `jolli recall`, onto the MCP server's stderr and into an
+		// agent's tool output, for as long as the database carries one name this
+		// build lacks — which a machine running mixed surface versions does
+		// routinely. The state is meant to be visible from `jolli doctor
+		// --schema-log`, which asks for it.
+		const spoke: string[] = [];
+		const record = (line: unknown) => {
+			spoke.push(String(line));
+		};
+		const warn = vi.spyOn(console, "warn").mockImplementation(record);
+		const error = vi.spyOn(console, "error").mockImplementation(record);
+		try {
+			await withDashboardDb(
+				(db) => {
+					db.prepare(
+						`INSERT INTO schema_migrations (slot, name, outcome, applied_by, applied_at_ms, duration_ms, ddl)
+						 VALUES (99, '2099-01-01-0000-from-the-future', 'applied', 'cli/99.0.0', 0, 0, '')`,
+					).run();
+					buildRollupQuietly(db, { now: () => NOW, timeZone: UTC });
+					buildRollupQuietly(db, { now: () => NOW, timeZone: UTC });
+				},
+				{ dbPath },
+			);
+		} finally {
+			warn.mockRestore();
+			error.mockRestore();
+		}
+		expect(spoke.filter((line) => line.includes("stats rollup"))).toEqual([]);
 	});
 
 	it("never settles today, however many times it runs", async () => {

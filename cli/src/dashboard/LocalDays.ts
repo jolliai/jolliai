@@ -56,10 +56,65 @@ function zonedParts(ms: number, timeZone: string): ZonedParts {
 	return { year: get("year"), month: get("month"), day: get("day"), hour: get("hour"), minute: get("minute") };
 }
 
-/** Local calendar day of `ms` as `YYYY-MM-DD`. */
-export function localDayKey(ms: number, timeZone: string): string {
+/**
+ * The last day {@link localDayKey} resolved, per zone, as the half-open interval
+ * it covers — so a run of instants inside one day answers from arithmetic
+ * instead of `Intl`.
+ *
+ * `formatToParts` allocates an array of part objects and `parts.find` walks it
+ * five times per call, and the callers here are per-ROW: bucketing a 30-day
+ * window's 12,000 usage rows called it 12,000 times. Measured at 86 ms of a
+ * ~330 ms stats render — the largest pure-JS cost left once the SQL was fixed.
+ *
+ * ⚠ ONE entry per zone, not an LRU, and that is a deliberate fit to the access
+ * pattern rather than a simplification: every caller walks instants in an order
+ * that is at least loosely time-sorted (a day series, a window scan), so the
+ * hit rate is what matters and a single slot already captures it.
+ *
+ * ⚠ A miss costs MORE than the uncached path did, which is what makes that
+ * ordering load-bearing rather than merely convenient. Filling the slot has to
+ * derive the interval: `localMidnight` (~2 `formatToParts`) plus `addLocalDays`
+ * (~6 — it re-snaps `fromMs` to its own midnight before stepping) on top of this
+ * call's own one, so ~9 where the uncached path spent 1. Two consequences before
+ * calling this from somewhere new. The per-day loops that seed a bucket map
+ * before walking rows (`DashboardQuery`'s heatmap / per-day maps, `StatsRollup`'s
+ * day walks) are 100% misses by construction — fine, since that is ~9 × the
+ * window length, well under a millisecond for 30 days. But a caller that
+ * ALTERNATES between two days row by row would be ~9x slower than with no memo
+ * at all; the fix there is a second slot or sorted rows, not a wider interval.
+ *
+ * ⚠ The interval is computed by {@link startOfLocalDay} / {@link addLocalDays},
+ * never by adding 86,400,000 — the whole reason this module exists is that a
+ * local day is not always 24 hours. Two DST properties make the memo safe: the
+ * interval really is the set of instants sharing that key (its bounds come from
+ * the same zone arithmetic the uncached path uses), and a fall-back repeated
+ * hour lies inside the interval it belongs to, so it hits with the right key.
+ */
+const dayKeyMemo = new Map<string, { fromMs: number; toMs: number; key: string }>();
+
+/**
+ * The uncached answer — and the one every boundary helper below must call.
+ *
+ * ⚠ `localMidnight` → `firstInstantOfLocalDay` bisects on the day key, so it
+ * asks this question thousands of times while ANSWERING it. Routing that through
+ * the memoised entry point makes `localDayKey` recursive through its own cache
+ * fill (measured: `RangeError: Maximum call stack size exceeded` on the first
+ * gap-date input). Callers below therefore take this function, never the export.
+ */
+function computeDayKey(ms: number, timeZone: string): string {
 	const p = zonedParts(ms, timeZone);
 	return `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+}
+
+/** Local calendar day of `ms` as `YYYY-MM-DD`. */
+export function localDayKey(ms: number, timeZone: string): string {
+	const hit = dayKeyMemo.get(timeZone);
+	if (hit && ms >= hit.fromMs && ms < hit.toMs) return hit.key;
+	const p = zonedParts(ms, timeZone);
+	const key = `${p.year}-${String(p.month).padStart(2, "0")}-${String(p.day).padStart(2, "0")}`;
+	const fromMs = localMidnight(p.year, p.month, p.day, timeZone);
+	dayKeyMemo.set(timeZone, { fromMs, toMs: addLocalDays(fromMs, 1, timeZone), key });
+	return key;
 }
 
 /**
@@ -132,7 +187,7 @@ function firstInstantOfLocalDay(year: number, month: number, day: number, timeZo
 	let hiMin = Math.ceil((naive + 14 * 3_600_000) / 60_000);
 	while (hiMin - loMin > 1) {
 		const midMin = Math.floor((loMin + hiMin) / 2);
-		if (localDayKey(midMin * 60_000, timeZone) < targetKey) loMin = midMin;
+		if (computeDayKey(midMin * 60_000, timeZone) < targetKey) loMin = midMin;
 		else hiMin = midMin;
 	}
 	return hiMin * 60_000;

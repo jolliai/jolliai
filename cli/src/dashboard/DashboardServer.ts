@@ -84,12 +84,13 @@
  *      on a GET needs it back — cross-site reachability here is unchanged.
  */
 
-import { randomBytes, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { hostname } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath, URL } from "node:url";
+import { gzipSync } from "node:zlib";
 import { clearAuthCredentials, getJolliUrl } from "../auth/AuthConfig.js";
 import { browserLogin } from "../auth/Login.js";
 import { getProjectRootDir, readLocalGitIdentity } from "../core/GitOps.js";
@@ -98,6 +99,7 @@ import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
 import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
 import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
+import { classifyScanError } from "../core/SqliteHelpers.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
 import { TRANSCRIPT_SOURCE_LABELS } from "../core/TranscriptSourceLabel.js";
@@ -107,8 +109,10 @@ import { install } from "../install/Installer.js";
 import { createLogger, errMsg } from "../Logger.js";
 import type { LocalAgentToolId } from "../Types.js";
 import {
+	type DashboardDbHandle,
 	ensureDashboardDbExists,
 	getDashboardDbPath,
+	isSchemaCurrent,
 	withDashboardDb,
 	withReadonlyDashboardDb,
 } from "./DashboardDb.js";
@@ -276,12 +280,17 @@ export function resolveDashboardAssetsDir(baseDir: string = HERE): string {
  * Sentry issue all rendered as one identical amber `R` while the editor showed
  * three distinct badges for the same memory.
  */
-export function assembleDashboardHtml(assetsDir: string, modelJson: string, token?: string): string {
-	const read = (...p: string[]) => readFileSync(join(assetsDir, ...p), "utf8");
-	let html = read("index.html");
+export function assembleDashboardHtml(
+	assetsDir: string,
+	modelJson: string,
+	token?: string,
+	assets?: DashboardAssets,
+): string {
+	const bundle = assets ?? buildDashboardAssets(assetsDir);
+	let html = readFileSync(join(assetsDir, "index.html"), "utf8");
 	const cssMarker = '<link rel="stylesheet" href="styles/main.css" />';
 	if (!html.includes(cssMarker)) throw new Error("dashboard template missing stylesheet marker");
-	html = html.replace(cssMarker, () => `<style>\n${read("styles", "main.css")}\n</style>`);
+	html = html.replace(cssMarker, () => `<link rel="stylesheet" href="${bundle.cssUrl}" />`);
 	const tokenScript = token
 		? `<script>window.__JOLLI_DASHBOARD_TOKEN__ = ${escapeForInlineScript(JSON.stringify(token))};</script>\n`
 		: "";
@@ -292,10 +301,138 @@ export function assembleDashboardHtml(assetsDir: string, modelJson: string, toke
 			JSON.stringify({ meta: SOURCE_META, neutral: NEUTRAL_SOURCE_COLOR }),
 		)};</script>\n` +
 		`<script>window.__JOLLI_DASHBOARD__ = ${escapeForInlineScript(modelJson)};</script>\n` +
-		DASHBOARD_SCRIPT_FILES.map((f) => `<script>\n${read("js", f)}\n</script>`).join("\n");
+		bundle.scriptUrls.map((url) => `<script src="${url}"></script>`).join("\n");
 	const marker = /<!-- scripts:start -->[\s\S]*?<!-- scripts:end -->/;
 	if (!marker.test(html)) throw new Error("dashboard template missing scripts block");
 	return html.replace(marker, () => scripts);
+}
+
+// ── Static asset bundle ─────────────────────────────────────────────────────
+
+/**
+ * One servable file: its bytes, a precomputed gzip of them, and the strong
+ * validator both are served under.
+ */
+interface DashboardAsset {
+	readonly contentType: string;
+	readonly body: Buffer;
+	readonly gzip: Buffer;
+	readonly etag: string;
+}
+
+export interface DashboardAssets {
+	/** URL for the stylesheet link, content-hashed. */
+	readonly cssUrl: string;
+	/** URLs for the app scripts, in `DASHBOARD_SCRIPT_FILES` order — which is a dependency order. */
+	readonly scriptUrls: ReadonlyArray<string>;
+	/** Everything servable, keyed by the exact URL path. */
+	readonly byPath: ReadonlyMap<string, DashboardAsset>;
+}
+
+/** URL prefix for the hashed asset routes. Its own constant so the route and the builder cannot drift. */
+const ASSET_URL_PREFIX = "/assets/";
+
+/**
+ * Reads the stylesheet and the app scripts once, and gives each a content-hashed
+ * URL.
+ *
+ * These used to be INLINED into every page — 181 KB of CSS and 496 KB of
+ * JavaScript, in a document served `no-store`, regardless of view. Navigation is
+ * a full page load (`window.location.href` on every repo / range / dimension /
+ * view change, see `shell.js`), so each click re-sent ~694 KB and the browser
+ * re-parsed half a megabyte of JavaScript it had already compiled a moment
+ * before. Externalising them makes the document ~15 KB and lets the HTTP cache
+ * and V8's code cache do their jobs across navigations.
+ *
+ * The hash in the URL is what makes `immutable` safe: assets change only when
+ * the CLI is upgraded, and an upgrade changes the bytes and therefore the URL,
+ * so a stale cached copy can never be served for new content. Computed once at
+ * server start rather than per request — the files cannot change under a running
+ * server (a `jolli` upgrade replaces the dist and the next command starts a new
+ * one), and re-hashing 680 KB per page load would trade one waste for another.
+ *
+ * ⚠ The map is the ALLOWLIST. Requests are answered by exact-path lookup, never
+ * by joining a path segment onto `assetsDir` — there is no traversal to defend
+ * against because no request string ever reaches the filesystem.
+ *
+ * gzip is precomputed here, once, for the same reason: it is the same bytes for
+ * every request, and compressing 680 KB per response would be a new per-request
+ * cost on the path this change exists to make cheap.
+ */
+export function buildDashboardAssets(assetsDir: string): DashboardAssets {
+	const byPath = new Map<string, DashboardAsset>();
+	const add = (name: string, contentType: string, ...parts: string[]): string => {
+		const body = readFileSync(join(assetsDir, ...parts));
+		const hash = createHash("sha256").update(body).digest("hex").slice(0, 8);
+		const dot = name.lastIndexOf(".");
+		const url = `${ASSET_URL_PREFIX}${name.slice(0, dot)}-${hash}${name.slice(dot)}`;
+		byPath.set(url, { contentType, body, gzip: gzipSync(body, { level: 6 }), etag: `"${hash}"` });
+		return url;
+	};
+	const cssUrl = add("main.css", "text/css; charset=utf-8", "styles", "main.css");
+	const scriptUrls = DASHBOARD_SCRIPT_FILES.map((f) => add(f, "text/javascript; charset=utf-8", "js", f));
+	return { cssUrl, scriptUrls, byPath };
+}
+
+/**
+ * Whether the client said it can take gzip.
+ *
+ * ⚠ Reads the q-values rather than testing for the substring, because the two
+ * disagree in exactly the case that matters: `Accept-Encoding: gzip;q=0` is a
+ * client REFUSING gzip (RFC 9110 §12.5.3), and a `\bgzip\b` match would answer
+ * yes and then send it a body it said it cannot decode — a hard failure, not a
+ * missed optimisation. `*` is honoured for the same reason in the other
+ * direction: it means "anything", which a substring test could never see. An
+ * explicit `gzip` entry always wins over `*`, whichever way each points.
+ *
+ * No real browser sends either form, so this is about the clients that are not
+ * browsers — curl invocations, proxies, and the odd health checker.
+ */
+function acceptsGzip(req: IncomingMessage): boolean {
+	const header = req.headers["accept-encoding"];
+	const value = Array.isArray(header) ? header.join(",") : (header ?? "");
+	let wildcard: boolean | undefined;
+	for (const part of value.split(",")) {
+		const [rawName, ...params] = part.split(";");
+		const name = rawName.trim().toLowerCase();
+		if (name !== "gzip" && name !== "*") continue;
+		// A malformed or absent q defaults to 1 — the spec's default, and the safe
+		// reading of a header we could not parse.
+		const q = params.map((p) => /^\s*q\s*=\s*([\d.]+)\s*$/i.exec(p)).find((m) => m !== null)?.[1];
+		const acceptable = q === undefined || Number.parseFloat(q) > 0;
+		if (name === "gzip") return acceptable;
+		wildcard = acceptable;
+	}
+	return wildcard ?? false;
+}
+
+/**
+ * Serves one hashed asset, or 404s.
+ *
+ * `immutable` plus a year is the strongest caching statement there is, and it is
+ * correct here only because of the hash: the URL names the content. A 304 path
+ * is kept beside it for the case `immutable` does not cover — a browser told to
+ * revalidate (a hard reload), and any client that ignores the directive.
+ */
+function serveAsset(req: IncomingMessage, res: ServerResponse, asset: DashboardAsset): void {
+	if (req.headers["if-none-match"] === asset.etag) {
+		res.writeHead(304, { ETag: asset.etag, "Cache-Control": "public, max-age=31536000, immutable" });
+		res.end();
+		return;
+	}
+	const gzip = acceptsGzip(req);
+	res.writeHead(200, {
+		"Content-Type": asset.contentType,
+		"Cache-Control": "public, max-age=31536000, immutable",
+		ETag: asset.etag,
+		"Content-Length": String(gzip ? asset.gzip.length : asset.body.length),
+		// Vary, even though the only thing that changes is the encoding: an
+		// intermediary that cached the gzip copy would otherwise hand it to a client
+		// that never asked for one.
+		Vary: "Accept-Encoding",
+		...(gzip ? { "Content-Encoding": "gzip" } : {}),
+	});
+	res.end(gzip ? asset.gzip : asset.body);
 }
 
 // ── Framed viewer documents (Knowledge / Graph iframes) ─────────────────────
@@ -611,6 +748,28 @@ async function readLocalAuthorIdentity(
 }
 
 /**
+ * The read failures `defaultModelBuilder`'s `readWithRecovery` answers by creating
+ * a schema. See the ⚠ note there for why it is these two and no others.
+ */
+const RECOVERABLE_OPEN_FAILURES: ReadonlySet<string> = new Set(["permission", "schema"]);
+
+/**
+ * Whether the database already carries every migration this build knows.
+ *
+ * The discriminator between "there is no schema here" and "this build's SQL is
+ * wrong" — the two states `classifyScanError` spells with the same `schema` kind.
+ * Answers `false` for a database it cannot open at all, which is the recoverable
+ * direction: a reader that cannot get in has nothing to say about the schema.
+ */
+async function schemaIsComplete(dbPath: string | undefined): Promise<boolean> {
+	try {
+		return await withReadonlyDashboardDb(isSchemaCurrent, { dbPath });
+	} catch {
+		return false;
+	}
+}
+
+/**
  * Builds only data for routes that are part of the released dashboard surface.
  */
 async function defaultModelBuilder(
@@ -621,14 +780,13 @@ async function defaultModelBuilder(
 	now: () => number,
 	launchCwd: string,
 ): Promise<DashboardModel> {
-	// The command creates the file before it binds, so this only
-	// covers the case where it disappears under a running server (a wiped
-	// `~/.jolli/jollimemory`, a `doctor` mid-restore). Recreating an empty
-	// schema beats the alternative: a read-only open raises SQLITE_CANTOPEN,
-	// which the request handler turns into a plain-text 500 — a page with no
-	// scripts on it, so nothing polls `/api/model` and the browser never comes
-	// back on its own. An empty database renders the normal "no data yet" page.
-	await ensureDashboardDbExists(dbPath ? { dbPath } : {});
+	// NOTE: the file is NOT checked here any more — see `readWithRecovery` at the
+	// bottom of this builder. `ensureDashboardDbExists` opens a WRITABLE handle
+	// and walks the migration log, and it ran on every `/api/model` — a poll every
+	// 30 s per open tab, plus every navigation — to cover a case that happens
+	// approximately never (the file disappearing under a running server). Paying a
+	// writable open on every read to pre-empt a rare failure is backwards when the
+	// failure is detectable and recoverable at the moment it occurs.
 	// Settings is built off config + a cheap folder-state peek, not the DB. Built
 	// here (before the read-only DB open) and threaded through `QueryOptions`. The
 	// launch cwd — `process.cwd()`, set to the git root by `DashboardCommand` when
@@ -658,60 +816,105 @@ async function defaultModelBuilder(
 		knowledge: menuConfig.dashboardKnowledgeMenuEnabled === true,
 		graph: menuConfig.dashboardGraphMenuEnabled === true,
 	};
-	return withReadonlyDashboardDb(
-		async (db) => {
-			// A rebase/reset/squash that rewrites history away leaves the old commits'
-			// rows in `commits` and `memories` forever. Reachability used to be asked
-			// of git here (a `rev-list --branches` per repo, on every load), and is now
-			// a materialised `memories.reachable` / `commits.reachable` column the feeds
-			// filter in SQL — maintained asynchronously by the backfill sweep and the
-			// daemon reconcile task (see MEMORY_REACHABLE_DDL / COMMIT_REACHABLE_DDL).
-			// So no view pays git on the read path.
-			//
-			// Standup is a FIRST-PERSON report, unlike every other view: its columns
-			// feed a Copy-as-standup draft the user posts as their own work, so a
-			// shared branch's teammate commits are a false claim rather than noise.
-			const authorIdentity =
-				request.view === "standup"
-					? await readLocalAuthorIdentity(
-							db
-								.prepare("SELECT worktree_root FROM repos WHERE disabled_at IS NULL")
-								.all() as ReadonlyArray<{ worktree_root: string }>,
-							identityCache,
-							now,
-						)
-					: undefined;
-			// Which of spec §9's three sentences the memory detail's EMPTY
-			// conversations list prints. Async — it reads the machine-global Claude
-			// owners ledger and stats the transcripts it names — so it is computed
-			// here and threaded through `QueryOptions`, exactly like the reachability
-			// sets above. Without this the page would fall through to the plainest
-			// wording forever, with nothing failing to say so.
-			//
-			// Only the memories view, and only when a memory is actually selected: a
-			// tree render with no `?hash=` has no detail pane to word.
-			const transcriptRepairState =
-				request.view === "memories" && request.hash
-					? await readMemoryTranscriptRepairState(db, request.scope, request.hash, request.detailRepoIdentity)
-					: undefined;
-			// Every view is now served straight from the database. The stats view
-			// used to get one more step here — a display-time LLM call compressing
-			// the Decisions card's text — which is what made this builder async and
-			// gave a GET a way to spend money. The card shows a stored topic title
-			// now, so the call is retired (JOLLI-2209).
-			return buildDashboardModel(db, {
-				...request,
-				registryRoots,
-				menus,
-				...(settingsModel ? { settingsModel } : {}),
-				...(knowledgeModel ? { knowledgeModel } : {}),
-				...(graphModel ? { graphModel } : {}),
-				...(authorIdentity ? { authorIdentity } : {}),
-				...(transcriptRepairState ? { transcriptRepairState } : {}),
-			});
-		},
-		{ dbPath },
-	);
+	/**
+	 * The read, with the one recovery the removed pre-flight used to buy.
+	 *
+	 * `ensureDashboardDbExists` ran ahead of every render to cover a file that
+	 * vanished under a running server (a wiped `~/.jolli/jollimemory`, a `doctor`
+	 * mid-restore). Recreating an empty schema really is better than the
+	 * alternative — a read-only open raises `SQLITE_CANTOPEN`, which the request
+	 * handler turns into a plain-text 500, and that page has no scripts on it, so
+	 * nothing polls `/api/model` and the browser never comes back on its own.
+	 *
+	 * So the recovery stays; only its trigger moves. Pay it when the open actually
+	 * fails that way, not on every poll. Exactly one retry: if creating the schema
+	 * did not make the file openable, the second failure is the real one and
+	 * belongs to the caller.
+	 *
+	 * ⚠ Two kinds, and both halves of that are deliberate. `permission` is what
+	 * `classifyScanError` calls SQLITE_CANTOPEN, i.e. the file is not there at all.
+	 * `schema` is the SAME situation one step further along and is the reason the
+	 * set is not just `permission`: SQLite opens a zero-length file as a valid empty
+	 * database, so a `doctor` caught mid-restore fails at the first query with `no
+	 * such table` rather than at the open — the very case named above, arriving
+	 * under a different code. `ensureDashboardDbExists` handles it correctly
+	 * (`isSchemaCurrent` reads the missing log as "not current" and migrates), and
+	 * without this it produced exactly the scriptless 500 this recovery exists to
+	 * prevent. A `locked` or `corrupt` database must NOT be met by writing a schema
+	 * over it, and `unknown` stays out for the same reason: creating a schema is
+	 * only safe where there demonstrably is not one.
+	 *
+	 * ⚠ This `catch` covers the whole read, not just the open — so `schema` also
+	 * arrives for a query naming a table or column THIS BUILD got wrong, which is a
+	 * bug and not a recoverable state. {@link schemaIsComplete} is what tells the
+	 * two apart, and it is asked only here, on a path that has already failed.
+	 * Without it a plain SQL mistake spent a redundant migrate and a doomed retry
+	 * and logged "creating the schema" while doing nothing of the kind — the wrong
+	 * answer to look at while debugging the real error underneath.
+	 */
+	const readWithRecovery = async <T>(read: (db: DashboardDbHandle) => Promise<T>): Promise<T> => {
+		try {
+			return await withReadonlyDashboardDb(read, { dbPath });
+		} catch (err) {
+			const kind = classifyScanError(err)?.kind;
+			if (kind === undefined || !RECOVERABLE_OPEN_FAILURES.has(kind)) throw err;
+			if (kind === "schema" && (await schemaIsComplete(dbPath))) throw err;
+			log.info("dashboard read failed (%s); creating the missing schema and retrying", kind);
+			await ensureDashboardDbExists(dbPath ? { dbPath } : {});
+			return withReadonlyDashboardDb(read, { dbPath });
+		}
+	};
+	return readWithRecovery(async (db) => {
+		// A rebase/reset/squash that rewrites history away leaves the old commits'
+		// rows in `commits` and `memories` forever. Reachability used to be asked
+		// of git here (a `rev-list --branches` per repo, on every load), and is now
+		// a materialised `memories.reachable` / `commits.reachable` column the feeds
+		// filter in SQL — maintained asynchronously by the backfill sweep and the
+		// daemon reconcile task (see MEMORY_REACHABLE_DDL / COMMIT_REACHABLE_DDL).
+		// So no view pays git on the read path.
+		//
+		// Standup is a FIRST-PERSON report, unlike every other view: its columns
+		// feed a Copy-as-standup draft the user posts as their own work, so a
+		// shared branch's teammate commits are a false claim rather than noise.
+		const authorIdentity =
+			request.view === "standup"
+				? await readLocalAuthorIdentity(
+						db.prepare("SELECT worktree_root FROM repos WHERE disabled_at IS NULL").all() as ReadonlyArray<{
+							worktree_root: string;
+						}>,
+						identityCache,
+						now,
+					)
+				: undefined;
+		// Which of spec §9's three sentences the memory detail's EMPTY
+		// conversations list prints. Async — it reads the machine-global Claude
+		// owners ledger and stats the transcripts it names — so it is computed
+		// here and threaded through `QueryOptions`, exactly like the reachability
+		// sets above. Without this the page would fall through to the plainest
+		// wording forever, with nothing failing to say so.
+		//
+		// Only the memories view, and only when a memory is actually selected: a
+		// tree render with no `?hash=` has no detail pane to word.
+		const transcriptRepairState =
+			request.view === "memories" && request.hash
+				? await readMemoryTranscriptRepairState(db, request.scope, request.hash, request.detailRepoIdentity)
+				: undefined;
+		// Every view is now served straight from the database. The stats view
+		// used to get one more step here — a display-time LLM call compressing
+		// the Decisions card's text — which is what made this builder async and
+		// gave a GET a way to spend money. The card shows a stored topic title
+		// now, so the call is retired (JOLLI-2209).
+		return buildDashboardModel(db, {
+			...request,
+			registryRoots,
+			menus,
+			...(settingsModel ? { settingsModel } : {}),
+			...(knowledgeModel ? { knowledgeModel } : {}),
+			...(graphModel ? { graphModel } : {}),
+			...(authorIdentity ? { authorIdentity } : {}),
+			...(transcriptRepairState ? { transcriptRepairState } : {}),
+		});
+	});
 }
 
 export interface DashboardServerOptions {
@@ -767,6 +970,63 @@ export function hasForeignOrigin(originHeader: string | undefined, port: number)
 	} catch {
 		return true;
 	}
+}
+
+/**
+ * Smallest payload worth compressing. Below it gzip's own framing plus the CPU
+ * cost buys nothing — and most JSON this server sends is a small view model.
+ */
+const GZIP_MIN_BYTES = 1024;
+
+/**
+ * Compresses a per-request body when the client takes gzip and it is big enough
+ * to be worth it.
+ *
+ * Per REQUEST, so unlike the asset bundle it cannot be precomputed — which is
+ * also why it is worth being careful about: `gzipSync` blocks the event loop,
+ * and this process serves everything on one thread. Level 6 on the largest
+ * payload here (a ~38 KB stats model) is well under a millisecond, and it
+ * replaces a transfer that is otherwise the biggest thing on the wire.
+ *
+ * `no-store` is kept on everything that goes through here. These bodies are the
+ * model and the token; the caching win of this change lives entirely in the
+ * hashed asset routes.
+ */
+function sendMaybeGzipped(
+	req: IncomingMessage,
+	res: ServerResponse,
+	status: number,
+	contentType: string,
+	body: string,
+): void {
+	const raw = Buffer.from(body, "utf8");
+	const gzip = raw.length >= GZIP_MIN_BYTES && acceptsGzip(req) ? gzipSync(raw, { level: 6 }) : undefined;
+	res.writeHead(status, {
+		"Content-Type": contentType,
+		"Cache-Control": "no-store",
+		"Content-Length": String((gzip ?? raw).length),
+		Vary: "Accept-Encoding",
+		...(gzip ? { "Content-Encoding": "gzip" } : {}),
+	});
+	res.end(gzip ?? raw);
+}
+
+/**
+ * The page document, compressed on the same terms.
+ *
+ * ⚠ This document is the one response that carries BOTH the mutation token and
+ * request-derived content (`?repo=` reaches the model verbatim through
+ * `parseScope`), so compressing it is the BREACH shape: a length oracle over a
+ * body that mixes a secret with attacker-chosen text. Accepted, deliberately.
+ * Reading a compressed length cross-origin needs a network observer, and this
+ * listener is loopback-only behind the host allowlist and the Origin check — an
+ * attacker positioned to measure it is already on the machine, where the token is
+ * reachable more directly. If that calculus ever changes, the fix is to drop this
+ * helper and send the document uncompressed: the win this change exists for is
+ * the hashed asset routes plus `/api/model`, and neither carries the token.
+ */
+function sendHtmlMaybeGzipped(req: IncomingMessage, res: ServerResponse, html: string): void {
+	sendMaybeGzipped(req, res, 200, "text/html", html);
 }
 
 function sendJson(res: ServerResponse, status: number, body: unknown): void {
@@ -1209,7 +1469,27 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 	const configDir = options.configDir;
 	const serverCwd = options.serverCwd ?? process.cwd();
 	const token = options.token ?? randomBytes(32).toString("hex");
+	/**
+	 * The dashboard's own asset directory, and the hashed CSS/JS bundle built out of
+	 * it — both resolved on first use and then reused for the life of the server.
+	 * Lazily, so that constructing a server still touches no filesystem (several
+	 * tests build one and never serve a page).
+	 *
+	 * One resolution site on purpose: three routes need the directory (the page, the
+	 * bundle, the context viewer's `marked`), and three copies of
+	 * `options.assetsDir ?? resolveDashboardAssetsDir()` are three chances for a
+	 * route to end up reading a different tree than the one it links to.
+	 */
 	let assetsDir: string | undefined;
+	let assets: DashboardAssets | undefined;
+	const dashboardAssetsDir = (): string => {
+		assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
+		return assetsDir;
+	};
+	const dashboardAssets = (): DashboardAssets => {
+		assets ??= buildDashboardAssets(dashboardAssetsDir());
+		return assets;
+	};
 	/** Lazily-resolved knowledge-graph viz assets (`<dist>/graph-assets/`) — reused by both iframe routes. */
 	let graphAssetsDir: string | undefined;
 	let boundPort = options.port;
@@ -1356,6 +1636,22 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			return;
 		}
 
+		// The hashed CSS/JS bundle. Answered by exact-path lookup against the map
+		// built at first render — a request string never reaches the filesystem, so
+		// there is no traversal to defend against and no allowlist to keep in sync
+		// with one. Ungated like every other read here: these are the same product
+		// assets anyone can read out of the npm package, and the page cannot render
+		// without them.
+		if (url.pathname.startsWith(ASSET_URL_PREFIX)) {
+			const asset = dashboardAssets().byPath.get(url.pathname);
+			if (!asset) {
+				sendText(res, 404, "Not found");
+				return;
+			}
+			serveAsset(req, res, asset);
+			return;
+		}
+
 		if (url.pathname === "/") {
 			// Unconditional now. This used to build a whole `repositories` model
 			// just to choose between two destinations — the LANDING page depended
@@ -1386,10 +1682,13 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				scope: parseScope(url),
 				...parseWindow(url),
 			});
-			assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
-			const html = assembleDashboardHtml(assetsDir, JSON.stringify(model), token);
-			res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
-			res.end(html);
+			const html = assembleDashboardHtml(dashboardAssetsDir(), JSON.stringify(model), token, dashboardAssets());
+			// The document itself stays `no-store` — it carries the model and the
+			// mutation token, both per request. What it no longer carries is the
+			// 680 KB of CSS and JS that used to be inlined into it; those are hashed
+			// URLs served `immutable` by the route above, so a navigation re-fetches
+			// only this ~15 KB.
+			sendHtmlMaybeGzipped(req, res, html);
 			return;
 		}
 
@@ -1438,8 +1737,7 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 				sendViewerHtml(res, 404, viewerMessageHtml("This document could not be found."));
 				return;
 			}
-			assetsDir ??= options.assetsDir ?? resolveDashboardAssetsDir();
-			const markedJs = resolveMarkedJs(assetsDir);
+			const markedJs = resolveMarkedJs(dashboardAssetsDir());
 			if (markedJs === undefined) {
 				// A 200 with guidance, not a 500: the document was found and the rest of
 				// the dashboard is fine — only this renderer is missing from the install.
@@ -1582,14 +1880,21 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			// here is a free public read, and `trusted` decides nothing beyond the
 			// settings gate above. (It used to also gate the Decisions gist's LLM
 			// call — the one paid path a GET had, now retired.)
-			sendJson(
+			// Gzipped when the client takes it. This is the biggest per-request body
+			// the server sends — the stats model measures ~38 KB — and the page
+			// re-fetches it every 30 s for as long as a stats tab is open.
+			sendMaybeGzipped(
+				req,
 				res,
 				200,
-				await buildModel({
-					view,
-					scope: parseScope(url),
-					...parseWindow(url),
-				}),
+				"application/json",
+				JSON.stringify(
+					await buildModel({
+						view,
+						scope: parseScope(url),
+						...parseWindow(url),
+					}),
+				),
 			);
 			return;
 		}

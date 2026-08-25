@@ -568,7 +568,28 @@ export function buildRollupQuietly(db: DashboardDbHandle, opts: BuildRollupOptio
 		// added no columns, and fired for one whose additions this build can read
 		// perfectly well.
 		if (dbHasUnknownMigrations(db)) {
-			log.info("stats rollup skipped: the database carries migrations this build does not know");
+			// The wording is strong because the state is not the rare one the old
+			// sentence implied: a database that has ever been opened by a RELEASED
+			// build carries migration names a development line may not have — and a
+			// machine running mixed surface versions (the whole point of the
+			// `dist-paths` version race) reaches that state routinely. While it holds,
+			// nothing settles into `stats_daily` and every dashboard render recomputes
+			// its full window.
+			//
+			// ⚠ `info`, never `warn`, and that is the same rule `SlowQueryLog`
+			// documents at length. `warn` goes to stderr regardless of
+			// `setSilentConsole` (see `Logger.createLogger`), and this line is NOT on a
+			// dashboard path: `applyStatsEvents` reaches it from every producer —
+			// `ProducerHooks.safeApply` passes no `skipRollup` — so a `warn` here
+			// prints to the terminal of `jolli recall`, onto the MCP server's stderr
+			// (and thereby into an agent's context), and out of the StopHook. Those
+			// processes are short-lived, so "once per process" would have been once per
+			// invocation. A warning that fires on every recall for a version-mixed
+			// install is not a signal. Visibility belongs to the surface that asked:
+			// `jolli doctor --schema-log` names the migrations and says what is off.
+			log.info(
+				"stats rollup is OFF: the database carries migrations this build does not know, so cached daily stats are never written and every dashboard render recomputes its full window. `jolli doctor --schema-log` lists the unknown names.",
+			);
 			return;
 		}
 		buildRollup(db, opts);
