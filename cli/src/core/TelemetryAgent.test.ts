@@ -66,19 +66,22 @@ describe("TELEMETRY_AGENTS vocabulary", () => {
 		expect(AGENT_DIMENSION_SINCE_VERSION).toMatch(/^\d+\.\d+\.\d+$/);
 	});
 
-	it("does not let the watershed fall behind the version being built", () => {
-		// The watershed starts as a prediction — which release this lands in is not
+	it("keeps the watershed at the release it actually shipped in", () => {
+		// The watershed started as a prediction — which release this lands in is not
 		// knowable while writing it — and a stale prediction fails silently, in a
-		// PUBLIC doc. This is the one half that can be checked: the dimension cannot
-		// ship in a release older than the constant, so the constant must never sit
-		// below `cli/package.json`. If main's version overtakes it while this is
-		// still unreleased, the guess was overtaken and someone has to look.
-		//
+		// PUBLIC doc. That prediction is now settled: the `agent` dimension shipped
+		// in 0.99.14 (the release tag carries this constant at "0.99.14"), so the
+		// value is a historical fact printed into TELEMETRY.md as the point
+		// agent-sliced charts begin. It must never move again — pin it exactly.
+		expect(AGENT_DIMENSION_SINCE_VERSION).toBe("0.99.14");
+
+		// And it can never claim a release that has not been built yet: a watershed
+		// in the future would tell readers the dimension does not exist when it does.
 		// Resolved from this file rather than `process.cwd()` so it does not depend
 		// on which directory vitest was invoked from.
 		const pkgPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "package.json");
 		const { version } = JSON.parse(readFileSync(pkgPath, "utf-8")) as { version: string };
-		expect(compareSemver(AGENT_DIMENSION_SINCE_VERSION, version)).toBeGreaterThanOrEqual(0);
+		expect(compareSemver(AGENT_DIMENSION_SINCE_VERSION, version)).toBeLessThanOrEqual(0);
 	});
 });
 

@@ -1,6 +1,14 @@
 # Changelog
 
-<!-- Last synced commit: b630a5790 | 2026-08-22 -->
+<!-- Last synced commit: 9a5797e31 | 2026-08-25 -->
+
+## 0.99.15
+
+- **Cursor work is captured right away** — Cursor conversations are recorded as they finish, so they show up even when you don't commit or open the dashboard.
+- **A much faster dashboard** — the Journeys, stats, and standup pages load far quicker now, especially on large repositories.
+- **See your MCP tool usage** — the dashboard shows which MCP tools your agents use.
+- **Turning an agent off now applies everywhere** — switch a source off in Settings and it stops showing up across the dashboard too, not just the sidebar.
+- Bug fixes.
 
 ## 0.99.14
 

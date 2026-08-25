@@ -1,6 +1,13 @@
 # Changelog
 
-<!-- Last synced commit: b630a5790 | 2026-08-22 -->
+<!-- Last synced commit: 9a5797e31 | 2026-08-25 -->
+
+## 0.99.15
+
+- **Cursor work is captured right away** — Cursor conversations are recorded as they finish, so they show up even when you don't commit or open the dashboard.
+- **A faster dashboard** — the dashboard you open from the sidebar loads much faster, especially on large repositories.
+- **Turning an agent off now applies everywhere** — switch a source off under **Settings → AI Agents** and it stays out of the dashboard too, not just the sidebar.
+- Bug fixes.
 
 ## 0.99.14
 
