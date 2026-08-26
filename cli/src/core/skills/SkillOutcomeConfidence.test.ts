@@ -2,17 +2,20 @@ import { describe, expect, it } from "vitest";
 import { skillOutcomeConfidence } from "./SkillOutcomeConfidence.js";
 
 describe("skillOutcomeConfidence", () => {
-	it("reports observed for the three mechanisms with a result record", () => {
+	it("reports observed for the four mechanisms with a result record", () => {
 		// Each of these was read off a real transcript: Claude's `tool_result`, Kimi's
-		// paired `tool.result`, OpenCode's `state.status`. See the module docblock.
+		// paired `tool.result`, OpenCode's `state.status`, Hermes' paired `skill_view`
+		// result row. See the module docblock.
 		expect(skillOutcomeConfidence("claude", "tool")).toBe("observed");
 		expect(skillOutcomeConfidence("kimi", "tool")).toBe("observed");
 		expect(skillOutcomeConfidence("opencode", "tool")).toBe("observed");
+		expect(skillOutcomeConfidence("hermes", "tool")).toBe("observed");
 	});
 
 	it("reports assumed when a result-capable mechanism has not produced its result yet", () => {
 		expect(skillOutcomeConfidence("claude", "tool", false)).toBe("assumed");
 		expect(skillOutcomeConfidence("kimi", "tool", false)).toBe("assumed");
+		expect(skillOutcomeConfidence("hermes", "tool", false)).toBe("assumed");
 	});
 
 	it("does not let an explicit observation promote a mechanism outside the allowlist", () => {

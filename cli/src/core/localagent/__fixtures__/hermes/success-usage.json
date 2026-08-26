@@ -1,0 +1,18 @@
+{
+  "estimated_cost_usd": 0.0,
+  "cost_status": "unknown",
+  "cost_source": "none",
+  "input_tokens": 3,
+  "output_tokens": 6,
+  "cache_read_tokens": 0,
+  "cache_write_tokens": 24191,
+  "reasoning_tokens": 0,
+  "total_tokens": 24200,
+  "api_calls": 1,
+  "model": "anthropic/claude-opus-4.6",
+  "provider": "custom",
+  "session_id": "20260827_143246_dac58e",
+  "completed": true,
+  "failed": false,
+  "service_tier": null
+}

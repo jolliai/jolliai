@@ -1,8 +1,8 @@
 /**
  * Aggregates active AI coding sessions across all supported transcript
- * sources (see `TRANSCRIPT_SOURCES` in Types.ts — currently thirteen:
+ * sources (see `TRANSCRIPT_SOURCES` in Types.ts — currently fourteen:
  * claude / codex / gemini / opencode / cursor / cursor-cli / copilot /
- * copilot-chat / cline / cline-cli / devin / antigravity / kimi), filters by
+ * copilot-chat / cline / cline-cli / devin / antigravity / kimi / hermes), filters by
  * recency window, resolves display titles, and returns a sorted list
  * ready for UI consumption.
  *
@@ -253,6 +253,7 @@ async function collectFromAllSources(cwd: string, config: JolliMemoryConfig): Pr
 		loadCursorCli(cwd, config),
 		loadAntigravity(cwd, config),
 		loadKimi(cwd, config),
+		loadHermes(cwd, config),
 	]);
 	const sessions: SessionInfo[] = [];
 	const failedSources: TranscriptSource[] = [];
@@ -334,6 +335,22 @@ async function loadKimi(cwd: string, config: JolliMemoryConfig): Promise<LoaderR
 	} catch (err) {
 		log.warn("discoverKimiSessions threw: %s", errMsg(err));
 		return { sessions: [], failed: ["kimi"] };
+	}
+}
+
+async function loadHermes(cwd: string, config: JolliMemoryConfig): Promise<LoaderResult> {
+	if (!isSourceEnabled("hermes", config)) return { sessions: [], failed: [] };
+	try {
+		const { scanHermesSessions } = await import("./HermesSessionDiscoverer.js");
+		const r = await scanHermesSessions(cwd);
+		if (r.error) {
+			log.warn("scanHermesSessions reported %s: %s", r.error.kind, r.error.message);
+			return { sessions: r.sessions, failed: ["hermes"] };
+		}
+		return { sessions: r.sessions, failed: [] };
+	} catch (err) {
+		log.warn("scanHermesSessions threw: %s", errMsg(err));
+		return { sessions: [], failed: ["hermes"] };
 	}
 }
 

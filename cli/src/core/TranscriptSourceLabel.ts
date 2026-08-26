@@ -27,6 +27,7 @@ export const TRANSCRIPT_SOURCE_LABELS: Readonly<Record<TranscriptSource, string>
 	devin: "Devin",
 	antigravity: "Antigravity",
 	kimi: "Kimi Code",
+	hermes: "Hermes",
 };
 
 export function transcriptSourceLabel(source: TranscriptSource | undefined): string {

@@ -936,6 +936,7 @@ describe("isSourceEnabled", () => {
 			"devin",
 			"antigravity",
 			"kimi",
+			"hermes",
 		] as const;
 		for (const s of sources) {
 			expect(isSourceEnabled(s, {})).toBe(true);
@@ -950,6 +951,7 @@ describe("isSourceEnabled", () => {
 		expect(isSourceEnabled("devin", { devinEnabled: false })).toBe(false);
 		expect(isSourceEnabled("antigravity", { antigravityEnabled: false })).toBe(false);
 		expect(isSourceEnabled("kimi", { kimiEnabled: false })).toBe(false);
+		expect(isSourceEnabled("hermes", { hermesEnabled: false })).toBe(false);
 	});
 
 	it("groups cursor + cursor-cli under a single cursorEnabled toggle", () => {

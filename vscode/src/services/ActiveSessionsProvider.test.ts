@@ -154,6 +154,7 @@ describe("ActiveSessionsProvider", () => {
 			"cursor-cli",
 			"devin",
 			"gemini",
+			"hermes",
 			"kimi",
 			"opencode",
 		]);

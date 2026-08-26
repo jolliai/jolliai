@@ -141,8 +141,11 @@ object CommitSelectionStore {
      * reserved across jollimemory and [TranscriptSource] names never contain one, so
      * this matches the CLI's `conversationKey` exactly.
      */
-    fun conversationKey(source: TranscriptSource, sessionId: String): String {
-        return "${source.name}:$sessionId"
+    fun conversationKey(source: TranscriptSource?, sessionId: String): String {
+        // Null-tolerant: a source this build cannot decode (see
+        // ActiveSessionAggregator.filterAndApplyConfig) must produce a stable key
+        // rather than NPE; the aggregator drops such items before the UI anyway.
+        return "${source?.name ?: "unknown"}:$sessionId"
     }
 
     private fun request(operation: String): JsonObject = JsonObject().apply { addProperty("operation", operation) }

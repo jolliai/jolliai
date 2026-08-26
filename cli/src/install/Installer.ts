@@ -41,6 +41,8 @@ import { scanCursorSessions } from "../core/CursorSessionDiscoverer.js";
 import { isDevinInstalled, isDevinPresent, scanDevinSessions } from "../core/DevinSessionDiscoverer.js";
 import { isGeminiInstalled } from "../core/GeminiSessionDetector.js";
 import { getProjectRootDir, isInsideGitRepo, listWorktrees } from "../core/GitOps.js";
+import { hermesConfigPath, isHermesHookInstalled } from "../core/HermesConfigPaths.js";
+import { isHermesInstalled, isHermesPresent, scanHermesSessions } from "../core/HermesSessionDiscoverer.js";
 import { resolveMemoryBankState } from "../core/KBPathResolver.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
 import { acquireRepoHooksLock, type StrictLockHandle, withRuntimeRegistryLock } from "../core/Locks.js";
@@ -526,6 +528,12 @@ export async function install(
 		// Kimi is a file-based (mcp.json) MCP host, not SQLite-gated, so presence is a
 		// plain on-disk check (does ~/.kimi-code exist) — same as Codex/Gemini.
 		const kimiPresentOnce = repoHooksOnly ? false : await isKimiInstalled();
+		// Hermes is SQLite-gated for transcript discovery, but registration only
+		// writes config.yaml. The looser presence check deliberately accepts the
+		// home before its first state.db and works below the node:sqlite runtime
+		// floor; using isHermesInstalled here strands both populations until a later
+		// explicit enable under a newer runtime.
+		const hermesPresentOnce = repoHooksOnly ? false : await isHermesPresent();
 
 		// Install .jolli/jollimemory/ state dir (always) and Claude Code hook (if enabled)
 		let claudeResult: HookOpResult = {};
@@ -622,6 +630,7 @@ export async function install(
 						devin: false,
 						antigravity: false,
 						kimi: false,
+						hermes: false,
 					};
 					await registerRepoMcpHosts(wt, cursorOnly);
 					// UNION (not replace), same reasoning as the Claude branch above: this hook
@@ -702,6 +711,7 @@ export async function install(
 				devin: devinPresentOnce,
 				antigravity: antigravityPresentOnce,
 				kimi: kimiPresentOnce,
+				hermes: hermesPresentOnce,
 			};
 			// Keep the user's `git status` clean by adding Jolli-managed paths to
 			// `.git/info/exclude`. Worktree-aware: linked worktrees may have their
@@ -777,6 +787,7 @@ export async function install(
 			devin: devinPresentOnce,
 			antigravity: antigravityPresentOnce,
 			kimi: kimiPresentOnce,
+			hermes: hermesPresentOnce,
 		});
 
 		// Prefer Jolli's skills by default: write a standing rule into each
@@ -986,6 +997,7 @@ export async function install(
 			postMergeHookPath: postMergeResult.path,
 			prePushHookPath: prePushResult.path,
 			geminiSettingsPath,
+			hermesConfigPath: hermesPresentOnce ? hermesConfigPath() : undefined,
 		};
 		/* v8 ignore start -- defensive: internal functions handle their own errors */
 	} catch (error: unknown) {
@@ -1323,6 +1335,8 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	const clineDetected = clineVscodeDetected || clineCliDetected;
 	const antigravityDetected = await isAntigravityInstalled();
 	const kimiDetected = await isKimiInstalled();
+	const hermesDetected = await isHermesInstalled();
+	const hermesHookInstalled = await isHermesHookInstalled();
 
 	// Check if we can enumerate worktrees; falls back gracefully if not a git repo
 	let enabledWorktrees: number | undefined;
@@ -1449,6 +1463,18 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		}
 	}
 
+	// Discover Hermes Agent sessions on-demand. SQLite-backed like Antigravity, so it
+	// carries a scan-error channel: an unreadable state.db must surface as "unavailable"
+	// rather than as the positive claim "0 conversations".
+	let hermesScanError: SqliteScanError | undefined;
+	if (config.hermesEnabled !== false && hermesDetected) {
+		const scan = await scanHermesSessions(projectDir);
+		if (scan.sessions.length > 0) {
+			allEnabledSessions = [...allEnabledSessions, ...scan.sessions];
+		}
+		hermesScanError = scan.error;
+	}
+
 	// Compute per-source session counts for integration status rows
 	const sessionsBySource: Partial<Record<TranscriptSource, number>> = {};
 	for (const s of allEnabledSessions) {
@@ -1526,6 +1552,7 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		gitHookInstalled,
 		prePushHookInstalled,
 		geminiHookInstalled,
+		hermesHookInstalled,
 		worktreeHooksInstalled,
 		activeSessions: allEnabledSessions.length,
 		mostRecentSession: filteredMostRecent,
@@ -1569,6 +1596,9 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 		antigravityScanError,
 		kimiDetected,
 		kimiEnabled: config.kimiEnabled,
+		hermesDetected,
+		hermesEnabled: config.hermesEnabled,
+		hermesScanError,
 		globalConfigDir,
 		worktreeStatePath,
 		memoryBank,
@@ -1582,11 +1612,12 @@ export async function getStatus(cwd?: string, storage?: StorageProvider): Promis
 	};
 
 	log.info(
-		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s, copilotChat=%s, cline=%s/%s",
+		"Status: enabled=%s, claude=%s, git=%s, geminiHook=%s, hermesHook=%s, worktreeHooks=%s, sessions=%d, summaries=%d, codex=%s/%s, gemini=%s/%s, enabledWorktrees=%s, opencode=%s/%s, cursor=%s/%s, copilot=%s/%s, copilotChat=%s, cline=%s/%s",
 		status.enabled,
 		status.claudeHookInstalled,
 		status.gitHookInstalled,
 		status.geminiHookInstalled,
+		status.hermesHookInstalled,
 		status.worktreeHooksInstalled,
 		status.activeSessions,
 		status.summaryCount,

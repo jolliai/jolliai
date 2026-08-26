@@ -2,6 +2,7 @@ package ai.jolli.jollimemory.core
 
 import com.google.gson.Gson
 import io.kotest.matchers.collections.shouldContainExactly
+import io.kotest.matchers.nulls.shouldBeNull
 import io.kotest.matchers.nulls.shouldNotBeNull
 import io.kotest.matchers.shouldBe
 import org.junit.jupiter.api.Test
@@ -20,15 +21,21 @@ import org.junit.jupiter.api.Test
  * assert non-null. Adding a source to the CLI without matching this enum
  * makes the round-trip null-check fail, giving the change author a signal
  * long before the sidebar crashes for end users.
+ *
+ * For the staged-rollout gap (`hermes`), the aggregator boundary drops the
+ * null-decoded item instead of letting it reach the UI — see
+ * [ActiveSessionAggregator.filterAndApplyConfig].
  */
 class ActiveSessionAggregatorTest {
 
 	private val gson = Gson()
 
 	/**
-	 * MUST match `cli/src/Types.ts TRANSCRIPT_SOURCES` verbatim. If a new source
-	 * ships on the CLI side, add its raw string here and the corresponding
-	 * `TranscriptSource` enum member together.
+	 * Matches the JVM-supported subset of `cli/src/Types.ts TRANSCRIPT_SOURCES`.
+	 * KNOWN GAP: `hermes` is intentionally omitted until the follow-up IntelliJ
+	 * integration PR can add its enum, config and UI mappings atomically. Keep this
+	 * comment with the omission so reviews do not mistake the staged rollout for
+	 * accidental drift.
 	 */
 	private val allSources = listOf(
 		"claude",
@@ -65,15 +72,46 @@ class ActiveSessionAggregatorTest {
 
 		result.items.forEachIndexed { i, item ->
 			item.shouldNotBeNull()
-			@Suppress("SENSELESS_COMPARISON")
-			(item.source as TranscriptSource?).shouldNotBeNull()
-			item.source.name shouldBe allSources[i]
+			item.source.shouldNotBeNull().name shouldBe allSources[i]
 		}
 		result.failedSources.forEachIndexed { i, source ->
-			@Suppress("SENSELESS_COMPARISON")
-			(source as TranscriptSource?).shouldNotBeNull()
-			source.name shouldBe allSources[i]
+			source.shouldNotBeNull().name shouldBe allSources[i]
 		}
+	}
+
+	@Test
+	fun `unknown CLI source is dropped at the decode boundary, never treated as a known source`() {
+		// `hermes` is the current unknown (see Types.kt's KNOWN JVM GAP): a newer
+		// CLI emits it in `active-conversations` while this enum does not know it.
+		val json = """{"items":[{"sessionId":"s1","source":"hermes","title":"Hermes session","messageCount":1,"updatedAt":"2026-08-26T00:00:00Z","transcriptPath":"/db#s1","isSelected":true}],"failedSources":["hermes"]}"""
+		val raw = gson.fromJson(json, ActiveConversationsResult::class.java)
+
+		// Gson's unknown-enum behavior is null, not an exception — which is exactly
+		// why the pre-fix code NPE'd later at `item.source.name` in the renderer.
+		@Suppress("SENSELESS_COMPARISON")
+		(raw.items.single().source as TranscriptSource?).shouldBeNull()
+		@Suppress("SENSELESS_COMPARISON")
+		(raw.failedSources.single() as TranscriptSource?).shouldBeNull()
+
+		// The boundary drops both: a hermes session must not ride claudeEnabled
+		// (misattribution) and must never reach the renderer (NPE).
+		val result = ActiveSessionAggregator.filterAndApplyConfig(raw, JolliMemoryConfig())
+		result.items shouldBe emptyList()
+		result.failedSources shouldBe emptyList()
+	}
+
+	@Test
+	fun `unknown failed source does not flip the unavailable banner when claude is disabled`() {
+		// The legacy `isSourceEnabled(null)` fallback reads claudeEnabled; a null
+		// source must be dropped BEFORE that fallback, or disabling claude would
+		// look like it silenced an undecodable source.
+		val json = """{"items":[],"failedSources":["hermes"]}"""
+		val raw = gson.fromJson(json, ActiveConversationsResult::class.java)
+		val result = ActiveSessionAggregator.filterAndApplyConfig(
+			raw,
+			JolliMemoryConfig(claudeEnabled = false),
+		)
+		result.failedSources shouldBe emptyList()
 	}
 
 	@Test

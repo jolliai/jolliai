@@ -607,6 +607,28 @@ describe("StatusTreeProvider", () => {
 		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Gemini");
 	});
 
+	it("includes Hermes in hooks description and tooltip when hermesHookInstalled is true", async () => {
+		const bridge = {
+			cwd: "/repo",
+			getStatus: vi.fn(async () =>
+				makeStatus({
+					gitHookInstalled: true,
+					claudeHookInstalled: true,
+					hermesHookInstalled: true,
+				}),
+			),
+		};
+		loadConfigFromDir.mockResolvedValue({ apiKey: "key" });
+
+		const provider = makeStatusProvider(bridge as never);
+		await provider.refresh();
+
+		const items = provider.getChildren();
+		const hooksItem = items.find((item) => item.label === "Hooks");
+		expect(hooksItem?.description).toBe("4 Git + 2 Claude + 1 Hermes");
+		expect(hooksItem?.tooltip).toContain("Hermes hook: installed");
+	});
+
 	it("shows 'none installed' when no hooks are installed", async () => {
 		const bridge = {
 			cwd: "/repo",

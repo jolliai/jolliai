@@ -43,6 +43,9 @@ export class StatusDataService {
 		if (status?.geminiHookInstalled) {
 			parts.push("1 Gemini");
 		}
+		if (status?.hermesHookInstalled) {
+			parts.push("1 Hermes");
+		}
 		return {
 			hasApiKey: !!config?.apiKey,
 			signedIn: !!config?.authToken,

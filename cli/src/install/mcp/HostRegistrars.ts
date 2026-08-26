@@ -13,6 +13,7 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { clineMcpSettingsPath, getClineStorageDirs, getInstalledClineStorageDirs } from "../../core/ClineDetector.js";
+import { listHermesHomeDirs, preAcceptHermesShellHook, revokeHermesShellHook } from "../../core/HermesConfigPaths.js";
 import { kimiCodeHome } from "../../core/KimiSessionDiscoverer.js";
 import { getGlobalConfigDir } from "../../core/SessionTracker.js";
 import { getVscodeUserDataDir } from "../../core/VscodeWorkspaceLocator.js";
@@ -26,6 +27,12 @@ import {
 	resolveMcpLauncherJs,
 } from "../McpRegistration.js";
 import { removeCodexMcpServer, upsertCodexMcpServer } from "./CodexTomlWriter.js";
+import {
+	removeYamlBlockEntry,
+	removeYamlHookCommand,
+	upsertYamlBlockEntry,
+	upsertYamlHookCommand,
+} from "./HermesConfigWriter.js";
 import { removeJsonMcpServer, upsertJsonMcpServer } from "./JsonMcpWriter.js";
 
 const log = createLogger("HostRegistrars");
@@ -42,6 +49,7 @@ export interface DetectedHosts {
 	devin: boolean;
 	antigravity: boolean;
 	kimi: boolean;
+	hermes: boolean;
 }
 
 export interface McpHostRegistrar {
@@ -337,6 +345,126 @@ const kimiRegistrar: McpHostRegistrar = {
 };
 
 /**
+ * Hermes Agent: global `<HERMES_HOME>/config.yaml` (defaulting to
+ * `~/.hermes/config.yaml`).
+ *
+ * Unlike every other host in this file, this registrar upserts TWO blocks in
+ * ONE file — the `mcp_servers` entry AND the `on_session_end` shell-hook entry
+ * — because Hermes has no per-manifest hook registration path: the ONLY way to
+ * declare a session-end hook is a `hooks:` block in the same config.yaml. So a
+ * hook-only or MCP-only path here would be a lie about what the operation
+ * really does, and splitting the two operations would double the number of
+ * atomic writes to a file the user cares about.
+ *
+ * Registration is also the point that pre-records the shell-hook approval in
+ * `shell-hooks-allowlist.json` — see the header of {@link
+ * preAcceptHermesShellHook} for why writing the config alone is not enough
+ * (Hermes silently refuses to register the hook on a non-TTY start otherwise).
+ * The approval is scoped to the exact `(event, command)` pair we wrote — no
+ * blanket auto-accept.
+ *
+ * ## POSIX-only for the hook, but MCP is cross-platform
+ *
+ * `run-hook` is an extension-less bash script; a hook command referencing it
+ * cannot spawn on Windows through Hermes' own `shlex.split` + `shell=False`
+ * subprocess model. So on win32 the MCP entry is still written (it uses the
+ * same `node <cliJs>` route the other cross-platform registrars use), and the
+ * hook is skipped. A win32-native dispatcher would fill this gap.
+ *
+ * Global config — never committed, so gitExcludePaths returns [].
+ */
+const HERMES_HOOK_EVENT = "on_session_end";
+
+/**
+ * Quote a POSIX path for `shlex.split` only when it needs it.
+ *
+ * Hermes spawns hooks with `shlex.split(command)` and `shell=False`, so a
+ * path containing spaces is otherwise split into several argv entries. Quote
+ * only the exceptional paths to keep the common no-space case byte-stable
+ * across upgrades and avoid re-writing every existing hook command.
+ */
+function shlexQuotePosix(path: string): string {
+	if (!/[\s"\\]/.test(path)) return path;
+	return `"${path.replace(/([\\"])/g, "\\$1")}"`;
+}
+
+/** The single Hermes hook command we register — POSIX bash absolute path. */
+function hermesHookCommand(): string {
+	return `${shlexQuotePosix(join(getGlobalConfigDir(), "run-hook"))} hermes-stop`;
+}
+
+const hermesRegistrar: McpHostRegistrar = {
+	host: "hermes",
+	scope: "global",
+	register: async () => {
+		const base = jolliEntry();
+		// The MCP entry Hermes reads: two nested keys under `mcp_servers`, each
+		// value a `{command, args}` object. Verified against Hermes 0.20.5's own
+		// mcp entry parser (agent/mcp_tool.py::_iter_mcp_config).
+		const mcpBody = [
+			"  jollimemory:",
+			`    command: ${JSON.stringify(base.command)}`,
+			`    args: ${JSON.stringify(base.args)}`,
+		].join("\n");
+		const command = hermesHookCommand();
+		// Hermes' hook value under an event is a LIST of `{command, timeout?}`
+		// entries — the same file may run multiple hooks per event. 30-second
+		// timeout matches Hermes' `DEFAULT_TIMEOUT_SECONDS = 60` at half, which is
+		// a comfortable ceiling for our session write (measured 200-500 ms) with
+		// plenty of headroom for a cold node startup on an untriggered runtime.
+		for (const home of await listHermesHomeDirs()) {
+			try {
+				const cfgPath = join(home, "config.yaml");
+				await upsertYamlBlockEntry(cfgPath, "mcp_servers", {
+					subKey: "jollimemory",
+					body: `${mcpBody}\n`,
+				});
+
+				if (process.platform === "win32") continue;
+
+				// Pre-record the approval BEFORE the hook command appears in
+				// config.yaml. Otherwise a headless Hermes that starts between the
+				// two writes would see the unapproved hook and silently refuse it
+				// until the next enable. Each profile owns an independent allowlist.
+				await preAcceptHermesShellHook(join(home, "shell-hooks-allowlist.json"), {
+					event: HERMES_HOOK_EVENT,
+					command,
+					scriptPath: join(getGlobalConfigDir(), "run-hook"),
+					nowIso: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
+				});
+				await upsertYamlHookCommand(cfgPath, HERMES_HOOK_EVENT, command, 30);
+			} catch (err) {
+				// Profiles are independent Hermes instances. One unreadable/broken
+				// profile must not prevent later profiles from receiving a valid setup.
+				log.warn("Hermes registration failed for profile home %s: %s", home, String(err));
+			}
+		}
+		if (process.platform === "win32") {
+			log.info("Hermes hook registration skipped on win32 — run-hook is POSIX-only");
+		}
+	},
+	remove: async () => {
+		const command = hermesHookCommand();
+		for (const home of await listHermesHomeDirs()) {
+			try {
+				const cfgPath = join(home, "config.yaml");
+				await removeYamlBlockEntry(cfgPath, "mcp_servers", "jollimemory");
+				if (process.platform !== "win32") {
+					await removeYamlHookCommand(cfgPath, HERMES_HOOK_EVENT, command);
+					await revokeHermesShellHook(join(home, "shell-hooks-allowlist.json"), {
+						event: HERMES_HOOK_EVENT,
+						command,
+					});
+				}
+			} catch (err) {
+				log.warn("Hermes removal failed for profile home %s: %s", home, String(err));
+			}
+		}
+	},
+	gitExcludePaths: () => [],
+};
+
+/**
  * Return the ordered list of registrars for the detected set of hosts.
  */
 export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
@@ -352,6 +480,7 @@ export function buildRegistrars(detected: DetectedHosts): McpHostRegistrar[] {
 	if (detected.devin) out.push(devinRegistrar);
 	if (detected.antigravity) out.push(antigravityRegistrar);
 	if (detected.kimi) out.push(kimiRegistrar);
+	if (detected.hermes) out.push(hermesRegistrar);
 	return out;
 }
 
@@ -369,6 +498,7 @@ const ALL_DETECTED: DetectedHosts = {
 	devin: true,
 	antigravity: true,
 	kimi: true,
+	hermes: true,
 };
 
 /** Run `fn` over `regs` with per-host error isolation — one failure is logged

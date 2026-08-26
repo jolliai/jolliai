@@ -110,6 +110,7 @@ export function buildSettingsHtml(nonce: string): string {
       ${buildToggleRow("clineEnabled", "Cline", "Session discovery for the Cline CLI (~/.cline/data/sessions) and the Cline VS Code extension (globalStorage)")}
       ${buildToggleRow("antigravityEnabled", "Antigravity", "Session discovery via Antigravity's per-conversation store (~/.gemini/antigravity*)")}
       ${buildToggleRow("kimiEnabled", "Kimi Code", "Session discovery via Kimi Code CLI's store (~/.kimi-code/sessions)")}
+      ${buildToggleRow("hermesEnabled", "Hermes", "Session discovery via Hermes Agent's state database (~/.hermes/state.db)")}
       <div class="error-message" id="integrations-error"></div>
       <p class="section-hint">Global preferences</p>
       ${buildToggleRow("globalInstructions", "Global Instructions", GLOBAL_INSTRUCTIONS_PROMPT)}

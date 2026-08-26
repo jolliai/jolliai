@@ -124,6 +124,29 @@ const kimiSource = defineSessionSource<DiskSession>({
 		(await import("../KimiSessionDiscoverer.js")).discoverKimiSessions(cwd, windowMs),
 });
 
+const hermesSource = defineSessionSource<DiskSession>({
+	source: "hermes",
+	// Its `updatedAt` is `COALESCE(last_activity_at, started_at)`, a column Hermes
+	// advances on every turn — measured on a real store, a session's stamp moved
+	// 493 s past its `started_at` over the conversation. That is the one property
+	// `daemonRescan` asks for.
+	//
+	// The re-scan cost was measured rather than assumed, since this opens a SQLite
+	// on a 30-second timer: 0.31 ms median / 0.58 ms max over 20 runs against a
+	// 1.3 MB database with a 3 MB un-checkpointed WAL. Cheap enough that a
+	// stateful mtime gate would buy nothing and cost a second source of truth
+	// about whether the store moved.
+	daemonRescan: true,
+	scan: async ({ windowMs }) =>
+		(await import("../HermesSessionDiscoverer.js"))
+			.scanHermesSessionsOnDisk(windowMs)
+			.then((r) => orFail("hermes", r.sessions, r.error)),
+	forRepo: async (scanned, cwd) =>
+		(await import("../HermesSessionDiscoverer.js")).hermesSessionsForRepo(scanned, cwd),
+	scanForRepo: async (cwd, windowMs) =>
+		(await import("../HermesSessionDiscoverer.js")).discoverHermesSessions(cwd, windowMs),
+});
+
 const openCodeSource = defineSessionSource<DiskSession>({
 	source: "opencode",
 	scan: async ({ windowMs }) =>
@@ -250,6 +273,7 @@ export const SESSION_SOURCES: ReadonlyArray<SessionSourceDefinition> = [
 	codexSource,
 	cursorSource,
 	kimiSource,
+	hermesSource,
 	openCodeSource,
 	copilotSource,
 	copilotChatSource,

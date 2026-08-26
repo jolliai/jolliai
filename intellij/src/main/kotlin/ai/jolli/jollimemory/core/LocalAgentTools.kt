@@ -42,6 +42,10 @@ object LocalAgentTools {
 			LocalAgentToolOption("cursor-agent", "Cursor", "Run `cursor-agent login` to sign in to Cursor."),
 			LocalAgentToolOption("opencode", "OpenCode", "Run `opencode auth login` to connect a provider."),
 			LocalAgentToolOption("kimi", "Kimi Code", "Run `kimi login` to sign in to your Moonshot account."),
+			// Hermes' model ids are provider/model pairs over a user-defined provider
+			// set, so the hint points at its own setup rather than a subscription
+			// login — mirrors `cli/src/core/localagent/ToolMeta.ts`.
+			LocalAgentToolOption("hermes", "Hermes", "Run `hermes setup` (or `hermes model`) to configure a provider."),
 		)
 
 	/** The single default tool (Claude Code) — the first of [DEFAULT_TOOLS]. */

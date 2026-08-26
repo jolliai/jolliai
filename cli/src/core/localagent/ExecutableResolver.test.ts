@@ -246,6 +246,20 @@ describe("resolveExecutable with launcher args", () => {
 		expect(r.launchArgs).toEqual(["--use-system-ca", "C:\\index.js"]);
 	});
 
+	// Hermes prints `Hermes Agent v0.20.5`, and `extractProbeVersion` deliberately
+	// accepts that `v`. Before the rank stripped it, `parseInt("v1")` was NaN and the
+	// `|| 0` collapsed every such build's MAJOR to zero — so a v1 binary ranked BELOW
+	// a v0 one and the older install won.
+	it("ranks a v-prefixed version by its real major", () => {
+		__resetResolverCacheForTest();
+		const r = resolveExecutable(spec, {
+			candidates: () => [{ file: "/old/hermes" }, { file: "/new/hermes" }],
+			probe: (c) => ({ ok: true, version: c.file === "/new/hermes" ? "v1.0.0" : "v0.20.5" }),
+			now: () => 1,
+		});
+		expect(r.file).toBe("/new/hermes");
+	});
+
 	it("falls back to the plain variant when the preferred one fails its probe", () => {
 		__resetResolverCacheForTest();
 		const r = resolveExecutable(spec, {

@@ -1038,6 +1038,7 @@ export function buildSidebarCss(): string {
   .tree-node.conversation-row .badge.transcript-source-cursor-cli   { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }
   .tree-node.conversation-row .badge.transcript-source-antigravity  { color: #f472b6; border-color: #f472b6; background: rgba(244,114,182,0.12); }
   .tree-node.conversation-row .badge.transcript-source-kimi         { color: #a78bfa; border-color: #a78bfa; background: rgba(167,139,250,0.12); }
+  .tree-node.conversation-row .badge.transcript-source-hermes       { color: #34d399; border-color: #34d399; background: rgba(52,211,153,0.12); }
 
   /* "Edited" marker — codicon-edit pencil glyph rendered inline after the
      row title. Intentionally a thin icon (no pill / border / fill) so it

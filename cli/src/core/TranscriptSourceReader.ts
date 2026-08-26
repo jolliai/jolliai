@@ -129,6 +129,8 @@ export async function readTranscriptForSource(
 			return (await import("./CopilotTranscriptReader.js")).readCopilotTranscript(transcriptPath, cursor);
 		case "devin":
 			return (await import("./DevinTranscriptReader.js")).readDevinTranscript(transcriptPath, cursor);
+		case "hermes":
+			return (await import("./HermesTranscriptReader.js")).readHermesTranscript(transcriptPath, cursor);
 		case "cursor-cli":
 			return (await import("./CursorCliTranscriptReader.js")).readCursorCliTranscript(transcriptPath, cursor);
 		case "copilot-chat":

@@ -109,8 +109,17 @@ export interface LocalAgentBackend {
 	 * than the interface, so a backend that never inspects it keeps the
 	 * one-parameter signature unchanged. Three do (cursor-agent, opencode, kimi);
 	 * codex declares it to attribute a refusal to the model it was handed.
+	 *
+	 * `cwd` is the throwaway directory THIS invocation ran in — the one
+	 * {@link buildInvocation} minted, and after degradation retries the one whose
+	 * run actually succeeded. It exists for a tool whose accounting arrives beside
+	 * stdout rather than inside it: Hermes writes its token, cost, and failure
+	 * report to a `--usage-file` path that only `buildInvocation` knows, so without
+	 * the directory back there is no way to find it. Hermes treats an absent or
+	 * malformed report as a failed verification because its plain stdout cannot
+	 * distinguish an answer from failure text.
 	 */
-	parseResult(stdout: string, requestedModel?: string): LocalAgentOutcome;
+	parseResult(stdout: string, requestedModel?: string, cwd?: string): LocalAgentOutcome;
 	/**
 	 * Cheap presence check — is this tool on disk? No capability probe, no
 	 * subprocess. Used by onboarding surfaces that must decide what to OFFER

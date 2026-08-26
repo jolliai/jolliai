@@ -1,4 +1,4 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -18,6 +18,7 @@ const NONE = {
 	devin: false,
 	antigravity: false,
 	kimi: false,
+	hermes: false,
 } as const;
 
 let dir: string;
@@ -706,5 +707,164 @@ describe("codex registrar — POSIX keeps the run-cli entry", () => {
 		const entry = upsertMock.mock.calls[0][1] as { command: string; args: string[] };
 		expect(entry.command).toBe(join(homedir(), ".jolli", "jollimemory", "run-cli"));
 		expect(entry.args).toEqual(["mcp"]);
+	});
+});
+
+/*
+ * Hermes registrar — end-to-end against a real, throwaway HERMES_HOME.
+ *
+ * Unlike Codex/Gemini/Kimi, we exercise the actual YAML writer here rather than
+ * mocking it. The writer's shape is the whole point (block-level upsert against
+ * an arbitrary user-authored config), and the drift risk is not "does the writer
+ * work" — it is "does the registrar hand it the right block, the right sub-key,
+ * and the right body". A mock cannot catch a body whose indent is off by one
+ * space or whose args array is JSON-quoted wrong.
+ */
+describe("hermes registrar — structure", () => {
+	it("appears in buildRegistrars when detected.hermes is true", () => {
+		const registrars = buildRegistrars({ ...NONE, hermes: true });
+		expect(registrars.map((r) => r.host)).toContain("hermes");
+	});
+	it("does not appear when detected.hermes is false", () => {
+		expect(buildRegistrars({ ...NONE }).map((r) => r.host)).not.toContain("hermes");
+	});
+	it("gitExcludePaths() returns [] — global config, never committed", () => {
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		expect(hermes.gitExcludePaths()).toEqual([]);
+	});
+});
+
+describe("hermes registrar — register/remove against a real config.yaml", () => {
+	let hermesHome: string;
+	let cfg: string;
+	let allowlist: string;
+
+	beforeEach(async () => {
+		hermesHome = await mkdtemp(join(tmpdir(), "hermes-home-"));
+		cfg = join(hermesHome, "config.yaml");
+		allowlist = join(hermesHome, "shell-hooks-allowlist.json");
+		process.env.HERMES_HOME = hermesHome;
+	});
+	afterEach(async () => {
+		delete process.env.HERMES_HOME;
+		await rm(hermesHome, { recursive: true, force: true });
+	});
+
+	it("writes both mcp_servers and hooks blocks when POSIX", async () => {
+		if (process.platform === "win32") return; // covered by the win32 test below
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		const text = await readFile(cfg, "utf-8");
+		expect(text).toContain("mcp_servers:\n  jollimemory:\n");
+		expect(text).toContain("command:");
+		expect(text).toContain("args:");
+		expect(text).toContain("hooks:\n  on_session_end:");
+		expect(text).toContain("run-hook");
+		expect(text).toContain("hermes-stop");
+		// And the allowlist got pre-approved.
+		const parsed = JSON.parse(await readFile(allowlist, "utf-8"));
+		expect(parsed.approvals).toHaveLength(1);
+		expect(parsed.approvals[0].event).toBe("on_session_end");
+	});
+
+	it("quotes a spaced run-hook path in the hook command for shlex.split", async () => {
+		if (process.platform === "win32") return;
+		const spacedHome = join(tmpdir(), "First Last");
+		vi.stubEnv("HOME", spacedHome);
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		const text = await readFile(cfg, "utf-8");
+		const quoted = `"${join(spacedHome, ".jolli", "jollimemory", "run-hook")}" hermes-stop`;
+		expect(text).toContain(`command: ${JSON.stringify(quoted)}`);
+	});
+
+	it("preserves an unrelated user MCP server", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(
+			cfg,
+			`model:\n  default: anthropic/claude-opus-4.6\n` +
+				`mcp_servers:\n  linear:\n    command: /usr/local/bin/linear-mcp\n    args: []\n` +
+				`custom_providers:\n  - name: sub2api\n    api_key: sk-c8d69c\n`,
+		);
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		const text = await readFile(cfg, "utf-8");
+		expect(text).toContain("linear:");
+		expect(text).toContain("jollimemory:");
+		// The plaintext api_key MUST survive. This is the whole point of the
+		// no-op short-circuit + atomic-write + mode-preservation contract.
+		expect(text).toContain("api_key: sk-c8d69c");
+	});
+
+	it("preserves user commands in on_session_end during register and remove", async () => {
+		if (process.platform === "win32") return;
+		await writeFile(
+			cfg,
+			`mcp_servers: {}\nhooks:\n  on_session_end:\n    - command: "/user/session-end"\n      timeout: 10\n`,
+		);
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		let text = await readFile(cfg, "utf-8");
+		expect(text).toContain('command: "/user/session-end"');
+		expect(text).toContain("hermes-stop");
+
+		await hermes.remove("/wt");
+		text = await readFile(cfg, "utf-8");
+		expect(text).toContain('command: "/user/session-end"');
+		expect(text).not.toContain("hermes-stop");
+		expect(text).toContain("hooks:\n  on_session_end:");
+	});
+
+	it("registers every named profile's independent config and allowlist", async () => {
+		if (process.platform === "win32") return;
+		const workProfile = join(hermesHome, "profiles", "work");
+		const personalProfile = join(hermesHome, "profiles", "personal");
+		await mkdir(workProfile, { recursive: true });
+		await mkdir(personalProfile, { recursive: true });
+		// A named profile is a complete Hermes instance: its home carries a config
+		// from creation. An EMPTY profile directory is not an instance yet and
+		// must not be fabricated into one (see listHermesHomeDirs).
+		await writeFile(join(workProfile, "config.yaml"), "model: {}\n");
+		await writeFile(join(personalProfile, "config.yaml"), "model: {}\n");
+		const emptyProfile = join(hermesHome, "profiles", "never-used");
+		await mkdir(emptyProfile, { recursive: true });
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+
+		for (const home of [hermesHome, personalProfile, workProfile]) {
+			const text = await readFile(join(home, "config.yaml"), "utf-8");
+			expect(text).toContain("mcp_servers:\n  jollimemory:");
+			expect(text).toContain("hooks:\n  on_session_end:");
+			const parsed = JSON.parse(await readFile(join(home, "shell-hooks-allowlist.json"), "utf-8"));
+			expect(parsed.approvals).toHaveLength(1);
+		}
+		// The empty profile directory received nothing — it is not a Hermes home.
+		await expect(readFile(join(emptyProfile, "config.yaml"), "utf-8")).rejects.toThrow(/ENOENT/);
+	});
+
+	it("is idempotent — a re-register on an already-registered file writes nothing", async () => {
+		if (process.platform === "win32") return;
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		const first = await readFile(cfg, "utf-8");
+		const firstAllow = await readFile(allowlist, "utf-8");
+		await hermes.register("/wt");
+		expect(await readFile(cfg, "utf-8")).toBe(first);
+		expect(await readFile(allowlist, "utf-8")).toBe(firstAllow);
+	});
+
+	it("remove() clears BOTH blocks and the allowlist entry", async () => {
+		if (process.platform === "win32") return;
+		const [hermes] = buildRegistrars({ ...NONE, hermes: true });
+		await hermes.register("/wt");
+		await hermes.remove("/wt");
+		const text = await readFile(cfg, "utf-8");
+		expect(text).not.toContain("jollimemory:");
+		expect(text).not.toContain("on_session_end:");
+		// Collapsed back to the `{}` idiom Hermes' own writer emits.
+		expect(text).toContain("mcp_servers: {}");
+		expect(text).toContain("hooks: {}");
+		const parsed = JSON.parse(await readFile(allowlist, "utf-8"));
+		expect(parsed.approvals).toHaveLength(0);
 	});
 });

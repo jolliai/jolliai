@@ -1852,6 +1852,28 @@ describe("Installer", () => {
 			await expect(readFile(join(emptyGlobalDir, "config.json"), "utf-8")).rejects.toThrow(/ENOENT/);
 		});
 
+		it("registers Hermes before its first state database exists", async () => {
+			// The Hermes installer creates its home before the first conversation
+			// creates state.db. MCP/hook registration must key off that raw presence,
+			// not the SQLite-gated session-discovery detector.
+			const savedHermesHome = process.env.HERMES_HOME;
+			const hermesHome = join(fakeHomeDir, "fresh-hermes");
+			process.env.HERMES_HOME = hermesHome;
+			await mkdir(hermesHome, { recursive: true });
+			try {
+				const result = await install(tempDir);
+				expect(result.success).toBe(true);
+				expect(result.hermesConfigPath).toBe(join(hermesHome, "config.yaml"));
+				await expect(stat(join(hermesHome, "state.db"))).rejects.toThrow();
+				const config = await readFile(join(hermesHome, "config.yaml"), "utf-8");
+				expect(config).toContain("mcp_servers:\n  jollimemory:");
+				if (process.platform !== "win32") expect(config).toContain("hooks:\n  on_session_end:");
+			} finally {
+				if (savedHermesHome === undefined) delete process.env.HERMES_HOME;
+				else process.env.HERMES_HOME = savedHermesHome;
+			}
+		});
+
 		it("registers Cline MCP when the VS Code extension is present", async () => {
 			const { isClinePresent } = await import("../core/ClineDetector.js");
 			const flavor = join(fakeHomeDir, "Code", "globalStorage", "saoudrizwan.claude-dev");
@@ -2303,6 +2325,25 @@ describe("Installer", () => {
 			expect(status.enabled).toBe(false);
 			expect(status.claudeHookInstalled).toBe(false);
 			expect(status.gitHookInstalled).toBe(false);
+		});
+
+		it("reports the Hermes shell hook from the active HERMES_HOME config", async () => {
+			const savedHermesHome = process.env.HERMES_HOME;
+			const hermesHome = join(fakeHomeDir, "hermes-status");
+			process.env.HERMES_HOME = hermesHome;
+			await mkdir(hermesHome, { recursive: true });
+			await writeFile(
+				join(hermesHome, "config.yaml"),
+				"hooks:\n  on_session_end:\n    - command: /jolli/run-hook hermes-stop\n",
+				"utf-8",
+			);
+			try {
+				const status = await getStatus(tempDir);
+				expect(status.hermesHookInstalled).toBe(true);
+			} finally {
+				if (savedHermesHome === undefined) delete process.env.HERMES_HOME;
+				else process.env.HERMES_HOME = savedHermesHome;
+			}
 		});
 
 		it("should use process.cwd() when getStatus is called without cwd", async () => {

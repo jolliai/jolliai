@@ -146,6 +146,8 @@ const REQUIRED_RUNTIME_FILES = [
 	"PrePushHook.js",
 	"QueueWorker.js",
 	"PrePushWorker.js",
+	"HermesStopHook.js",
+	"HermesDiscoveryWorker.js",
 ];
 
 function assertCompleteDist(distDir, label) {

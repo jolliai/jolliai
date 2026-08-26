@@ -4055,6 +4055,22 @@ describe("CLI", () => {
 			expect(calls.some((s) => s.includes("Gemini hook") && s.includes(".gemini/settings.json"))).toBe(true);
 		});
 
+		it("should display hermes config path when hermesConfigPath is returned", async () => {
+			vi.mocked(install).mockResolvedValueOnce({
+				success: true,
+				message: "OK",
+				warnings: [],
+				claudeSettingsPath: "/project/.claude/settings.json",
+				gitHookPath: "/project/.git/hooks/post-commit",
+				hermesConfigPath: "/home/user/.hermes/config.yaml",
+			});
+
+			await main(["enable", "-y"]);
+
+			const calls = vi.mocked(console.log).mock.calls.map((c) => String(c[0]));
+			expect(calls.some((s) => s.includes("Hermes Agent hooks") && s.includes(".hermes/config.yaml"))).toBe(true);
+		});
+
 		it("should print warnings on enable failure", async () => {
 			vi.mocked(install).mockResolvedValueOnce({
 				success: false,

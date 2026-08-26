@@ -84,7 +84,13 @@ describe("listPresentLocalAgents", () => {
 			if (id === "codex") throw new Error("registry exploded");
 			return fake(id, true) as never;
 		});
-		expect(listPresentLocalAgents().map((a) => a.id)).toEqual(["claude-code", "cursor-agent", "opencode", "kimi"]);
+		expect(listPresentLocalAgents().map((a) => a.id)).toEqual([
+			"claude-code",
+			"cursor-agent",
+			"opencode",
+			"kimi",
+			"hermes",
+		]);
 	});
 
 	/**

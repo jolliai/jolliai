@@ -42,6 +42,7 @@ function baseInput(over: Partial<SettingsApplyInput> = {}): SettingsApplyInput {
 		clineEnabled: true,
 		antigravityEnabled: true,
 		kimiEnabled: true,
+		hermesEnabled: true,
 		globalInstructions: "default",
 		aiProvider: "anthropic",
 		model: "sonnet",
@@ -203,6 +204,7 @@ describe("parseSettingsApplyInput", () => {
 				"clineEnabled",
 				"antigravityEnabled",
 				"kimiEnabled",
+				"hermesEnabled",
 			].map((f) => [f, false]),
 		);
 		expect(() => parseSettingsApplyInput(rawBody(allOff))).toThrow(/At least one AI agent/);

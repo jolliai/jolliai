@@ -46,7 +46,7 @@ import { formatAccumulatedEntry, mergeAccumulatedBody, restorePriorHarvest } fro
 import type { SourceDefinition } from "./SourceDefinition.js";
 import { getRegistry } from "./SourceDefinitionRegistry.js";
 import * as SourceEngine from "./SourceEngine.js";
-import { type ExtractOptions, getEnvelopeParser } from "./TranscriptEnvelopeParser.js";
+import { type ExtractOptions, getEnvelopeParser, type NormalizedToolResult } from "./TranscriptEnvelopeParser.js";
 
 const log = createLogger("ReferenceExtractor");
 
@@ -64,6 +64,40 @@ export interface ExtractReferencesResult {
  * `transcriptPath` (NOT a pre-parsed SessionTranscript). The per-source envelope
  * parser is chosen by `opts.source` (default "claude").
  */
+/**
+ * Second entry point, for sources whose transcript is NOT a line-oriented stream.
+ *
+ * Every line-oriented source flows through {@link extractReferencesFromTranscript},
+ * whose reduction — parse envelope → walk each payload → dedupe — is the same
+ * reduction any other source needs once its own reader has produced the same
+ * {@link NormalizedToolResult}s. SQLite-backed sources have no line stream to feed
+ * that entry, so exposing the reduction lets them share it verbatim instead of
+ * copying the walk, the wrap-throw guard and the dedupe rule into a second place.
+ *
+ * The results carried here MUST already have been through the source's own
+ * envelope unwrap (Hermes: strip the `<untrusted_tool_result>` wrapper, unwrap
+ * the `{"result": "<inner>"}` shell, JSON-parse the inner) — this function
+ * assumes `payload` is the business object every source's normalizer produces.
+ */
+export function referencesFromNormalizedResults(results: ReadonlyArray<NormalizedToolResult>): Reference[] {
+	const collected: Reference[] = [];
+	for (const r of results) {
+		// Same wrap-throw rule as the JSONL path: a pathologically deep payload
+		// must not take an entire scan down with it.
+		try {
+			walkPayload(r.payload, r.def, r.toolName, r.referencedAt, collected);
+		} catch (err) {
+			log.warn(
+				"Dropping tool_result on line %d (%s): payload walk failed: %s",
+				r.lineNumber,
+				r.toolName,
+				(err as Error).message,
+			);
+		}
+	}
+	return dedupeKeepLatest(collected);
+}
+
 export async function extractReferencesFromTranscript(
 	transcriptPath: string,
 	opts: ExtractOptions = {},

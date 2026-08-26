@@ -53,6 +53,7 @@ vi.mock("../dashboard/DbBackfill.js", () => ({
 }));
 
 import { readManualDisableFlagReadonly } from "../core/RepoProfile.js";
+import { DAEMON_RESCAN_SOURCES } from "../core/sessions/SessionSources.js";
 import { canUseDashboardDb } from "../dashboard/DashboardDb.js";
 import { dbRescanSessions } from "../dashboard/DbBackfill.js";
 import { existingWorktrees, listActiveRepos, type RegisteredRepo } from "../dashboard/RepoRegistry.js";
@@ -124,7 +125,9 @@ describe("sessionRescanTask", () => {
 	it("reports the interval in seconds and the sources it watches", async () => {
 		await sessionRescanTask(60_000).run();
 
-		expect(infoLines()[0]).toContain("[codex]");
+		// Derived from the registry rather than spelled out, so opting another source
+		// into `daemonRescan` does not have to be re-typed here.
+		expect(infoLines()[0]).toContain(`[${DAEMON_RESCAN_SOURCES.map((d) => d.source).join(",")}]`);
 		expect(infoLines()[0]).toContain("every 60s");
 	});
 

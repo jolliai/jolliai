@@ -62,6 +62,7 @@ export interface SettingsApplyInput {
 	readonly clineEnabled: boolean;
 	readonly antigravityEnabled: boolean;
 	readonly kimiEnabled: boolean;
+	readonly hermesEnabled: boolean;
 	readonly globalInstructions: "enabled" | "disabled" | "default";
 	readonly aiProvider: "anthropic" | "jolli" | "local-agent";
 	/** `"sonnet"` (the default) is stored as unset. */
@@ -126,6 +127,7 @@ const AGENT_FIELDS = [
 	"clineEnabled",
 	"antigravityEnabled",
 	"kimiEnabled",
+	"hermesEnabled",
 ] as const;
 
 function asBool(v: unknown): boolean {
@@ -345,6 +347,7 @@ export async function applySettings(
 			clineEnabled: input.clineEnabled,
 			antigravityEnabled: input.antigravityEnabled,
 			kimiEnabled: input.kimiEnabled,
+			hermesEnabled: input.hermesEnabled,
 			aiProvider: input.aiProvider,
 			// "sonnet" is the default — stored as unset so the config stays minimal.
 			model: input.model === "sonnet" ? undefined : input.model,

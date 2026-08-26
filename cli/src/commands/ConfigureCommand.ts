@@ -99,6 +99,7 @@ const VALID_CONFIG_KEYS = [
 	"devinEnabled",
 	"antigravityEnabled",
 	"kimiEnabled",
+	"hermesEnabled",
 	"mcpPlatformToolsEnabled",
 	"globalInstructions",
 	"logLevel",
@@ -189,6 +190,7 @@ function coerceConfigValue(key: ConfigKey, raw: string): string | number | boole
 		key === "devinEnabled" ||
 		key === "antigravityEnabled" ||
 		key === "kimiEnabled" ||
+		key === "hermesEnabled" ||
 		key === "mcpPlatformToolsEnabled" ||
 		key === "syncTranscripts" ||
 		key === "syncSessions" ||
@@ -318,6 +320,11 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		key: "kimiEnabled",
 		type: "boolean",
 		description: "Enable Kimi Code CLI (~/.kimi-code) session discovery (true/false)",
+	},
+	{
+		key: "hermesEnabled",
+		type: "boolean",
+		description: "Enable Hermes Agent (~/.hermes) session discovery (true/false; requires Node 22.13+ at runtime)",
 	},
 	{
 		key: "mcpPlatformToolsEnabled",

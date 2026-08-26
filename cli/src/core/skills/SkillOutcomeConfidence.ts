@@ -78,6 +78,10 @@ export type SkillOutcomeConfidence = "observed" | "assumed";
  *   - `claude:tool`    — the `tool_result` record's `toolUseResult.success` + `is_error`
  *   - `kimi:tool`      — the paired `tool.result` event's `result.isError`
  *   - `opencode:tool`  — the `part` row's `state.status` (`completed` vs `error`)
+ *   - `hermes:tool`    — the paired `skill_view` result row's `content.success`
+ *                        (HermesSkillScanner stamps `outcomeObserved: true` only
+ *                        when the tool_call_id resolved, so a pending call still
+ *                        degrades to `assumed`)
  *
  * Absent, and each for a measured reason rather than an omission:
  *
@@ -98,6 +102,7 @@ const OUTCOME_REPORTING_MECHANISMS: ReadonlySet<string> = new Set<string>([
 	"claude:tool",
 	"kimi:tool",
 	"opencode:tool",
+	"hermes:tool",
 ]);
 
 /**

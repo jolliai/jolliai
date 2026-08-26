@@ -1169,6 +1169,13 @@ const READER_BACKED_TOOL_SOURCES = [
 	"cursor-cli",
 	"cline-cli",
 	"devin",
+	// Hermes joined with its reader, which was written against a live v0.20.5
+	// `~/.hermes/state.db`: every `tool_calls` entry is the OpenAI
+	// `{id, function:{name, arguments}}` envelope, and its MCP names carry the
+	// `mcp__<server>__<tool>` prefix verbatim (`tools/mcp_tool.py`), so the
+	// classification is Claude's and needed no guess. `HermesTranscriptReader.test.ts`
+	// asserts a non-empty extraction over that captured shape.
+	"hermes",
 ] as const;
 
 /**

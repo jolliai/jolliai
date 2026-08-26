@@ -88,6 +88,7 @@ export function buildConversationDetailsHtml(opts: BuildHtmlOptions): string {
 		".badge.transcript-source-cursor-cli   { color: #2dd4bf; border-color: #2dd4bf; background: rgba(45,212,191,0.12); }",
 		".badge.transcript-source-antigravity  { color: #f472b6; border-color: #f472b6; background: rgba(244,114,182,0.12); }",
 		".badge.transcript-source-kimi         { color: #a78bfa; border-color: #a78bfa; background: rgba(167,139,250,0.12); }",
+		".badge.transcript-source-hermes       { color: #34d399; border-color: #34d399; background: rgba(52,211,153,0.12); }",
 		".edited-notice { display: flex; align-items: center; gap: 8px; margin: 0 0 16px 0; padding: 10px 12px; border-radius: 6px; border: 1px solid var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)); background: color-mix(in srgb, var(--vscode-gitDecoration-modifiedResourceForeground, var(--vscode-focusBorder)) 12%, transparent); color: var(--vscode-foreground); }",
 		".edited-notice.hidden { display: none; }",
 		/* Leading marker — codicon-edit glyph in modified-file yellow. Matches
@@ -177,6 +178,8 @@ function providerLabel(source: string): string {
 			return "Antigravity";
 		case "kimi":
 			return "Kimi Code";
+		case "hermes":
+			return "Hermes";
 		default:
 			return source;
 	}

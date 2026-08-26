@@ -85,8 +85,22 @@ function toLines(out: string): string[] {
 }
 
 /** Compares dotted version strings descending; missing/garbage sorts last. */
+/**
+ * A version string as comparable segments.
+ *
+ * The leading `v` is stripped because {@link extractProbeVersion} deliberately
+ * ACCEPTS one (`/^v?\d+\./`) and Hermes is the first shipped tool to print it
+ * — `Hermes Agent v0.20.5`. Without the strip, `parseInt("v0")` is NaN and the
+ * `|| 0` below silently collapses every such build's MAJOR to zero, so
+ * `v1.0.0` ranks BELOW `v0.20.5` and the older binary wins the newest-capable
+ * race on a machine that has both. Every other tool prints a bare number
+ * (`2.1.212`, `0.146.0-alpha.3`), so nothing else changes.
+ */
 function versionRank(v: string | undefined): number[] {
-	return (v ?? "0").split(".").map((n) => Number.parseInt(n, 10) || 0);
+	return (v ?? "0")
+		.replace(/^v/i, "")
+		.split(".")
+		.map((n) => Number.parseInt(n, 10) || 0);
 }
 function isNewer(a: string | undefined, b: string | undefined): boolean {
 	const ra = versionRank(a);

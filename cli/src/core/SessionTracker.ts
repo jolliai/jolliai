@@ -223,6 +223,8 @@ export function isSourceEnabled(source: TranscriptSource | undefined, config: Jo
 			return config.antigravityEnabled !== false;
 		case "kimi":
 			return config.kimiEnabled !== false;
+		case "hermes":
+			return config.hermesEnabled !== false;
 		default:
 			return true;
 	}

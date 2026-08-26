@@ -8,9 +8,9 @@
  * `surface` comes from `__JOLLI_CLIENT_KIND__`, a compile-time constant each
  * bundler `define`s, so the complete set of values a running process can emit
  * equals the set of build configurations that exist — six. This product supports
- * thirteen hosts ({@link TRANSCRIPT_SOURCES}), only three of which ship a plugin
+ * fourteen hosts ({@link TRANSCRIPT_SOURCES}), only three of which ship a plugin
  * bundle; everything else is *observed* by whichever artifact happens to be
- * running, so ten of thirteen report the surface of the observer.
+ * running, so eleven of fourteen report the surface of the observer.
  *
  * Worse than invisible, they are misattributed. Repo hooks are installed as
  * source-neutral `run-hook` calls and resolved at trigger time by

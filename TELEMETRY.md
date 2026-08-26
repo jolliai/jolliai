@@ -19,7 +19,7 @@ collected — generated from the event registry the code actually uses.
   is known. It is a fixed, low-cardinality list of tool names, never free-form:
   `claude`, `codex`, `gemini`, `opencode`, `cursor`, `cursor-cli`,
   `copilot`, `copilot-chat`, `cline`, `cline-cli`, `devin`, `antigravity`,
-  `kimi`. See below for when it is omitted.
+  `kimi`, `hermes`. See below for when it is omitted.
 - Coarse environment facts: OS, architecture, runtime version, and which Jolli
   environment your client is pointed at (`local` / `dev` / `preview` / `prod`).
 - The events listed below, each with a small bag of **bucketed or boolean**

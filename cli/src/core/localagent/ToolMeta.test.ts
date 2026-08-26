@@ -54,15 +54,16 @@ describe("ToolMeta model pinning", () => {
 	// Which tools are pinned is a decision, so it is spelled out here rather than
 	// derived: pinning or unpinning one has to be a visible edit to this list, not
 	// an accident. claude-code and codex are pinned because their model namespaces
-	// are ones this project can name; cursor-agent, opencode and kimi keep
+	// are ones this project can name; cursor-agent, opencode, kimi and hermes keep
 	// deferring to their own configuration (cursor's catalogue is 200+ entries of
-	// which a free plan can use one, and opencode spends the user's own provider
-	// credit).
+	// which a free plan can use one, opencode spends the user's own provider
+	// credit, and hermes model ids are `provider/model` pairs over a provider set
+	// the user defines, so no shipped list could be right on every machine).
 	it("pins a model list for claude-code and codex, and for no other tool", () => {
 		for (const id of ["claude-code", "codex"] as LocalAgentToolId[]) {
 			expect(localAgentToolModels(id).length).toBeGreaterThan(0);
 		}
-		for (const id of ["cursor-agent", "opencode", "kimi"] as LocalAgentToolId[]) {
+		for (const id of ["cursor-agent", "opencode", "kimi", "hermes"] as LocalAgentToolId[]) {
 			expect(localAgentToolModels(id)).toEqual([]);
 		}
 	});

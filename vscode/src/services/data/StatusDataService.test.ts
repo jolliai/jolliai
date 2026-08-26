@@ -39,9 +39,10 @@ describe("StatusDataService.derive", () => {
 			gitHookInstalled: true,
 			claudeHookInstalled: true,
 			geminiHookInstalled: true,
+			hermesHookInstalled: true,
 		});
 		const derived = StatusDataService.derive(status, null);
-		expect(derived.hooksDescription).toBe("4 Git + 2 Claude + 1 Gemini");
+		expect(derived.hooksDescription).toBe("4 Git + 2 Claude + 1 Gemini + 1 Hermes");
 		expect(derived.allHooksInstalled).toBe(true);
 	});
 

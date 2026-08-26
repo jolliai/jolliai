@@ -135,6 +135,8 @@ const REQUIRED_RUNTIME_FILES = [
 	"PrePushHook.js",
 	"QueueWorker.js",
 	"PrePushWorker.js",
+	"HermesStopHook.js",
+	"HermesDiscoveryWorker.js",
 ] as const;
 
 function isCompleteRuntimeDist(distDir: string): boolean {

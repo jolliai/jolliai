@@ -223,12 +223,16 @@ export function resolveClaudeHookActive(status: StatusInfo, _isClaudePlugin: boo
 	return status.claudeHookInstalled;
 }
 
-/** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini"` / `"none installed"`). */
+/** The one-line hook summary (`"5 Git + 2 Claude + 1 Gemini + 1 Hermes"` / `"none installed"`). */
 export function buildHookSummary(status: StatusInfo, claudeHookActive: boolean): string {
 	const hookParts: string[] = [];
 	if (status.gitHookInstalled) hookParts.push(`${status.prePushHookInstalled ? 5 : 4} Git`);
 	if (claudeHookActive) hookParts.push("2 Claude");
 	if (status.geminiHookInstalled) hookParts.push("1 Gemini");
+	// Hermes' on_session_end is an agent-lifecycle hook like Claude's
+	// Stop/SessionStart and Gemini's AfterAgent — surface it alongside them
+	// so the summary reflects every agent hook this machine has installed.
+	if (status.hermesHookInstalled) hookParts.push("1 Hermes");
 	return hookParts.length > 0 ? hookParts.join(" + ") : "none installed";
 }
 
@@ -360,6 +364,16 @@ export function buildIntegrationRows(
 					enabled: status.kimiEnabled !== false,
 					hookInstalled: undefined,
 					sessionCount: counts.kimi,
+				},
+			],
+			[
+				"Hermes",
+				status.hermesDetected ?? false,
+				{
+					enabled: status.hermesEnabled !== false,
+					hookInstalled: status.hermesHookInstalled,
+					sessionCount: counts.hermes,
+					scanError: status.hermesScanError,
 				},
 			],
 		];

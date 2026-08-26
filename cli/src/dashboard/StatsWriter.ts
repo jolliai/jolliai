@@ -78,6 +78,27 @@ const APPLY_BASE_DELAY_MS = 120;
 /** How many pending rows one drain pass claims. Bounded to keep write locks short. */
 const DRAIN_BATCH_SIZE = 500;
 
+/**
+ * Coerce an `lastCallAtMs` value to an integer for `session_tool_use`'s
+ * INTEGER column.
+ *
+ * The pipeline's contract is integer milliseconds (see `ToolCallCount.lastCallAtMs`),
+ * and every reader is *supposed* to hand us one — but Hermes' `messages.timestamp`
+ * is a REAL (float epoch seconds), and one arithmetic slip (`row.timestamp * 1000`
+ * without a round) leaked a fractional millisecond all the way to SQLite, which
+ * rejects it with "cannot store REAL value in INTEGER column" and takes the whole
+ * `commit.summary` projection down. The reader has been fixed (`Math.round` at
+ * source), but the sink is the type contract — coercing here means a future reader
+ * that leaks a float truncates the sub-ms precision no consumer wants rather than
+ * failing the projection loop under retry. Rounds rather than floors so a value
+ * within .5 ms of a whole ms lands on the closer instant.
+ */
+function toIntegerMs(value: number | null | undefined): number | null {
+	if (value === null || value === undefined) return null;
+	if (!Number.isFinite(value)) return null;
+	return Math.round(value);
+}
+
 export interface ApplyOptions {
 	readonly producerKind: ProducerKind;
 	readonly producerVersion?: string;
@@ -1132,7 +1153,7 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			// All four are written together or not at all — a partially-filled row would
 			// let a reader take three tokens with no confidence to qualify them.
 			const previous = previousTools.get(`${tool.kind}\u0000${tool.name}`);
-			const incomingLastCallAtMs = tool.lastCallAtMs ?? null;
+			const incomingLastCallAtMs = toIntegerMs(tool.lastCallAtMs);
 			const previousLastCallAtMs = previous?.last_call_at_ms ?? null;
 			const lastCallAtMs =
 				incomingLastCallAtMs === null
@@ -1554,7 +1575,7 @@ function projectCommitSummary(db: DashboardDbHandle, event: CommitSummaryEvent, 
 							t.kind,
 							t.server ?? null,
 							t.calls,
-							t.lastCallAtMs ?? null,
+							toIntegerMs(t.lastCallAtMs),
 							nowMs,
 						);
 					}

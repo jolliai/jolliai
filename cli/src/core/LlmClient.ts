@@ -539,7 +539,7 @@ async function runWithFlagDegradation(
 	exe: ResolvedExecutable,
 	run: typeof defaultRunInvocation,
 	opts: FlagDegradationOpts,
-): Promise<{ stdout: string; disabledFlagIds: ReadonlySet<string> }> {
+): Promise<{ stdout: string; disabledFlagIds: ReadonlySet<string>; cwd: string }> {
 	const flags = backend.optionalFlags ?? [];
 	const known = await loadUnsupportedFlagIds(backend.id, exe.version, opts.globalDir);
 	// Only the ids learned in THIS call get written back; `known` is already on
@@ -588,7 +588,10 @@ async function runWithFlagDegradation(
 					[...blind].join(", "),
 				);
 			}
-			return { stdout, disabledFlagIds: disabled };
+			// The cwd of the attempt that SUCCEEDED, not of the last one built: a
+			// backend whose accounting is written beside stdout (Hermes' `--usage-file`)
+			// needs the directory that run actually used.
+			return { stdout, disabledFlagIds: disabled, cwd: invocation.cwd };
 		} catch (err) {
 			const remaining = flags.filter((f) => !disabled.has(f.id));
 			if (!(err instanceof LocalAgentSetupError) || remaining.length === 0) throw err;
@@ -677,7 +680,7 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 	const spawnedCwds: string[] = [];
 	try {
 		const runOnce = async (model: string) => {
-			const { stdout, disabledFlagIds } = await runWithFlagDegradation(backend, exe, run, {
+			const { stdout, disabledFlagIds, cwd } = await runWithFlagDegradation(backend, exe, run, {
 				prompt,
 				model,
 				systemPrompt: "You output only what the prompt asks for, with no preamble or commentary.",
@@ -689,7 +692,7 @@ async function callLocalAgent(options: LlmCallOptions, source: LlmCredentialSour
 			// tool's usage report can name several models (claude adds a small helper
 			// turn of its own), and the one we ASKED for is the only non-heuristic way
 			// to say which entry is the answering turn. See ClaudeCodeBackend.pickModel.
-			return { outcome: backend.parseResult(stdout, model || undefined), disabledFlagIds };
+			return { outcome: backend.parseResult(stdout, model || undefined, cwd), disabledFlagIds };
 		};
 
 		// A model the tool REFUSES must not take the machine's summaries down with

@@ -15,6 +15,7 @@ const REMEDY_CASES = [
 	["cursor-agent", "Cursor", "cursor-agent login"],
 	["opencode", "OpenCode", "opencode auth login"],
 	["kimi", "Kimi Code", "kimi login"],
+	["hermes", "Hermes", "hermes setup"],
 ] as const;
 
 /** Tools whose metadata claims a separate desktop app, and the app each names. */

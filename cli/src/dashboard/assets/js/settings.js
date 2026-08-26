@@ -74,6 +74,7 @@ window.JD = window.JD || {};
 		],
 		["antigravityEnabled", "Antigravity", "Session discovery via Antigravity's per-conversation store (~/.gemini/antigravity*)"],
 		["kimiEnabled", "Kimi Code", "Session discovery via Kimi Code CLI's store (~/.kimi-code/sessions)"],
+		["hermesEnabled", "Hermes", "Session discovery via Hermes Agent's state database (~/.hermes/state.db)"],
 	];
 
 	var GLOBAL_INSTRUCTIONS_HINT =

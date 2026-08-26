@@ -129,6 +129,7 @@ export async function buildSettingsPageModel(
 			clineEnabled: config.clineEnabled !== false,
 			antigravityEnabled: config.antigravityEnabled !== false,
 			kimiEnabled: config.kimiEnabled !== false,
+			hermesEnabled: config.hermesEnabled !== false,
 			globalInstructions:
 				config.globalInstructions === "enabled"
 					? "enabled"

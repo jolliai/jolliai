@@ -66,6 +66,9 @@ import { discoverDevinSessions, isDevinInstalled } from "../core/DevinSessionDis
 import { readDevinTranscript } from "../core/DevinTranscriptReader.js";
 import { readGeminiTranscript } from "../core/GeminiTranscriptReader.js";
 import { getCommitInfo, getCurrentBranch, getDiffContent, getDiffStats, resolveStateRoot } from "../core/GitOps.js";
+import { discoverHermesConversations } from "../core/HermesDiscovery.js";
+import { discoverHermesSessions, isHermesInstalled } from "../core/HermesSessionDiscoverer.js";
+import { readHermesTranscript } from "../core/HermesTranscriptReader.js";
 import { enqueueIngestOperation } from "../core/IngestTrigger.js";
 import { discoverKimiConversations } from "../core/KimiDiscovery.js";
 import { discoverKimiSessions, isKimiInstalled } from "../core/KimiSessionDiscoverer.js";
@@ -148,6 +151,7 @@ import {
 	withRequiredOrphanWriteLock,
 } from "../core/SummaryStore.js";
 import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
+import { discoverHermesSkills } from "../core/skills/HermesSkillDiscovery.js";
 import { associateSkillsWithCommit } from "../core/skills/SkillArchive.js";
 import { mergeSkillRefs } from "../core/skills/SkillDelta.js";
 import { getTelemetryContext, setTelemetryAgent, track } from "../core/Telemetry.js";
@@ -748,6 +752,15 @@ export async function runWorker(cwd: string, force = false): Promise<void> {
 						}),
 						discoverCursorConversations(cwd).then(undefined, (error: unknown) => {
 							log.warn("Cursor artifact discovery failed (non-fatal): %s", (error as Error).message);
+						}),
+						// Hermes is hookless as shipped — its shell hooks are machine-global,
+						// opt-in and approved once, so a repo cannot assume one is armed. This
+						// pass is its only event-driven route today.
+						discoverHermesSkills(cwd).then(undefined, (error: unknown) => {
+							log.warn("Hermes skill discovery failed (non-fatal): %s", (error as Error).message);
+						}),
+						discoverHermesConversations(cwd).then(undefined, (error: unknown) => {
+							log.warn("Hermes reference discovery failed (non-fatal): %s", (error as Error).message);
 						}),
 					]).then(() => true),
 					deadline(ARTIFACT_DISCOVERY_DEADLINE_MS),
@@ -4059,6 +4072,15 @@ async function loadSessionTranscripts(
 			log.info("Discovered %d Kimi session(s)", kimiSessions.length);
 		}
 	}
+	// Discover Hermes Agent sessions (on-demand scan of ~/.hermes/state.db plus each
+	// named profile's, scoped by the `git_repo_root` / `cwd` columns each row records).
+	if (config.hermesEnabled !== false && (await isHermesInstalled())) {
+		const hermesSessions = await discoverHermesSessions(cwd);
+		if (hermesSessions.length > 0) {
+			allSessions = [...allSessions, ...hermesSessions];
+			log.info("Discovered %d Hermes session(s)", hermesSessions.length);
+		}
+	}
 
 	// ONE row per conversation, keyed `(source, sessionId)` — the same identity
 	// `DashboardCollector` dedupes on, not a new one invented here.
@@ -4690,6 +4712,13 @@ async function readAllTranscripts(
 				result = await readClineCliTranscript(session.transcriptPath, cursor, beforeTimestamp);
 			} catch (error: unknown) {
 				log.error("Skipping Cline CLI session %s: %s", session.sessionId, (error as Error).message);
+				continue;
+			}
+		} else if (source === "hermes") {
+			try {
+				result = await readHermesTranscript(session.transcriptPath, cursor, beforeTimestamp);
+			} catch (error: unknown) {
+				log.error("Skipping Hermes session %s: %s", session.sessionId, (error as Error).message);
 				continue;
 			}
 		} else if (source === "devin") {

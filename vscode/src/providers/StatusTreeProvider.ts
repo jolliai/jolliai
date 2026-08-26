@@ -127,6 +127,9 @@ function buildFullStatusItems(
 	if (s.geminiHookInstalled) {
 		hookParts.push("1 Gemini");
 	}
+	if (s.hermesHookInstalled) {
+		hookParts.push("1 Hermes");
+	}
 	const allHooksInstalled = s.gitHookInstalled;
 	const hooksDescription =
 		hookParts.length > 0 ? hookParts.join(" + ") : "none installed";
@@ -140,6 +143,7 @@ function buildFullStatusItems(
 		`Git hooks: ${gitHookCount > 0 ? `${gitHookCount} installed` : "not installed"} (${gitHookList})`,
 		`Claude Code hooks: ${s.claudeHookInstalled ? "2 installed" : "not installed"} (Stop, SessionStart)`,
 		`Gemini hook: ${s.geminiHookInstalled ? "installed" : "not installed"} (AfterAgent)`,
+		`Hermes hook: ${s.hermesHookInstalled ? "installed" : "not installed"} (on_session_end)`,
 	];
 	if (hookRuntime) {
 		hooksTooltipLines.push(`Hook runtime: ${hookRuntime}`);
@@ -480,6 +484,32 @@ function buildFullStatusItems(
 		undefined,
 		counts.kimi,
 	);
+
+	// Hermes Agent: sessions discovered from ~/.hermes/state.db (and each named
+	// profile's). SQLite-backed, so an unreadable store surfaces as "unavailable"
+	// rather than as the positive claim "0 conversations" — same shape as Antigravity.
+	if (s.hermesScanError) {
+		items.push(
+			new StatusItem(
+				"Hermes Integration",
+				`unavailable — ${s.hermesScanError.kind}`,
+				ICON_WARN,
+				`Hermes database scan failed (${s.hermesScanError.kind}): ${s.hermesScanError.message}`,
+			),
+		);
+	} else {
+		pushIntegrationItem(
+			items,
+			s.hermesDetected ?? false,
+			s.hermesEnabled !== false,
+			undefined,
+			"Hermes Integration",
+			"Hermes sessions found — session discovery is enabled",
+			"Hermes detected but session discovery is disabled in config",
+			undefined,
+			counts.hermes,
+		);
+	}
 
 	if (extensionOutdated) {
 		items.push(

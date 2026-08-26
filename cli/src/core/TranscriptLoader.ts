@@ -128,6 +128,18 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 			return [];
 		}
 	}
+	if (opts.source === "hermes") {
+		try {
+			const { readHermesTranscript } = await import("./HermesTranscriptReader.js");
+			const result = await readHermesTranscript(opts.transcriptPath);
+			return [...result.entries];
+		} catch (err) {
+			if (!isEnoent(err)) {
+				log.warn("loadTranscript (hermes) failed for %s: %s", opts.transcriptPath, errMsg(err));
+			}
+			return [];
+		}
+	}
 	if (opts.source === "cursor-cli") {
 		try {
 			const { readCursorCliTranscript } = await import("./CursorCliTranscriptReader.js");
@@ -197,14 +209,23 @@ export async function loadTranscript(opts: LoadOptions): Promise<TranscriptEntry
 
 /**
  * Per-line JSONL parsers. Sources that own a dedicated single-artifact
- * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` / `devin`
- * SQLite DBs; `cline` / `cline-cli` plain-JSON files; `antigravity` whole-file
- * transcript_full.jsonl) are intentionally absent — those are dispatched at the
- * top of `loadTranscript` before this table is consulted.
+ * reader (`gemini` JSON file; `opencode` / `cursor` / `copilot` / `devin` /
+ * `hermes` SQLite DBs; `cline` / `cline-cli` plain-JSON files; `antigravity`
+ * whole-file transcript_full.jsonl) are intentionally absent — those are
+ * dispatched at the top of `loadTranscript` before this table is consulted.
  */
 type JsonlSource = Exclude<
 	TranscriptSource,
-	"gemini" | "opencode" | "cursor" | "cursor-cli" | "copilot" | "cline" | "cline-cli" | "devin" | "antigravity"
+	| "gemini"
+	| "opencode"
+	| "cursor"
+	| "cursor-cli"
+	| "copilot"
+	| "cline"
+	| "cline-cli"
+	| "devin"
+	| "antigravity"
+	| "hermes"
 >;
 const PARSERS: Record<JsonlSource, (line: string) => TranscriptEntry | undefined> = {
 	claude: parseClaude,

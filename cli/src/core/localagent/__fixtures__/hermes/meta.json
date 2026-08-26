@@ -1,0 +1,7 @@
+{
+  "id": "hermes",
+  "note": "Captured verbatim from a real `hermes --ignore-rules --usage-file <path> -z 'Reply with exactly: fixture-ok'` run (Hermes Agent v0.20.5, upstream f751a8c5). success-usage.json is the exact usage report; stdout was `fixture-ok` and stderr was empty.",
+  "status": 0,
+  "signal": null,
+  "stderrTail": ""
+}

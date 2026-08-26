@@ -3,6 +3,7 @@ import {
 	builtinTool,
 	classifyCodexToolName,
 	classifyCursorToolName,
+	classifyHermesToolName,
 	classifyToolName,
 	mcpTool,
 	skillTool,
@@ -67,6 +68,17 @@ describe("classifyToolName (mcp__server__tool dialect)", () => {
 
 	it("attributes a malformed server-only name to the server rather than dropping it", () => {
 		expect(classifyToolName("mcp__srv")).toEqual({ name: "srv", kind: "mcp", server: "srv", calls: 0 });
+	});
+
+	it("keeps the tool intact when a malformed MCP name has an empty server", () => {
+		// `mcpTool` deliberately renders this as `.search`; the Hermes reference
+		// extractor removes that one-character display separator and keeps `search`.
+		expect(classifyToolName("mcp____search")).toEqual({
+			name: ".search",
+			kind: "mcp",
+			server: "",
+			calls: 0,
+		});
 	});
 
 	it("does not treat a single-underscore mcp_ prefix as MCP", () => {
@@ -179,6 +191,56 @@ describe("ToolUseTally", () => {
 		expect(tally.hasSeen("toolu_1")).toBe(false);
 		tally.addOnce("toolu_1", builtinTool("Bash"));
 		expect(tally.hasSeen("toolu_1")).toBe(true);
+	});
+});
+
+describe("classifyHermesToolName (identity lives in wrapped `arguments`)", () => {
+	// The exact envelope captured from a real Hermes v0.20.5 run against a live MCP
+	// server. Progressive tool disclosure hides every MCP tool behind a `tool_call`
+	// bridge, so `function.name` is the bridge and the real name is inside its
+	// JSON-string arguments.
+	const REAL_BRIDGE_ARGS = '{"name": "mcp__jollimemory__search", "arguments": {"query": "hermes"}}';
+
+	it("unwraps the bridge to the real MCP identity", () => {
+		expect(classifyHermesToolName("tool_call", REAL_BRIDGE_ARGS)).toEqual({
+			name: "jollimemory.search",
+			kind: "mcp",
+			server: "jollimemory",
+			calls: 0,
+		});
+	});
+
+	it("keeps a core tool's own name — those are never deferred", () => {
+		// `terminal`, `read_file`, `skill_view` are in `_HERMES_CORE_TOOLS`.
+		expect(classifyHermesToolName("terminal", '{"command":"ls"}')).toEqual(builtinTool("terminal"));
+	});
+
+	it("classifies a direct mcp__ name, for a session with nothing to defer", () => {
+		// Tier 0 (no deferrable tools) is pure passthrough, so both shapes are real.
+		expect(classifyHermesToolName("mcp__github__issue_read")).toMatchObject({ kind: "mcp", server: "github" });
+	});
+
+	it("leaves the discovery bridges as builtins", () => {
+		// They list and describe tools without invoking one; counting them as MCP
+		// would inflate every MCP figure with calls that reached no server — the same
+		// reason Cursor's `GetMcpTools` stays a builtin.
+		expect(classifyHermesToolName("tool_search", '{"query":"jolli"}')).toEqual(builtinTool("tool_search"));
+		expect(classifyHermesToolName("tool_describe", '{"names":["mcp__x__y"]}')).toEqual(
+			builtinTool("tool_describe"),
+		);
+	});
+
+	it("keeps an unusable bridge call as a builtin rather than dropping or inventing", () => {
+		for (const args of [undefined, "", "{not json", '"a string"', "{}", '{"name":""}', '{"name":7}']) {
+			expect(classifyHermesToolName("tool_call", args), String(args)).toEqual(builtinTool("tool_call"));
+		}
+	});
+
+	it("unwraps a non-MCP deferred tool to a builtin under its real name", () => {
+		// Plugin tools defer too, and their names carry no `mcp__` prefix.
+		expect(classifyHermesToolName("tool_call", '{"name":"some_plugin_tool"}')).toEqual(
+			builtinTool("some_plugin_tool"),
+		);
 	});
 });
 

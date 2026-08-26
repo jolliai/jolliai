@@ -72,14 +72,18 @@ describe("SESSION_SOURCES", () => {
 		for (const def of SESSION_SOURCES) expect(typeof def.usesAlreadyRecorded, def.source).toBe("boolean");
 	});
 
-	it("opts exactly codex into the daemon's 30-second re-scan", () => {
+	it("opts exactly codex and hermes into the daemon's 30-second re-scan", () => {
 		// The sibling flag above is pinned exhaustively and this one was not, which is the
-		// asymmetry worth closing: a copy-pasted `daemonRescan: true` on a 13th source would
+		// asymmetry worth closing: a copy-pasted `daemonRescan: true` on another source would
 		// put that agent's whole-transcript parse (Claude) or its per-conversation SQLite
 		// open (Antigravity) on a machine-wide 30-second timer, with the full suite green.
 		// Nothing else in the product would notice — the flag has no other reader.
+		//
+		// Both members earned it the same way: an `updatedAt` that moves when a
+		// conversation is appended to, plus a measured re-scan cost. Hermes' is one
+		// indexed-window query over a small `sessions` table (0.31 ms median).
 		const rescanned = SESSION_SOURCES.filter((def) => def.daemonRescan).map((def) => def.source);
-		expect(rescanned).toEqual(["codex"]);
+		expect(rescanned).toEqual(["codex", "hermes"]);
 	});
 
 	it("derives DAEMON_RESCAN_SOURCES from the flag rather than from a second list", () => {

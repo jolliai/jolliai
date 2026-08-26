@@ -252,9 +252,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         }
         val conversations = rawConversations.map {
             val key = CommitSelectionStore.conversationKey(it.source, it.sessionId)
+            val sourceName = it.source?.name ?: "unknown"
             WmConversation(
-                source = it.source.name,
-                title = it.title.ifBlank { "${it.source.name} conversation" },
+                source = sourceName,
+                title = it.title.ifBlank { "$sourceName conversation" },
                 messageCount = it.messageCount,
                 key = key,
                 excluded = key in exclusions.conversations,
@@ -299,9 +300,10 @@ class WorkingMemoryPanel(private val project: Project) : JPanel(BorderLayout()) 
         if (included.isEmpty()) return null
         val usageSources = setOf(TranscriptSource.claude, TranscriptSource.codex, TranscriptSource.gemini)
         val sessions = included.map { c ->
-            val entries = if (c.source in usageSources) {
+            val source = c.source
+            val entries = if (source != null && source in usageSources) {
                 try {
-                    TranscriptMessageCounter.loadTranscript(c.source, c.transcriptPath, cwd)
+                    TranscriptMessageCounter.loadTranscript(source, c.transcriptPath, cwd)
                 } catch (_: Exception) {
                     emptyList()
                 }

@@ -75,6 +75,9 @@ vi.mock("../core/CursorSessionDiscoverer.js", () => ({
 vi.mock("../core/KimiSessionDiscoverer.js", () => ({
 	scanKimiSessionsOnDisk: vi.fn(async () => []),
 }));
+vi.mock("../core/HermesSessionDiscoverer.js", () => ({
+	scanHermesSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
+}));
 vi.mock("../core/OpenCodeSessionDiscoverer.js", () => ({
 	scanOpenCodeSessionsOnDisk: vi.fn(async () => ({ sessions: [] })),
 }));
@@ -134,6 +137,7 @@ import { scanOpenCodeSessionsOnDisk } from "../core/OpenCodeSessionDiscoverer.js
 import { readCutoverFence, readManualDisableFlagSync } from "../core/RepoProfile.js";
 import { BACKFILL_SESSION_WINDOW_MS } from "../core/SessionWindow.js";
 import { getIndex, resolveReadStorage } from "../core/SummaryStore.js";
+import { DAEMON_RESCAN_SOURCES } from "../core/sessions/SessionSources.js";
 import type { SkillUsage, StoredTranscript, ToolCallCount } from "../Types.js";
 import { withIsolatedHome } from "../testUtils/isolatedHome.js";
 import {
@@ -3077,7 +3081,14 @@ describe("dbRescanSessions", () => {
 		// `sources-disabled`, not `no-sources`: the latter is the documented build-level
 		// off switch ("no definition declares daemonRescan"), and reporting it here would
 		// describe the build rather than the user's own decision.
-		const result = await withDisabledSources({ codexEnabled: false }, () =>
+		//
+		// EVERY re-scanned source has to be switched off for the pass to report the
+		// user's decision — one still on means there is real work to do. The literal
+		// below is guarded by the membership assertion so opting a third source in
+		// fails here with a message naming it, rather than silently changing what
+		// this test exercises.
+		expect(DAEMON_RESCAN_SOURCES.map((d) => d.source)).toEqual(["codex", "hermes"]);
+		const result = await withDisabledSources({ codexEnabled: false, hermesEnabled: false }, () =>
 			dbRescanSessions({ repos: [repo], dbPath, emitted: new Map() }),
 		);
 

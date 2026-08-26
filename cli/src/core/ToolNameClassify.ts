@@ -22,6 +22,14 @@
  *     sibling field (`payload.namespace`, or `invocation.server`) rather than
  *     inside the name. Its builtin names are bare and undecorated
  *     (`exec_command`, `wait`, `apply_patch` — real 2026-07/08 rollouts).
+ *   - **one generic builtin + identity in wrapped `arguments`** — Hermes, whose
+ *     "progressive tool disclosure" replaces every MCP / non-core plugin tool with
+ *     a `tool_call` bridge and puts the real `mcp__<server>__<tool>` name inside
+ *     that bridge's JSON-string arguments. Its CORE tools (`terminal`,
+ *     `skill_view`, …) are never deferred and keep their own names. See
+ *     {@link classifyHermesToolName} — captured from a real run, not inferred from
+ *     the fact that Hermes' own `mcp_prefixed_tool_name` builds a Claude-shaped
+ *     name: it does, and the model still never sees it.
  *   - **one generic builtin + identity in `input`** — Cursor (both the IDE's
  *     Agents Window and cursor-agent). This entry used to say cursor-agent spoke
  *     the `mcp__` dialect "because it speaks the Anthropic block format"; the
@@ -117,6 +125,61 @@ export function classifyCodexToolName(name: string, namespace?: string): ToolCal
 /** The generic builtin Cursor routes every MCP invocation through. */
 const CURSOR_MCP_TOOL = "CallMcpTool";
 
+/** Hermes' bridge tool: the one entry point every deferred tool is invoked through. */
+const HERMES_BRIDGE_TOOL = "tool_call";
+
+/**
+ * Classifies a Hermes tool call, whose MCP identity is WRAPPED rather than named.
+ *
+ * Hermes runs "progressive tool disclosure" (`tools/tool_search.py`): the moment a
+ * session has ANY MCP or non-core plugin tool, those tools leave the model-visible
+ * array and are reached through three bridge tools — `tool_search`,
+ * `tool_describe` and `tool_call`. Core tools (`terminal`, `read_file`,
+ * `skill_view`, … — `toolsets._HERMES_CORE_TOOLS`) are never deferred and are
+ * still called by their own names.
+ *
+ * So an MCP call looks like this, captured from a real run:
+ *
+ *     { "function": { "name": "tool_call",
+ *                     "arguments": "{\"name\": \"mcp__jollimemory__search\",
+ *                                   \"arguments\": {\"query\": \"hermes\"}}" } }
+ *
+ * The real name is `mcp__<server>__<tool>` — Claude's dialect — but it is inside
+ * the bridge's `arguments`, which is itself a JSON STRING. Reading `function.name`
+ * and stopping there files every MCP call in this product as one
+ * `builtin:tool_call` bucket with no server, which is indistinguishable from "this
+ * person uses no MCP servers". That is the same silent failure `CallMcpTool`
+ * caused for Cursor, and it is why this classifier exists rather than a reuse of
+ * {@link classifyToolName}.
+ *
+ * A DIRECT `mcp__…` name is still classified normally: Tier 0 (a session with no
+ * deferrable tools) is pure passthrough, so both shapes are legitimate and neither
+ * is worth guessing about.
+ *
+ * `tool_search` and `tool_describe` stay BUILTINS under their own names. They list
+ * and describe tools without invoking one, so counting them as MCP would inflate
+ * every MCP figure with calls that never reached a server — the same reason
+ * Cursor's `GetMcpTools` is not treated as an MCP call.
+ *
+ * A bridge call whose `arguments` will not parse, or which names nothing, stays a
+ * builtin `tool_call`: the call is real and must not be dropped, but inventing an
+ * identity for it would put a wrong row in the group-by-server ranking.
+ */
+export function classifyHermesToolName(name: string, rawArguments?: unknown): ToolCallCount {
+	if (name !== HERMES_BRIDGE_TOOL) return classifyToolName(name);
+	if (typeof rawArguments !== "string" || rawArguments.length === 0) return builtinTool(name);
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(rawArguments);
+	} catch {
+		return builtinTool(name);
+	}
+	if (parsed === null || typeof parsed !== "object") return builtinTool(name);
+	const inner = (parsed as { name?: unknown }).name;
+	if (typeof inner !== "string" || inner.length === 0) return builtinTool(name);
+	return classifyToolName(inner);
+}
+
 /**
  * Classifies a Cursor tool call, whose MCP identity lives in `input` rather than
  * in the name.
@@ -205,6 +268,10 @@ export const TOOL_CALL_TIME_SOURCES: ReadonlyArray<string> = [
 	"cursor",
 	"cursor-cli",
 	"antigravity",
+	// Hermes stamps every row: `messages.timestamp REAL NOT NULL`, epoch seconds,
+	// present on the tool-call turn itself — so the stamp is the CALL's own instant
+	// and not the session's.
+	"hermes",
 ];
 
 export class ToolUseTally {

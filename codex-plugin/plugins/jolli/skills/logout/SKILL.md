@@ -32,7 +32,7 @@ available. Explain the provider-aware result:
 
 - Space binding and cloud sharing require a future Jolli sign-in.
 - `local-agent` memory generation continues through the configured
-  Codex, Claude Code, Cursor, OpenCode, or Kimi Code login.
+  Codex, Claude Code, Cursor, OpenCode, Kimi Code, or Hermes login.
 - `anthropic` generation continues when its preserved Anthropic key exists.
 - `jolli` generation stops unless another Jolli API key remains configured.
 

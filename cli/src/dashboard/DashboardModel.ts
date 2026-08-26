@@ -572,6 +572,7 @@ export interface SettingsAgents {
 	readonly clineEnabled: boolean;
 	readonly antigravityEnabled: boolean;
 	readonly kimiEnabled: boolean;
+	readonly hermesEnabled: boolean;
 	readonly globalInstructions: "enabled" | "disabled" | "default";
 }
 

@@ -134,7 +134,7 @@ class ConversationRowComponent(
 		cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
 
 		// Left side: source badge / logo (no more checkbox), vertically centered.
-		val badge = SourceBadge.leadFor(item.source.name)
+		val badge = SourceBadge.leadFor(item.source?.name ?: "unknown")
 		val leftPanel = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
 			isOpaque = false
 			add(badge)

@@ -11,7 +11,7 @@ class ConversationVirtualFile(
 	val item: ActiveConversationItem,
 	val cwd: String,
 ) : LightVirtualFile(
-	"${sourceEmoji(item.source.name)} ${item.title}",
+	"${sourceEmoji(item.source?.name ?: "unknown")} ${item.title}",
 	"",
 ) {
 	/** Stable identity so the same conversation always reuses the same tab. */
@@ -21,7 +21,7 @@ class ConversationVirtualFile(
 		return item.source == other.item.source && item.sessionId == other.item.sessionId
 	}
 
-	override fun hashCode(): Int = 31 * item.source.hashCode() + item.sessionId.hashCode()
+	override fun hashCode(): Int = 31 * (item.source?.hashCode() ?: 0) + item.sessionId.hashCode()
 
 	override fun isWritable(): Boolean = false
 }

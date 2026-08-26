@@ -399,6 +399,18 @@ export interface SidebarWebviewDeps {
 	 */
 	openCodeSkillDiscovery?: { discover(): void };
 	/**
+	 * Polling-path Hermes skill discovery. Hermes' shell hooks are machine-global,
+	 * opt-in and approved once, so a repo cannot assume one is armed — this tick is
+	 * what surfaces its skills WHILE the work is happening rather than at commit.
+	 */
+	hermesSkillDiscovery?: { discover(): void };
+	/**
+	 * Polling-path Hermes reference discovery. Hermes has no per-turn reference
+	 * hook (see AGENTS.md), so this tick is what surfaces its MCP references
+	 * WHILE the work is happening rather than at commit.
+	 */
+	hermesReferenceDiscovery?: { discover(): void };
+	/**
 	 * Called once when the sidebar webview first becomes visible. Used to trigger
 	 * lazy-loaded data sources (e.g. MemoriesStore.ensureFirstLoad()) that the
 	 * original tree views populated via onDidChangeVisibility — replaced here
@@ -2597,6 +2609,16 @@ export class SidebarWebviewProvider
 		}
 		try {
 			this.deps.openCodeSkillDiscovery?.discover();
+		} catch {
+			// ignore — background discovery must never break the refresh.
+		}
+		try {
+			this.deps.hermesSkillDiscovery?.discover();
+		} catch {
+			// ignore — background discovery must never break the refresh.
+		}
+		try {
+			this.deps.hermesReferenceDiscovery?.discover();
 		} catch {
 			// ignore — background discovery must never break the refresh.
 		}

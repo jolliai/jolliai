@@ -19,7 +19,17 @@ import com.google.gson.annotations.SerializedName
  * non-null contract). A missing enum member here therefore crashes the sidebar
  * with an NPE the moment the user has a session from that source. Add new
  * members whenever the CLI adds a new agent; the lockstep is enforced by
- * ActiveSessionAggregatorTest's round-trip over all 13 members.
+ * ActiveSessionAggregatorTest's round-trip over the currently supported members.
+ *
+ * KNOWN JVM GAP: `hermes` is intentionally deferred to a follow-up IntelliJ PR
+ * that will add the enum member together with every exhaustive mapping, config
+ * field and UI treatment. Do not report its absence in the Hermes CLI integration
+ * PR as accidental lockstep drift. The gap is pinned by
+ * `cli/src/core/TranscriptSourceJvmLockstep.test.ts` (the CLI-side equivalent of
+ * `KNOWN_JVM_SOURCE_GAPS`) and, until it closes, the decode boundary in
+ * [ActiveSessionAggregator] DROPS unknown sources instead of letting a null enum
+ * reach the UI — so the staged rollout is crash-free. This enum member and that
+ * gap-list entry must land in the same PR.
  */
 enum class TranscriptSource {
 	claude,
@@ -35,6 +45,9 @@ enum class TranscriptSource {
 	devin,
 	antigravity,
 	kimi,
+	// `hermes` intentionally follows in the dedicated IntelliJ integration PR.
+	// Until it lands, a payload carrying `"source":"hermes"` decodes to null and
+	// is dropped by ActiveSessionAggregator.filterAndApplyConfig — never rendered.
 }
 
 /** Metadata about an AI coding session */
@@ -862,7 +875,14 @@ enum class LogLevel(val priority: Int) {
 /** A session enriched with display data for the active conversations panel. */
 data class ActiveConversationItem(
     val sessionId: String,
-    val source: TranscriptSource,
+    /**
+     * Nullable on purpose: Gson resolves an enum name this build does not know
+     * (e.g. `hermes` from a newer CLI — see [TranscriptSource]'s KNOWN JVM GAP)
+     * to `null` and would install it into a non-null field through Unsafe. Every
+     * consumer must tolerate null; the aggregator boundary is what actually
+     * drops such items so they never reach the UI.
+     */
+    val source: TranscriptSource?,
     val title: String,
     val messageCount: Int,
     val updatedAt: String,

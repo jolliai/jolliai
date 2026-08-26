@@ -329,6 +329,7 @@ case "$HOOK_TYPE" in
   stop)               SCRIPT="StopHook.js" ;;
   session-start)      SCRIPT="SessionStartHook.js" ;;
   gemini-after-agent) SCRIPT="GeminiAfterAgentHook.js" ;;
+  hermes-stop)        SCRIPT="HermesStopHook.js" ;;
   *)                  echo "ERROR: unknown hook type '$HOOK_TYPE'" >&2; exit 0 ;;
 esac
 

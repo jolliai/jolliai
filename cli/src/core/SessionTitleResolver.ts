@@ -38,6 +38,7 @@ const PARSE_LINE: Record<TranscriptSource, (line: string) => string | undefined>
 	"cursor-cli": parseCursorCliUserLine,
 	antigravity: parseAntigravityUserLine,
 	kimi: parseKimiUserLine,
+	hermes: parseHermesUserLine,
 };
 
 /**
@@ -246,6 +247,14 @@ function parseAntigravityUserLine(_line: string): string | undefined {
 
 function parseDevinUserLine(_line: string): string | undefined {
 	// Same as OpenCode: Devin sessions carry SessionInfo.title from the discoverer.
+	return undefined;
+}
+
+function parseHermesUserLine(_line: string): string | undefined {
+	// Same as OpenCode: Hermes is sqlite-backed and its discoverer carries
+	// `sessions.title` — which Hermes itself generates with an LLM
+	// (`title_source: "llm"`), so it is better than any first-message truncation
+	// this could produce.
 	return undefined;
 }
 

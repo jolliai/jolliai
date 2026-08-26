@@ -95,7 +95,12 @@ vi.mock("./CliUtils.js", async (importOriginal) => {
 
 import { Command } from "commander";
 import * as detect from "../core/localagent/DetectAgents.js";
+import { LOCAL_AGENT_TOOLS } from "../core/localagent/ToolMeta.js";
 import { promptSetup, registerDisableCommand, registerEnableCommand } from "./EnableCommand.js";
+
+/** The sub-menu lists every registered tool plus one "go back" entry. Derived so
+ *  a new backend cannot silently break the two size assertions below. */
+const LOCAL_AGENT_TOOL_COUNT = Object.keys(LOCAL_AGENT_TOOLS).length;
 
 const GLOBAL_CONFIG_DIR = "/global/config";
 const promptText = h.promptText;
@@ -197,7 +202,7 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 			GLOBAL_CONFIG_DIR,
 		);
 		// Never probed claude-code on the way through — the blank consumed no candidate.
-		expect(logs.join("\n")).toContain("Enter a number between 1 and 6");
+		expect(logs.join("\n")).toContain(`Enter a number between 1 and ${LOCAL_AGENT_TOOL_COUNT + 1}`);
 	});
 
 	it("gives up and skips (writing nothing) when the sub-menu answer stays blank", async () => {
@@ -218,7 +223,7 @@ describe("EnableCommand — promptSetup local-agent tool selection", () => {
 		await promptSetup();
 
 		const subMenuPrompt = h.promptText.mock.calls[1][0] as string;
-		expect(subMenuPrompt).toContain("Choice (1-6)");
+		expect(subMenuPrompt).toContain(`Choice (1-${LOCAL_AGENT_TOOL_COUNT + 1})`);
 		expect(subMenuPrompt).not.toContain("[1]");
 	});
 

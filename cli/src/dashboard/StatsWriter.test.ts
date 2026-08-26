@@ -1259,6 +1259,42 @@ describe("skill_invocations projection", () => {
 			),
 		).toEqual([{ origin_root: "repo-agents" }]);
 	});
+
+	it("coerces a fractional-millisecond lastCallAtMs to an integer without failing the projection", async () => {
+		// Hermes' `messages.timestamp` is a REAL (float epoch seconds), so a reader
+		// that multiplies by 1000 without rounding leaks a fractional millisecond into
+		// `ToolCallCount.lastCallAtMs`. `session_tool_use.last_call_at_ms` is INTEGER,
+		// which SQLite would reject with "cannot store REAL value in INTEGER column",
+		// taking the whole `commit.summary` projection down under retry. The reader has
+		// been rounded at the source (HermesTranscriptReader), but the sink is the type
+		// contract — so a bad value here is truncated rather than throwing.
+		//
+		// 1787729417.26218 * 1000 = 1787729417262.18 — the exact shape captured from
+		// this machine's Hermes state.db when the bug was diagnosed.
+		await applyStatsEvents([sessionEvent([skillBucket({ lastCallAtMs: 1_787_729_417_262.18 })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		const rows = await query<{ last_call_at_ms: number }>(
+			"SELECT last_call_at_ms FROM session_tool_use WHERE kind = 'skill'",
+		);
+		expect(rows).toEqual([{ last_call_at_ms: 1_787_729_417_262 }]);
+	});
+
+	it("stores null for a NaN/Infinity lastCallAtMs — treats non-finite floats as 'no time'", async () => {
+		// A reader that mis-computes a float can produce NaN; keep that from being
+		// stored as a bogus epoch instant. Non-finite → null, matching how the readers
+		// themselves gate the field with `Number.isFinite`.
+		await applyStatsEvents([sessionEvent([skillBucket({ lastCallAtMs: Number.NaN })])], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect(
+			await query<{ last_call_at_ms: number | null }>(
+				"SELECT last_call_at_ms FROM session_tool_use WHERE kind = 'skill'",
+			),
+		).toEqual([{ last_call_at_ms: null }]);
+	});
 });
 
 describe("recall.observed projection", () => {

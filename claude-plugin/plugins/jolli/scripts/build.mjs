@@ -91,6 +91,13 @@ const options = {
 		// + "/<Worker>.js" — must exist as their own files in this dist.
 		{ in: resolve(jmSrc, "hooks", "QueueWorker.ts"), out: "QueueWorker" },
 		{ in: resolve(jmSrc, "hooks", "PrePushWorker.ts"), out: "PrePushWorker" },
+		// Hermes' `on_session_end` hook — dispatched through `run-hook`, resolved
+		// back to this dist by dist-paths at end-of-turn, so a registered dist that
+		// omits it turns Hermes' hook into a "node <missing file>" that silently
+		// drops the capture. Its detached discovery worker is a fixed sibling
+		// filename, same shape as CursorDiscoveryWorker.
+		{ in: resolve(jmSrc, "hooks", "HermesStopHook.ts"), out: "HermesStopHook" },
+		{ in: resolve(jmSrc, "hooks", "HermesDiscoveryWorker.ts"), out: "HermesDiscoveryWorker" },
 		// No dashboard server entry: `jolli dashboard` serves in its own process,
 		// so the server rides in Cli.js. Its ASSETS are still copied below, and
 		// still for the dist-paths reason — this dist can win arbitration, and
@@ -131,6 +138,8 @@ const EXPECTED_ENTRY_OUTS = [
 	"PrePushHook",
 	"QueueWorker",
 	"PrePushWorker",
+	"HermesStopHook",
+	"HermesDiscoveryWorker",
 ];
 const actualOuts = options.entryPoints.map((e) => e.out).sort();
 const expectedOuts = [...EXPECTED_ENTRY_OUTS].sort();

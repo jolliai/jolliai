@@ -95,6 +95,11 @@ const cliOptions = {
 		{ in: `${jmSrc}/hooks/PrePushWorker.ts`,           out: "PrePushWorker" },
 		{ in: `${jmSrc}/hooks/GeminiAfterAgentHook.ts`,   out: "GeminiAfterAgentHook" },
 		{ in: `${jmSrc}/hooks/SessionStartHook.ts`,       out: "SessionStartHook" },
+		// Hermes' `on_session_end` hook + its detached discovery worker. Same
+		// dist-completeness reason as the plugin bundles: a bundled dist can win
+		// arbitration and would then have to serve every registered host's hook.
+		{ in: `${jmSrc}/hooks/HermesStopHook.ts`,         out: "HermesStopHook" },
+		{ in: `${jmSrc}/hooks/HermesDiscoveryWorker.ts`,  out: "HermesDiscoveryWorker" },
 		// No DashboardServerEntry: `jolli dashboard` serves in its own process, so
 		// the server rides in Cli.js. dist/dashboard-assets/ is still mirrored from
 		// the CLI build by scripts/copy-dashboard-assets.mjs — the page runtime is

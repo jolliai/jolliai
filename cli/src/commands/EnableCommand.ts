@@ -525,6 +525,9 @@ async function reportEnableResult(
 			if (result.geminiSettingsPath) {
 				console.log(`    - Gemini hook (${result.geminiSettingsPath})`);
 			}
+			if (result.hermesConfigPath) {
+				console.log(`    - Hermes Agent hooks (${result.hermesConfigPath})`);
+			}
 		}
 
 		for (const warning of result.warnings) {

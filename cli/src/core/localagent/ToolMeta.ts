@@ -146,6 +146,16 @@ export const LOCAL_AGENT_TOOLS: Record<LocalAgentToolId, LocalAgentToolMeta> = {
 	"cursor-agent": { label: "Cursor", loginHint: "Run `cursor-agent login` to sign in to Cursor." },
 	opencode: { label: "OpenCode", loginHint: "Run `opencode auth login` to connect a provider." },
 	kimi: { label: "Kimi Code", loginHint: "Run `kimi login` to sign in to your Moonshot account." },
+	// No `models` list on purpose: Hermes model ids are `provider/model` pairs over
+	// a user-defined provider set, so any list shipped here would be a 400 on some
+	// machine. `resolveLocalAgentModel` then yields "" and no `-m` is emitted, and
+	// the user's own `model.default` answers — see HermesBackend decision 4.
+	// The IntelliJ DEFAULT_TOOLS mirror carries this entry too (pinned by
+	// `LocalAgentToolsTest`); the remaining IntelliJ Hermes work — the
+	// `TranscriptSource` enum member and its UI wiring — is tracked by the
+	// `KNOWN_JVM_TRANSCRIPT_SOURCE_GAPS` list in
+	// `cli/src/core/TranscriptSourceJvmLockstep.test.ts`.
+	hermes: { label: "Hermes", loginHint: "Run `hermes setup` (or `hermes model`) to configure a provider." },
 };
 
 // The `?? …` fallbacks below are unreachable per the `LocalAgentToolId` type,

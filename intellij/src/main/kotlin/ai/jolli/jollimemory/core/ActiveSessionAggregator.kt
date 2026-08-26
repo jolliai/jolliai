@@ -53,15 +53,38 @@ object ActiveSessionAggregator {
 			requestJson = gson.toJson(mapOf("windowMs" to windowMs)),
 		)
 		val raw = gson.fromJson(result, ActiveConversationsResult::class.java)
-		// Belt-and-suspenders: CLI aggregator already filters by config, this
-		// pass catches any config drift between the CLI process and the JVM
-		// (config.json edited after the bridge call started, etc). `failedSources`
-		// gets the SAME gate so a source the user just disabled cannot spike the
-		// "N sources unavailable" banner mid-render — VS Code parity with
-		// `ActiveSessionsProvider.listWithDiagnostics`.
 		val config = SessionTracker.loadConfigFromDir(SessionTracker.getGlobalConfigDir())
-		val items = raw.items.filter { isSourceEnabled(it.source, config) }
-		val failedSources = raw.failedSources.filter { isSourceEnabled(it, config) }
+		return filterAndApplyConfig(raw, config)
+	}
+
+	/**
+	 * Drop undecodable sources, then apply the config gate.
+	 *
+	 * Belt-and-suspenders: the CLI aggregator already filters by config, and this
+	 * pass catches any config drift between the CLI process and the JVM
+	 * (config.json edited after the bridge call started, etc). `failedSources`
+	 * gets the SAME gate so a source the user just disabled cannot spike the
+	 * "N sources unavailable" banner mid-render — VS Code parity with
+	 * `ActiveSessionsProvider.listWithDiagnostics`.
+	 *
+	 * The FIRST filter is the crash fix: a CLI newer than this plugin can emit a
+	 * source this enum does not know yet (`hermes` is the current case — see
+	 * [TranscriptSource]'s KNOWN JVM GAP), and Gson decodes an unknown enum
+	 * constant to null. A null source must be DROPPED, never treated as any known
+	 * source: mapping it onto claude (the legacy `isSourceEnabled(null)` fallback
+	 * for pre-source sessions) would misattribute the session, and rendering
+	 * `source.name` would NPE. `failedSources` gets the same drop so the banner
+	 * cannot name a source we cannot decode.
+	 */
+	internal fun filterAndApplyConfig(
+		raw: ActiveConversationsResult,
+		config: JolliMemoryConfig,
+	): ActiveConversationsResult {
+		val items = raw.items.filter { item ->
+			val source = item.source
+			source != null && isSourceEnabled(source, config)
+		}
+		val failedSources = raw.failedSources.filterNotNull().filter { isSourceEnabled(it, config) }
 		return ActiveConversationsResult(items = items, failedSources = failedSources)
 	}
 }

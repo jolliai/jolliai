@@ -89,7 +89,7 @@ class ConversationFileEditor(
 			val titleLabel = JBLabel(item.title).apply {
 				font = font.deriveFont(Font.BOLD, font.size2D + 2f)
 			}
-			val sourceLabel = JBLabel("${item.source.name}  ·  ${item.messageCount} messages").apply {
+			val sourceLabel = JBLabel("${item.source?.name ?: "unknown"}  ·  ${item.messageCount} messages").apply {
 				foreground = JBColor.GRAY
 			}
 			val headerLeft = JPanel().apply {
@@ -132,7 +132,10 @@ class ConversationFileEditor(
 
 	private fun loadTranscript() {
 		ApplicationManager.getApplication().executeOnPooledThread {
-			val source = item.source
+			// An undecodable source (newer CLI, see Types.kt's KNOWN JVM GAP) is
+			// dropped at the aggregator, so this is unreachable in practice — but a
+			// null here must not NPE a pooled thread; show nothing instead.
+			val source = item.source ?: return@executeOnPooledThread
 			val raw = TranscriptMessageCounter.loadUnreadTranscript(source, item.transcriptPath, cwd)
 			val view = ConversationOverlayStore.loadView(OverlayKey(cwd, source, item.sessionId), raw)
 
@@ -357,7 +360,7 @@ class ConversationFileEditor(
 	fun doSave() {
 		if (editedContent.isEmpty() && deletedIndices.isEmpty()) return
 
-		val source = item.source
+		val source = item.source ?: return
 		val key = OverlayKey(cwd, source, item.sessionId)
 
 		// Build identity-based rules from raw entries (pre-edit content)

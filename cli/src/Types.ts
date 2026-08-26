@@ -30,6 +30,12 @@ export const TRANSCRIPT_SOURCES = [
 	"devin",
 	"antigravity",
 	"kimi",
+	// KNOWN JVM GAP: IntelliJ Hermes transcript support is intentionally deferred
+	// to a follow-up PR. The gap is enforced by
+	// `TranscriptSourceJvmLockstep.test.ts` (the transcript-source analogue of
+	// `KNOWN_JVM_SOURCE_GAPS`) and must be emptied in the PR that adds the Kotlin
+	// enum member; until then the JVM decode boundary drops null-decoded sources.
+	"hermes",
 ] as const;
 
 /** Which AI coding agent produced the transcript. Derived from the runtime allowlist. */
@@ -625,7 +631,7 @@ export function isIngestOperation(op: GitOperation): op is IngestOperation {
 export type LlmCredentialSource = "anthropic-config" | "anthropic-env" | "jolli-proxy" | "local-agent";
 
 /** Which local-agent CLI tool drives generation when aiProvider === "local-agent". */
-export type LocalAgentToolId = "claude-code" | "codex" | "cursor-agent" | "opencode" | "kimi";
+export type LocalAgentToolId = "claude-code" | "codex" | "cursor-agent" | "opencode" | "kimi" | "hermes";
 
 /** Metadata from the LLM API call that generated this summary */
 export interface LlmCallMetadata {
@@ -1424,7 +1430,7 @@ export interface ReferenceCommitRef {
  * are absent because they have no skill concept on disk at all — there is
  * nothing to capture, as opposed to something we have not got round to.
  */
-export type SkillSource = "claude" | "opencode" | "codex" | "cursor" | "kimi";
+export type SkillSource = "claude" | "opencode" | "codex" | "cursor" | "kimi" | "hermes";
 
 /**
  * Which skill ROOT a skill was loaded from, when the host names the file it read.
@@ -2018,6 +2024,8 @@ export interface JolliMemoryConfig {
 	readonly antigravityEnabled?: boolean;
 	/** Enable Kimi Code CLI (~/.kimi-code) session discovery at post-commit time (default: auto-detect) */
 	readonly kimiEnabled?: boolean;
+	/** Enable Hermes Agent (~/.hermes) session discovery at post-commit time (default: auto-detect) */
+	readonly hermesEnabled?: boolean;
 	/** Global minimum log level written to debug.log (default: "info") */
 	readonly logLevel?: LogLevel;
 	/** Per-module log level overrides (e.g. { "GitOps": "debug" }) */
@@ -2298,6 +2306,8 @@ export interface InstallResult {
 	readonly prePushHookPath?: string;
 	/** Absolute path to the Gemini settings file (set on successful install when Gemini detected) */
 	readonly geminiSettingsPath?: string;
+	/** Absolute path to the Hermes config file (set on successful install when Hermes detected) */
+	readonly hermesConfigPath?: string;
 	/**
 	 * Set when `respectManualDisable` short-circuited the run: the repo carries the
 	 * manual opt-out, so NOTHING was installed even though `success` is `true`.
@@ -2334,6 +2344,8 @@ export interface StatusInfo {
 	readonly prePushHookInstalled?: boolean;
 	/** Whether the Gemini AfterAgent hook is installed in .gemini/settings.json */
 	readonly geminiHookInstalled: boolean;
+	/** Whether the Hermes on_session_end shell hook is installed in ~/.hermes/config.yaml */
+	readonly hermesHookInstalled?: boolean;
 	/**
 	 * Whether the current worktree has all required per-worktree hooks installed
 	 * for the integrations enabled in config.
@@ -2411,6 +2423,16 @@ export interface StatusInfo {
 	readonly kimiDetected?: boolean;
 	/** Whether Kimi session discovery is enabled in config (undefined = auto-detect) */
 	readonly kimiEnabled?: boolean;
+	/** Whether the Hermes Agent home directory (~/.hermes) was detected */
+	readonly hermesDetected?: boolean;
+	/** Whether Hermes session discovery is enabled in config (undefined = auto-detect) */
+	readonly hermesEnabled?: boolean;
+	/**
+	 * Hermes state-db scan failed with a real (non-ENOENT) error — corrupt,
+	 * locked, schema drift, or permission denied. UI surfaces this adjacent to
+	 * the Hermes row instead of silently rendering "0 sessions".
+	 */
+	readonly hermesScanError?: SqliteScanError;
 	/** Directory path for global config (~/.jolli/jollimemory) */
 	readonly globalConfigDir?: string;
 	/** Path to the worktree state directory */

@@ -39,6 +39,7 @@ PUBLISH_REQUIRED_DIST=(
 	Cli.js PluginBootstrapHook.js StopHook.js SessionStartHook.js
 	PostCommitHook.js PostMergeHook.js PostRewriteHook.js PrepareMsgHook.js PrePushHook.js
 	QueueWorker.js PrePushWorker.js
+	HermesStopHook.js HermesDiscoveryWorker.js
 	dashboard-assets/index.html
 	dashboard-assets/styles/main.css
 	dashboard-assets/js/format.js

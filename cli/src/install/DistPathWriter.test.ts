@@ -35,6 +35,8 @@ const requiredRuntimeFiles = [
 	"PrePushHook.js",
 	"QueueWorker.js",
 	"PrePushWorker.js",
+	"HermesStopHook.js",
+	"HermesDiscoveryWorker.js",
 ] as const;
 
 afterEach(async () => {

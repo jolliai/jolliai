@@ -19,6 +19,8 @@ import {
 	buildLiveSkillsMarkdown,
 	buildSkillsAggregateMarkdown,
 } from "../../cli/src/core/SkillsAggregateMarkdown.js";
+import { discoverHermesConversations } from "../../cli/src/core/HermesDiscovery.js";
+import { discoverHermesSkills } from "../../cli/src/core/skills/HermesSkillDiscovery.js";
 import { discoverOpenCodeSkills } from "../../cli/src/core/skills/OpenCodeSkillDiscovery.js";
 import { discoverCodexConversations } from "../../cli/src/core/CodexDiscovery.js";
 import { discoverCursorConversations } from "../../cli/src/core/CursorDiscovery.js";
@@ -1595,6 +1597,26 @@ export function activate(context: vscode.ExtensionContext): void {
 			discover: () => {
 				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
 				if (cwd) void discoverOpenCodeSkills(cwd);
+			},
+		},
+		// Polling-path Hermes skill discovery, ridden on the same 60s tick. Hermes'
+		// shell hooks are machine-global, opt-in and approved once, so a repo cannot
+		// assume one is armed — without this its skills would only appear after a
+		// commit. discoverHermesSkills never rejects and single-flights per cwd.
+		hermesSkillDiscovery: {
+			discover: () => {
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (cwd) void discoverHermesSkills(cwd);
+			},
+		},
+		// Polling-path Hermes reference discovery, ridden on the same 60s tick.
+		// Same rationale as Kimi's: without a per-turn hook (see AGENTS.md for why
+		// we don't ship one), MCP references only reach the panel at commit time —
+		// this tick surfaces them WHILE the work is happening.
+		hermesReferenceDiscovery: {
+			discover: () => {
+				const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+				if (cwd) void discoverHermesConversations(cwd);
 			},
 		},
 		pinStore: { addPin, removePin, listPins },

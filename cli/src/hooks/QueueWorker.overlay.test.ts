@@ -80,6 +80,11 @@ vi.mock("../core/KimiSessionDiscoverer.js", () => ({
 	isKimiInstalled: vi.fn().mockResolvedValue(false),
 }));
 
+vi.mock("../core/HermesSessionDiscoverer.js", () => ({
+	discoverHermesSessions: vi.fn().mockResolvedValue([]),
+	isHermesInstalled: vi.fn().mockResolvedValue(false),
+}));
+
 vi.mock("../core/KimiDiscovery.js", () => ({
 	discoverKimiConversations: vi.fn().mockResolvedValue(undefined),
 }));
