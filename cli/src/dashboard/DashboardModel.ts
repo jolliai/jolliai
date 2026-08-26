@@ -116,14 +116,19 @@ export interface SessionUpsertedEvent {
 /**
  * One recall call, observed by the surface that served it.
  *
- * The odd one out among these events: every other one restates a fact that
- * still exists somewhere else (a commit, a session file, a summary), so losing
- * it costs a rescan. A recall call exists only while it is being answered.
- * That is why it is emitted from the answering edges — `runRecall` (MCP) and
- * the `jolli recall` command — instead of being recovered later from a
- * transcript, which is what the Recall card used to do and what made every CLI
- * run, every non-Claude agent and everything past the 48 h session-retention
- * window invisible to it.
+ * ⚠ FROZEN HISTORICAL WIRE TYPE — nothing emits this any more. `recall` is now
+ * observed as a {@link LookupObservedEvent} with `kind: "recall"`, and this event's
+ * `projectRecallObserved` survives as a rewriting adapter onto `memory_lookups`.
+ * The table it used to project into (`recall_receipts`) is deliberately still
+ * there — see `RECALL_RECEIPTS_DDL` for why dropping it is an older dist's
+ * problem, not a cleanup.
+ *
+ * It stays declared, and `projectEvent` keeps a case for it, because `events_raw`
+ * can still hold un-drained rows written by an OLDER dist on the same machine
+ * (`run-hook` picks the highest registered dist, which is not always the newest
+ * build a user has). An unknown type throws and parks the row as `failed`
+ * permanently, so removing this case would strand exactly those rows. The
+ * surviving projector rewrites them onto `memory_lookups`.
  *
  * `sessionId` is the agent's own session id when the host exposes one in the
  * environment, absent otherwise (a recall typed into a plain terminal).
@@ -131,14 +136,71 @@ export interface SessionUpsertedEvent {
 export interface RecallObservedEvent {
 	readonly type: "recall.observed";
 	readonly repoIdentity: string;
-	readonly surface: RecallSurface;
+	readonly surface: LookupSurface;
 	readonly atMs: number;
 	readonly sessionId?: string;
 	readonly outcome: RecallOutcome;
 }
 
-/** Which surface answered a recall call. */
-export type RecallSurface = "mcp" | "cli";
+/** Which surface answered a lookup. */
+export type LookupSurface = "mcp" | "cli";
+
+/**
+ * @deprecated Spelled `LookupSurface` now that `search` shares the channel. Kept as
+ * an alias because {@link RecallObservedEvent} above is frozen and reads better with
+ * the old name in its own signature history.
+ */
+export type RecallSurface = LookupSurface;
+
+/**
+ * One lookup against a repo's memory, observed by the surface that served it.
+ *
+ * The odd one out among these events: every other one restates a fact that still
+ * exists somewhere else (a commit, a session file, a summary), so losing it costs a
+ * rescan. A lookup exists only while it is being answered. That is why it is emitted
+ * from the answering edges — the MCP `search` / `recall` tools and the `jolli search`
+ * / `jolli recall` commands — instead of being recovered later from a transcript,
+ * which is what the Recall card used to do and what made every CLI run, every
+ * non-Claude agent and everything past the 48 h session-retention window invisible to
+ * it.
+ *
+ * **The union is the per-kind shape constraint**, and deliberately so: `memory_lookups`
+ * carries no CHECK constraints, because SQLite cannot alter one without rebuilding the
+ * table and that would cancel the whole point of a `kind` column. So the compiler is
+ * what stops a `search` without a query or a `recall` with one — adding a third kind
+ * is a compile error here, not a migration.
+ */
+export type LookupObservedEvent = {
+	readonly type: "lookup.observed";
+	readonly repoIdentity: string;
+	readonly surface: LookupSurface;
+	readonly atMs: number;
+	readonly sessionId?: string;
+} & (
+	| {
+			readonly kind: "search";
+			/** Verbatim, as the user typed it. */
+			readonly query: string;
+			/** {@link normalizeLookupQuery}'s output — the bucket the card groups on. */
+			readonly queryKey: string;
+			readonly resultCount: number;
+	  }
+	| {
+			readonly kind: "recall";
+			/**
+			 * What was asked for — a branch in the common case, but the `jolli recall`
+			 * command takes a branch OR a keyword and this carries whichever arrived,
+			 * because the field records the REQUEST rather than a resolved ref.
+			 *
+			 * Absent when the caller had none to give: a bare `jolli recall` resolves
+			 * the current branch inside `resolveRecall`, and the legacy-event adapter
+			 * has no branch on the wire at all.
+			 */
+			readonly target?: string;
+			readonly hit: boolean;
+			readonly resultCount: number;
+	  }
+);
 
 /** One file touched by a commit, as `git --numstat` reports it. */
 export interface CommitFileChange {
@@ -342,7 +404,8 @@ export type StatsEvent =
 	| WorktreeStatusEvent
 	| RepoEnabledEvent
 	| RepoDisabledEvent
-	| RecallObservedEvent;
+	| RecallObservedEvent
+	| LookupObservedEvent;
 
 /** Envelope written to `events_raw`, carrying provenance alongside the payload. */
 export interface StatsEventEnvelope {
@@ -393,7 +456,47 @@ export function statsEventId(event: StatsEvent): string {
 			// session, possibly the same result. Two calls in the same millisecond
 			// would collide into one row — accepted, since the alternative (a
 			// random id) would make a re-drained event duplicate instead.
+			//
+			// Frozen along with the event: an old dist's un-drained row must still
+			// resolve to the id it would have had, or a re-drain writes a second row.
 			return `recall:${event.repoIdentity}:${event.surface}:${event.atMs}`;
+		case "lookup.observed":
+			// Same rule as above, plus `kind` — and, for a search, the query's own
+			// bucket key.
+			//
+			// ⚠ The key is not decoration. An agent firing several `search` calls at
+			// once is the ORDINARY shape of this event (unlike recall, which a turn
+			// makes once), so two searches landing in the same millisecond on the same
+			// surface is a real case — and `projectLookupObserved` restates every
+			// column in its UPDATE arm, so a shared id does not merge them, the second
+			// OVERWRITES the first: one query gone, one search uncounted, nothing
+			// anywhere to say so. `queryKey` rather than `query` because it is the
+			// bucket the card groups on, so two spellings of one search still converge
+			// exactly as they do in the read path.
+			//
+			// **It separates DIFFERENT queries, and that is all it can do.** Two calls
+			// that agree on repo, surface, millisecond AND normalised text still share
+			// an id, and the second still overwrites the first — the same accepted
+			// collision `recall` carries above, reached through one more field. It is
+			// accepted for a reason that is structural rather than a judgement about
+			// likelihood: this id must be a pure function of the event's own data (the
+			// projector re-derives it from `data_json` on every drain), and two events
+			// whose data is identical cannot be told apart by any function of it. The
+			// only fixes are a disambiguator STORED IN the event — a nonce, which
+			// permanently opts this event out of the "several producers converge on one
+			// row" guarantee the whole id scheme exists for — or a re-keying, which the
+			// frozen-id rule below forbids.
+			//
+			// What bounds the damage: `events_raw` is keyed on `seq`, not on this id, so
+			// BOTH calls are durably logged and only the projected row is lost. The
+			// count is recoverable by a future projector; nothing is destroyed.
+			//
+			// `recall` keeps the timestamp alone: its only argument is a branch, which
+			// two calls in one millisecond would almost certainly share, so there is
+			// nothing to add and the shape stays the frozen event's.
+			return event.kind === "search"
+				? `lookup:${event.repoIdentity}:search:${event.surface}:${event.atMs}:${event.queryKey}`
+				: `lookup:${event.repoIdentity}:recall:${event.surface}:${event.atMs}`;
 		case "repo.enabled":
 		case "repo.disabled":
 			return `repo:${event.repoIdentity}`;
@@ -1314,21 +1417,20 @@ export interface TokenBreakdown {
 }
 
 /**
- * One decision mined from a commit memory — the Decisions card's "Latest" line.
+ * One cell of the Decisions card's waffle — one commit memory in the window.
  *
- * Carries the owning topic's TITLE, not the decision prose. The card renders
- * that one line and nothing else, so the block itself (1 sentence to a
- * multi-bullet paragraph, measured at ~1,900 characters on a real memory) is
- * deliberately not on the wire — it had no reader and one display-time LLM call
- * per render existed only to compress it (retired with JOLLI-2209).
+ * **Deliberately four narrow fields, and that is a performance constraint rather
+ * than minimalism.** The cells are NOT capped (their count IS the card's
+ * `N memories` figure, so truncating would make the picture lie), and `/api/model`
+ * is re-polled every 30 s. Everything here is therefore readable straight out of
+ * SQL: `title` is `memories.commit_message`, a STORED generated column, and
+ * `decisionCount` falls out of the decision rows the card already queries. The two
+ * fields the detail region also wants — `category` and the decision bullets — both
+ * require parsing `summary_json`, so they are served per-click by
+ * `/api/decision-cell` instead of parsed for every memory in the window twice a
+ * minute. The feed's own `MEMORY_CARDS_LIMIT` exists for the same reason.
  */
-export interface DecisionRecord {
-	/**
-	 * The owning topic's title. `""` when the payload carries neither a title nor
-	 * a decision line short enough to stand in for one; the card then renders no
-	 * quote at all, which is the point — this line is one line wide.
-	 */
-	readonly title: string;
+export interface MemoryCell {
 	/**
 	 * The MEMORY's commit hash — what `/memories?hash=` resolves against, since
 	 * that route reads `memories.commit_hash`.
@@ -1338,35 +1440,244 @@ export interface DecisionRecord {
 	 * those rows the two disagree and the live hash addresses nothing.
 	 */
 	readonly commitHash: string;
-	readonly repoName: string;
 	/**
-	 * Stable repo token, so the card's title can address this memory's row —
-	 * {@link repoName} is a display label two registered repos can share, and
-	 * their commit hashes overlap by construction (a fork, a vendored tree).
+	 * Stable repo token, so a cell can address this memory's row — a display name
+	 * is a label two registered repos can share, and their commit hashes overlap by
+	 * construction (a fork, a vendored tree).
 	 */
 	readonly repoIdentity: string;
-	readonly committedAtMs: number;
+	/**
+	 * The memory's title, and the cell's tooltip. Same field the Memory Activity row
+	 * renders (`memories.commit_message`) — one memory must not read as two
+	 * different things on one page.
+	 */
+	readonly title: string;
+	/** How many decisions this memory recorded. `0` is the "none recorded" cell. */
+	readonly decisionCount: number;
 }
+
+/**
+ * The Decisions card's detail region — the body of `/api/memory-decisions`.
+ *
+ * Fetched per selection, EXCEPT the card's default one, which is inlined on
+ * {@link DecisionsCard.selected} so the first paint needs no request at all.
+ *
+ * ⚠ That inline was removed once and put back, and the reason it is right now is
+ * that the CONTENT changed under it. While this carried decision PROSE it was ~2 KB
+ * per memory and had to be capped to be affordable on a payload the page re-polls
+ * every 30 s; the cap is what made "fetch everything" the better trade. Listing
+ * topic TITLES instead costs about 500 bytes and one `summary_json` parse — for a
+ * single memory, inside a build that is already parsing a batch of them for the
+ * feed.
+ *
+ * What that buys is measured, not stylistic: the endpoint answers in 9 ms, but node
+ * serves it on the same thread as `buildDashboardModel` (404 ms for the stats view)
+ * and the machine-wide sweeps the dashboard process runs beside it. A 9 ms request
+ * that lands behind one of those is what the reader sees as a slow spinner, and the
+ * only reliable fix is not to make the request.
+ */
+export interface MemoryDecisions {
+	readonly commitHash: string;
+	readonly repoIdentity: string;
+	readonly repoName: string;
+	readonly title: string;
+	/**
+	 * The memory's dominant topic category (`ux`, `bugfix`, …) — a `TopicCategory`,
+	 * NOT `commitType`. Same value, from the same vote, as the Memory Activity row's
+	 * category chip. Absent when the memory recorded no categorised topic.
+	 */
+	readonly category?: string;
+	/**
+	 * The TITLE of every decision this memory recorded, in topic order — not the
+	 * prose, and not a sample.
+	 *
+	 * A decision is written `Title: body`, so the title is the clause before the
+	 * first colon. Measured over 333 real bullets the median body runs 382
+	 * characters; a card listing those is a wall of text, and the memory's own page
+	 * is one click away for anyone who wants them.
+	 *
+	 * ⚠ Never DROPPED, and clamped rather than left to CSS. Dropping a bullet past
+	 * 140 characters — inherited from the retired `decisionTitle`, where it was right
+	 * for ONE line standing alone — discarded every bullet real data has (the
+	 * shortest measured 178), so the card told a five-decision memory it had recorded
+	 * none. Every decision-carrying topic therefore produces a row, and the row's
+	 * text is cut to {@link DECISION_TITLE_MAX} on a word boundary by `clampLabel`.
+	 *
+	 * That bound clears every genuine topic title (34–85 characters measured) and
+	 * bites only a decision written as prose with no `Title:` split. It is also the
+	 * ONLY cut: `.dec-row` wraps instead of ellipsising, so what the reader sees is
+	 * exactly what this field holds — and the row is a link, so the memory's own page
+	 * is one click from the full text.
+	 *
+	 * Empty means the memory really recorded none — which the card states in words,
+	 * since those are a third of the squares.
+	 */
+	readonly decisions: ReadonlyArray<DecisionTopicRef>;
+}
+
+/** One decision-carrying topic: its title, and where to land on the memory page. */
+export interface DecisionTopicRef {
+	readonly title: string;
+	/**
+	 * Position in `collectDisplayTopics(summary)`, which is what the Memories page
+	 * renders each topic's `id="topic-<index>"` from — its topic list is a straight
+	 * 1:1 map of that array, so the two indexes cannot drift apart without the
+	 * mapping itself changing.
+	 *
+	 * It exists so a row lands on ITS OWN topic. Every row used to point at the
+	 * section header (`#what-changed`), which was right while the card showed one
+	 * "latest decision" and wrong the moment it listed several: seven rows all
+	 * scrolled to the same place.
+	 */
+	readonly topicIndex: number;
+}
+
+/**
+ * Longest a rendered decision title may be.
+ *
+ * Measured against one real memory's 14 decisions: the 11 written `Title: body`
+ * produced titles of 34–85 characters, so this clears every genuine one and bites
+ * only the prose ones — which is the point. A row here is a TITLE; a 380-character
+ * sentence sitting among rows of five words is what this bound exists to stop.
+ */
+export const DECISION_TITLE_MAX = 100;
 
 /**
  * Memory-tier "Decisions" card — a standalone widget distinct from the KPI
  * sub-line and from the per-commit `MemoryCard.decision` line in the feed.
  *
- * Deliberately carries no "recalled" figure. `recall_receipts` does record one
- * call per recall — that part is written and still is — but nothing ties a
- * receipt back to the DECISION it served, so "this decision came back" would be
- * inferred, not measured. The card's subtitle used to promise it and was
+ * Deliberately carries no "recalled" figure. `memory_lookups` does record one row
+ * per recall (`kind = 'recall'`) — that part is written and still is — but nothing
+ * ties a lookup back to the DECISION it served, so "this decision came back" would
+ * be inferred, not measured. The card's subtitle used to promise it and was
  * corrected with JOLLI-2193; {@link MemoryCard}'s `reuse` field is the same
  * unmeasured claim and is likewise never emitted.
  */
 export interface DecisionsCard {
-	/** Decisions mined from commit memories in the window. */
+	/**
+	 * Decisions mined from commit memories in the window.
+	 *
+	 * Counted over REACHABLE memories only, the same population
+	 * {@link StatsModel.memoriesCreated} counts and the same one the waffle draws —
+	 * so `sum(perDay[].cells[].decisionCount) === keptCount` holds by construction.
+	 * "The memory this cell addresses" is the whole rule, and it is `commits` that
+	 * decides which generation that is: a memory folded into a later root whose own
+	 * commit is still reachable is a cell like any other, and its decisions are
+	 * counted here. Filtering the derivation to root memories instead drew those
+	 * cells quiet while `/memories?hash=` listed the decisions they reported none
+	 * of — see `TOPIC_DECISIONS_CTE`.
+	 * It did not always: this figure is mirrored into
+	 * {@link StatsModel.decisionsCaptured} and rendered directly beside
+	 * "X of Y captured", which has always filtered reachability, so on any repo with
+	 * rewritten history the two contradicted each other on one line. The cost of the
+	 * fix is that `kept` DROPS on such a machine — to the truth.
+	 */
 	readonly keptCount: number;
 	readonly repoCount: number;
-	/** Most recent decision by commit date, absent when the window has none. */
-	readonly latest?: DecisionRecord;
-	/** One point per local day in the window, oldest first — the card's step chart. */
-	readonly perDay: ReadonlyArray<{ readonly date: string; readonly count: number }>;
+	/**
+	 * One entry per local day in the window, oldest first — the waffle's columns.
+	 *
+	 * `sum(cells.length)` equals {@link StatsModel.memoriesCreated} exactly; cells are
+	 * never truncated, because the picture's whole claim is that it shows all of them.
+	 */
+	readonly perDay: ReadonlyArray<DecisionDay>;
+	/**
+	 * The cell selected on first paint — the last memory of the last day that has
+	 * any — WITH its detail, so opening the page costs no extra request. Every other
+	 * cell is fetched on click.
+	 *
+	 * Chosen SERVER-side off the canonical `(committedAtMs, repoIdentity, commitHash)`
+	 * order rather than by the page: "the last one" is only well defined once ties are
+	 * broken, and two memories committed in the same second are common enough that a
+	 * client-side pick would flip between 30 s polls.
+	 *
+	 * Absent when the window holds no memory at all — the third state, distinct from
+	 * "below the memory tier" and from "no decisions".
+	 */
+	readonly selected?: MemoryDecisions;
+}
+
+/** One column of the Decisions waffle. */
+export interface DecisionDay {
+	/** Local `YYYY-MM-DD`. */
+	readonly date: string;
+	/** That day's memories, in `(committedAtMs, repoIdentity, commitHash)` order. */
+	readonly cells: ReadonlyArray<MemoryCell>;
+}
+
+/**
+ * One row of the Memory Top Search Terms card.
+ *
+ * `term` is EXTRACTED from the queries, not one of them — see `clusterSearchTerms`.
+ * That is what makes this a ranking: an agent composes each query from whatever the
+ * reader asked, so one subject is almost never phrased the same way twice, and
+ * grouping by the query itself produced a list of ones.
+ */
+export interface SearchTermRow {
+	/** The label — a phrase shared by {@link queries}, or a lone query's own text. */
+	readonly term: string;
+	/** Total searches this term covers, not distinct phrasings. */
+	readonly searches: number;
+	/**
+	 * The distinct phrasings behind it, most recent first, capped at
+	 * {@link SEARCH_TERM_QUERIES_LIMIT}.
+	 *
+	 * Inlined rather than fetched: it is the raw text this card already had to load
+	 * to compute the term, so a request to show it would be a round trip for
+	 * something already in memory. It also replaced an expansion that re-ran the
+	 * SEARCH — which needed a per-repo Orama index, could not compare scores across
+	 * repos, and answered "what would this find today" to a question about what was
+	 * asked.
+	 */
+	readonly queries: ReadonlyArray<string>;
+}
+
+/** How many rows the card lists, and how many phrasings one row reveals. */
+export const SEARCH_TERM_ROWS_LIMIT = 6;
+export const SEARCH_TERM_QUERIES_LIMIT = 5;
+
+/**
+ * Longest a rendered search term may be.
+ *
+ * A term that stands for a single query IS that query, and a query is a sentence —
+ * so this row can carry a whole one where the clustered rows carry a phrase. CSS
+ * ellipsis alone cuts wherever the pixel runs out, which for English is mid-word
+ * ("…recorded a de…"); `clampLabel` cuts on a word boundary first, and falls back to
+ * the character boundary for CJK, where the character IS the unit. The CSS ellipsis
+ * stays as the width-aware backstop — only it knows the real column width.
+ */
+export const SEARCH_TERM_MAX = 48;
+
+/**
+ * Memory-tier "Memory Top Search Terms" card.
+ *
+ * Counts `memory_lookups` rows of `kind = 'search'` — lookups the reader made against
+ * their OWN memory, never MCP tool arguments read out of a transcript (the MCPs card
+ * promises the opposite about those, and this must not be mistaken for it).
+ *
+ * ⚠ `sessions` is `COUNT(DISTINCT session_id)`, which IGNORES NULL — and a `jolli
+ * search` typed into a plain terminal has no agent session to attribute. So a search
+ * can raise {@link searches} without raising this, which is correct rather than a
+ * rounding error: the question is "how many agent sessions searched". The card says
+ * "agent sessions" for that reason; do not relabel it "sessions".
+ */
+export interface SearchTermsCard {
+	readonly searches: number;
+	readonly distinctQueries: number;
+	readonly sessions: number;
+	/**
+	 * How many terms the window holds in total — the footer's denominator.
+	 *
+	 * ⚠ NOT {@link distinctQueries}, and the difference is the whole card: several
+	 * phrasings collapse onto one term, so this is `clusterSearchTerms`' own row
+	 * count before the cap. The footer read "Showing 3 of 43 terms" off the query
+	 * count for a window that had 3 terms and was showing all of them, inviting the
+	 * reader to look for 40 rows that do not exist. A count of the ROWS cannot stand
+	 * in either — that is what the cap already bounds.
+	 */
+	readonly termCount: number;
+	/** Top {@link SEARCH_TERM_ROWS_LIMIT} buckets by search count. */
+	readonly rows: ReadonlyArray<SearchTermRow>;
 }
 
 /** The Stats page payload. */
@@ -1446,6 +1757,8 @@ export interface StatsModel {
 	readonly decisionsCaptured?: number;
 	/** The standalone Decisions card. Mirrors {@link decisionsCaptured} in `keptCount`. */
 	readonly decisions?: DecisionsCard;
+	/** The Memory Top Search Terms card. Absent below the memory tier, like `decisions`. */
+	readonly searchTerms?: SearchTermsCard;
 	/** Skills, MCP servers and the tool mix — Claude-only coverage, stated. */
 	readonly toolUsage: ToolUsage;
 	/** Absent when no bucket falls in the window — a consumer shows "no data",
@@ -2140,8 +2453,10 @@ export type ToolUsagePage =
  * `server.tool` name recorded for the recall feature's own MCP tool — the
  * `session_tool_use.tool_name` value the tool-usage card keys off for its
  * "recall calls" line, which is the only surface left that reads it. The
- * standalone Recall card, which counted `recall_receipts` instead, was removed
- * (JOLLI-2193) along with its query; the receipts themselves are still written.
+ * standalone Recall card, which counted the recall receipts instead, was removed
+ * (JOLLI-2193) along with its query; the receipts themselves are still written —
+ * as `memory_lookups` rows of `kind = 'recall'`, that table having superseded
+ * `recall_receipts` (which stays in the schema, unwritten by this build).
  */
 export const RECALL_MCP_TOOL_NAME = "jollimemory.recall";
 
@@ -2160,8 +2475,9 @@ export const RECALL_MCP_TOOL_NAME = "jollimemory.recall";
  *     `jolli:recall` from a plugin one), which fed the card's `skillInvocations`
  *     gap detector: "the skill ran but never actually recalled".
  *
- * Both would have to come back to rebuild that card. `recall_receipts` and
- * `session_tool_use` still hold the evidence — nothing about the DATA changed.
+ * Both would have to come back to rebuild that card. `memory_lookups`
+ * (`kind = 'recall'`) and `session_tool_use` still hold the evidence — nothing
+ * about the DATA changed.
  */
 
 /**

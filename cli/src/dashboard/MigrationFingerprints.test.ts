@@ -74,6 +74,7 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// add-column code entries, absent from this list by construction and guarded by
 	// their companion tests instead.
 	["2026-08-25-0000-memory-transcripts-covering-index", "0b4cd41295aa"],
+	["2026-08-26-0000-memory-lookups", "f6c22b277b2d"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

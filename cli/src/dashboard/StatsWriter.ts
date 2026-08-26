@@ -52,6 +52,7 @@ import { BUSY_TIMEOUT_BY_ROLE, DEFAULT_BUSY_TIMEOUT_MS, inTransaction, withDashb
 import {
 	type CommitCreatedEvent,
 	type CommitSummaryEvent,
+	type LookupObservedEvent,
 	type ProducerKind,
 	type RecallObservedEvent,
 	type RepoDisabledEvent,
@@ -466,6 +467,13 @@ const KNOWN_EVENT_TYPES = [
 	"commit.created",
 	"commit.summary",
 	"worktree.status",
+	"lookup.observed",
+	// Legacy inbound, and its membership here is load-bearing rather than tidy:
+	// nothing emits it any more, but an older dist on the same machine still can,
+	// and this list is the allowlist `reviveStuckEvents` reads. Dropping the name
+	// would leave such a row parked as `failed` with nothing offering it a second
+	// attempt. See `RecallObservedEvent`'s docstring and `projectEvent`'s own
+	// legacy section.
 	"recall.observed",
 ] as const satisfies ReadonlyArray<StatsEvent["type"]>;
 
@@ -528,6 +536,18 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): 
 		case "worktree.status":
 			projectWorktree(db, event);
 			return;
+		case "lookup.observed":
+			projectLookupObserved(db, event, nowMs);
+			return;
+
+		// ── Legacy inbound events ─────────────────────────────────────────────
+		// Nothing in this build emits these. They are here because `events_raw` is
+		// machine-global and an OLDER dist can still be writing into it — a plugin
+		// bundle execs its own `dist/` and never passes through `run-hook`'s version
+		// race, so this is an ongoing inbound path rather than a bounded backlog.
+		// Deleting a case does not make such rows ignored, it makes them PERMANENT
+		// `failed` rows (see the default branch), and drops the type out of
+		// KNOWN_EVENT_TYPES so `reviveStuckEvents` never retries it either.
 		case "recall.observed":
 			projectRecallObserved(db, event, nowMs);
 			return;
@@ -1237,35 +1257,94 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 }
 
 /**
- * Records one recall call.
+ * Records one lookup against a repo's memory — `search` or `recall`.
  *
  * Keyed on the event's own id so a re-drained event converges on the row it
  * already wrote instead of appending a second call — the same idempotency
  * every other projection here has, expressed as an UPSERT because there is no
  * natural business key for "a call" beyond when it happened.
+ *
+ * The `kind`-dependent columns are written as NULL for the kind that has no such
+ * fact (`query`/`query_key` on a recall, `target` on a search). That is the shape
+ * `memory_lookups` documents; it carries no CHECK to enforce it, because the
+ * `LookupObservedEvent` union already does and SQLite cannot alter a CHECK without
+ * rebuilding the table.
+ *
+ * ⚠ Every column is restated in the UPDATE arm, `kind` included. The alternative —
+ * updating only what "can change" — assumes the second write of a given
+ * `receipt_id` describes the same lookup, which is exactly what a hash collision or
+ * a same-millisecond pair does not. Overwriting wholesale keeps the row equal to the
+ * last event that claimed it rather than a splice of two.
+ */
+function projectLookupObserved(db: DashboardDbHandle, event: LookupObservedEvent, nowMs: number): void {
+	const repoId = ensureRepoRow(db, event.repoIdentity);
+	const isSearch = event.kind === "search";
+	db.prepare(
+		`INSERT INTO memory_lookups
+		   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key, target,
+		    result_count, hit, updated_at_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(receipt_id) DO UPDATE SET
+		   kind          = excluded.kind,
+		   surface       = excluded.surface,
+		   session_id    = excluded.session_id,
+		   at_ms         = excluded.at_ms,
+		   query         = excluded.query,
+		   query_key     = excluded.query_key,
+		   target        = excluded.target,
+		   result_count  = excluded.result_count,
+		   hit           = excluded.hit,
+		   updated_at_ms = excluded.updated_at_ms`,
+	).run(
+		statsEventId(event),
+		repoId,
+		event.kind,
+		event.surface,
+		event.sessionId ?? null,
+		event.atMs,
+		isSearch ? event.query : null,
+		isSearch ? event.queryKey : null,
+		isSearch ? null : (event.target ?? null),
+		event.resultCount,
+		(isSearch ? event.resultCount > 0 : event.hit) ? 1 : 0,
+		nowMs,
+	);
+}
+
+/**
+ * Projects a legacy `recall.observed` row onto {@link projectLookupObserved}.
+ *
+ * Nothing emits that event any more (see `RecallObservedEvent`), but `events_raw`
+ * can hold un-drained rows an older dist wrote — `run-hook` picks the highest
+ * REGISTERED dist, which is not always the newest build on the machine. An unknown
+ * event type throws and parks the row as `failed`, so dropping this case would
+ * strand exactly those rows rather than merely ignore them.
+ *
+ * It keeps `statsEventId(event)` — the `recall:` form — rather than re-deriving a
+ * `lookup:` id: the id IS the idempotency key, and re-keying would let a row that
+ * has already been projected under the old id be written a second time under a new
+ * one. `target` is NULL because the legacy event never carried a branch.
  */
 function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent, nowMs: number): void {
 	const repoId = ensureRepoRow(db, event.repoIdentity);
 	const outcome = event.outcome;
 	db.prepare(
-		`INSERT INTO recall_receipts
-		   (receipt_id, repo_id, at_ms, surface, session_id, hit, commit_count, commits_json,
-		    updated_at_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		`INSERT INTO memory_lookups
+		   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key, target,
+		    result_count, hit, updated_at_ms)
+		 VALUES (?, ?, 'recall', ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
 		 ON CONFLICT(receipt_id) DO UPDATE SET
-		   updated_at_ms = excluded.updated_at_ms,
-		   hit          = excluded.hit,
-		   commit_count = excluded.commit_count,
-		   commits_json = excluded.commits_json`,
+		   result_count  = excluded.result_count,
+		   hit           = excluded.hit,
+		   updated_at_ms = excluded.updated_at_ms`,
 	).run(
 		statsEventId(event),
 		repoId,
-		event.atMs,
 		event.surface,
 		event.sessionId ?? null,
-		outcome.hit ? 1 : 0,
+		event.atMs,
 		outcome.commitCount,
-		outcome.commits.length > 0 ? JSON.stringify(outcome.commits) : null,
+		outcome.hit ? 1 : 0,
 		nowMs,
 	);
 }

@@ -134,6 +134,33 @@ export function commitCategoryLabels(db: DashboardDbHandle, scope: DashboardScop
 }
 
 /**
+ * Shortens a label to `max` characters, cutting on a WORD boundary when there is
+ * one.
+ *
+ * The two scripts need opposite things and get them from the same rule. Latin text
+ * has spaces, so the cut lands after a whole word — `text-overflow: ellipsis` alone
+ * cuts wherever the pixel runs out, which is mid-word for English and is what a
+ * reader reports as "…recorded a de…". CJK has no spaces, so `lastIndexOf(" ")`
+ * finds nothing and the cut falls back to the character boundary, which is exactly
+ * right there: a Chinese character IS the unit.
+ *
+ * The `max / 2` floor keeps that fallback honest for a mixed string — one very long
+ * Latin token followed by a space would otherwise cut almost everything away to
+ * reach the boundary.
+ *
+ * ⚠ This does NOT replace the CSS ellipsis, which is the only thing that knows the
+ * column's real width. It runs first so the common case is already short enough for
+ * CSS never to fire, and the visible cut is the one made here.
+ */
+export function clampLabel(text: string, max: number): string {
+	const trimmed = text.trim();
+	if (trimmed.length <= max) return trimmed;
+	const cut = trimmed.slice(0, max);
+	const lastSpace = cut.lastIndexOf(" ");
+	return `${(lastSpace > max / 2 ? cut.slice(0, lastSpace) : cut).trimEnd()}…`;
+}
+
+/**
  * Splits a topic's `decisions` field into cleaned bullet lines.
  *
  * The field is one prose block (a markdown bullet list, or occasionally a
@@ -281,4 +308,144 @@ export function stripPluginPrefixSql(col: string): string {
  */
 export function mcpFoldedIdentifierSql(col: string, kindCol: string): string {
 	return `CASE WHEN ${kindCol} = 'mcp' THEN ${stripPluginPrefixSql(col)} ELSE ${col} END`;
+}
+
+/**
+ * The one row every MCP server the host could only name by an id is folded onto.
+ *
+ * A SPACE is what makes it collision-safe. Every host that reports a server name
+ * sanitizes it into a tool-name prefix first (`claude.ai Linear` →
+ * `claude_ai_Linear`), so no real `t.server` value on the `claude` path can carry
+ * one; `codex`/`cursor` take theirs from a sibling field and could in principle,
+ * which is the residual `charts.js` accepts for its own `Other` key and is not
+ * worth a rename loop here — the label says what it is either way.
+ */
+export const UNIDENTIFIED_MCP_SERVER = "unidentified server";
+
+/**
+ * Is this MCP "server name" actually an opaque id the host fell back to?
+ *
+ * WHY THE ROWS EXIST AT ALL. `session_tool_use.server` is whatever the host put
+ * between the `mcp__` prefix and the tool (see `classifyToolName`), and Claude
+ * Code has a known defect that puts a connector's ID there instead of the
+ * `serverInfo.name` the MCP handshake returned: for an OAuth-protected
+ * connector the first connection 401s, the id is stored as the prefix, and
+ * nothing rewrites it once OAuth completes (anthropics/claude-code#58015,
+ * #47614, and #21050 / #22276 where the id eats the 64-char tool-name budget).
+ * So the calls behind such a row are REAL — only the name is unusable, and it is
+ * unusable in a way nothing downstream can repair: the transcript carries no
+ * id → name mapping, so there is nothing to resolve it against.
+ *
+ * TWO SHAPES, both measured rather than guessed. The bare UUID is the one in the
+ * bug report (`c781d8b5-a5fc-4bbe-a50a-7c046078108e`, 4 calls / 3 tools, filed
+ * beside `Claude_Browser` and `ccd_session` — both of which are real app-internal
+ * servers and must NOT match). The `mcpsrv_01…` form is the same id namespace
+ * spelled the other way: `~/.claude/mcp-needs-auth-cache.json` on a real machine
+ * holds `{"claude.ai Slack":{"id":"mcpsrv_01F3Uz9yG4YRBeCEEmvFTeUU"}}`, and
+ * claude-code#19980 records that a server identifier is accepted as "a UUID or an
+ * `mcpsrv_*` tagged id". Recognising only one of the two would leave the same bug
+ * reachable through the other spelling.
+ *
+ * The UUID test is deliberately three conditions rather than 32 character
+ * classes: the `?` pattern pins the length and the four separator positions, the
+ * negated class admits nothing but hex and `-`, and the replace-count pins the
+ * dash TOTAL at four — so every remaining position is hex. Without that third
+ * test a name of 36 dashes matches. `GLOB`, never `LIKE`, for the reason
+ * {@link stripPluginPrefixSql} states: `LIKE` is case-insensitive for ASCII and
+ * takes a collating sequence, `GLOB` neither.
+ */
+function opaqueServerIdSql(col: string): string {
+	return (
+		`((${col} GLOB '????????-????-????-????-????????????'` +
+		` AND ${col} NOT GLOB '*[^0-9a-fA-F-]*'` +
+		` AND length(replace(${col}, '-', '')) = 32)` +
+		` OR (${col} GLOB 'mcpsrv_*' AND length(${col}) = 31` +
+		` AND ${col} NOT GLOB 'mcpsrv_*[^0-9A-Za-z]*'))`
+	);
+}
+
+/**
+ * The MCP server a dashboard row is grouped under: plugin alias folded away
+ * (see {@link stripPluginPrefixSql}), then any opaque id folded onto
+ * {@link UNIDENTIFIED_MCP_SERVER}.
+ *
+ * ONE EXPRESSION, applied at READ time, is the whole fix — and both halves of
+ * that matter.
+ *
+ * Read time, for `stripPluginPrefixSql`'s reason: the stored row is a literal
+ * record of what the host reported and stays one, so the rows already in the
+ * table are corrected too. Normalising in `classifyToolName` would fix only
+ * sessions parsed after the change and would throw away the id, which is the one
+ * thing a reader can still take to `claude mcp list` to find out which connector
+ * it was.
+ *
+ * One expression, because everything the MCPs page says about servers is keyed
+ * through this: the SERVER table, the `N servers` count, the chart's series (so
+ * an id no longer takes a colour and no longer pushes a real server into
+ * `Other`), the per-server share of all MCP calls, and `/api/mcp-detail`'s
+ * lookup. Filtering the rows out instead would mean a WHERE clause in six
+ * places, each omission silent, and would have to drop the calls from the totals
+ * or explain their absence.
+ *
+ * WHAT THE FOLD CLAIMS, and what it therefore costs: several distinct ids merge
+ * into ONE row, so `N servers` counts them once. That is the price of the header
+ * agreeing with the rows it sits above, and the label is honest about being a
+ * bucket. What it does NOT touch is `tool_name` — a tool row still reads
+ * `<id>.get_issue`, which keeps the detail pane's tool list the one place the id
+ * survives, and keeps a merged row's `tool_count` counting each id's tools
+ * separately.
+ */
+export function mcpServerKeySql(col: string): string {
+	const folded = stripPluginPrefixSql(col);
+	return `CASE WHEN ${opaqueServerIdSql(folded)} THEN '${UNIDENTIFIED_MCP_SERVER}' ELSE ${folded} END`;
+}
+
+/**
+ * {@link mcpServerKeySql} applied to MCP rows ONLY — the guarded form
+ * {@link mcpFoldedIdentifierSql} is to {@link stripPluginPrefixSql}, and for the
+ * same reason: a query whose result set mixes `session_tool_use.kind` values must
+ * not rename an identifier some other kind chose.
+ */
+export function mcpServerFoldedIdentifierSql(col: string, kindCol: string): string {
+	return `CASE WHEN ${kindCol} = 'mcp' THEN ${mcpServerKeySql(col)} ELSE ${col} END`;
+}
+
+/**
+ * {@link opaqueServerIdSql}'s predicate in TypeScript, for the callers that hold
+ * a name rather than a column.
+ *
+ * The two are asserted equivalent over one corpus by `DashboardScopeUtil.test.ts`
+ * — the SQL runs against a real in-memory database there rather than being
+ * compared as text — because they answer the same question about the same values
+ * and a drift between them is invisible: the row folds one way and its label is
+ * stripped the other.
+ */
+export function isOpaqueMcpServerId(name: string): boolean {
+	return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(name)
+		? true
+		: /^mcpsrv_[0-9A-Za-z]{24}$/.test(name);
+}
+
+/**
+ * Drops the `<server>.` prefix `mcpTool` folds into a tool's display name when
+ * that server is an opaque id.
+ *
+ * Needed because the fold gives several ids ONE row, so the pane's own
+ * `stripServerPrefix` has no single prefix to remove and every tool in it would
+ * render as its id — in a narrow mono column, three tools all reading
+ * `c781d8b5-a5f…` with the part that tells them apart cut off. Stripping is
+ * conditional on the segment really being an id, so a server genuinely named
+ * with a dot keeps its name.
+ *
+ * ACCEPTED COST, measured on a database with two ids injected: the pane then
+ * lists `get_issue` twice with different counts, because the rows are still
+ * DISTINCT per id (which is what keeps `toolCount` honest — 4 tools, not 2).
+ * Two rows sharing a label reads worse than it is, and it is still strictly
+ * better than four rows whose labels are all the same truncated id. It needs at
+ * least two unresolvable servers on one machine to appear at all.
+ */
+export function stripOpaqueMcpServerIdPrefix(toolName: string): string {
+	const dot = toolName.indexOf(".");
+	if (dot <= 0) return toolName;
+	return isOpaqueMcpServerId(toolName.slice(0, dot)) ? toolName.slice(dot + 1) : toolName;
 }

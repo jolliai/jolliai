@@ -304,6 +304,8 @@ describe("Cli entry — cold-start import graph", () => {
 		expect(specifiers).toHaveLength(importStatements);
 
 		const ALLOWED_LEAF_MODULES = new Set([
+			// Imports nothing itself — it is one env read and one boolean.
+			"./core/AgentSessionEnv.js",
 			"./core/ProjectDir.js",
 			"./core/SqliteWarning.js",
 			"./core/TraceContext.js",

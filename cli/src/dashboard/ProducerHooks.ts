@@ -41,11 +41,12 @@ import {
 import { canUseDashboardDb } from "./DashboardDb.js";
 import type {
 	CommitCreatedEvent,
+	LookupObservedEvent,
+	LookupSurface,
 	ProducerKind,
-	RecallObservedEvent,
-	RecallSurface,
 	StatsEvent,
 } from "./DashboardModel.js";
+import { normalizeLookupQuery } from "./LookupQuery.js";
 import { ensureWorktreeListed, readRepoRegistry, registerRepo, resolveRepoIdentity } from "./RepoRegistry.js";
 import { applyStatsEvents, observeWorktree } from "./StatsWriter.js";
 
@@ -194,27 +195,88 @@ export async function recordSessionFromHook(cwd: string, session: SessionEventIn
 export async function recordRecallReceipt(
 	cwd: string,
 	outcome: RecallOutcome,
-	surface: RecallSurface,
+	surface: LookupSurface,
+	options: { branch?: string; dbPath?: string } = {},
+): Promise<boolean> {
+	return recordLookupReceipt(
+		cwd,
+		{
+			kind: "recall",
+			surface,
+			hit: outcome.hit,
+			resultCount: outcome.commitCount,
+			...(outcome.atMs !== undefined ? { atMs: outcome.atMs } : {}),
+			...(options.branch ? { target: options.branch } : {}),
+		},
+		options.dbPath,
+	);
+}
+
+/**
+ * What a caller knows about the lookup it just answered.
+ *
+ * The `kind`-discriminated shape of {@link LookupObservedEvent} minus the three
+ * fields this module fills in itself — the repo identity (resolved from `cwd`), the
+ * session id (read from the environment) and the normalised query key (derived).
+ * `atMs` is optional so a caller that has no clock of its own does not have to
+ * invent one.
+ */
+export type LookupObservation = { readonly surface: LookupSurface; readonly atMs?: number } & (
+	| { readonly kind: "search"; readonly query: string; readonly resultCount: number }
+	| { readonly kind: "recall"; readonly target?: string; readonly hit: boolean; readonly resultCount: number }
+);
+
+/**
+ * Records one lookup against this repo's memory, from the surface that served it.
+ *
+ * Called by the MCP `search`/`recall` tools and the `jolli search`/`jolli recall`
+ * commands right after the answer is produced — the only moment the call exists.
+ * Everything else in this module restates something durable (a commit, a session
+ * file, a summary) and can be re-collected later; a lookup cannot, which is why it
+ * is observed at the edge rather than recovered from a transcript afterwards.
+ *
+ * It keeps the same three rules regardless: a failed write is a log line, a Node
+ * below the `node:sqlite` floor skips silently, and neither can touch the answer the
+ * user is waiting for. Which is also why the caller must not await this on the
+ * response path — the receipt is worth strictly less than the latency of the lookup
+ * it describes.
+ */
+export async function recordLookupReceipt(
+	cwd: string,
+	observation: LookupObservation,
 	dbPath?: string,
 ): Promise<boolean> {
-	const atMs = outcome.atMs ?? Date.now();
+	const atMs = observation.atMs ?? Date.now();
 	const sessionId = currentAgentSessionId();
 	return safeApply(
 		cwd,
-		// Both surfaces ARE the CLI binary — `jolli mcp` is one of its commands —
-		// so they share the producer kind (and its write-lock budget). Which of
-		// the two answered is a fact about the recall, and rides on the receipt's
-		// own `surface` column.
+		// Every surface here IS the CLI binary — `jolli mcp` is one of its commands —
+		// so they share the producer kind (and its write-lock budget). Which of them
+		// answered is a fact about the lookup, and rides on the row's own `surface`
+		// column.
 		"cli",
 		async (repoIdentity) => [
 			{
-				type: "recall.observed",
+				type: "lookup.observed",
 				repoIdentity,
-				surface,
 				atMs,
 				...(sessionId ? { sessionId } : {}),
-				outcome,
-			} satisfies RecallObservedEvent,
+				...(observation.kind === "search"
+					? {
+							kind: "search" as const,
+							surface: observation.surface,
+							query: observation.query,
+							queryKey: normalizeLookupQuery(observation.query),
+							resultCount: observation.resultCount,
+						}
+					: {
+							kind: "recall" as const,
+							surface: observation.surface,
+							hit: observation.hit,
+							resultCount: observation.resultCount,
+							...(observation.target ? { target: observation.target } : {}),
+						}),
+			} satisfies LookupObservedEvent,
 		],
 		dbPath,
 	);

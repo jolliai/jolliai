@@ -638,4 +638,93 @@ window.JD = window.JD || {};
 			'"/></svg>'
 		);
 	};
+
+	/* One waffle cell's identity — the repo AND the hash, never the hash alone.
+
+	   Two registered repos overlap on commit hashes BY CONSTRUCTION (a fork, a
+	   vendored tree), which is why every cell carries its own `repoIdentity` and why
+	   the server scopes `decisionCountsFor` on `repo_id` as well as the hash. The
+	   page dropped that half, and under an all-repos scope holding both sides of one
+	   hash the whole interaction collapsed onto the first of them: two rings lit for
+	   one click, the detail cache answered for whichever repo was fetched first, the
+	   second repo's fetch was short-circuited by that cached entry, and its cell was
+	   unreachable — the panel named, listed and deep-linked the OTHER repo's memory
+	   with no way to reach the one that was clicked.
+
+	   Spelled ONCE because five things compare it: the ring below, the selection, the
+	   detail cache, the error marker and the fetch guard. `\u0000` for the separator
+	   is the same choice the server's `repoIdentity\0commitHash` keys make — it
+	   cannot occur in either half, so no pair of values can spell another pair's key.
+	   The key is state, never markup: the cells carry the two halves as separate
+	   attributes and this is rebuilt from them. */
+	JD.decisionCellKey = (cell) => cell.repoIdentity + "\u0000" + cell.commitHash;
+
+	/* The Decisions card's waffle: one column per day, one CELL PER MEMORY, filled
+	   when that memory recorded at least one decision.
+
+	   `days`: [{date, cells: [{commitHash, repoIdentity, title, decisionCount}]}],
+	   oldest first, every day in the window present (empty ones included, so the
+	   column spacing is real time rather than "days that had activity").
+
+	   DOM buttons rather than SVG rects, and that is not a style choice. The cells
+	   are a control — one selects, and the selected one has to be unmistakable at
+	   11×8px. A stroke on an SVG rect is half-covered by its own fill and cannot sit
+	   OUTSIDE the shape, so on a filled cell it reads as nothing; `outline` with
+	   `outline-offset` puts a ring in the gap between cells and keeps the fill. The
+	   button also brings its own focus ring, hover state and keyboard activation
+	   instead of three hand-rolled ones.
+
+	   Column height is the day's memory count and nothing is truncated: the number of
+	   squares IS the card's "N memories" figure, so a capped column would make the
+	   picture contradict the line above it. Flex does the sizing, so no cell-height
+	   arithmetic is needed here — but only because `.dec-waffle` gives it a DEFINITE
+	   height to shrink against; see there for what an unbounded box did to a busy
+	   day's column.
+
+	   Each cell carries its OWN title, not the column's: the tooltip names the
+	   memory, which is the only way a reader can tell one square from another. */
+	JD.decisionWaffle = (days, opts) => {
+		var options = opts || {};
+		var cols = days
+			.map((day) => {
+				/* Quiet cells at the base, lit above. Position within a day carries no
+				   meaning — the axis is the day, and the corpus holds no time of day to
+				   order by — so it is spent on the one comparison the legend is already
+				   making, and each column reads as two bands instead of a shuffle.
+				   `slice()` first: `sort` mutates, and this array is the payload's. */
+				var ordered = day.cells.slice().sort((a, b) => (a.decisionCount ? 1 : 0) - (b.decisionCount ? 1 : 0));
+				var blocks = ordered
+					.map((cell) => {
+						var lit = cell.decisionCount > 0;
+						var count = lit
+							? cell.decisionCount + (cell.decisionCount === 1 ? " decision" : " decisions")
+							: "no decisions";
+						var label = cell.title || cell.commitHash.slice(0, 8);
+						return (
+							'<button type="button" class="dec-cell' +
+							(lit ? "" : " is-quiet") +
+							(options.selectedKey === JD.decisionCellKey(cell) ? " is-selected" : "") +
+							'" data-decision-cell="' +
+							JD.esc(cell.commitHash) +
+							'" data-decision-repo="' +
+							JD.esc(cell.repoIdentity) +
+							'" title="' +
+							JD.esc(label + " — " + count) +
+							'" aria-label="' +
+							JD.esc(label + ", " + count) +
+							'"></button>'
+						);
+					})
+					.join("");
+				return (
+					'<div class="dec-col" title="' +
+					JD.esc(day.date + ": " + day.cells.length + (day.cells.length === 1 ? " memory" : " memories")) +
+					'">' +
+					blocks +
+					"</div>"
+				);
+			})
+			.join("");
+		return '<div class="dec-waffle" role="group" aria-label="Memories captured per day">' + cols + "</div>";
+	};
 })(window.JD);

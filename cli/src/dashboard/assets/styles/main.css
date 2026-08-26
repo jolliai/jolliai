@@ -408,14 +408,20 @@ body {
   }
   @media (min-width: 900px) {
     .span7 { grid-column: span 7; } .span5 { grid-column: span 5; }
-    /* Half-and-half band — Decisions beside Spend: what the work banked and what
-       it cost. It was Tokens beside Spend (one question in two units — tokens vs
-       dollars, which a rising cached share moves in opposite directions) until
-       Tokens moved up to lead the band below. */
+    /* Unused by any card today — part of the width palette, like span7/span5
+       above. It held Decisions beside Spend until Decisions grew to span8 and
+       Spend took a row of its own. */
     .span6 { grid-column: span 6; }
+    /* Two-thirds / one-third band — Decisions beside Memory Top Search Terms: what
+       the work banked, and what the reader went back and asked their memory for.
+       They are NOT equals. Decisions carries a per-day chart of every memory in the
+       window plus the selected one's decisions; the terms card is six ranked rows.
+       Splitting the row evenly gave the chart too little and the list too much. */
+    .span8 { grid-column: span 8; }
     /* Equal-third band — Skills / MCPs / Tokens, matching jolli-design's own
        three-up row: three widgets of the same weight, so none of them leads.
-       Decisions held the third seat until it swapped with Tokens. */
+       Decisions held the third seat until it swapped with Tokens. Now also the
+       terms card's seat beside Decisions. */
     .span4 { grid-column: span 4; }
   }
   .card h2 { margin: 0; font-size: 13px; font-weight: 600; letter-spacing: .01em; }
@@ -529,7 +535,13 @@ body {
 
   /* ---------- heatmap & records ---------- */
   .heat-legend { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--muted); flex-wrap: wrap; }
-  .heat-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+  /* The container's `gap` separates the ENTRIES, never a swatch from its own label —
+     that is inside one entry, so it needs the same inline-flex + margin the
+     `.dist-labels` legend below uses. Without it the 10px chip sits flush against
+     the text (the markup has no whitespace between the tags either) and reads as
+     one glued token. */
+  .heat-legend span { display: inline-flex; align-items: center; }
+  .heat-legend i { width: 10px; height: 10px; border-radius: 2px; display: inline-block; margin-right: 5px; }
   .dist { display: flex; gap: 2px; height: 10px; border-radius: 5px; overflow: hidden; max-width: 420px; }
   .dist i { display: block; }
   .dist-labels { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 6px; font-size: 11px; color: var(--muted); }
@@ -599,29 +611,119 @@ body {
   .jd[data-tier="2"] .t2hide { display: none; }
 
   /* ---------- decisions ----------
-     A span6 card, sharing the half-and-half band with Spend. Its width has been
-     span12 (span6 until the Recall card beside it was removed, JOLLI-2193), then
-     span4 in the equal-third band, and none of it mattered: the step chart below
-     scales to any column, so nothing on the card was ever using the extra. Carries
-     no "recalled" figure of its own — see DecisionsCard's doc comment.
+     A span8 card — two thirds of a band, paired with Memory Top Search Terms at
+     span4. Its width has been span12, span4, and span6-beside-Spend, and none of it
+     mattered: the chart below scales to any column. Carries no "recalled" figure of
+     its own — see DecisionsCard's doc comment.
 
-     The `.hdr-stat` rules that used to head this section are still gone, and the
-     kept count is still not one: at span6 it rides in `widgetHead`'s shared aside
-     instead, styled inline at the same 18px as Spend's figure beside it. That
-     aside is the generalised form of what `.hdr-stat` did for this card alone. */
-  .stepchart { margin-top: 10px; }
-  .stepchart svg { display: block; width: 100%; height: 60px; }
-  .dec-quote {
-    font-size: 12.5px; color: var(--ink-2); border-left: 2px solid var(--border); padding-left: 10px;
-    margin-top: 12px; line-height: 1.55; font-style: italic;
+     The headline is `.card-headline` (shared with the Search Terms card), NOT
+     `widgetHead`'s right-aligned aside: the sub here is a sentence naming two
+     denominators, and a sentence right-aligned against the card edge reads as a
+     caption for the title rather than for the number. The aside stays correct for
+     Spend, whose figure is a single number. */
+  .card-headline { margin: 14px 0 4px; }
+  .card-headline .num { font-size: 26px; font-weight: 700; line-height: 1.15; letter-spacing: -.01em; }
+  .card-headline .sub { font-size: 12.5px; color: var(--muted); margin-top: 2px; }
+
+  /* One square per memory in the window, filled when it recorded a decision.
+
+     The height is DEFINITE, and that is the whole change here — the SAME 120px, spelt
+     as `height` rather than `min-height`. Cells are never truncated (their count IS
+     the card's "N memories" figure), so a busy day's column is as tall as its memory
+     count, and against a merely `min-height`ed box `height: 8px` had nothing to shrink
+     from: measured in Chrome, a 60-memory day drew a 598px column and the card became
+     a wall. The one word turns that same declaration into a flex-basis the cells
+     shrink off, and the quiet repo the 120px floor was chosen for renders exactly as
+     it did. `align-items: stretch` (the default, and why `flex-end` is gone) is what
+     hands each column that height; the `column-reverse` below is what keeps the bars
+     growing from the baseline now that the box no longer bottom-aligns them.
+
+     Twelve memories in a day still draw at the full 8px, and between there and the
+     1px floor flex interpolates — 20 in a day is a 4px cell. The floor is what fixes
+     the ceiling: 40 memories in ONE day is the most that fits, past which the column
+     grows again at 3px per memory instead of 10px. There is no floor-free version of
+     this — one square per memory with a visible minimum has a maximum — and the two
+     ways to bound it absolutely are both worse: clipping the overflow hides exactly
+     the LIT cells, which the sort raises to the top, and scrolling hides the baseline
+     the columns are read against. */
+  .dec-chart { margin-top: 10px; }
+  .dec-waffle { display: flex; gap: 2px; height: 120px; }
+  /* column-reverse so the FIRST child sits at the base — the sort puts the
+     none-recorded memories first (see JD.decisionWaffle). */
+  .dec-col { display: flex; flex-direction: column-reverse; gap: 2px; flex: 1 1 0; min-width: 0; }
+  /* `--s4` is this card's tint, and the legend swatch in `decisionsCard` spells the
+     same token inline — a legend that names a colour it does not paint is worse than
+     no legend, so the two move together or not at all. The card's header icon carries
+     it too; `.dec-dot` deliberately does NOT — see there. */
+  .dec-cell {
+    height: 8px; border: 0; border-radius: 2px; padding: 0; cursor: pointer;
+    background: var(--s4); display: block; width: 100%;
+    /* The floor the shrink stops at. Without it a tall column drives the cells to
+       zero and the day disappears from a chart that says it draws every memory. At
+       this density the squares have stopped being countable anyway — what the column
+       still shows is the two BANDS the sort creates, which is what the legend names. */
+    min-height: 1px;
   }
-  .dec-quote .qlab { font-size: 10px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-style: normal; display: block; margin-bottom: 3px; }
-  /* The title opens its memory (JOLLI-2197), but it is the whole content of the
-     quote — so it keeps the quote's own color and only picks up an affordance
-     on hover/focus. */
-  .dec-quote .dec-jump { color: inherit; text-decoration: none; }
-  .dec-quote .dec-jump:hover { text-decoration: underline; }
-  .dec-quote .dec-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
+  .dec-cell.is-quiet { background: var(--heat-track); }
+  .dec-cell:hover { filter: brightness(1.12); }
+  /* OUTSIDE the cell, and the fill is kept. A ring drawn inside an 11×8px square is
+     half-covered by its own fill and reads as nothing on a filled cell; the 2px gap
+     between cells is what `outline-offset` puts it in. This is also why the cells
+     are buttons rather than SVG rects — see JD.decisionWaffle. */
+  .dec-cell.is-selected { outline: 2px solid var(--accent); outline-offset: 1px; }
+  .dec-cell:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .dec-axis { display: flex; justify-content: space-between; font-size: 11px; color: var(--muted); margin-top: 6px; }
+  .dec-legend { margin-top: 8px; gap: 14px; }
+
+  /* The selected memory. Separated from the chart by a rule, because it is a
+     different level of detail rather than a caption for the picture.
+
+     `min-height` HERE, on the whole region, and it is the only one — which is the
+     difference between the comment and what shipped. It sat on `.dec-list`, and the
+     three states that jump are precisely the ones that render no list: "Loading
+     decisions…", "Could not load…" and "This memory recorded no decisions." are each
+     a single `<p>`, so every click collapsed the card by ~130px and snapped it back
+     when the response landed. The list is fetched per selection, so its height is
+     unknown when the click lands; reserving the box one level up covers all four
+     states at once, `.is-empty` included — that one is the state a click leaves. */
+  .dec-detail {
+    margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--grid); font-size: 12.5px;
+    min-height: 168px;
+  }
+  .dec-detail.is-empty { color: var(--muted); }
+  .dec-detail-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  /* One row per decision-carrying topic, each a link into the memory that recorded
+     it. `align-content: start` so a short list sits under the heading rather than
+     spreading through the reserved height above. */
+  .dec-list { display: grid; gap: 2px; margin-top: 8px; align-content: start; }
+  .dec-row {
+    display: flex; gap: 9px; align-items: baseline;
+    font-size: 12.5px; line-height: 1.5; color: var(--ink-2);
+    text-decoration: none; padding: 5px 8px; margin: 0 -8px; border-radius: 6px;
+  }
+  .dec-row:hover { background: var(--lock-bg); color: var(--ink); }
+  .dec-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+  /* Decorative: a real list marker is indented by the UA and would not line up with
+     the heading above. `translateY` sits it on the text's optical centre rather than
+     its baseline.
+
+     `--accent`, NOT this card's `--s4` tint, matching the mockup. The tint answers
+     "which category of work is this" and is spent on the waffle, whose legend names
+     it; every row down here is a LINK into the memory that recorded it, and the dot
+     is the marker of that list — so it takes the colour the page already uses for
+     something you can follow (the same token `.dec-row:focus-visible` rings with).
+     Painting it `--s4` made the markers read as data of the same kind as the squares
+     above them. */
+  .dec-dot {
+    width: 5px; height: 5px; border-radius: 50%; background: var(--accent);
+    flex: none; transform: translateY(-2px);
+  }
+  .dec-none { margin: 8px 0 0; color: var(--muted); }
+  /* The title opens its memory, but it IS the heading — so it keeps the heading's
+     colour and only picks up an affordance on hover/focus. */
+  .dec-detail .dec-jump { color: inherit; text-decoration: none; }
+  .dec-detail .dec-jump:hover { text-decoration: underline; }
+  .dec-detail .dec-jump:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 3px; }
 
   /* ---------- do next (M6) ---------- */
   .donext { display: grid; gap: 10px; }
@@ -1191,6 +1293,22 @@ body {
      shrink below their content, so one missing link puts the row back outside
      the card. Verified in a real browser — jsdom cannot measure this. */
   .ranklist li { min-width: 0; }
+  /* A row's expansion (Search Terms). Deliberately a sibling of `.rl-top` and
+     `.rl-bar` rather than a child of `.rl-top`: that is a flex row, and an extra
+     child there would spend one of its 8px gaps and take the width off the only
+     thing that gives, which is the truncating name. */
+  /* A term row DISCLOSES rather than navigates, so it says so on hover the way a
+     link does. Scoped to `.rl-term`, not `.rl-click`: the Skills and MCP rows also
+     carry `.rl-click` and they open a page — underlining those would promise the
+     wrong thing. */
+  .ranklist .rl-term:hover .rl-name { text-decoration: underline; }
+  .ranklist .rl-expand { margin-top: 8px; font-size: 11.5px; color: var(--muted); line-height: 1.5; }
+  /* Quoted, because these are the reader's own words rather than the card's: a term
+     is a label this page derived, a query is a sentence someone sent. The quotes are
+     what keeps the two levels apart at a glance. */
+  .ranklist .rl-expand > div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ranklist .rl-expand > div::before { content: "\201C"; }
+  .ranklist .rl-expand > div::after { content: "\201D"; }
   .ranklist .rl-top { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; min-width: 0; }
   /* min-width:0 is what makes the ellipsis work: a flex item's default
      min-width is auto, i.e. "never shrink below my content", so a long skill

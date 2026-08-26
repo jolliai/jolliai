@@ -71,6 +71,7 @@ import {
 import {
 	commitCategoryLabels,
 	mcpFoldedIdentifierSql,
+	mcpServerFoldedIdentifierSql,
 	resolveScope,
 	scopeFilter,
 	scopeToRepoIds,
@@ -489,7 +490,10 @@ function buildConversations(
 /**
  * The two identifier columns this page's activity rows are grouped by, with a
  * plugin registration alias folded away — the same merge the MCPs card makes,
- * so one server reached two ways is one row on both surfaces.
+ * so one server reached two ways is one row on both surfaces. The server column
+ * additionally folds an opaque host id onto `UNIDENTIFIED_MCP_SERVER`
+ * ({@link mcpServerFoldedIdentifierSql}), so this row's `label` cannot be a bare
+ * connector UUID either — the activity list reads the server for an MCP row.
  *
  * The GUARDED form, unlike `DashboardQuery.ts`'s `TOOL_KEY_SQL` /
  * `SERVER_KEY_SQL`: those sit behind a `t.kind = 'mcp'` WHERE clause, while this
@@ -503,7 +507,7 @@ function buildConversations(
  * `plugin_jolli_jollimemory` — waiting for whoever renders it next.
  */
 const ACTIVITY_TOOL_KEY_SQL = mcpFoldedIdentifierSql("stu.tool_name", "stu.kind");
-const ACTIVITY_SERVER_KEY_SQL = mcpFoldedIdentifierSql("stu.server", "stu.kind");
+const ACTIVITY_SERVER_KEY_SQL = mcpServerFoldedIdentifierSql("stu.server", "stu.kind");
 
 function buildActivity(
 	db: DashboardDbHandle,

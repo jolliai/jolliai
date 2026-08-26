@@ -1,10 +1,13 @@
 /**
  * The agent session a process is running inside, when one advertised itself in
  * the environment. Shared by every surface that needs to know "which session am
- * I a child of" — the recall-receipt producer ([ProducerHooks.ts](../dashboard/ProducerHooks.ts))
+ * I a child of" — the lookup-receipt producer ([ProducerHooks.ts](../dashboard/ProducerHooks.ts))
  * and the post-commit hook, which stamps it onto the queue entry so a commit
  * made from one worktree can be attributed to the session that authored it even
  * when that session ran in another checkout.
+ *
+ * ⚠ The environment answers for the process, and a process is only the right
+ * answer while it belongs to ONE session — see {@link setAmbientSessionIdTrusted}.
  */
 
 /**
@@ -51,11 +54,43 @@ export function isSafeSessionId(id: string): boolean {
 }
 
 /**
+ * Whether this process's environment still names the session it is acting for.
+ *
+ * True for an ordinary short-lived invocation — a `jolli` command, a git hook, the
+ * per-session `mcp` proxy — each launched by the session it serves, so an inherited
+ * marker is a fact about the work in front of it.
+ *
+ * A long-lived SHARED server is the opposite case, and `mcp-serve` is the one that
+ * makes it concrete: it is keyed by WORKTREE and a version tie ATTACHES rather than
+ * evicting, so several sessions (and several hosts) reach the same process, whose
+ * env was frozen at spawn from whichever proxy happened to be first. Left trusted,
+ * every `search` and `recall` that daemon answered would be filed under the
+ * spawning session's id — so the Search Terms card's "N agent sessions" would count
+ * one, for ever, however many sessions searched. That is a WRONG value rather than
+ * a missing one, which is the failure the note on {@link SESSION_ID_ENV_VARS}
+ * refuses a guessed id to avoid; a null is visible as a null.
+ *
+ * Set from ONE place — the CLI entry, off the same `isAgentInferenceExempt`
+ * predicate that decides whether telemetry may infer its `agent` from the env, for
+ * the same reason and over the same processes. There is no per-connection session
+ * id to fall back to (the MCP `initialize` handshake names the HOST, not a session),
+ * so the honest answer for a shared server is simply no id.
+ */
+let ambientSessionIdTrusted = true;
+
+/** See {@link ambientSessionIdTrusted}. Idempotent; the CLI entry calls it once. */
+export function setAmbientSessionIdTrusted(trusted: boolean): void {
+	ambientSessionIdTrusted = trusted;
+}
+
+/**
  * The agent session this process is running inside, or `undefined` for a plain
- * terminal and for every host in the note above. A blank value is treated as
- * absent rather than returned as an empty id.
+ * terminal, for every host in the note above, and for a shared server that has
+ * declared its env untrustworthy. A blank value is treated as absent rather than
+ * returned as an empty id.
  */
 export function currentAgentSessionId(): string | undefined {
+	if (!ambientSessionIdTrusted) return undefined;
 	for (const name of SESSION_ID_ENV_VARS) {
 		const id = process.env[name]?.trim();
 		// A malformed value (traversal, separators) is treated as absent rather

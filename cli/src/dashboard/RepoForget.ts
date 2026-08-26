@@ -97,11 +97,11 @@ interface RepoChildTable {
  * The tables that reference `repos.id` directly, derived from the schema rather
  * than listed here.
  *
- * Twelve today (`branches`, `commits`, `context`, `ingest_cursors`, `memories`,
- * `recall_receipts`, `repo_state`, `sessions`, `topic_pages`,
+ * Thirteen today (`branches`, `commits`, `context`, `ingest_cursors`, `memories`,
+ * `memory_lookups`, `recall_receipts`, `repo_state`, `sessions`, `topic_pages`,
  * `topic_processed_sources`, `transcripts`, `worktree_status`), and the other ten
  * tables that carry a `repo_id` reach `repos` only through one of those with
- * `ON DELETE CASCADE`, so deleting these twelve empties all of them. Every
+ * `ON DELETE CASCADE`, so deleting these thirteen empties all of them. Every
  * reference is `NO ACTION`, so the row itself cannot go first.
  *
  * Derived because a hand-kept list fails in the direction that is hard to

@@ -79,6 +79,7 @@ import type { CommitInfo, SessionInfo } from "../Types.js";
 import { canUseDashboardDb, withDashboardDb } from "./DashboardDb.js";
 import {
 	recordCommitsFromWorker,
+	recordLookupReceipt,
 	recordMemoryEdit,
 	recordRecallReceipt,
 	recordSessionFromHook,
@@ -178,50 +179,108 @@ describe("recordRecallReceipt", () => {
 		delete process.env.CLAUDE_CODE_SESSION_ID;
 	});
 
-	it("writes one receipt row carrying the surface and the served commits", async () => {
-		expect(await recordRecallReceipt("/repo", hit, "mcp", dbPath)).toBe(true);
+	it("writes one receipt row carrying the kind, the surface and the served count", async () => {
+		expect(await recordRecallReceipt("/repo", hit, "mcp", { dbPath })).toBe(true);
+		// `commits_json` is deliberately gone with the table it lived on: nothing ever
+		// read it, and a blob column would have made the generic table's per-column
+		// privacy review meaningless. What survives is the count.
 		expect(
-			await readRows("SELECT surface, session_id, hit, commit_count, commits_json FROM recall_receipts"),
-		).toEqual([
-			{
-				surface: "mcp",
-				session_id: null,
-				hit: 1,
-				commit_count: 2,
-				commits_json: JSON.stringify([{ hash: "a".repeat(40), date: "2026-07-25" }]),
-			},
-		]);
+			await readRows("SELECT kind, surface, session_id, hit, result_count, query FROM memory_lookups"),
+		).toEqual([{ kind: "recall", surface: "mcp", session_id: null, hit: 1, result_count: 2, query: null }]);
 	});
 
 	it("attributes the call to the agent session the host advertised", async () => {
 		process.env.CLAUDE_CODE_SESSION_ID = "sess-uuid";
-		await recordRecallReceipt("/repo", hit, "mcp", dbPath);
-		expect(await readRows("SELECT session_id FROM recall_receipts")).toEqual([{ session_id: "sess-uuid" }]);
+		await recordRecallReceipt("/repo", hit, "mcp", { dbPath });
+		expect(await readRows("SELECT session_id FROM memory_lookups")).toEqual([{ session_id: "sess-uuid" }]);
 	});
 
 	it("leaves the session unattributed rather than guessing when the env is blank", async () => {
 		process.env.CLAUDE_CODE_SESSION_ID = "   ";
-		await recordRecallReceipt("/repo", hit, "cli", dbPath);
-		expect(await readRows("SELECT surface, session_id FROM recall_receipts")).toEqual([
+		await recordRecallReceipt("/repo", hit, "cli", { dbPath });
+		expect(await readRows("SELECT surface, session_id FROM memory_lookups")).toEqual([
 			{ surface: "cli", session_id: null },
 		]);
 	});
 
 	it("stamps a call that carries no atMs of its own", async () => {
-		await recordRecallReceipt("/repo", { hit: false, commitCount: 0, commits: [] }, "cli", dbPath);
-		const rows = await readRows("SELECT at_ms FROM recall_receipts");
+		await recordRecallReceipt("/repo", { hit: false, commitCount: 0, commits: [] }, "cli", { dbPath });
+		const rows = await readRows("SELECT at_ms FROM memory_lookups");
 		expect(Number(rows[0].at_ms)).toBeGreaterThan(0);
 	});
 
 	it("skips silently when the runtime lacks flag-free node:sqlite", async () => {
 		vi.mocked(canUseDashboardDb).mockReturnValue(false);
-		expect(await recordRecallReceipt("/repo", hit, "mcp", dbPath)).toBe(false);
+		expect(await recordRecallReceipt("/repo", hit, "mcp", { dbPath })).toBe(false);
 		expect(existsSync(dbPath)).toBe(false);
 	});
 
 	it("never throws when identity resolution fails — a receipt is worth less than the answer", async () => {
 		vi.mocked(getProjectRootDir).mockRejectedValue(new Error("not a git repo"));
-		await expect(recordRecallReceipt("/nowhere", hit, "cli", dbPath)).resolves.toBe(false);
+		await expect(recordRecallReceipt("/nowhere", hit, "cli", { dbPath })).resolves.toBe(false);
+	});
+});
+
+describe("recordLookupReceipt", () => {
+	beforeEach(() => {
+		delete process.env.CLAUDE_CODE_SESSION_ID;
+	});
+	afterEach(() => {
+		delete process.env.CLAUDE_CODE_SESSION_ID;
+	});
+
+	it("normalises the query into a bucket key and keeps the verbatim text", async () => {
+		expect(
+			await recordLookupReceipt(
+				"/repo",
+				{ kind: "search", surface: "cli", query: "  Rate   Limiter ", resultCount: 2 },
+				dbPath,
+			),
+		).toBe(true);
+		// The key is computed HERE, not in SQL: SQLite has no expression that folds
+		// runs of internal whitespace, and a migration must not derive business data.
+		expect(await readRows("SELECT kind, surface, query, query_key, result_count FROM memory_lookups")).toEqual([
+			{ kind: "search", surface: "cli", query: "  Rate   Limiter ", query_key: "rate limiter", result_count: 2 },
+		]);
+	});
+
+	it("carries a recall's branch through as the target", async () => {
+		// The branch is part of the REQUEST and `RecallOutcome` describes the RESULT,
+		// so it travels as its own argument rather than being folded into that type.
+		await recordRecallReceipt("/repo", { hit: true, commitCount: 1, commits: [] }, "mcp", {
+			branch: "feature/auth",
+			dbPath,
+		});
+		expect(await readRows("SELECT kind, target, query FROM memory_lookups")).toEqual([
+			{ kind: "recall", target: "feature/auth", query: null },
+		]);
+	});
+
+	it("leaves the target null when the caller had no branch to give", async () => {
+		// A bare `jolli recall` resolves the current branch inside `resolveRecall`,
+		// where the caller cannot see it — NULL is the honest answer, not a guess.
+		await recordRecallReceipt("/repo", { hit: false, commitCount: 0, commits: [] }, "cli", { dbPath });
+		expect(await readRows("SELECT target FROM memory_lookups")).toEqual([{ target: null }]);
+	});
+
+	it("skips silently when the runtime lacks flag-free node:sqlite", async () => {
+		vi.mocked(canUseDashboardDb).mockReturnValue(false);
+		expect(
+			await recordLookupReceipt("/repo", { kind: "search", surface: "cli", query: "x", resultCount: 0 }, dbPath),
+		).toBe(false);
+		expect(existsSync(dbPath)).toBe(false);
+	});
+
+	it("never throws when the write fails — a receipt is worth less than the answer", async () => {
+		// Any producer-side failure takes this path: the projection fails, the row is
+		// parked in `events_raw`, and the search the user is waiting on is untouched.
+		// It is what makes a missing table survivable for whichever dist wrote the
+		// event — the reason `recall_receipts` can be left in place rather than needing
+		// every dist upgraded in lockstep.
+		vi.mocked(getProjectRootDir).mockRejectedValue(new Error("not a git repo"));
+		await expect(
+			recordLookupReceipt("/nowhere", { kind: "search", surface: "cli", query: "x", resultCount: 0 }, dbPath),
+		).resolves.toBe(false);
 	});
 });
 

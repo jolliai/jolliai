@@ -196,6 +196,8 @@ async function writeOutputFile(outputPath: string, body: string): Promise<void> 
  * listing, not a recall that came back empty.
  */
 function recordRecallMiss(projectDir: string): void {
+	// No branch: a miss is recorded from paths that never resolved one, so the
+	// receipt's `target` is legitimately NULL rather than unknown.
 	void recordRecallReceipt(projectDir, { hit: false, commitCount: 0, commits: [], atMs: Date.now() }, "cli");
 }
 
@@ -237,6 +239,9 @@ async function outputRecall(
 			atMs: Date.now(),
 		},
 		"cli",
+		// This path has the resolved branch in hand — unlike the miss above and the
+		// MCP tool's bare-recall case, both of which record a NULL target.
+		{ branch },
 	);
 
 	if (ctx.commitCount === 0) {
@@ -364,7 +369,14 @@ export function registerRecallCommand(program: Command): void {
 					});
 					// Same receipt the MCP tool writes (see runRecall) — this is the
 					// path the jolli-recall skill takes when the host has no MCP.
-					void recordRecallReceipt(projectDir, recallOutcomeOf(result, Date.now()), "cli");
+					// `branchOrKeyword` verbatim: it is what the caller asked for, which is
+					// what the receipt is a record of — so a KEYWORD lands in `target` too,
+					// and that column is a request rather than a resolved ref (see its note
+					// in the memory_lookups migration). Absent for a bare `jolli recall`,
+					// which resolves the current branch inside `resolveRecall`.
+					void recordRecallReceipt(projectDir, recallOutcomeOf(result, Date.now()), "cli", {
+						...(branchOrKeyword ? { branch: branchOrKeyword } : {}),
+					});
 					const payload = JSON.stringify(result);
 					// `--output` is honored in JSON mode too: write the SAME payload
 					// that would go to stdout to the file. Previously this branch

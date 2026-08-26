@@ -1297,7 +1297,11 @@ describe("skill_invocations projection", () => {
 	});
 });
 
-describe("recall.observed projection", () => {
+/* The FROZEN legacy event, kept because `events_raw` can still hold un-drained rows
+   an older dist wrote — an unknown type throws and parks the row `failed` for ever.
+   Nothing emits it any more; its projector is now a rewriting adapter onto
+   `memory_lookups`. */
+describe("recall.observed projection (legacy adapter)", () => {
 	const recallEvent = (over: Record<string, unknown> = {}) =>
 		({
 			event: {
@@ -1316,35 +1320,41 @@ describe("recall.observed projection", () => {
 			(db) =>
 				db
 					.prepare(
-						"SELECT receipt_id, at_ms, surface, session_id, hit, commit_count, commits_json FROM recall_receipts ORDER BY at_ms",
+						"SELECT receipt_id, kind, at_ms, surface, session_id, hit, result_count, query, query_key, target FROM memory_lookups ORDER BY at_ms",
 					)
 					.all() as Array<Record<string, unknown>>,
 			{ dbPath },
 		);
 
-	it("stores one row per call, with the served commits", async () => {
+	it("rewrites a legacy call onto memory_lookups, keeping its original id", async () => {
 		await applyStatsEvents([recallEvent({ sessionId: "s1" })], { producerKind: "cli", dbPath });
 		expect(await receipts()).toEqual([
 			{
+				// The `recall:` id, NOT a re-derived `lookup:` one. It is the idempotency
+				// key, so re-keying would let a row already projected under the old id be
+				// written a second time under a new one.
 				receipt_id: "recall:repo-1:mcp:1700000000000",
+				kind: "recall",
 				at_ms: 1_700_000_000_000,
 				surface: "mcp",
 				session_id: "s1",
 				hit: 1,
-				commit_count: 1,
-				commits_json: JSON.stringify([{ hash: "a".repeat(40), date: "2026-07-01" }]),
+				result_count: 1,
+				// The legacy event carries no branch, and `commits_json` had no reader —
+				// so both are legitimately absent rather than lost.
+				query: null,
+				query_key: null,
+				target: null,
 			},
 		]);
 	});
 
-	it("stores a miss with no commits payload", async () => {
+	it("stores a miss", async () => {
 		await applyStatsEvents([recallEvent({ outcome: { hit: false, commitCount: 0, commits: [] } })], {
 			producerKind: "cli",
 			dbPath,
 		});
-		expect(await receipts()).toEqual([
-			expect.objectContaining({ hit: 0, commit_count: 0, commits_json: null, session_id: null }),
-		]);
+		expect(await receipts()).toEqual([expect.objectContaining({ hit: 0, result_count: 0, session_id: null })]);
 	});
 
 	it("keeps calls from the two surfaces apart even at the same instant", async () => {
@@ -1362,7 +1372,7 @@ describe("recall.observed projection", () => {
 		});
 		const rows = await receipts();
 		expect(rows).toHaveLength(1);
-		expect(rows[0]).toMatchObject({ hit: 0, commit_count: 0, commits_json: null });
+		expect(rows[0]).toMatchObject({ hit: 0, result_count: 0 });
 	});
 
 	it("seeds a repos row for a repo nothing else has registered yet", async () => {
@@ -1375,6 +1385,138 @@ describe("recall.observed projection", () => {
 			{ dbPath },
 		);
 		expect(row).toEqual({ repo_identity: "brand-new" });
+	});
+});
+
+describe("lookup.observed projection", () => {
+	const lookups = async () =>
+		withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						"SELECT receipt_id, kind, surface, session_id, at_ms, query, query_key, target, result_count, hit FROM memory_lookups ORDER BY receipt_id",
+					)
+					.all() as Array<Record<string, unknown>>,
+			{ dbPath },
+		);
+
+	const searchEvent = (over: Record<string, unknown> = {}) =>
+		({
+			event: {
+				type: "lookup.observed" as const,
+				kind: "search" as const,
+				repoIdentity: "repo-1",
+				surface: "mcp" as const,
+				atMs: 1_700_000_000_000,
+				query: "Rate  Limiter",
+				queryKey: "rate limiter",
+				resultCount: 3,
+				...over,
+			},
+			producerKind: "cli" as const,
+		}) as StatsEventEnvelope;
+
+	it("writes a search with its verbatim query and its bucket key", async () => {
+		await applyStatsEvents([searchEvent({ sessionId: "s1" })], { producerKind: "cli", dbPath });
+		expect(await lookups()).toEqual([
+			{
+				// The query's bucket key is part of the id — see statsEventId.
+				receipt_id: "lookup:repo-1:search:mcp:1700000000000:rate limiter",
+				kind: "search",
+				surface: "mcp",
+				session_id: "s1",
+				at_ms: 1_700_000_000_000,
+				// The verbatim spelling is what the card displays; the key is what it
+				// groups on. Both travel, because normalising at read time would mean
+				// two places spelling one rule.
+				query: "Rate  Limiter",
+				query_key: "rate limiter",
+				// A search asked for no branch, so `target` is legitimately NULL.
+				target: null,
+				result_count: 3,
+				// Derived for a search — `hit` is exactly `result_count > 0` here, and
+				// only earns its column because a recall can serve a branch with no
+				// commits.
+				hit: 1,
+			},
+		]);
+	});
+
+	it("writes a recall with its branch and no query", async () => {
+		await applyStatsEvents(
+			[
+				{
+					event: {
+						type: "lookup.observed",
+						kind: "recall",
+						repoIdentity: "repo-1",
+						surface: "cli",
+						atMs: 1_700_000_000_001,
+						target: "feature/auth",
+						hit: true,
+						resultCount: 0,
+					},
+					producerKind: "cli",
+				} as StatsEventEnvelope,
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect(await lookups()).toEqual([
+			expect.objectContaining({
+				kind: "recall",
+				target: "feature/auth",
+				query: null,
+				query_key: null,
+				// hit WITHOUT results: a recall can resolve a branch that has no commits,
+				// which is why `hit` is stored rather than derived from the count.
+				hit: 1,
+				result_count: 0,
+			}),
+		]);
+	});
+
+	it("keeps a search and a recall apart at the same instant on the same surface", async () => {
+		// `kind` is part of the id for exactly this: two lookups answered in the same
+		// millisecond are two lookups, not one row overwritten twice.
+		await applyStatsEvents(
+			[
+				searchEvent(),
+				{
+					event: {
+						type: "lookup.observed",
+						kind: "recall",
+						repoIdentity: "repo-1",
+						surface: "mcp",
+						atMs: 1_700_000_000_000,
+						hit: false,
+						resultCount: 0,
+					},
+					producerKind: "cli",
+				} as StatsEventEnvelope,
+			],
+			{ producerKind: "cli", dbPath },
+		);
+		expect((await lookups()).map((r) => r.kind).sort()).toEqual(["recall", "search"]);
+	});
+
+	it("keeps two searches apart at the same instant on the same surface", async () => {
+		// The case `kind` alone does not cover, and the one that actually happens: an
+		// agent fires several `search` calls at once. Without the query key in the id
+		// the second does not merge into the first, it overwrites every column of it —
+		// one query lost and one search uncounted, with nothing to show it happened.
+		await applyStatsEvents([searchEvent(), searchEvent({ query: "auth guard", queryKey: "auth guard" })], {
+			producerKind: "cli",
+			dbPath,
+		});
+		expect((await lookups()).map((r) => r.query_key).sort()).toEqual(["auth guard", "rate limiter"]);
+	});
+
+	it("converges on one row when the same event is applied twice", async () => {
+		await applyStatsEvents([searchEvent()], { producerKind: "cli", dbPath });
+		await applyStatsEvents([searchEvent({ resultCount: 0 })], { producerKind: "cli", dbPath });
+		const rows = await lookups();
+		expect(rows).toHaveLength(1);
+		expect(rows[0]).toMatchObject({ result_count: 0, hit: 0 });
 	});
 });
 
@@ -2449,7 +2591,7 @@ describe("sync stamps", () => {
 			{ producerKind: "cli", dbPath, now: at(7_000) },
 		);
 
-		const [r] = await query<{ at_ms: number; updated_at_ms: number }>("SELECT * FROM recall_receipts");
+		const [r] = await query<{ at_ms: number; updated_at_ms: number }>("SELECT * FROM memory_lookups");
 		expect(r?.at_ms).toBe(1_700_000_300_000);
 		expect(r?.updated_at_ms).toBe(7_000);
 	});

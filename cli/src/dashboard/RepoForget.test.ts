@@ -120,6 +120,7 @@ describe("repoChildTables", () => {
 			"context.repo_id",
 			"ingest_cursors.repo_id",
 			"memories.repo_id",
+			"memory_lookups.repo_id",
 			"recall_receipts.repo_id",
 			"repo_state.repo_id",
 			"sessions.repo_id",

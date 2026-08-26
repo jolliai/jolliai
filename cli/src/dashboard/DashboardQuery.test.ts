@@ -23,7 +23,13 @@ import type {
 	StatsModel,
 	ToolUsageRow,
 } from "./DashboardModel.js";
-import { MCP_DETAIL_TOOL_LIMIT, MEMORY_CARDS_LIMIT, TOOL_ROWS_LIMIT } from "./DashboardModel.js";
+import {
+	DECISION_TITLE_MAX,
+	MCP_DETAIL_TOOL_LIMIT,
+	MEMORY_CARDS_LIMIT,
+	SEARCH_TERM_ROWS_LIMIT,
+	TOOL_ROWS_LIMIT,
+} from "./DashboardModel.js";
 import { markCommitsReachability } from "./DbBackfill.js";
 
 /** UTC+8, no DST — the zone the day-boundary cases below contrast with UTC. */
@@ -35,6 +41,7 @@ import {
 	buildSkillDetail,
 	buildToolUsagePage,
 	type QueryOptions,
+	readMemoryDecisions,
 	STANDUP_MAX_OFFSET,
 } from "./DashboardQuery.js";
 import { volumeReachable } from "./RepoForget.js";
@@ -112,6 +119,13 @@ async function seedSupersededPredecessor(
 		committedAtMs: number;
 		/** Topics the predecessor recorded — a superseded generation keeps its own. */
 		topics?: ReadonlyArray<Record<string, unknown>>;
+		/**
+		 * `commits.reachable`. Defaults to 1, the state the column is written in and
+		 * the state the reachability pass has not yet corrected; pass 0 for the
+		 * settled shape an amend leaves behind. Which one a case seeds is the whole
+		 * question for any consumer whose generation rule lives in this column.
+		 */
+		reachable?: 0 | 1;
 	},
 ): Promise<void> {
 	await withDashboardDb(
@@ -120,9 +134,9 @@ async function seedSupersededPredecessor(
 				id: number;
 			};
 			db.prepare(
-				`INSERT INTO commits (event_id, repo_id, hash, branch, message, committed_at_ms)
-				 VALUES (?, ?, ?, ?, 'superseded', ?)`,
-			).run(`ev-${predHash}`, repoId, predHash, opts.branch, opts.committedAtMs);
+				`INSERT INTO commits (event_id, repo_id, hash, branch, message, committed_at_ms, reachable)
+				 VALUES (?, ?, ?, ?, 'superseded', ?, ?)`,
+			).run(`ev-${predHash}`, repoId, predHash, opts.branch, opts.committedAtMs, opts.reachable ?? 1);
 			const { id: commitId } = db
 				.prepare("SELECT id FROM commits WHERE repo_id = ? AND hash = ?")
 				.get(repoId, predHash) as { id: number };
@@ -3611,16 +3625,18 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		expect(model.stats?.totalCommits).toBe(2);
 		expect(model.stats?.memoriesCreated).toBe(2);
 		expect(model.stats?.decisions?.keptCount).toBe(1);
-		// The card's title links here, and `/memories?hash=` resolves against
+		// The cells link here, and `/memories?hash=` resolves against
 		// `memories.commit_hash` — so this has to be the MEMORY's hash, which the
 		// rewrite left behind at `mem1`, and not the live `commits.hash` the alias
 		// join entered from. Selecting the latter sent the click to a detail pane
 		// that could not resolve, on precisely the commits this test covers.
-		expect(model.stats?.decisions?.latest?.commitHash).toBe("mem1");
+		const hashes = (model.stats?.decisions?.perDay ?? []).flatMap((day) => day.cells.map((c) => c.commitHash));
+		expect(hashes).toContain("mem1");
+		expect(model.stats?.decisions?.selected?.commitHash).toBeDefined();
 		expect(model.stats?.memoryCards?.map((c) => c.commitHash)).toContain("mem1");
 	});
 
-	it("assembles the Decisions card from mined commit decisions, latest first", async () => {
+	it("assembles the Decisions card from mined commit decisions", async () => {
 		await seedMemory();
 		const model = await withDashboardDb(
 			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
@@ -3631,34 +3647,307 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		if (!decisions) throw new Error("decisions missing");
 		expect(decisions.keptCount).toBe(1);
 		expect(decisions.repoCount).toBe(1);
-		// The card renders the OWNING TOPIC'S TITLE (`t0` in this fixture), not the
-		// decision prose — which is left out of the payload entirely, since the
-		// card is one line wide and a real block runs to ~1,900 characters.
-		expect(decisions.latest).toMatchObject({
-			title: "t0",
-			commitHash: "mem1",
-			repoName: "jolli",
-			// Addresses the memory's row from the card's title link; a repo NAME
-			// cannot, since two registered repos can share one.
-			repoIdentity: "repo-1",
-		});
-		expect(decisions.latest).not.toHaveProperty("text");
 		// decisionsCaptured mirrors the card's count rather than a second query.
 		expect(model.stats?.decisionsCaptured).toBe(1);
 		// …and the per-row counts under Memory Activity are the same rule, so the
 		// list cannot contradict the "N decisions" figure above it.
 		expect(model.stats?.memoryCards.find((c) => c.commitHash === "mem1")?.decisionCount).toBe(1);
 		expect(model.stats?.memoryCards.find((c) => c.commitHash === "mem2")).not.toHaveProperty("decisionCount");
-		// One point per local day of the default 30-day window.
+		// One column per local day of the default 30-day window.
 		expect(decisions.perDay).toHaveLength(30);
-		expect(decisions.perDay.reduce((sum, d) => sum + d.count, 0)).toBe(1);
+
+		const cells = decisions.perDay.flatMap((day) => day.cells);
+		// THE TWO IDENTITIES. Both cards on this page count over the same population,
+		// and these are what say so: the grid holds exactly the memories the sub-line
+		// claims, and the filled squares account for exactly the kept count. The
+		// second only holds because the decisions query filters reachability the same
+		// way `memoriesCreated` does — without that predicate a squashed-away
+		// memory's decisions inflate `keptCount` past anything the grid can show.
+		expect(cells).toHaveLength(model.stats?.memoriesCreated ?? -1);
+		expect(cells.reduce((sum, cell) => sum + cell.decisionCount, 0)).toBe(decisions.keptCount);
+
+		// The cell's tooltip is the MEMORY's title — the same field the Memory
+		// Activity row renders, so one memory cannot read as two things on one page.
+		const mem1 = cells.find((cell) => cell.commitHash === "mem1");
+		expect(mem1?.title).toBe(model.stats?.memoryCards.find((c) => c.commitHash === "mem1")?.title);
+		expect(mem1?.decisionCount).toBe(1);
+		// `category` and the bullets are deliberately NOT on a cell: they need a
+		// `summary_json` parse, and the cells are uncapped and re-sent every 30 s.
+		expect(mem1).not.toHaveProperty("category");
+		expect(mem1).not.toHaveProperty("bullets");
+
+		// The default selection travels WITH its detail — one `summary_json` parse and
+		// a few hundred bytes of topic titles — so the first paint needs no request.
+		expect(decisions.selected?.commitHash).toEqual(expect.any(String));
+		expect(decisions.selected?.decisions).toEqual(expect.any(Array));
 	});
 
-	// `TopicSummary.title` is required by the schema, so both branches below are
-	// malformed/pre-schema payloads only — but they are the only inputs that can
-	// put unbounded prose where a one-line title goes, so the bound is pinned.
-	describe("Decisions card title fallback", () => {
-		async function seedTitlelessDecision(decisions: string): Promise<void> {
+	it("keeps a folded-but-reachable memory's decisions on its own cell", async () => {
+		await seedMemory();
+		// Re-file mem1 as a CHILD of mem2 — the shape a squash leaves behind on a
+		// commit that is still reachable — while leaving its own topics in place.
+		// The waffle draws a cell for it (its commit is reachable, so
+		// `memoriesCreated` counts it), so everything the card says about that cell
+		// has to describe THAT memory. A roots-only derivation drew it quiet while
+		// `/memories?hash=` opened it and listed the decisions the cell reported none
+		// of: measured on a real database, 8 of 121 cells addressed a child memory
+		// and 4 of them carried decision-bearing topics.
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				db.prepare(
+					`UPDATE memories SET parent_hash = 'mem2', child_pos = 0, root_hash = 'mem2', depth = 1
+					  WHERE repo_id = ? AND commit_hash = 'mem1'`,
+				).run(id);
+			},
+			{ dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		const decisions = model.stats?.decisions;
+		if (!decisions) throw new Error("decisions missing");
+		const cells = decisions.perDay.flatMap((day) => day.cells);
+		expect(cells).toHaveLength(2);
+		const mem1 = cells.find((cell) => cell.commitHash === "mem1");
+		expect(mem1?.decisionCount).toBe(1);
+		// The count beside the picture is the same population the picture draws.
+		expect(decisions.keptCount).toBe(1);
+		expect(cells.reduce((sum, cell) => sum + cell.decisionCount, 0)).toBe(decisions.keptCount);
+		// And the cell is openable: the detail endpoint resolves the same memory the
+		// cell addresses, so the newest cell can still stand in as the default.
+		expect(decisions.selected?.commitHash).toBe("mem1");
+		expect(decisions.selected?.decisions).toHaveLength(1);
+		const detail = await withDashboardDb((db) => readMemoryDecisions(db, "repo-1", "mem1"), { dbPath });
+		expect(detail?.decisions).toHaveLength(1);
+	});
+
+	it("counts a rewritten commit's decisions once when it also carries its own memory", async () => {
+		await seedMemory();
+		// A commit can match BOTH a `memories` row of its own and a `commit_aliases`
+		// entry pointing at a second one — an amend whose predecessor was summarized.
+		// The card resolves that the way `commitsInRange` does (the direct row wins),
+		// because the cell it draws is keyed on exactly that COALESCE; an `OR` join
+		// matched both rows and billed the cell's decisions twice.
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				db.prepare(
+					"INSERT INTO commit_aliases (repo_id, old_hash, target_hash, created_ms) VALUES (?, 'mem1', 'mem2', 0)",
+				).run(id);
+			},
+			{ dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		const decisions = model.stats?.decisions;
+		if (!decisions) throw new Error("decisions missing");
+		const cells = decisions.perDay.flatMap((day) => day.cells);
+		expect(cells.find((cell) => cell.commitHash === "mem1")?.decisionCount).toBe(1);
+		expect(decisions.keptCount).toBe(1);
+	});
+
+	it("counts decisions only over reachable memories, so the grid and the count agree", async () => {
+		await seedMemory();
+		await withDashboardDb(
+			(db) => {
+				const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+					id: number;
+				};
+				// mem1 is the one carrying a decision. Mark its commit unreachable —
+				// the shape a squash or an amend leaves behind.
+				db.prepare("UPDATE commits SET reachable = 0 WHERE repo_id = ? AND hash = 'mem1'").run(id);
+			},
+			{ dbPath },
+		);
+		const model = await withDashboardDb(
+			(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+			{ dbPath },
+		);
+		const decisions = model.stats?.decisions;
+		if (!decisions) throw new Error("decisions missing");
+		// The decision is gone from BOTH sides. Before the reachability predicate it
+		// stayed in `keptCount` while the grid dropped the memory — putting a figure
+		// next to "X of Y captured" that was counted over a different population.
+		expect(decisions.keptCount).toBe(0);
+		expect(decisions.perDay.flatMap((d) => d.cells)).toHaveLength(model.stats?.memoriesCreated ?? -1);
+	});
+
+	describe("Memory Top Search Terms", () => {
+		/** One `memory_lookups` row, straight in — the projector has its own tests. */
+		async function seedLookup(over: Record<string, unknown> = {}): Promise<void> {
+			await withDashboardDb(
+				(db) => {
+					const { id } = db.prepare("SELECT id FROM repos WHERE repo_identity = 'repo-1'").get() as {
+						id: number;
+					};
+					const row = {
+						receipt_id: `r${Math.random()}`,
+						kind: "search",
+						surface: "cli",
+						session_id: "s1",
+						at_ms: nowMs - 3_600_000,
+						query: "Rate Limiter",
+						query_key: "rate limiter",
+						target: null,
+						result_count: 2,
+						hit: 1,
+						...over,
+					};
+					db.prepare(
+						`INSERT INTO memory_lookups (receipt_id, repo_id, kind, surface, session_id, at_ms, query,
+						                             query_key, target, result_count, hit, updated_at_ms)
+						 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)`,
+					).run(
+						row.receipt_id,
+						id,
+						row.kind,
+						row.surface,
+						row.session_id,
+						row.at_ms,
+						row.query,
+						row.query_key,
+						row.target,
+						row.result_count,
+						row.hit,
+					);
+				},
+				{ dbPath },
+			);
+		}
+
+		async function card() {
+			const model = await withDashboardDb(
+				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
+				{ dbPath },
+			);
+			return model.stats?.searchTerms;
+		}
+
+		it("extracts a term from differently-worded queries and lists them behind it", async () => {
+			// The card's whole claim. Grouping by the query itself was the first
+			// implementation and produced a list of ones: an agent composes each query
+			// from whatever the reader asked, so a subject is rarely phrased twice the
+			// same way.
+			await seedMemory();
+			await seedLookup({
+				query: "how did we handle rate limiter bursts",
+				query_key: "how did we handle rate limiter bursts",
+			});
+			await seedLookup({
+				query: "why is the rate limiter per org",
+				query_key: "why is the rate limiter per org",
+			});
+			await seedLookup({ query: "rate limiter retry-after", query_key: "rate limiter retry-after" });
+			const terms = await card();
+			expect(terms?.searches).toBe(3);
+			// Three distinct queries, ONE term — that difference is the feature, and
+			// `termCount` is the half of it the footer prints (the other denominator
+			// would have claimed two more rows than exist).
+			expect(terms?.distinctQueries).toBe(3);
+			expect(terms?.termCount).toBe(1);
+			expect(terms?.rows).toHaveLength(1);
+			expect(terms?.rows[0]).toMatchObject({ term: "rate limiter", searches: 3 });
+			expect(terms?.rows[0].queries).toHaveLength(3);
+		});
+
+		it("folds two spellings of one query into a single search count", async () => {
+			await seedMemory();
+			await seedLookup({ query: "rate limiter", at_ms: nowMs - 7_200_000 });
+			await seedLookup({ query: "Rate  Limiter", at_ms: nowMs - 3_600_000 });
+			const terms = await card();
+			expect(terms?.searches).toBe(2);
+			expect(terms?.distinctQueries).toBe(1);
+			// Shown under what was last actually sent, not the lower-cased grouping key.
+			expect(terms?.rows[0]).toMatchObject({ term: "Rate  Limiter", searches: 2 });
+		});
+
+		it("counts recall lookups in neither the totals nor the rows", async () => {
+			// `kind = 'search'` on every read is what a shared table costs. Without it a
+			// recall silently inflates the search count.
+			await seedMemory();
+			await seedLookup();
+			await seedLookup({ kind: "recall", query: null, query_key: null, target: "feature/x" });
+			const terms = await card();
+			expect(terms?.searches).toBe(1);
+			expect(terms?.rows).toHaveLength(1);
+		});
+
+		it("counts agent sessions, which a terminal search does not join", async () => {
+			// COUNT(DISTINCT) ignores NULL, and a search typed into a plain terminal has
+			// no session to attribute. So `searches` can rise without `sessions` — which
+			// is why the card says "agent sessions" rather than "sessions".
+			await seedMemory();
+			await seedLookup({ session_id: "s1" });
+			await seedLookup({ session_id: null, query: "auth guard", query_key: "auth guard" });
+			const terms = await card();
+			expect(terms?.searches).toBe(2);
+			expect(terms?.sessions).toBe(1);
+		});
+
+		it("excludes lookups outside the window", async () => {
+			await seedMemory();
+			await seedLookup({ at_ms: nowMs - 90 * 86_400_000 });
+			expect((await card())?.searches).toBe(0);
+		});
+
+		/* Queries that share NO word with each other, so each stands alone as its own
+		   term. A shared filler word ("… alpha", "… noise") is not neutral padding here
+		   — the clustering would correctly fold them into one row, which is the
+		   opposite of what these two cases set up. */
+		const UNRELATED = [
+			"deployment rollback",
+			"invoice worker",
+			"cache warmup",
+			"session pruning",
+			"webhook batching",
+			"token refresh",
+			"schema migration",
+			"queue depth",
+			"proxy timeout",
+			"index rebuild",
+		];
+
+		it("caps the rows while the totals keep counting the whole window", async () => {
+			await seedMemory();
+			for (let i = 0; i < SEARCH_TERM_ROWS_LIMIT + 2; i++) {
+				await seedLookup({ query: UNRELATED[i], query_key: UNRELATED[i] });
+			}
+			const terms = await card();
+			expect(terms?.rows).toHaveLength(SEARCH_TERM_ROWS_LIMIT);
+			// The footer's denominator comes from here, not from the rows — a card that
+			// added up what it displays would under-report the moment it capped. These
+			// queries share no word, so every one is its own term and the two totals
+			// coincide; the test above is where they must not.
+			expect(terms?.distinctQueries).toBe(SEARCH_TERM_ROWS_LIMIT + 2);
+			expect(terms?.termCount).toBe(SEARCH_TERM_ROWS_LIMIT + 2);
+		});
+
+		it("clusters over EVERY query in the window, not a top-N of them", async () => {
+			// The cap is on the clustered ROWS. Capping the queries first would hide the
+			// phrasing that names a subject, so a term could lose the very evidence it
+			// was extracted from.
+			await seedMemory();
+			for (const query of UNRELATED) await seedLookup({ query, query_key: query });
+			await seedLookup({ query: "rate limiter bursts", query_key: "rate limiter bursts" });
+			await seedLookup({ query: "rate limiter per org", query_key: "rate limiter per org" });
+			const terms = await card();
+			expect(terms?.rows[0]).toMatchObject({ term: "rate limiter", searches: 2 });
+		});
+	});
+
+	/* The detail region's bullets. It is the ONE path that parses `summary_json`
+	   for this card, so what it drops and what it keeps is the whole contract. */
+	describe("selected memory detail", () => {
+		/** One memory whose topics are given verbatim, so the unit under test is clear. */
+		async function seedTopics(topics: ReadonlyArray<Record<string, unknown>>): Promise<void> {
 			await seedMemory();
 			await withDashboardDb(
 				(db) => {
@@ -3666,7 +3955,7 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 						id: number;
 					};
 					db.prepare("UPDATE memories SET summary_json = ? WHERE repo_id = ? AND commit_hash = 'mem1'").run(
-						JSON.stringify({ commitHash: "mem1", topics: [{ title: "", decisions }] }),
+						JSON.stringify({ commitHash: "mem1", topics }),
 						id,
 					);
 				},
@@ -3674,33 +3963,86 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 			);
 		}
 
-		async function latestTitle(): Promise<string | undefined> {
+		async function detail() {
 			const model = await withDashboardDb(
 				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 				{ dbPath },
 			);
-			return model.stats?.decisions?.latest?.title;
+			return withDashboardDb((db) => readMemoryDecisions(db, "repo-1", "mem1"), { dbPath }).then((d) => ({
+				detail: d,
+				model,
+			}));
 		}
 
-		it("falls back to the clause before the first colon", async () => {
-			await seedTitlelessDecision("- **Picked SQLite**: needed local durability without a server.");
-			expect(await latestTitle()).toBe("Picked SQLite");
+		it("carries the dominant topic category, not the commit type", async () => {
+			await seedTopics([{ title: "t0", category: "bugfix", decisions: "- Picked SQLite: needed durability." }]);
+			const { detail: d } = await detail();
+			expect(d?.category).toBe("bugfix");
 		});
 
-		it("answers empty rather than a paragraph when the bullet has no colon to cut at", async () => {
-			// Measured at 314 characters against a real decisions block: with no
-			// `: ` the old fallback handed the whole bullet to a one-line card.
-			const sprawling = `Rejected the second scheduler entirely ${"because it would own the same fact twice ".repeat(6)}`;
-			expect(sprawling.length).toBeGreaterThan(120);
-			await seedTitlelessDecision(`- **${sprawling}**`);
-			expect(await latestTitle()).toBe("");
+		it("lists ONE title per decision-carrying topic, not one per bullet", async () => {
+			// The unit is what makes the list agree with the count beside it:
+			// `TOPIC_DECISIONS_CTE` emits one row per decision-carrying TOPIC, so
+			// `keptCount` and a cell's `decisionCount` are topic counts. Splitting each
+			// block into bullets printed 14 rows for a memory the card called 7.
+			await seedTopics([
+				{ title: "Fix the selection feedback", decisions: "- one: a\n- two: b\n- three: c" },
+				{ title: "Unify the two receipt tables", decisions: "- four: d\n- five: e" },
+			]);
+			const { detail: d, model } = await detail();
+			expect(d?.decisions).toEqual([
+				{ title: "Fix the selection feedback", topicIndex: 0 },
+				{ title: "Unify the two receipt tables", topicIndex: 1 },
+			]);
+			// …and that is exactly the number the grid prints for this memory.
+			const cell = (model.stats?.decisions?.perDay ?? [])
+				.flatMap((day) => day.cells)
+				.find((c) => c.commitHash === "mem1");
+			expect(cell?.decisionCount).toBe(d?.decisions.length);
 		});
 
-		// The bound only exists to stop prose; a short colon-less bullet is a
-		// perfectly good title and must survive.
-		it("keeps a colon-less bullet that is already title-length", async () => {
-			await seedTitlelessDecision("- **Picked SQLite over a server**");
-			expect(await latestTitle()).toBe("Picked SQLite over a server");
+		it("skips a topic that recorded no decision, so the list matches the count", async () => {
+			await seedTopics([
+				{ title: "Recorded nothing", decisions: "" },
+				{ title: "Recorded something", decisions: "- one: a" },
+			]);
+			const { detail: d } = await detail();
+			// `topicIndex` is the position in the WHOLE topic list, not in the filtered
+			// one — it addresses `id="topic-<index>"` on the Memories page, which
+			// renders every topic including the ones that recorded nothing.
+			expect(d?.decisions).toEqual([{ title: "Recorded something", topicIndex: 1 }]);
+		});
+
+		it("falls back to a bullet's own clause when the payload has no topic title", async () => {
+			// `TopicSummary.title` is required by the schema, so this is malformed data
+			// only — but such a topic still recorded a decision and still counts, so it
+			// must still produce a row rather than leave the list short of the count.
+			await seedTopics([{ title: "", decisions: "- Picked SQLite: needed local durability." }]);
+			const { detail: d } = await detail();
+			expect(d?.decisions).toEqual([{ title: "Picked SQLite", topicIndex: 0 }]);
+		});
+
+		it("clamps a title too long to be one", async () => {
+			const sprawling = `Rejected the second scheduler ${"because it would own the same fact twice ".repeat(20)}`;
+			expect(sprawling.length).toBeGreaterThan(DECISION_TITLE_MAX);
+			await seedTopics([{ title: sprawling, decisions: "- one: a" }]);
+			const { detail: d } = await detail();
+			const clamped = d?.decisions[0].title ?? "";
+			expect(clamped.length).toBeLessThanOrEqual(DECISION_TITLE_MAX + 1);
+			expect(clamped.endsWith("…")).toBe(true);
+			// Cut on a word BOUNDARY: what survives is a prefix of the original ending
+			// where a space follows, so the ellipsis never lands mid-token.
+			const kept = clamped.slice(0, -1);
+			expect(sprawling.startsWith(kept)).toBe(true);
+			expect(sprawling[kept.length]).toBe(" ");
+		});
+
+		it("answers undefined for a hash with no current-generation memory", async () => {
+			await seedMemory();
+			const missing = await withDashboardDb((db) => readMemoryDecisions(db, "repo-1", "nope"), { dbPath });
+			// `/api/decision-cell` turns this into a 404. An empty detail object would
+			// read as "this memory recorded nothing", which is a different fact.
+			expect(missing).toBeUndefined();
 		});
 	});
 
@@ -4046,23 +4388,28 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 		},
 	);
 
-	it("counts a decision once however many predecessors recorded it", async () => {
+	it("counts decisions over exactly the population memoriesCreated counts", async () => {
 		await seedMemory();
 		const read = async () => {
 			const model = await withDashboardDb(
 				(db) => buildDashboardModel(db, { view: "stats", scope: { kind: "all" }, timeZone: "UTC", nowMs }),
 				{ dbPath },
 			);
-			return { captured: model.stats?.decisionsCaptured, kept: model.stats?.decisions?.keptCount };
+			return {
+				captured: model.stats?.decisionsCaptured,
+				kept: model.stats?.decisions?.keptCount,
+				memories: model.stats?.memoriesCreated,
+			};
 		};
 		const before = await read();
 		expect(before.captured).toBeGreaterThan(0);
 
-		// The same defect as the axis test above, one card over: a predecessor
-		// keeps its OWN topics, and every consumer of TOPIC_INSIGHTS_CTE joins
-		// `commits`, which keeps the predecessor's row. Unfiltered, the decision
-		// this branch reached once is counted once per amend — right beside
-		// `memoriesCreated`, which filters the same history out via isReachable.
+		// A predecessor keeps its OWN topics, and this card joins `commits`, which
+		// keeps rows git can no longer reach — so an amended-away generation would
+		// have its decision counted again on every rewrite. `c.reachable = 1` is
+		// what excludes it, and that is deliberately the ONLY generation rule on
+		// this path: `TOPIC_DECISIONS_CTE` carries no `parent_hash IS NULL` of its
+		// own (see its docblock — restoring one is a review blocker).
 		for (const n of [1, 2]) {
 			await seedSupersededPredecessor(dbPath, "mem1", `mem1-dec-${n}`, {
 				branch: "feature/dash",
@@ -4070,11 +4417,30 @@ describe("buildDashboardModel — memory tier (phase 2)", () => {
 				tokens: 20000,
 				estCostUsd: 3,
 				committedAtMs: nowMs - 3 * 3_600_000,
+				reachable: 0,
 				topics: [{ title: "Retry policy", category: "bugfix", decisions: "- Keep jittered backoff." }],
 			});
 		}
-
 		expect(await read()).toEqual(before);
+
+		// The other side of the same rule, and the defect that retired the CTE's
+		// filter: a child memory whose commit is still REACHABLE is a cell the
+		// waffle draws and `memoriesCreated` counts, so its decisions belong to the
+		// figure printed directly above it. Filtering on the memory's generation
+		// drew that cell quiet while `/memories?hash=` listed the decisions it had
+		// just reported none of.
+		await seedSupersededPredecessor(dbPath, "mem1", "mem1-dec-live", {
+			branch: "feature/dash",
+			childPos: 20,
+			tokens: 20000,
+			estCostUsd: 3,
+			committedAtMs: nowMs - 3 * 3_600_000,
+			topics: [{ title: "Retry policy", category: "bugfix", decisions: "- Keep jittered backoff." }],
+		});
+		const after = await read();
+		expect(after.memories).toBe((before.memories ?? 0) + 1);
+		expect(after.captured).toBe((before.captured ?? 0) + 1);
+		expect(after.kept).toBe((before.kept ?? 0) + 1);
 	});
 
 	it("builds the ticket dimension with a (no ticket) bucket", async () => {

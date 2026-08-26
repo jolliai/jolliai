@@ -23,7 +23,11 @@
  *
  * The map is exactly `SYNCED_TABLES`, and `SessionPushManifest.test.ts` asserts
  * that: a stamped table that is not sent is either a missing decision or a stale
- * stamp. `recall_receipts` is the stale case and has no entry here — it left the
+ * stamp. `memory_lookups` is the not-yet case and has no entry here — it carries a
+ * stamp column and a keyset index built in advance, but the backend has not listed
+ * the table yet, so sending would upload into a void (its own entry in
+ * `NEVER_SYNCED_TABLES` carries the full flip checklist). Its predecessor
+ * `recall_receipts` is the stale case and has no entry here either — it left the
  * channel, while its stamp column and the two indexes behind the channel's paging
  * stay in the schema because they have already been migrated.
  *

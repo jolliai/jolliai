@@ -3190,7 +3190,7 @@ describe("Decisions card gist (Stats view only)", () => {
 	// behind entirely. There is nothing left to gate — the display-time LLM call
 	// that used to compress that prose is retired (JOLLI-2209), so a token-free
 	// call gets the identical payload.
-	it("serves the latest decision as its topic title, with no decision prose on the wire", async () => {
+	it("names the default cell by identity, with no decision prose on the wire", async () => {
 		const dbPath = join(dir, "dashboard.db");
 		await seedDecisionCommit(dbPath, "mem1", "- **Picked SQLite**: needed local durability without a server.");
 
@@ -3200,11 +3200,12 @@ describe("Decisions card gist (Stats view only)", () => {
 		const res = await get(port, "/api/model?view=stats", { "X-Jolli-Dashboard-Token": "tok" });
 
 		expect(res.status).toBe(200);
-		const latest = ((await res.json()) as DashboardModel).stats?.decisions?.latest;
-		// `t0` is seedDecisionCommit's topic title.
-		expect(latest).toMatchObject({ commitHash: "mem1", title: "t0" });
-		expect(latest).not.toHaveProperty("text");
-		expect(latest).not.toHaveProperty("gist");
+		const selected = ((await res.json()) as DashboardModel).stats?.decisions?.selected;
+		// The DEFAULT selection travels with its detail so the first paint needs no
+		// request. Topic TITLES, not the prose behind them — about 500 bytes for one
+		// memory, against a request node would serve on the same thread as this build.
+		expect(selected).toMatchObject({ commitHash: "mem1", decisions: [{ title: "t0", topicIndex: 0 }] });
+		expect(selected).not.toHaveProperty("text");
 	});
 
 	it("serves a token-free stats call the same decision payload", async () => {
@@ -3217,10 +3218,33 @@ describe("Decisions card gist (Stats view only)", () => {
 		const res = await get(port, "/api/model?view=stats");
 
 		expect(res.status).toBe(200);
-		expect(((await res.json()) as DashboardModel).stats?.decisions?.latest).toMatchObject({
+		expect(((await res.json()) as DashboardModel).stats?.decisions?.selected).toMatchObject({
 			commitHash: "mem1",
-			title: "t0",
 		});
+	});
+
+	it("serves one memory's detail on demand, and 404s a hash it has no memory for", async () => {
+		const dbPath = join(dir, "dashboard.db");
+		await seedDecisionCommit(dbPath, "mem1", "- **Picked SQLite**: needed local durability without a server.");
+		const port = await listen(
+			createDashboardServer({ port: 0, assetsDir, dbPath, configDir: join(dir, "config"), token: "tok" }),
+		);
+
+		const ok = await get(port, "/api/memory-decisions?detailRepo=repo-1&hash=mem1");
+		expect(ok.status).toBe(200);
+		expect(await ok.json()).toMatchObject({
+			commitHash: "mem1",
+			// The owning TOPIC's title (`t0` in seedDecisionCommit), one row per
+			// decision-carrying topic — not the prose, and not one row per bullet.
+			decisions: [{ title: "t0", topicIndex: 0 }],
+		});
+
+		// A real answer, not an empty detail object: the memory may have been
+		// regenerated or its commit rewritten under the reader, and an empty body
+		// would read as "this memory recorded nothing".
+		expect((await get(port, "/api/memory-decisions?detailRepo=repo-1&hash=nope")).status).toBe(404);
+		expect((await get(port, "/api/memory-decisions?detailRepo=repo-1")).status).toBe(400);
+		expect((await get(port, "/api/memory-decisions?hash=mem1")).status).toBe(400);
 	});
 
 	it("filters the standup board to the local git identity, read per enabled repo", async () => {

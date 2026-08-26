@@ -10,7 +10,7 @@
  */
 
 import { readFileSync } from "node:fs";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { MEMORY_CARD_MAJOR_LINES } from "./DashboardModel.js";
 
 interface SeriesPoint {
@@ -34,6 +34,17 @@ interface JDNamespace {
 		limit: number,
 	) => { keys: ReadonlyArray<string>; series: ReadonlyArray<SeriesPoint>; byKey: Record<string, number> };
 	fmtUsd: (n: number) => string;
+	/* The per-memory decisions the card fetches, cached by `decisionCellKey`, plus
+	   the click that selected one and the key whose fetch failed. All three are keyed
+	   on (repoIdentity, commitHash) — never the hash alone, which two registered
+	   repos can share. */
+	decisionCell: string | null;
+	decisionCellDetail: Record<string, unknown>;
+	decisionCellError: string | null;
+	decisionCellKey: (cell: { repoIdentity: string; commitHash: string }) => string;
+	/* Which search term is expanded. Pure view state — the queries behind it ride on
+	   the payload, so unlike the decisions panel there is nothing to fetch or cache. */
+	searchTermOpen: string | null;
 }
 
 /** Minimal element stub: enough for the renderer to write into and be read back. */
@@ -559,17 +570,16 @@ describe("widget card heads", () => {
 	const DECISIONS_DATA = { decisions: { keptCount: 4, repoCount: 1, perDay: [] } };
 	const TOKENS_DATA = { tokenBreakdown: { input: 700, output: 200, cached: 100, perDay: [] } };
 
-	it("hands Decisions' kept count to the head's aside at span6", () => {
+	it("keeps Decisions' kept count OUT of the head, in the shared headline block", () => {
 		const head = headOf("Decisions", DECISIONS_DATA);
-		// The spacer is `widgetHead`'s aside branch, and nothing else emits it.
-		expect(head).toContain('<div class="spacer"></div>');
-		expect(head).toContain("4 kept");
-		// 18px, the size Spend's figure uses beside it in the same band — a headline
-		// figure that disagreed with its own row's other card would read as a
-		// different kind of number.
-		expect(head).toContain("font-size:18px");
-		// And it is no longer under the title, which is what the seat change bought.
-		expect(titleBlockOf("Decisions", DECISIONS_DATA)).not.toContain("4 kept");
+		// `widgetHead`'s aside branch — the spacer is the only thing that emits it —
+		// is deliberately unused here. The sub under this figure is a whole sentence
+		// naming two denominators, and a sentence right-aligned against the card edge
+		// reads as a caption for the title rather than for the number.
+		expect(head).not.toContain('<div class="spacer"></div>');
+		expect(head).not.toContain("4 kept");
+		// It lives in `.card-headline`, which the Search Terms card shares.
+		expect(decisionsHtml(DECISIONS_DATA.decisions)).toContain('<div class="card-headline"><div class="num">4 kept');
 		// The slice really is the WHOLE head. An aside nests two more divs, so the
 		// scan this replaced — "to the first `</div></div>`" — stopped inside it and
 		// left every negative assertion over a head weaker than it reads.
@@ -728,29 +738,161 @@ function barWidths(html: string): ReadonlyArray<number> {
 
 /** The Decisions card, sliced out of the same rendered page. */
 function decisionsHtml(decisions: Record<string, unknown> | undefined): string {
+	return cardHtml("Decisions", { decisions });
+}
+
+/** One card, sliced out of the same rendered page. */
+function cardHtml(label: string, stats: Record<string, unknown>): string {
 	app.innerHTML = "";
-	JD.renderStats(model({}, { decisions }));
+	JD.renderStats(model({}, stats));
 	const html = app.innerHTML;
-	const start = html.indexOf('aria-label="Decisions"');
+	const start = html.indexOf(`aria-label="${label}"`);
 	expect(start).toBeGreaterThan(-1);
 	return html.slice(start, html.indexOf("</section>", start));
 }
 
-const LATEST = {
-	title: "Verify before documenting an exact ticket match",
+const CELL = {
 	commitHash: "h1",
-	repoName: "jolliai",
 	repoIdentity: "https://github.com/jolliai/jolliai",
-	committedAtMs: Date.parse("2026-07-27T16:54:00Z"),
+	title: "Verify before documenting an exact ticket match",
+	decisionCount: 2,
 };
 
-const DECISIONS = { keptCount: 4, repoCount: 1, latest: LATEST, perDay: [{ date: "2026-07-30", count: 4 }] };
+/** What `/api/memory-decisions` answers, as the page caches it on `JD`. */
+const DETAIL = {
+	commitHash: "h1",
+	repoIdentity: "https://github.com/jolliai/jolliai",
+	repoName: "jolliai",
+	title: "Verify before documenting an exact ticket match",
+	category: "bugfix",
+	decisions: [
+		{ title: "Store the quota window start", topicIndex: 0 },
+		{ title: "Keep the audit log append-only", topicIndex: 2 },
+	],
+};
+
+/** A second cell, so the fetch-driven states have a cell that is NOT the default. */
+const CELL2 = { ...CELL, commitHash: "h2", title: "Another memory" };
+
+const DECISIONS = {
+	keptCount: 4,
+	repoCount: 1,
+	perDay: [{ date: "2026-07-30", cells: [CELL, CELL2] }],
+	// The default selection travels WITH its detail, so the first paint needs no
+	// request — see MemoryDecisions.
+	selected: DETAIL,
+};
+
+/**
+ * Renders as if the reader had clicked a cell that is not the default.
+ *
+ * Keyed through `JD.decisionCellKey` rather than by hash, because that is what the
+ * page stores: a harness that keyed the cache by hash would keep passing after the
+ * page went back to doing the same, which is the collision this pair guards.
+ */
+function withClicked(
+	cell: { repoIdentity: string; commitHash: string },
+	detail: Record<string, unknown> | null,
+	run: () => void,
+): void {
+	const key = JD.decisionCellKey(cell);
+	JD.decisionCell = key;
+	JD.decisionCellDetail = detail ? { [key]: detail } : {};
+	try {
+		run();
+	} finally {
+		JD.decisionCell = null;
+		JD.decisionCellDetail = {};
+	}
+}
+
+/** Renders with the default cell's detail already fetched, which is the loaded state. */
+function withDetail(detail: Record<string, unknown> | null, run: () => void): void {
+	JD.decisionCellDetail = detail ? { [JD.decisionCellKey(CELL)]: detail } : {};
+	try {
+		run();
+	} finally {
+		JD.decisionCellDetail = {};
+	}
+}
 
 describe("Decisions card", () => {
-	it("shows the decision's topic title, opening that memory in a new tab", () => {
+	/* The card fires its default fetch from `wireDecisionCells`, and in this harness
+	   that request always rejects — there is no server. Its `.catch` lands
+	   ASYNCHRONOUSLY, so without this reset the failure state leaks into whichever
+	   case runs next and it reads as that case's own bug. */
+	beforeEach(() => {
+		JD.decisionCell = null;
+		JD.decisionCellDetail = {};
+		JD.decisionCellError = null;
+	});
+
+	it("draws one cell per memory, each carrying its own memory title as the tooltip", () => {
 		const html = decisionsHtml(DECISIONS);
+		// The tooltip is on the CELL, not the column: it names the memory, which is
+		// the only way a reader can tell one square from another.
+		expect(html).toContain('title="Verify before documenting an exact ticket match — 2 decisions"');
+		expect(html).toContain('data-decision-cell="h1"');
+		// A button, so it is a SELECTOR rather than a link — the deep link belongs to
+		// the detail region, and one click cannot mean both "show me this" and "take
+		// me away from here". Being a real button is also what makes the selection
+		// ring an `outline` (outside the square) instead of a stroke inside it.
+		expect(html).toContain('<button type="button" class="dec-cell');
+	});
+
+	it("marks the selected cell, and separates the two states by class", () => {
+		const html = decisionsHtml(DECISIONS);
+		expect(html).toContain("is-selected");
+		// A cell that recorded something carries no extra class; the quiet ones do.
+		expect(html).not.toContain("is-quiet");
+	});
+
+	it("says none-recorded on a cell that has no decision rather than leaving it bare", () => {
+		const html = decisionsHtml({
+			...DECISIONS,
+			perDay: [{ date: "2026-07-30", cells: [{ ...CELL, decisionCount: 0 }] }],
+		});
+		expect(html).toContain("— no decisions");
+		expect(html).toContain("is-quiet");
+	});
+
+	it("renders the default selection's decisions with no request at all", () => {
+		// The payload carries them. This is the case a spinner used to sit on: the
+		// first paint fired a fetch whose response was then rejected by a guard that
+		// compared against `JD.decisionCell`, which the default selection never sets.
+		const html = decisionsHtml(DECISIONS);
+		expect(html).toContain("Store the quota window start");
+		expect(html).not.toContain("Loading decisions…");
+	});
+
+	it("names a clicked memory immediately and waits only for its decisions", () => {
+		// The head comes from the CELL, which is already on the payload, so a click is
+		// acknowledged at once. Blanking the whole panel while loading would make every
+		// click look like it had cleared the card.
+		let html = "";
+		withClicked(CELL2, null, () => {
+			html = decisionsHtml(DECISIONS);
+		});
+		expect(html).toContain("<strong>Another memory</strong>");
+		expect(html).toContain("Loading decisions…");
+	});
+
+	it("shows the fetched category and decisions, opening the memory in a new tab", () => {
+		let html = "";
+		withDetail(DETAIL, () => {
+			html = decisionsHtml(DECISIONS);
+		});
 		expect(html).toContain("<strong>Verify before documenting an exact ticket match</strong>");
 		expect(html).toContain('class="dec-jump"');
+		expect(html).toContain("Store the quota window start");
+		// Each row lands on ITS OWN topic. They all pointed at the section header
+		// (`#what-changed`) while this region showed one "latest decision"; listing
+		// several made that seven rows scrolling to the same place.
+		expect(html).toContain("#topic-0");
+		expect(html).toContain("#topic-2");
+		// `ux`/`bugfix` are TopicCategory, the same chip Memory Activity's rows carry
+		// — not `commitType`.
+		expect(html).toContain('<span class="mem-activity-category">bugfix</span>');
 		// The SAME deep link the memory's own row carries, so the decision and the
 		// row lead to one place. `detailRepo`, not `repo`: it names the owning repo
 		// without scoping the Memories tree to it.
@@ -762,33 +904,259 @@ describe("Decisions card", () => {
 	it("lands on the memory's topics, at the same anchor the feed's count uses", () => {
 		// `#what-changed` is the topics section's own header in `memories.js`. One
 		// anchor serves both callers, and neither can address anything finer: the
-		// feed's chip knows a decision COUNT, and `DecisionRecord` carries no topic
-		// index — `buildDecisionsCard`'s ordering settles which topic it MEANS, not
-		// where the link goes.
+		// feed's chip knows a decision COUNT, and a cell carries no topic index.
 		expect(decisionsHtml(DECISIONS)).toContain(
 			'href="/memories?repo=jolliai&range=month&dimension=model&hash=h1&detailRepo=https%3A%2F%2Fgithub.com%2Fjolliai%2Fjolliai#what-changed"',
 		);
 	});
 
-	// The card used to render the whole decisions block through an inline-only
-	// markdown renderer — measured at ~1,900 characters on a real memory.
-	it("renders no decision prose and no quote marks", () => {
-		const html = decisionsHtml({ ...DECISIONS, latest: { ...LATEST, text: "picked sqlite because…" } });
-		expect(html).not.toContain("picked sqlite");
-		expect(html).not.toContain("“");
-		expect(html).not.toContain("undefined");
+	it("states that a memory recorded nothing rather than collapsing to blank space", () => {
+		// A third of the squares are this state, so it has to be a thing the card SAYS.
+		let html = "";
+		withClicked(CELL2, { ...DETAIL, commitHash: "h2", decisions: [] }, () => {
+			html = decisionsHtml(DECISIONS);
+		});
+		expect(html).toContain("This memory recorded no decisions.");
 	});
 
-	// Needs a payload carrying neither a topic title nor a parseable decision
-	// line — an empty quote block would be worse than none.
-	it("omits the quote entirely when the title came back empty", () => {
-		expect(decisionsHtml({ ...DECISIONS, latest: { ...LATEST, title: "" } })).not.toContain("dec-quote");
+	it("lists one row per decision-carrying topic, uncapped and clickable", () => {
+		// It was capped at two and each was dropped whole past 140 characters —
+		// measured against real data, that rule discarded every bullet there was and
+		// left the card claiming a five-decision memory had recorded none.
+		let html = "";
+		withClicked(
+			CELL2,
+			{ ...DETAIL, commitHash: "h2", decisions: [0, 1, 2, 3].map((i) => ({ title: `d${i}`, topicIndex: i })) },
+			() => {
+				html = decisionsHtml(DECISIONS);
+			},
+		);
+		// Each row is a LINK into the memory that recorded it — a `<li>` the reader
+		// cannot act on was the shape this replaced.
+		expect(html.match(/class="dec-row"/g) ?? []).toHaveLength(4);
 	});
 
-	it("renders the card with no quote at all when the window holds no decisions", () => {
+	it("says the window is empty when it holds no memory at all", () => {
+		// A third state, distinct from "not enabled" and from "recorded no decisions".
 		const html = decisionsHtml({ keptCount: 0, repoCount: 0, perDay: [] });
 		expect(html).toContain("0 kept");
-		expect(html).not.toContain("dec-quote");
+		expect(html).toContain("No memories in this window.");
+	});
+
+	it("asks the reader to pick when the window has cells but the payload has no default", () => {
+		// `selected` is simply ABSENT whenever the server could not read a default —
+		// see `pickDefaultSelection`, whose probe budget this is the residue of — and
+		// on the wire that is indistinguishable from an empty window unless the CELLS
+		// are consulted. They used to share one sentence, so a full waffle whose own
+		// sub-line read "38 memories" printed "No memories in this window." directly
+		// under it, on first paint, with nothing to click that would clear it.
+		const html = decisionsHtml({ keptCount: 4, repoCount: 1, perDay: [{ date: "2026-07-30", cells: [CELL] }] });
+		expect(html).toContain("Pick a square to see the decisions behind it.");
+		expect(html).not.toContain("No memories in this window.");
+		// The waffle itself is unaffected — the cell is still there and still clickable.
+		expect(html).toContain('data-decision-cell="h1"');
+	});
+
+	/* Two registered repos sharing one commit hash — a fork or a vendored tree, which
+	   the SERVER already guards (`decisionCountsFor` scopes on `repo_id`, and every
+	   cell carries its own `repoIdentity`). The page used to key selection, the ring,
+	   the detail cache, the error marker and the fetch guard on the hash alone, which
+	   collapsed both cells onto whichever one came first: two rings for one click, and
+	   the second repo's memory unreachable behind a cache entry belonging to the
+	   first. */
+	describe("two repos sharing a commit hash", () => {
+		const FORK_CELL = { ...CELL, repoIdentity: "https://github.com/other/jolliai", title: "The fork memory" };
+		const SHARED = {
+			keptCount: 4,
+			repoCount: 2,
+			perDay: [{ date: "2026-07-30", cells: [CELL, FORK_CELL] }],
+			selected: DETAIL,
+		};
+
+		it("rings only the selected repo's cell, not every cell with that hash", () => {
+			const html = decisionsHtml(SHARED);
+			// Both cells are drawn under the same hash, distinguished by their repo.
+			expect(html.match(/data-decision-cell="h1"/g) ?? []).toHaveLength(2);
+			expect(html.match(/class="dec-cell is-selected"/g) ?? []).toHaveLength(1);
+			// And it is the DEFAULT selection's repo that carries the ring, which is
+			// only decidable from `data-decision-repo`.
+			const selected = html.indexOf("dec-cell is-selected");
+			expect(html.slice(selected, selected + 200)).toContain(
+				'data-decision-repo="https://github.com/jolliai/jolliai"',
+			);
+		});
+
+		it("shows the clicked repo's own memory rather than the other repo's cached detail", () => {
+			// The default selection's detail is inlined on the payload under the FIRST
+			// repo's identity. Clicking the fork's cell must not read it: keyed by hash
+			// alone, `detailForCell` answered "already to hand" and the panel rendered
+			// this repo's title over the other one's decisions, with no request ever sent.
+			let html = "";
+			withClicked(FORK_CELL, null, () => {
+				html = decisionsHtml(SHARED);
+			});
+			expect(html).toContain("<strong>The fork memory</strong>");
+			expect(html).toContain("Loading decisions…");
+			expect(html).not.toContain("Store the quota window start");
+			// The deep link goes to the fork's row, not the first repo's.
+			expect(html).toContain("detailRepo=https%3A%2F%2Fgithub.com%2Fother%2Fjolliai");
+		});
+
+		it("keeps each repo's fetched decisions to itself", () => {
+			let html = "";
+			withClicked(
+				FORK_CELL,
+				{
+					...DETAIL,
+					repoIdentity: FORK_CELL.repoIdentity,
+					decisions: [{ title: "Fork own call", topicIndex: 1 }],
+				},
+				() => {
+					html = decisionsHtml(SHARED);
+				},
+			);
+			expect(html).toContain("Fork own call");
+			expect(html).not.toContain("Store the quota window start");
+		});
+	});
+});
+
+describe("Memory Top Search Terms card", () => {
+	const TERMS = {
+		searches: 11,
+		distinctQueries: 8,
+		sessions: 3,
+		// Fewer terms than queries, always: several phrasings collapse onto one. The
+		// footer's denominator is THIS number, which is why the fixture keeps them
+		// distinct.
+		termCount: 4,
+		rows: [
+			{
+				term: "rate limiter",
+				searches: 7,
+				queries: ["how did we handle rate limiter bursts", "rate limiter retry-after"],
+			},
+		],
+	};
+
+	function searchHtml(searchTerms: Record<string, unknown> | undefined): string {
+		return cardHtml("Memory Top Search Terms", { searchTerms });
+	}
+
+	it("takes its two sub-line figures from the server, not from the rows on screen", () => {
+		const html = searchHtml(TERMS);
+		expect(html).toContain("11 searches");
+		// 8 distinct queries behind 1 visible row: summing what is displayed would
+		// under-report the moment the list caps.
+		expect(html).toContain("8 distinct queries · 3 agent sessions");
+		// "agent sessions", because COUNT(DISTINCT session_id) skips a terminal search.
+		expect(html).not.toContain("3 sessions<");
+	});
+
+	it("states the whole TERM count in the footer, never the query count", () => {
+		// `termCount`, not `distinctQueries`: the sub-line's 8 counts phrasings, and
+		// several of those collapse onto one term. Reading the denominator off it
+		// claimed rows that do not exist — "Showing 3 of 43 terms" for a window that
+		// held three terms and was showing all of them.
+		expect(searchHtml(TERMS)).toContain("Showing 1 of 4 terms");
+		expect(searchHtml(TERMS)).not.toContain("of 8 terms");
+		// This list does not page, so no button — one that could only ever be pressed
+		// once is chrome pretending to be an affordance.
+		expect(searchHtml(TERMS)).not.toContain("data-toolmore");
+	});
+
+	it("sets a term in prose type, not the code type an identifier gets", () => {
+		// Monospace is for identifiers — a skill name, an MCP server — where the shape
+		// of the string is part of reading it. A search term is a phrase someone typed.
+		const html = searchHtml(TERMS);
+		expect(html).toContain('<span class="rl-name" title="rate limiter"');
+		expect(html).not.toContain("rl-name mono");
+		// …while the lists that DO name identifiers keep it.
+		expect(
+			usageHtml("Skills", {
+				skills: [{ name: "code-review", kind: "skill", sessions: 1, calls: 1, agents: [] }],
+				skillsTotal: 1,
+				skillCallsTotal: 1,
+			}),
+		).toContain("rl-name mono");
+	});
+
+	it("makes each row an expander rather than a jump to a detail page", () => {
+		const html = searchHtml(TERMS);
+		expect(html).toContain('data-search-term="rate limiter"');
+		// `rl-term` is what earns the hover underline — the Skills/MCP rows carry
+		// `rl-click` too and they navigate, so the affordance must not be shared.
+		expect(html).toContain('class="rl-click rl-term"');
+		expect(html).toContain('aria-expanded="false"');
+		expect(html).not.toContain("data-skill=");
+		expect(html).not.toContain("data-mcp=");
+	});
+
+	it("leaves a one-query term as plain text rather than a button that reveals nothing", () => {
+		const html = searchHtml({
+			...TERMS,
+			rows: [{ term: "queue depth", searches: 1, queries: ["queue depth"] }],
+		});
+		expect(html).not.toContain("data-search-term=");
+		expect(html).toContain("queue depth");
+	});
+
+	it("renders nothing extra while the row is closed", () => {
+		expect(searchHtml(TERMS)).not.toContain("rl-expand");
+	});
+
+	it("reveals the queries the term was extracted from, with no request", () => {
+		// They are the same strings the card already loaded to compute the term, so a
+		// fetch would be a round trip for something in memory. This replaced an
+		// expansion that re-ran the SEARCH — a per-repo Orama index, scores that do not
+		// compare across repos, and today's answer to a question about what was asked.
+		JD.searchTermOpen = "rate limiter";
+		try {
+			const html = searchHtml(TERMS);
+			expect(html).toContain("how did we handle rate limiter bursts");
+			expect(html).toContain("rate limiter retry-after");
+		} finally {
+			JD.searchTermOpen = null;
+		}
+	});
+
+	it("prompts rather than showing an empty card when nothing has been searched", () => {
+		expect(
+			searchHtml({ ...TERMS, searches: 0, distinctQueries: 0, sessions: 0, termCount: 0, rows: [] }),
+		).toContain("No searches in this window");
+	});
+
+	it("locks the card below the memory tier, like Decisions", () => {
+		expect(searchHtml(undefined)).toContain("locked-panel");
+	});
+});
+
+/* `rankedList` grew a trailing options object for the Search Terms card's
+   expansion. The three lists that were already there pass none, so their markup
+   must be exactly what it was — a shared row builder that quietly changes shape
+   for its existing callers is how one card's feature becomes another card's bug. */
+describe("rankedList options are inert for the callers that pass none", () => {
+	const skills = {
+		skills: [{ name: "code-review", kind: "skill", sessions: 3, calls: 4, agents: [] }],
+		skillsTotal: 1,
+		skillCallsTotal: 4,
+	};
+
+	it("emits no expansion slot and no row attributes on a Skills row", () => {
+		const html = usageHtml("Skills", skills);
+		expect(html).not.toContain("rl-expand");
+		expect(html).not.toContain("data-search-term");
+		// The row keeps the jump it always had, and nothing else.
+		expect(html).toContain('data-skill="code-review"');
+	});
+
+	it("emits no expansion slot on either MCP list", () => {
+		const html = usageHtml("MCPs", {
+			servers: [{ server: "linear", tools: 2, calls: 9, agents: [] }],
+			serversTotal: 1,
+			mcpCallsTotal: 9,
+		});
+		expect(html).not.toContain("rl-expand");
 	});
 });
 

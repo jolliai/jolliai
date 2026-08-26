@@ -22,7 +22,7 @@ import { collectDisplayTopics } from "../core/SummaryTree.js";
 import { TOOL_RECORDING_SOURCES } from "../core/TranscriptParser.js";
 import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import { createLogger, errMsg } from "../Logger.js";
-import type { CommitSummary, SkillEntryPath } from "../Types.js";
+import type { CommitSummary, SkillEntryPath, TopicSummary } from "../Types.js";
 import { ACTIVITY_BUCKET_MS } from "./ActivityBuckets.js";
 import { buildCoaching } from "./CoachingQuery.js";
 import type { DashboardDbHandle } from "./DashboardDb.js";
@@ -36,8 +36,9 @@ import type {
 	DashboardScope,
 	DashboardView,
 	DaySeriesPoint,
-	DecisionRecord,
+	DecisionDay,
 	DecisionsCard,
+	DecisionTopicRef,
 	FunStats,
 	GraphModel,
 	HeatmapCell,
@@ -47,8 +48,11 @@ import type {
 	McpServerDetail,
 	McpServerRow,
 	MemoryCard,
+	MemoryCell,
+	MemoryDecisions,
 	RecentSession,
 	RepoOption,
+	SearchTermsCard,
 	SeriesDimension,
 	SettingsPageModel,
 	SkillDayPoint,
@@ -68,14 +72,18 @@ import type {
 	ToolUsageTokens,
 } from "./DashboardModel.js";
 import {
+	clampLabel,
 	commitCategoryLabels,
+	mcpServerKeySql,
 	placeholders,
 	type ResolvedScope,
 	resolveScope,
 	scopeFilter,
 	scopeToRepoIds,
 	splitDecisionBullets,
+	stripOpaqueMcpServerIdPrefix,
 	stripPluginPrefixSql,
+	UNIDENTIFIED_MCP_SERVER,
 } from "./DashboardScopeUtil.js";
 import {
 	addLocalDays,
@@ -85,6 +93,7 @@ import {
 	machineTimeZone,
 	startOfLocalDay,
 } from "./LocalDays.js";
+import { clusterSearchTerms } from "./LookupQuery.js";
 import { buildMemories } from "./MemoriesQuery.js";
 import { volumeReachable } from "./RepoForget.js";
 import { type DayPlan, planDays, readRollupSeries, TOKENS_KIND } from "./StatsRollup.js";
@@ -94,11 +103,15 @@ import { WORKTREE_STATUS_MAX_AGE_MS } from "./StatsWriter.js";
 const log = createLogger("DashboardQuery");
 
 import {
+	DECISION_TITLE_MAX,
 	isRecallMcpToolName,
 	MCP_DETAIL_TOOL_LIMIT,
 	MEMORY_CARD_MAJOR_LINES,
 	MEMORY_CARDS_LIMIT,
 	RECALL_MCP_TOOL_NAME,
+	SEARCH_TERM_MAX,
+	SEARCH_TERM_QUERIES_LIMIT,
+	SEARCH_TERM_ROWS_LIMIT,
 	TOOL_ROWS_LIMIT,
 } from "./DashboardModel.js";
 
@@ -407,6 +420,21 @@ interface CommitRow {
 	 */
 	readonly root_hash: string | null;
 	/**
+	 * The MEMORY's own `commit_hash`, which is NOT always {@link hash}: a commit
+	 * rewritten after it was summarized keeps its memory filed under the pre-rewrite
+	 * hash, and `/memories?hash=` resolves against `memories.commit_hash`. Anything
+	 * that builds a link into a memory must use this; null when the commit has no
+	 * memory at all.
+	 */
+	readonly memory_hash: string | null;
+	/**
+	 * `memories.commit_message` — the memory's own title, which is what the feed row
+	 * renders. Deliberately not {@link message} (`commits.message`): the two can
+	 * differ once a memory is regenerated, and one memory showing two different
+	 * titles on one page is the defect this column exists to avoid.
+	 */
+	readonly memory_message: string | null;
+	/**
 	 * `commits.reachable` (0/1) — maintained asynchronously (see COMMIT_REACHABLE_DDL),
 	 * so the callers that DO filter rewritten-away commits (the "captured" count, the
 	 * standup board) read it here instead of a per-request `git rev-list`. The heatmap
@@ -444,7 +472,10 @@ function commitsInRange(
 			        COALESCE(m.turns, ma.turns) AS turns, COALESCE(m.tokens, ma.tokens) AS tokens,
 			        COALESCE(m.est_cost_usd, ma.est_cost_usd) AS est_cost_usd,
 			        COALESCE(m.ticket_id, ma.ticket_id) AS ticket_id,
-			        COALESCE(m.root_hash, ma.root_hash) AS root_hash, r.repo_name, r.repo_identity, c.reachable
+			        COALESCE(m.root_hash, ma.root_hash) AS root_hash,
+			        COALESCE(m.commit_hash, ma.commit_hash) AS memory_hash,
+			        COALESCE(m.commit_message, ma.commit_message) AS memory_message,
+			        r.repo_name, r.repo_identity, c.reachable
 			   FROM commits c JOIN repos r ON r.id = c.repo_id
 			   LEFT JOIN memories m ON m.repo_id = c.repo_id AND m.commit_hash = c.hash
 			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
@@ -471,13 +502,31 @@ function commitsInRange(
  * row holds is the whole `decisions` block, which is prose and has no title in
  * it to recover.
  *
- * **`m.parent_hash IS NULL`** — the same "current generation" rule
- * {@link buildSeries} states at length, for the same reason and with the same
- * trap. `memories` holds one row per GENERATION, so a branch amended or squashed
- * four times keeps its predecessors' topics, and every consumer of this CTE
- * joins `commits`, which retains the predecessors' rows. Unfiltered, one
- * decision is counted once per rewrite — directly beside `memoriesCreated`,
- * which filters the same history out via `isReachable`.
+ * ## Why there is no generation filter, and why adding one back is a review blocker
+ *
+ * There was: `m.parent_hash IS NULL`, so only the CURRENT generation of a
+ * rewritten branch contributed rows. It was answering the right question at the
+ * wrong altitude, and the answer it gave was visible as a lie.
+ *
+ * `memories` holds one row per GENERATION, so a branch amended or squashed four
+ * times keeps its predecessors' rows, and counting all of them would count one
+ * decision once per rewrite. But **which generation is live is a property of the
+ * commit, not of the memory**, and both consumers already say so: the Decisions
+ * card enters from `commits` under `c.reachable = 1` (a superseded generation
+ * whose commit no ref reaches contributes nothing, and that is the same
+ * predicate `memoriesCreated` applies), and {@link decisionCountsFor} is handed
+ * an explicit page of hashes. Restating the rule here was therefore redundant in
+ * the case it was written for and WRONG in the case it was not: a commit whose
+ * memory was folded into a later root while the commit itself stayed reachable
+ * is a cell the waffle draws and `memoriesCreated` counts — and it was drawn
+ * quiet, reporting zero decisions, while `/memories?hash=` (which has no such
+ * filter, see `buildMemoryDetail`) opened the same memory and listed them.
+ * Measured on a real database: 8 of 121 cells addressed a child memory, 4 of
+ * them carrying decision-bearing topics of their own.
+ *
+ * So the rule is the same one the retired `kind` column left behind — a
+ * consumer says which memories it wants at the point it asks, and this
+ * derivation makes rows for all of them.
  *
  * ## Why there is no `todo` branch, and no `kind` column
  *
@@ -513,8 +562,7 @@ const TOPIC_DECISIONS_CTE = `WITH topic_decisions AS (
 	       TRIM(COALESCE(json_extract(t.value, '$.title'), '')) AS topic_title,
 	       t.key * 2 AS ord
 	  FROM memories m, json_each(m.summary_json, '$.topics') t
-	 WHERE m.parent_hash IS NULL
-	   AND TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
+	 WHERE TRIM(COALESCE(json_extract(t.value, '$.decisions'), '')) <> ''
 )`;
 
 const totalTokens = (row: SessionRow): number => row.input_tokens + row.output_tokens + row.cached_tokens;
@@ -750,48 +798,6 @@ function readPricesAsOf(db: DashboardDbHandle, scope: DashboardScope): string | 
 }
 
 /**
- * Longest fallback title {@link decisionTitle} will emit, past which it answers
- * `""` instead.
- *
- * Sized off the real corpus rather than picked: the 8,950 stored topic titles on
- * this machine run 32..117 characters (p50 68, p99 94), so a genuine title never
- * reaches this bound and only the fallback can. It is the fallback's no-colon
- * branch that needs it — that one hands back the whole first bullet, measured at
- * 314 characters on a real decisions block, which is precisely the paragraph
- * `decisionTitle` exists to keep off a one-line card.
- */
-const DECISION_TITLE_MAX = 120;
-
-/**
- * What the Decisions card renders: the owning topic's title.
- *
- * `TopicSummary.title` is required by the summary schema, so the fallback here
- * is for malformed or pre-schema payloads only, never the normal path. It takes
- * the first bullet of the decisions block (already `**`-stripped by
- * {@link splitDecisionBullets}) and, since these are written `Title: body`,
- * keeps the clause before the first colon. An empty answer is better than a
- * paragraph: the card is one line wide, and the block it would otherwise print
- * has been measured at ~1,900 characters.
- *
- * Which is why the bound is enforced rather than assumed. A bullet with no
- * `: ` to cut at leaves the whole thing standing, so the "clause" this returns
- * was only ever short by convention — see {@link DECISION_TITLE_MAX}.
- */
-function decisionTitle(topicTitle: string | null, text: string): string {
-	const title = topicTitle?.trim();
-	if (title) return title;
-	const [first] = splitDecisionBullets(text);
-	if (!first) return "";
-	const colon = first.indexOf(": ");
-	const derived = colon > 0 ? first.slice(0, colon) : first;
-	// Dropped whole, not truncated with an ellipsis: half a sentence reads as a
-	// title that got cut, while nothing at all reads as "this memory recorded no
-	// title" — which is the truth for the malformed payload this branch is for,
-	// and the card already renders no quote when the title comes back empty.
-	return derived.length <= DECISION_TITLE_MAX ? derived : "";
-}
-
-/**
  * Decisions mined from commit memories in the window — the standalone
  * Decisions card. Reuses {@link TOPIC_DECISIONS_CTE} rather than re-deriving the
  * `json_each` walk a second time.
@@ -812,64 +818,388 @@ function decisionTitle(topicTitle: string | null, text: string): string {
  * Carries no "recalled" figure: that needs recall receipts, which — like the
  * feed's `MemoryCard.reuse` — nothing records yet.
  */
+/**
+ * The title of one decision-carrying topic — what the detail region lists.
+ *
+ * **A decision has no title of its own; its TOPIC does.** `TopicSummary` is
+ * `{title, trigger, response, decisions}` where `decisions` is ONE prose field
+ * holding however many bullets that topic recorded, so the only human-written title
+ * anywhere near a decision is the topic's.
+ *
+ * ⚠ Listing the topic is also what makes the list agree with the COUNT beside it.
+ * `TOPIC_DECISIONS_CTE` emits one row per decision-carrying TOPIC, so `keptCount`
+ * and a cell's `decisionCount` are topic counts — and a list built by splitting each
+ * block into bullets printed 14 rows for a memory the same card called 7 decisions.
+ * Three earlier attempts did string surgery on the bullets (drop them / truncate
+ * them / cut at the first comma) and every one was answering a question the schema
+ * had already answered one level up.
+ *
+ * The fallback exists for a malformed payload only: the schema requires `title`.
+ * Such a topic still recorded a decision and still counts, so it must still produce
+ * a row — it borrows the clause before its first bullet's colon rather than
+ * vanishing and leaving the list one short of the count.
+ */
+function topicDecisionTitle(topic: TopicSummary): string {
+	const title = topic.title?.trim();
+	if (title) return clampLabel(title, DECISION_TITLE_MAX);
+	const [first] = splitDecisionBullets(topic.decisions);
+	if (!first) return "";
+	const colon = first.indexOf(": ");
+	return clampLabel(colon > 0 ? first.slice(0, colon) : first, DECISION_TITLE_MAX);
+}
+
+/**
+ * A memory's headline category — the most common one across its display topics.
+ *
+ * Extracted so the feed row's chip and the Decisions card's detail region cannot
+ * disagree about one memory. They are on the same page, so a drift would be visible
+ * as the same commit carrying two categories.
+ *
+ * Ties break on iteration order, which is topic order — the first topic wins, which
+ * is the summary's own lead. Not stable across a regenerate that reorders topics,
+ * and that is acceptable for a chip.
+ */
+function dominantCategory(topics: ReadonlyArray<TopicSummary>): string | undefined {
+	const counts = new Map<string, number>();
+	for (const topic of topics) {
+		if (topic.category) counts.set(topic.category, (counts.get(topic.category) ?? 0) + 1);
+	}
+	return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+}
+
+/**
+ * One memory's decisions — the body of `/api/memory-decisions`.
+ *
+ * The ONLY path that parses `summary_json` for this card, and keeping it that way
+ * is the point: it runs for ONE memory per request, never for every memory in the
+ * window on every 30 s poll. That is what lets the waffle stay uncapped (see
+ * {@link MemoryCell}) AND the decision list stay uncapped.
+ *
+ * Returns undefined for a hash this repo has no memory row for at all; the route
+ * turns that into a 404, which is a real answer — the memory may have been
+ * regenerated or its commit rewritten under the reader.
+ *
+ * **No `parent_hash IS NULL` filter, and re-adding one is a review blocker.** It
+ * had one, matching the generation filter {@link TOPIC_DECISIONS_CTE} used to
+ * carry, and it made every cell addressing a folded-but-still-reachable memory
+ * un-openable: the count said zero, and the click answered 404, which the page
+ * renders as "Could not load this memory's decisions." `buildMemoryDetail` — the
+ * `/memories?hash=` route the cell's own title links to — has never filtered
+ * generation, so the reader could open the very memory this endpoint denied and
+ * read the decisions it reported none of.
+ */
+export function readMemoryDecisions(
+	db: DashboardDbHandle,
+	repoIdentity: string,
+	commitHash: string,
+): MemoryDecisions | undefined {
+	const row = db
+		.prepare(
+			`SELECT m.summary_json, m.commit_message, r.repo_name
+			   FROM memories m
+			   JOIN repos r ON r.id = m.repo_id
+			  WHERE r.repo_identity = ? AND m.commit_hash = ?`,
+		)
+		.get(repoIdentity, commitHash) as
+		| { summary_json: string; commit_message: string | null; repo_name: string }
+		| undefined;
+	if (!row) return undefined;
+	// Not guarded: `memories` computes its generated columns with `json_extract`, so
+	// SQLite rejects a malformed payload at INSERT — see buildMemoryCards.
+	const topics = collectDisplayTopics(JSON.parse(row.summary_json) as CommitSummary);
+	const category = dominantCategory(topics);
+	// Every decision's TITLE, in topic order — no count cap. One memory per request,
+	// so nothing rides the model poll.
+	// ONE ROW PER DECISION-CARRYING TOPIC — the same unit `keptCount` and a cell's
+	// `decisionCount` are counted in, so the list length equals the number printed
+	// beside it. Splitting each block into bullets does not.
+	const decisions: DecisionTopicRef[] = [];
+	// `entries()` because the INDEX is the payload: it is what the Memories page
+	// renders `id="topic-<index>"` from, so a row can land on its own topic instead
+	// of on the section header every row shared.
+	for (const [topicIndex, topic] of topics.entries()) {
+		if (splitDecisionBullets(topic.decisions).length === 0) continue;
+		const title = topicDecisionTitle(topic);
+		if (title) decisions.push({ title, topicIndex });
+	}
+	return {
+		commitHash,
+		repoIdentity,
+		repoName: row.repo_name,
+		title: row.commit_message ?? "",
+		...(category ? { category } : {}),
+		decisions,
+	};
+}
+
+/**
+ * How many cells the default selection may fail on before giving up.
+ *
+ * A cell is a captured commit and {@link readMemoryDecisions} resolves any memory
+ * row, so the walk normally stops on its first probe. It is not therefore dead:
+ * `memories` and `commits` are written by different passes, so a cell can name a
+ * memory the reader's database has not stored yet (an import still draining, a
+ * row deleted between the cell query and this one), and that is exactly the case
+ * where "take the last cell, give up if it resolved to nothing" put "No memories
+ * in this window." under a full waffle — the page's empty-window sentence, and
+ * indistinguishable on the wire from a dropped `selected`.
+ *
+ * So the walk keeps going, and the cap is what stops it being unbounded: each
+ * probe is one `summary_json` parse, ~0.9 ms measured, and this builder is on the
+ * 30 s `/api/model` poll — a window whose every cell missed would otherwise pay
+ * one parse per memory on every tick, which is exactly the cost
+ * {@link MemoryCell} is shaped to avoid. Twelve is ~11 ms worst case; past that
+ * the card ships no default and the page says so, which is a true statement
+ * rather than a slow one.
+ *
+ * ⚠ This used to absorb a defect rather than a race: `readMemoryDecisions` read
+ * ROOT memories only, so a memory folded into a later root while its own commit
+ * stayed reachable answered nothing here — 5 of 37 cells on a real 30-day
+ * window. That filter is gone (see there); do not restore it and leave this
+ * walk to paper over it.
+ */
+const DEFAULT_SELECTION_PROBES = 12;
+
+/**
+ * The card's default selection: the newest memory in the window whose detail can
+ * actually be read.
+ *
+ * Picked here rather than in the page because "the last one" is only well defined
+ * once ties are broken, and `perDay`'s cells are already in the canonical
+ * (committedAtMs, repoIdentity, commitHash) order — two memories committed in the
+ * same second are common enough that a client-side pick would flip between polls.
+ *
+ * "whose detail can actually be read" is the part that is not cosmetic. Taking the
+ * last cell and giving up when it resolved to nothing is what put "No memories in
+ * this window." under a full waffle reading "38 memories": the sentence is the
+ * page's empty-window state, and dropping `selected` is indistinguishable from an
+ * empty window on the wire. Walking back is the fix on this side; the page no
+ * longer spells the two the same way either.
+ */
+function pickDefaultSelection(db: DashboardDbHandle, perDay: ReadonlyArray<DecisionDay>): MemoryDecisions | undefined {
+	let probes = 0;
+	for (let day = perDay.length - 1; day >= 0; day--) {
+		const cells = perDay[day].cells;
+		for (let i = cells.length - 1; i >= 0; i--) {
+			probes++;
+			const detail = readMemoryDecisions(db, cells[i].repoIdentity, cells[i].commitHash);
+			// Defensive rather than reachable from a consistent snapshot: a cell exists
+			// because its commit resolved to a `memories` row, and this reads that same
+			// row by the same key. It survives for the one way the two can disagree —
+			// `SotImport` replacing that row while this model is being built — which is
+			// also why the walk is capped rather than unbounded.
+			/* v8 ignore start */
+			if (!detail) {
+				if (probes >= DEFAULT_SELECTION_PROBES) return undefined;
+				continue;
+			}
+			/* v8 ignore stop */
+			return detail;
+		}
+	}
+	return undefined;
+}
+
 function buildDecisionsCard(
 	db: DashboardDbHandle,
 	scope: DashboardScope,
 	fromMs: number,
 	toMs: number,
 	timeZone: string,
+	/**
+	 * The window's CAPTURED commits, already filtered to `root_hash != null &&
+	 * reachable === 1` by the caller — the exact rows behind `memoriesCreated`,
+	 * passed in rather than re-queried so the waffle's cell count and that figure
+	 * cannot drift.
+	 */
+	memories: ReadonlyArray<CommitRow>,
 ): DecisionsCard {
 	const filter = scopeFilter(scopeToRepoIds(db, scope), "c.repo_id");
+	// One row per MEMORY, not per decision, and nothing this card shows needs the
+	// decisions themselves: `byMemory` is a count, `keptCount` is their sum and
+	// `repoCount` is the distinct repos among them. Per-decision rows were a leftover
+	// of the "latest decision" quote this card used to carry — a memory with forty
+	// topics materialised forty rows to be tallied straight back down to `40`.
+	// No ORDER BY for the same reason: the cells are ordered by `memories` below,
+	// under the canonical order `pickDefaultSelection` depends on, and this result is
+	// only ever read into a map.
 	const rows = db
 		.prepare(
 			`${TOPIC_DECISIONS_CTE}
-			 SELECT i.text, i.topic_title, i.commit_hash, c.committed_at_ms, r.repo_name, r.repo_identity
+			 SELECT i.commit_hash, r.repo_name, r.repo_identity, COUNT(*) AS decisions
 			   FROM commits c
 			   JOIN repos r ON r.id = c.repo_id
+			   -- The SAME resolution commitsInRange performs, and it has to be the same
+			   -- one: a rewritten commit's memory is still filed under the pre-rewrite
+			   -- hash, reachable only through the alias, and the cells below are keyed
+			   -- on CommitRow.memory_hash, which is exactly this COALESCE. Written as an
+			   -- OR over both hashes it was a near-miss: a commit carrying BOTH its own
+			   -- memory row and an alias to a second one matched twice, counting that
+			   -- cell's decisions once per match while the cell itself resolved to only
+			   -- one of them.
+			   LEFT JOIN memories dm ON dm.repo_id = c.repo_id AND dm.commit_hash = c.hash
 			   LEFT JOIN commit_aliases al ON al.repo_id = c.repo_id AND al.old_hash = c.hash
-			   -- See commitsInRange: a rewritten commit's decisions are still filed
-			   -- under the pre-rewrite hash, reachable only through the alias.
-			   JOIN topic_decisions i ON i.repo_id = c.repo_id AND (i.commit_hash = c.hash OR i.commit_hash = al.target_hash)
-			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?${filter.sql}
-			  -- i.ord because one commit contributes several decision rows sharing its
-			  -- timestamp, so the date alone does not pick a first row — and rows[0]
-			  -- here IS the card (its one line and its one deep link).
-			  ORDER BY c.committed_at_ms DESC, i.ord`,
+			   JOIN topic_decisions i
+			     ON i.repo_id = c.repo_id AND i.commit_hash = COALESCE(dm.commit_hash, al.target_hash)
+			  WHERE c.committed_at_ms >= ? AND c.committed_at_ms < ?
+			    -- Reachability, the same predicate memoriesCreated applies. Without it
+			    -- this counted decisions from memories that have since been squashed
+			    -- away, which put a number NEXT TO "X of Y captured" that was counted
+			    -- over a different population -- see the docblock.
+			    AND c.reachable = 1${filter.sql}
+			  -- On the repo AND the resolved hash, the pair the cells are keyed on. Two
+			  -- commits in the window can resolve to one memory (a commit plus an alias
+			  -- to it), and COUNT(*) still totals both, exactly as summing their rows did.
+			  GROUP BY c.repo_id, i.commit_hash`,
 		)
 		.all(fromMs, toMs, ...filter.params) as ReadonlyArray<{
-		text: string;
-		topic_title: string | null;
 		commit_hash: string;
-		committed_at_ms: number;
 		repo_name: string;
 		repo_identity: string;
+		decisions: number;
 	}>;
 
-	const perDayMap = new Map<string, number>();
-	for (let dayStart = fromMs; dayStart < toMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
-		perDayMap.set(localDayKey(dayStart, timeZone), 0);
-	}
+	// Decisions per MEMORY, keyed the way the cells are.
+	const byMemory = new Map<string, number>();
+	let keptCount = 0;
 	for (const row of rows) {
-		const key = localDayKey(row.committed_at_ms, timeZone);
-		perDayMap.set(key, (perDayMap.get(key) ?? 0) + 1);
+		byMemory.set(`${row.repo_identity}\0${row.commit_hash}`, row.decisions);
+		keptCount += row.decisions;
 	}
 
-	const first = rows[0];
-	const latest: DecisionRecord | undefined = first
-		? {
-				title: decisionTitle(first.topic_title, first.text),
-				commitHash: first.commit_hash,
-				repoName: first.repo_name,
-				repoIdentity: first.repo_identity,
-				committedAtMs: first.committed_at_ms,
-			}
-		: undefined;
+	const perDayMap = new Map<string, MemoryCell[]>();
+	for (let dayStart = fromMs; dayStart < toMs; dayStart = addLocalDays(dayStart, 1, timeZone)) {
+		perDayMap.set(localDayKey(dayStart, timeZone), []);
+	}
+	// Canonical order: ascending, with tie-breakers. `committed_at_ms` alone is not a
+	// total order — two memories in the same second are ordinary — so without these
+	// the "last cell of the last day" the default selection lands on could differ
+	// between two builds of the same payload, flipping the detail region across a 30 s
+	// poll and making the render tests flaky.
+	const ordered = [...memories].sort(
+		(a, b) =>
+			a.committed_at_ms - b.committed_at_ms ||
+			a.repo_identity.localeCompare(b.repo_identity) ||
+			(a.memory_hash ?? "").localeCompare(b.memory_hash ?? ""),
+	);
+	for (const memory of ordered) {
+		const cells = perDayMap.get(localDayKey(memory.committed_at_ms, timeZone));
+		// A memory whose day is not in the map cannot happen (the window seeded every
+		// day and the caller filtered to it), but skipping beats inventing a column.
+		if (!cells) continue;
+		// `memory_hash` is non-null on every row the caller passes (it filtered on
+		// `root_hash != null`, which comes from the same join), so the fallback is
+		// unreachable rather than a real case.
+		const memoryHash = memory.memory_hash ?? memory.hash;
+		cells.push({
+			commitHash: memoryHash,
+			repoIdentity: memory.repo_identity,
+			title: memory.memory_message ?? "",
+			decisionCount: byMemory.get(`${memory.repo_identity}\0${memoryHash}`) ?? 0,
+		});
+	}
+
+	const perDay: DecisionDay[] = [...perDayMap.entries()].map(([date, cells]) => ({ date, cells }));
+
+	// The default cell's detail travels INLINE — one `summary_json` parse and ~500
+	// bytes of topic titles, against a first-paint request that node would serve on
+	// the same thread as this very build. See MemoryDecisions.
+	const selected = pickDefaultSelection(db, perDay);
 
 	return {
-		keptCount: rows.length,
+		keptCount,
 		repoCount: new Set(rows.map((r) => r.repo_name)).size,
-		...(latest ? { latest } : {}),
-		perDay: [...perDayMap.entries()].map(([date, count]) => ({ date, count })),
+		perDay,
+		...(selected ? { selected } : {}),
+	};
+}
+
+/**
+ * The Memory Top Search Terms card.
+ *
+ * Counts `memory_lookups` rows of `kind = 'search'` — searches the reader made
+ * against their OWN memory, observed at the answering edge. Never MCP tool arguments
+ * read out of a transcript; the MCPs card promises the opposite about those, and the
+ * two must not be confused.
+ *
+ * Rows are CLUSTERED, not grouped by query (see `clusterSearchTerms`). Grouping by
+ * the query itself was the first implementation and it does not produce a ranking:
+ * an agent composes each query from whatever the reader asked, so one subject is
+ * almost never phrased the same way twice, and the card became six rows of
+ * "1 search" with six full-width bars.
+ *
+ * ⚠ `kind = 'search'` on EVERY read of this table. The predicate is what a shared
+ * table costs, and `ix_memory_lookups_kind_at` exists for it — an unfiltered read
+ * would silently fold recall calls into the search count.
+ *
+ * The three headline figures come from ONE aggregate rather than from summing the
+ * rows below: `rows` is capped at {@link SEARCH_TERM_ROWS_LIMIT}, so adding up what
+ * is on screen would under-report every figure the moment a seventh term exists —
+ * the same rule the Skills card states for its own "N runs · M skills" line.
+ */
+function buildSearchTerms(db: DashboardDbHandle, scope: DashboardScope, fromMs: number, toMs: number): SearchTermsCard {
+	const filter = scopeFilter(scopeToRepoIds(db, scope), "repo_id");
+	const totals = db
+		.prepare(
+			`SELECT COUNT(*) AS searches,
+			        COUNT(DISTINCT query_key) AS distinct_queries,
+			        -- COUNT(DISTINCT) ignores NULL, and a plain-terminal search has no
+			        -- agent session to attribute. So this is deliberately "how many AGENT
+			        -- sessions searched", not "how many searches had a home".
+			        COUNT(DISTINCT session_id) AS sessions
+			   FROM memory_lookups
+			  WHERE kind = 'search' AND at_ms >= ? AND at_ms < ?${filter.sql}`,
+		)
+		.get(fromMs, toMs, ...filter.params) as { searches: number; distinct_queries: number; sessions: number };
+
+	// EVERY distinct query in the window, not a top-N: the terms are extracted from
+	// this set, so a query withheld here is one the clustering cannot see and a
+	// subject can lose the phrasing that would have named it. The cap applies to the
+	// clustered ROWS instead, below.
+	const tallies = (
+		db
+			.prepare(
+				`SELECT query_key, COUNT(*) AS searches, MAX(at_ms) AS last_at_ms,
+				        -- The display spelling: the most recent verbatim query in the bucket,
+				        -- so an expanded row reads back as something that was actually sent
+				        -- rather than as the lower-cased key it groups on. SQLite's
+				        -- bare-column rule makes this the row that produced MAX(at_ms).
+				        query
+				   FROM memory_lookups
+				  WHERE kind = 'search' AND at_ms >= ? AND at_ms < ?${filter.sql}
+				  GROUP BY query_key`,
+			)
+			.all(fromMs, toMs, ...filter.params) as ReadonlyArray<{
+			query_key: string;
+			searches: number;
+			last_at_ms: number;
+			query: string | null;
+		}>
+	).map((row) => ({
+		query: row.query ?? row.query_key,
+		queryKey: row.query_key,
+		searches: row.searches,
+		lastAtMs: row.last_at_ms,
+	}));
+
+	// Clustered ONCE: the full set is what `termCount` counts and the capped head is
+	// what `rows` renders, so building it twice would be the two-copies-of-one-figure
+	// bug this card's own footer already had.
+	const clusters = clusterSearchTerms(tallies);
+	return {
+		searches: totals.searches,
+		distinctQueries: totals.distinct_queries,
+		sessions: totals.sessions,
+		// The number of TERMS, not of queries — see SearchTermsCard.termCount.
+		termCount: clusters.length,
+		rows: clusters.slice(0, SEARCH_TERM_ROWS_LIMIT).map((cluster) => ({
+			// Clamped on a WORD boundary here so the visible cut is not the CSS
+			// ellipsis's mid-word one — see SEARCH_TERM_MAX. A single-query term is
+			// a whole sentence, which is the row this bites.
+			term: clampLabel(cluster.term, SEARCH_TERM_MAX),
+			searches: cluster.searches,
+			queries: cluster.queries.slice(0, SEARCH_TERM_QUERIES_LIMIT),
+		})),
 	};
 }
 
@@ -957,10 +1287,16 @@ function buildStats(
 	// card list and has to count the same rows that list renders — otherwise a
 	// branch of forty squashed predecessors reads as "41 captured" over two
 	// cards.
-	const memoriesCreated =
-		tier === "installed" ? undefined : rangeCommits.filter((c) => c.root_hash != null && c.reachable === 1).length;
+	// ONE filter, two readers: the "captured" figure and the Decisions waffle's cells.
+	// They are rendered on the same page, one directly above the other, so computing
+	// the population twice is how they come to disagree.
+	const capturedCommits = rangeCommits.filter((c) => c.root_hash != null && c.reachable === 1);
+	const memoriesCreated = tier === "installed" ? undefined : capturedCommits.length;
 	const decisions =
-		tier === "installed" ? undefined : buildDecisionsCard(db, scope, window.startMs, window.endMs, timeZone);
+		tier === "installed"
+			? undefined
+			: buildDecisionsCard(db, scope, window.startMs, window.endMs, timeZone, capturedCommits);
+	const searchTerms = tier === "installed" ? undefined : buildSearchTerms(db, scope, window.startMs, window.endMs);
 
 	const pricesAsOf = readPricesAsOf(db, scope);
 
@@ -1046,6 +1382,7 @@ function buildStats(
 		...(pricesAsOf ? { pricesAsOf } : {}),
 		...(memoriesCreated !== undefined ? { memoriesCreated } : {}),
 		...(decisions !== undefined ? { decisionsCaptured: decisions.keptCount, decisions } : {}),
+		...(searchTerms !== undefined ? { searchTerms } : {}),
 	};
 }
 
@@ -1452,11 +1789,7 @@ function buildMemoryCards(db: DashboardDbHandle, scope: DashboardScope, window: 
 		// a schema test rather than by a defensive branch that could never run.
 		const summary = JSON.parse(row.summary_json) as CommitSummary;
 		const topics = collectDisplayTopics(summary);
-		const counts = new Map<string, number>();
-		for (const topic of topics) {
-			if (topic.category) counts.set(topic.category, (counts.get(topic.category) ?? 0) + 1);
-		}
-		const category = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+		const category = dominantCategory(topics);
 		const decision = firstDecisionLine(topics) ?? row.recap ?? undefined;
 		const decisionCount = decisionCounts.get(`${row.repo_identity}\0${row.commit_hash}`) ?? 0;
 		const changed = (row.insertions ?? 0) + (row.deletions ?? 0);
@@ -1498,6 +1831,12 @@ function buildMemoryCards(db: DashboardDbHandle, scope: DashboardScope, window: 
  * `commits` side, where a rewritten commit's insights are filed under the
  * pre-rewrite hash. `topic_decisions` is derived FROM `memories`, and these cards
  * are selected from `memories` too, so both sides already name the same hash.
+ *
+ * And no generation filter either, for the same reason there is none in the CTE:
+ * `page` comes from {@link buildMemoryCards}, which selects `parent_hash IS NULL`
+ * itself, so the hashes handed in ARE the current generation. Asking twice is how
+ * a consumer's own selection and a filter buried in a shared derivation come to
+ * disagree.
  */
 function decisionCountsFor(
 	db: DashboardDbHandle,
@@ -1666,14 +2005,17 @@ function toolUsageWhere(
 const TOOL_LIST_KIND: Readonly<Record<ToolUsageList, string>> = { skill: "skill", tool: "mcp", server: "mcp" };
 
 /**
- * The MCP server a row is grouped under, plugin alias folded away.
+ * The MCP server a row is grouped under: plugin alias folded away, and an opaque
+ * id the host could not resolve to a name folded onto `UNIDENTIFIED_MCP_SERVER`
+ * — see {@link mcpServerKeySql} for both halves and why the fold is here rather
+ * than in the parser or in a WHERE clause.
  *
- * Unguarded {@link stripPluginPrefixSql} rather than `mcpFoldedIdentifierSql`:
- * every query reading these two constants pins `t.kind = ?` to
- * {@link TOOL_LIST_KIND}, so the rows are MCP by construction. The memory-detail
- * activity query in `MemoriesQuery.ts` mixes kinds and takes the guarded form.
+ * Unguarded rather than `mcpServerFoldedIdentifierSql`: every query reading these
+ * two constants pins `t.kind = ?` to {@link TOOL_LIST_KIND}, so the rows are MCP
+ * by construction. The memory-detail activity query in `MemoriesQuery.ts` mixes
+ * kinds and takes the guarded form.
  */
-const SERVER_KEY_SQL = stripPluginPrefixSql("t.server");
+const SERVER_KEY_SQL = mcpServerKeySql("t.server");
 
 /** The tool a row is grouped under — same fold, because the name embeds the server. */
 const TOOL_KEY_SQL = stripPluginPrefixSql("t.tool_name");
@@ -2838,6 +3180,10 @@ export function buildMcpServerDetail(db: DashboardDbHandle, opts: McpServerDetai
  * dot that means nothing is not.
  */
 function stripServerPrefix(toolName: string, server: string): string {
+	// The aggregate row has no single prefix to remove — see
+	// `stripOpaqueMcpServerIdPrefix` on why stripping each row's own id beats
+	// leaving them in place, and on the two-rows-one-label case it accepts.
+	if (server === UNIDENTIFIED_MCP_SERVER) return stripOpaqueMcpServerIdPrefix(toolName);
 	const prefix = `${server}.`;
 	return toolName.startsWith(prefix) ? toolName.slice(prefix.length) : toolName;
 }
@@ -3368,9 +3714,15 @@ export function buildDashboardModel(db: DashboardDbHandle, opts: QueryOptions): 
 		// `.usedCalls` straight off it and throws — and Stats is the one view with
 		// a 30 s poll, so it throws again every tick on the payload it already
 		// stored) and `DecisionRecord.text` became `title`.
+		// 4 → 5 when the Decisions card became a waffle: `DecisionsCard.latest` is
+		// gone and `perDay` carries `cells` rather than `count`, so a pre-5 tab draws
+		// its step chart off `undefined` — and Stats polls, so once per tick.
+		// `SearchTermsCard.termCount` needed no bump: it ADDS a field, and the tab
+		// that could miss it is one whose JS predates it too (the asset routes are
+		// hashed, so old JS never meets a new payload field it reads).
 		// `JD.refreshNow` compares this against the tab's own
 		// `window.__JOLLI_DASHBOARD__.schemaVersion` and reloads on mismatch.
-		schemaVersion: 4,
+		schemaVersion: 5,
 		view: options.view,
 		tier,
 		generatedAtMs: nowMs,

@@ -7,6 +7,7 @@
  * both as a CLI and as a programmatic import (`@jolli.ai/cli/api`).
  */
 
+import { setAmbientSessionIdTrusted } from "./core/AgentSessionEnv.js";
 import { resolveProjectDir, resolveProjectDirInfo } from "./core/ProjectDir.js";
 import { silenceSqliteExperimentalWarning } from "./core/SqliteWarning.js";
 import { runWithTrace, traceIdFromEnv } from "./core/TraceContext.js";
@@ -106,6 +107,13 @@ export function isDetachedDaemonInvocation(argv: ReadonlyArray<string>): boolean
  * shell would otherwise stamp `agent: "claude"` on the bridge's own lifecycle
  * events (the JVM UI events it forwards are already safe — the
  * `telemetry-track` action re-bootstraps without inference before tracking).
+ *
+ * It now answers a SECOND question, `setAmbientSessionIdTrusted`, and that is one
+ * predicate rather than two lists on purpose: both ask "does this process's env
+ * name the session in front of it", and a member added for one is a member for the
+ * other. Telemetry would report a shared daemon's tool calls under the spawning
+ * host; `memory_lookups.session_id` would file every session's searches under the
+ * spawning session's id.
  */
 export function isAgentInferenceExempt(argv: ReadonlyArray<string>): boolean {
 	return isDetachedDaemonInvocation(argv) || argv[0] === "ide-bridge-serve";
@@ -323,10 +331,16 @@ if (!process.env.VITEST) {
 				// than per process — and that is what the CallTool handler now uses
 				// (CLIENTINFO_AGENTS in TelemetryAgent.ts), so keeping inference off
 				// here costs nothing the handshake does not give back better.
+				const envNamesThisSession = !isAgentInferenceExempt(argv);
 				await bootstrapTelemetry({
 					cwd: resolveProjectDir(),
-					inferAgentFromEnv: !isAgentInferenceExempt(argv),
+					inferAgentFromEnv: envNamesThisSession,
 				});
+				// The same fact, for the other consumer of this process's env: the
+				// session id a lookup receipt is filed under. A shared daemon has no
+				// per-connection session to fall back to, so the honest answer there is
+				// no id at all — see `setAmbientSessionIdTrusted`.
+				setAmbientSessionIdTrusted(envNamesThisSession);
 				let failed = false;
 				try {
 					await main();

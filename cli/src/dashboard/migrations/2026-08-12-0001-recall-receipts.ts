@@ -31,6 +31,39 @@ import { type DbMigration, sqlMigration } from "./MigrationHelpers.js";
  * carries), taken from the host's environment when it exposes one, and NULL
  * otherwise — a `jolli recall` typed into a plain terminal belongs to no
  * session and must not be attributed to one.
+ *
+ * ## Nothing in this build writes it, and it must NOT be dropped
+ *
+ * `recall` is now observed as a `memory_lookups` row of `kind = 'recall'`
+ * (`MEMORY_LOOKUPS_DDL`), and `projectRecallObserved` survives only as a rewriting
+ * adapter onto that table. This one is therefore write-dead HERE — and retained on
+ * purpose, because "here" is one dist among several on the same machine.
+ *
+ * A `2026-08-26-0001-drop-recall-receipts` entry existed on a branch and was removed
+ * before it merged. Two measurements killed it, both about an OLDER dist that
+ * `run-hook`'s version race still lets win:
+ *
+ *  - **Reads.** 0.99.10-0.99.12 carry the standalone Recall card, whose
+ *    `buildRecallUsage` SELECTs this table UNCONDITIONALLY from inside the single
+ *    model build, and `DashboardServer`'s request handler turns the throw into a
+ *    plain-text 500. So the table's absence takes that dist's WHOLE dashboard
+ *    offline — every page and every JSON model route — not one blank card. The card
+ *    was removed in 0.99.13, so 0.99.13-0.99.15 only write.
+ *  - **Writes.** Those are survivable but NOT self-healing. `drainPending` parks the
+ *    event instead of failing the recall the user is waiting on, and
+ *    `ProducerHooks.recordLookupReceipt` never throws — but `no such table`
+ *    classifies as `failed_kind = 'error'`, which `REVIVABLE_PREDICATE` deliberately
+ *    excludes, so a row that spends its five attempts is reachable only by
+ *    `jolli doctor --fix` (`unparkStuckEvents`), which is deliberately manual.
+ *
+ * It was REMOVED rather than compensated with a re-`CREATE` entry, and that choice is
+ * the `2026-08-19-0000-session-stats-heal` shape from `migrations/index.ts`: the drop
+ * had never been in a release, so no user database ever carried the name, and a
+ * compensating entry would have shipped to everyone for ever for the sole benefit of a
+ * developer machine that had pulled the branch. Such a machine keeps a log row this
+ * build does not know, which makes `dbHasUnknownMigrations` true and switches the
+ * `stats_daily` rollup off (`StatsRollup.ts`) — a one-off hand repair of one machine's
+ * derived state, never a product entry.
  */
 export const RECALL_RECEIPTS_DDL: DbMigration = sqlMigration(
 	"RECALL_RECEIPTS_DDL",

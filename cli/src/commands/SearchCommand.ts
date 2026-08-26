@@ -14,6 +14,7 @@ import type { SearchHitResult } from "../core/SearchIndex.js";
 import { createStorage } from "../core/StorageFactory.js";
 import { getActiveStorage, setActiveStorage } from "../core/SummaryStore.js";
 import { bucket, track } from "../core/Telemetry.js";
+import { recordLookupReceipt } from "../dashboard/ProducerHooks.js";
 import { setLogDir } from "../Logger.js";
 import { isSafeQuery, parsePositiveInt, readStdin, resolveProjectDir } from "./CliUtils.js";
 
@@ -151,9 +152,24 @@ export function registerSearchCommand(program: Command): void {
 					getActiveStorage(),
 				);
 
+				// Two records, two audiences, and they must not be confused for each
+				// other. `track` is REMOTE product telemetry, which is why it sends a
+				// length bucket and never the text (see queryLenBucket). The receipt
+				// below is LOCAL: it is what the dashboard's Search Terms card lists,
+				// so it necessarily carries the query itself, and its table is in
+				// `NEVER_SYNCED_TABLES` for exactly that reason.
 				track("search_performed", {
 					result_count_bucket: bucket(hits.length),
 					query_len_bucket: queryLenBucket(query),
+				});
+				// Fire-and-forget: a search exists only while it is being answered, so
+				// it is recorded here or not at all — and never at the cost of the
+				// answer's latency.
+				void recordLookupReceipt(projectDir, {
+					kind: "search",
+					surface: "cli",
+					query,
+					resultCount: hits.length,
 				});
 				await writeOutput({ hits }, options, () => renderHitsText(hits));
 			} catch (error: unknown) {

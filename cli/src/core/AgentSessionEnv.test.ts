@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
-import { currentAgentSessionId, isSafeSessionId } from "./AgentSessionEnv.js";
+import { currentAgentSessionId, isSafeSessionId, setAmbientSessionIdTrusted } from "./AgentSessionEnv.js";
 
 const KEY = "CLAUDE_CODE_SESSION_ID";
 const original = process.env[KEY];
@@ -7,6 +7,9 @@ const original = process.env[KEY];
 afterEach(() => {
 	if (original === undefined) delete process.env[KEY];
 	else process.env[KEY] = original;
+	// The flag is process-wide, so a case that clears it must put it back or every
+	// later case reads `undefined` and passes for the wrong reason.
+	setAmbientSessionIdTrusted(true);
 });
 
 describe("currentAgentSessionId", () => {
@@ -36,6 +39,18 @@ describe("currentAgentSessionId", () => {
 			process.env[KEY] = hostile;
 			expect(currentAgentSessionId()).toBeUndefined();
 		}
+	});
+
+	it("is undefined once a shared server declares its env untrustworthy, even with a real id present", () => {
+		// `mcp-serve` is keyed by worktree and a version tie ATTACHES, so several
+		// sessions reach one process whose env was frozen at spawn. Reporting that
+		// first session's id for everybody's searches is a WRONG value, not a missing
+		// one — and there is no per-connection session id to fall back to.
+		process.env[KEY] = "4ad551f5-35b5-4331-b807-987843d81113";
+		setAmbientSessionIdTrusted(false);
+		expect(currentAgentSessionId()).toBeUndefined();
+		setAmbientSessionIdTrusted(true);
+		expect(currentAgentSessionId()).toBe("4ad551f5-35b5-4331-b807-987843d81113");
 	});
 });
 

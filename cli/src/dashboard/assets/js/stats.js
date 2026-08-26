@@ -116,14 +116,15 @@ window.JD = window.JD || {};
 		   bar chart already makes one band up; the only thing that distinguishes
 		   these two widgets is that this one is denominated in money, so that is
 		   what the icon has to say. */
-		/* span6 rather than a full row of its own. It shared the row with Tokens
-		   until the two swapped bands, and now shares it with Decisions — the
-		   pairing changed, the width did not, because nothing on this card was
-		   using twelve columns. What the halved width costs is chart resolution:
-		   the bars are a 660-wide viewBox drawn at `width="100%"`, so they scale
-		   rather than clip. */
+		/* span12: this card has a ROW to itself now, so a half-width one left the
+		   other half empty. It was span6 while it shared a row — first with Tokens,
+		   then with Decisions — and kept that width through both pairings because
+		   nothing on it needed twelve columns. That reasoning was about a card with a
+		   NEIGHBOUR; Decisions grew to span8 and took the seat, so what governs the
+		   width now is the row, not the content. The bars are a 660-wide viewBox drawn
+		   at `width="100%"`, so they scale into it rather than clip. */
 		var html =
-			'<section class="card span6" aria-label="Spend">' +
+			'<section class="card span12" aria-label="Spend">' +
 			widgetHead(
 				widgetIcon(
 					"--s4",
@@ -272,6 +273,13 @@ window.JD = window.JD || {};
 	   scroll left the reader mid-topic with nothing above the fold saying which
 	   topic the decision belongs to. */
 	var TOPICS_ANCHOR = "what-changed";
+
+	/* The id `memories.js` puts on each individual topic — `topic-<index>`, where the
+	   index is the position in `collectDisplayTopics(summary)`. Its topic list is a
+	   straight 1:1 map of that array, so the index the server sends addresses the
+	   element this prefix names. Spelled here beside TOPICS_ANCHOR because both are
+	   the other page's ids and belong together. */
+	var TOPIC_ANCHOR_PREFIX = "topic-";
 
 	/* What the list is: the window's memories, or the most recent slice of them.
 	   The distinction is `memoryCardsCapped`, and it has to come from the server —
@@ -509,44 +517,64 @@ window.JD = window.JD || {};
 		return lines.map((each) => JD.esc(each)).join("&#10;");
 	}
 
+	/* The left-aligned headline both memory-tier cards of the Decisions band carry —
+	   Decisions itself (span8) and Memory Top Search Terms (span4): a big figure with
+	   a qualifying line under it. They do NOT share a width, only this headline; no
+	   card on the page is span6 (see main.css, where the class is documented as
+	   unused).
+
+	   It replaced `widgetHead`'s right-aligned `aside` on these two. That slot is
+	   still there and still correct for Spend, whose head is one line and whose
+	   figure is a single number; here the sub is a whole sentence naming two
+	   denominators, and a sentence right-aligned against a card edge reads as a
+	   caption for the title rather than for the number. */
+	function cardHeadline(figure, sub) {
+		return (
+			'<div class="card-headline"><div class="num">' +
+			figure +
+			"</div>" +
+			(sub ? '<div class="sub">' + sub + "</div>" : "") +
+			"</div>"
+		);
+	}
+
 	/* What this card counts and why it is worth looking at.
 	   "What Jolli decided to keep" is gone: it described the STORE rather than
 	   the reader's own work, and the card's subject is the decisions the reader's
-	   sessions made — Jolli is what banked them, not what made them. */
+	   sessions made — Jolli is what banked them, not what made them.
+
+	   The last sentence exists because the card prints two numbers that look like
+	   they should match and do not: `kept` counts DECISIONS while the grid counts
+	   MEMORIES, and one memory can record several. Without it the card invites the
+	   reader to find a bug that is not there. */
 	var DECISIONS_HINT =
 		"Decisions your sessions made, accumulating across the range — the knowledge Jolli banked, " +
-		"with the receipts behind it.";
+		"with the receipts behind it. One square is one memory; a memory can record more than one decision, " +
+		"so the kept count runs ahead of the filled squares.";
 
-	/* Decisions (span6) — the corpus of decisions itself: kept count, a
-	   cumulative step chart, and the latest one as a single TITLE line.
-	   Distinct from the KPI sub-line (gone with the KPI strip) and from the
-	   feed's per-commit `decision` line — this is the standalone widget those
-	   always implied but never had. Carries no "recalled" figure — see
-	   DecisionsCard's doc comment in DashboardModel.ts.
+	/* Decisions (span8) — the corpus of decisions itself: a kept count, a waffle of
+	   the window's memories (filled = recorded a decision), and the selected
+	   memory's own detail underneath.
 
-	   Paired with Spend in the half-and-half band, having swapped seats with
-	   Tokens — see the band comment in `renderStats`. Width has never been what
-	   this card needs: the step chart draws with `preserveAspectRatio="none"`,
-	   so it fills whatever column it is given (span12, then span4, now span6).
-	   What the half row buys is the HEAD. At a third of a row a right-aligned
-	   headline does not fit beside the title, which is why the kept count sat
-	   below it in the band; here it rides in `widgetHead`'s aside at 18px, the
-	   same size and slot as Spend's own figure beside it. The window stays off
-	   the card either way — the topbar range control is where that is set and
-	   stated, the same reason Tokens dropped its own `Last 30 days`. */
+	   The waffle replaced a cumulative step chart, and the detail region replaced a
+	   one-line "Latest ·" quote. Both changes are the same change: the card used to
+	   assert a total and show one example of it, and now it shows the whole
+	   population and lets the reader pick which example they want. That is also why
+	   the cells are not capped — the count of squares IS the "N memories" figure in
+	   the sub-line, so a truncated column would make the card contradict itself.
+
+	   Carries no "recalled" figure — see DecisionsCard's doc comment in
+	   DashboardModel.ts. */
 	function decisionsCard(model) {
 		var esc = JD.esc;
 		var decisions = model.stats.decisions;
 		var icon = widgetIcon(
-			"--s1",
+			"--s4",
 			'<path d="M9 18h6M10 22h4M12 2a6 6 0 0 0-4 10.4c.6.5 1 1.3 1 2.1V16h6v-1.5c0-.8.4-1.6 1-2.1A6 6 0 0 0 12 2Z"/>',
 		);
-		var open = '<section class="card span6" aria-label="Decisions">';
+		var open = '<section class="card span8" aria-label="Decisions">';
 
 		if (!decisions) {
-			/* Bare head here, for the reason Tokens' empty state keeps one: there is
-			   no count to right-align, and the locked panel below states the whole
-			   situation already. */
 			return (
 				open +
 				widgetHead(icon, "Decisions", null, DECISIONS_HINT) +
@@ -557,87 +585,57 @@ window.JD = window.JD || {};
 			);
 		}
 
-		/* `N kept`, not a bare `N`: the sub under it names the noun and the window,
+		/* `N kept`, not a bare `N`: the sub under it names the nouns and the window,
 		   so the figure has to carry the verb or it reads as a second total of
-		   whatever the card counted. */
+		   whatever the card counted.
+
+		   Both denominators come from `stats`, NOT from a copy on the card: they are
+		   the same `memoriesCreated` / `totalCommits` Memory Activity prints one card
+		   down, and two copies of one figure on one page is how they come to differ. */
+		var created = model.stats.memoriesCreated;
+		var total = model.stats.totalCommits;
 		var html =
 			open +
-			widgetHead(
-				icon,
-				"Decisions",
-				null,
-				DECISIONS_HINT,
-				'<div class="num" style="font-size:18px;font-weight:650">' +
-					decisions.keptCount +
-					' kept</div><div class="sub">decisions<br>in this window</div>',
+			widgetHead(icon, "Decisions", null, DECISIONS_HINT) +
+			cardHeadline(
+				decisions.keptCount + " kept",
+				created == null
+					? ""
+					: esc(created) +
+							(created === 1 ? " memory, of " : " memories, of ") +
+							esc(total) +
+							(total === 1 ? " commit in this window" : " commits in this window"),
 			);
 
-		/* Cumulative step chart over `perDay` — an empty window still draws a
-		   flat baseline rather than an empty box. */
-		var w = 300;
-		var h = 60;
-		var total = decisions.perDay.reduce((sum, d) => sum + d.count, 0) || 1;
-		var cum = 0;
-		var points = [];
-		decisions.perDay.forEach((day, i) => {
-			var x = decisions.perDay.length > 1 ? (i / (decisions.perDay.length - 1)) * w : 0;
-			points.push(x + "," + (h - 4 - (cum / total) * (h - 8)));
-			cum += day.count;
-			points.push(x + "," + (h - 4 - (cum / total) * (h - 8)));
-		});
-		var poly = points.join(" ");
+		var selected = selectedDecisionCell(model);
 		html +=
-			'<div class="stepchart"><svg viewBox="0 0 ' +
-			w +
-			" " +
-			h +
-			'" preserveAspectRatio="none"><polyline points="' +
-			poly +
-			'" fill="none" stroke="var(--s1)" stroke-width="2"/>' +
-			'<polygon points="' +
-			poly +
-			" " +
-			w +
-			"," +
-			h +
-			" 0," +
-			h +
-			'" fill="color-mix(in srgb, var(--s1) 12%, transparent)"/></svg></div>';
+			'<div class="dec-chart">' +
+			JD.decisionWaffle(decisions.perDay, selected ? { selectedKey: JD.decisionCellKey(selected) } : {}) +
+			"</div>";
 
-		/* Title only (JOLLI-2192), and it opens that memory (JOLLI-2197) — the same
-		   deep link the memory's own row carries, so the decision and the row lead
-		   to one place. An in-page scroll to the row was tried first and reads as a
-		   no-op: the newest decision's commit is usually the newest memory, so the
-		   scroll lands on the row already at the top of the list.
-
-		   It lands on the memory's topics rather than the top of the page, which is
-		   where the decision it names actually lives — `buildDecisionsCard` takes
-		   `rows[0]` of `ORDER BY committed_at_ms DESC, i.ord`, and `ord` is `t.key *
-		   2` over the topics carrying a non-empty decisions block, so this title is
-		   the first decision-carrying topic of that memory. The section anchor makes
-		   that ordering argument load-bearing for the WORDING only, never for the
-		   destination: both callers land on the same header whatever the topic list
-		   turns out to hold, so a decisions block that survives the query's TRIM but
-		   that `splitDecisionBullets` empties can no longer send a reader somewhere
-		   the card did not mean.
-
-		   Skipped entirely when the title came back empty, which needs a payload
-		   carrying neither a topic title nor a parseable decision line. */
-		if (decisions.latest && decisions.latest.title) {
+		/* The window's own bounds, off the payload rather than the range control:
+		   `perDay` is what the picture above actually drew, so its first and last day
+		   are the only labels that cannot disagree with it. */
+		var firstDay = decisions.perDay[0];
+		var lastDay = decisions.perDay[decisions.perDay.length - 1];
+		if (firstDay && lastDay) {
 			html +=
-				'<div class="dec-quote"><span class="qlab">Latest · ' +
-				esc(decisions.latest.repoName) +
-				'</span><a class="dec-jump" href="' +
-				memoryHref(model, decisions.latest.commitHash, decisions.latest.repoIdentity, TOPICS_ANCHOR) +
-				'" target="_blank" rel="noopener"><strong>' +
-				esc(decisions.latest.title) +
-				"</strong></a></div>";
+				'<div class="dec-axis"><span>' +
+				esc(firstDay.date) +
+				"</span><span>" +
+				esc(lastDay.date) +
+				"</span></div>";
 		}
+		html +=
+			'<div class="heat-legend dec-legend"><span><i style="background:var(--s4)"></i>recorded a decision</span>' +
+			'<span><i style="background:var(--heat-track)"></i>none recorded</span></div>';
+
+		html += decisionDetail(model, selected);
 
 		/* The footer carried a "kept, not merged" chip beside the repo count. It
 		   was removed: it answered a question about how decisions are STORED that
-		   nothing else on the page raises, so under the latest-decision quote it
-		   read as a status on that decision rather than a note about the corpus.
+		   nothing else on the page raises, so under the detail region it read as a
+		   status on that memory rather than a note about the corpus.
 		   The repo-count measure stays — it qualifies the numbers above it. */
 		return (
 			html +
@@ -645,6 +643,302 @@ window.JD = window.JD || {};
 			decisions.repoCount +
 			(decisions.repoCount === 1 ? " repo</b>" : " repos</b>") +
 			" in this window</span></div></section>"
+		);
+	}
+
+	/* Which cell the detail region is showing.
+
+	   `JD.decisionCell` is the reader's click; `decisions.selected` is the server's
+	   default (the last memory of the last day that has one, picked there because
+	   "the last one" needs the tie-breakers only the query has). The click WINS, but
+	   only while it still names a cell in the window on screen — changing the range
+	   or the repo scope, or a poll that lands after that commit was rebased away,
+	   must fall back rather than leave the region describing something the grid no
+	   longer contains.
+
+	   Both searches match on `JD.decisionCellKey`, never on the hash: under an
+	   all-repos scope two repos can carry the same hash, and matching half the
+	   identity returns whichever of them the payload happened to list first. */
+	function selectedDecisionCell(model) {
+		var decisions = model.stats.decisions;
+		if (!decisions) return null;
+		var want = JD.decisionCell;
+		if (want) {
+			for (var i = 0; i < decisions.perDay.length; i++) {
+				var cells = decisions.perDay[i].cells;
+				for (var j = 0; j < cells.length; j++) {
+					if (JD.decisionCellKey(cells[j]) === want) return cells[j];
+				}
+			}
+		}
+		var fallback = decisions.selected;
+		if (!fallback) return null;
+		var fallbackKey = JD.decisionCellKey(fallback);
+		for (var d = 0; d < decisions.perDay.length; d++) {
+			var row = decisions.perDay[d].cells;
+			for (var c = 0; c < row.length; c++) {
+				if (JD.decisionCellKey(row[c]) === fallbackKey) return row[c];
+			}
+		}
+		return null;
+	}
+
+	/* Which of the two "nothing is selected" states this is — and they are two
+	   facts, not one.
+
+	   They used to share one sentence, so "No memories in this window." printed
+	   under a full waffle whose own sub-line said "38 memories": a card
+	   contradicting itself on two adjacent lines, on first paint, with nothing to
+	   click that would clear it. The cause is upstream — the payload simply omits
+	   `selected` when the server could not read a default (see
+	   `pickDefaultSelection`), and on the wire that is indistinguishable from an
+	   empty window UNLESS the cells are consulted. They are right here, so this is
+	   where the two are told apart.
+
+	   The second sentence is an instruction rather than a diagnosis on purpose: the
+	   reader cannot act on "this window's newest memories are children of squashed
+	   ones", and every cell on screen is still clickable. */
+	function emptyDetailReason(model) {
+		var perDay = (model.stats.decisions || {}).perDay || [];
+		var cells = 0;
+		for (var i = 0; i < perDay.length; i++) cells += perDay[i].cells.length;
+		return cells === 0 ? "No memories in this window." : "Pick a square to see the decisions behind it.";
+	}
+
+	/* The selected memory's detail. Three states, and none of them may be blank:
+
+	   - the server inlined this cell's detail (the default selection) or a click has
+	     already fetched it → render it;
+	   - a click is in flight → say so, because the region is the only feedback the
+	     click has;
+	   - the window holds no memory at all → say THAT, which is a different fact from
+	     "this memory recorded no decisions" and from "Jolli is not enabled". */
+	function decisionDetail(model, cell) {
+		var esc = JD.esc;
+		if (!cell) {
+			return '<div class="dec-detail is-empty">' + emptyDetailReason(model) + "</div>";
+		}
+		/* The HEAD is built from the CELL, which the payload already carries, so the
+		   panel names the memory the moment it is clicked. Only the list waits on the
+		   request — a panel that blanked entirely while loading would make every click
+		   look like it had cleared the card. */
+		var detail = detailForCell(model, cell);
+		var chips = "";
+		if (detail && detail.category)
+			chips += '<span class="mem-activity-category">' + esc(detail.category) + "</span>";
+		/* The repo chip earns its space only when the page is showing more than one —
+		   under a single-repo scope every row would repeat what the topbar says. The
+		   same rule Memory Activity's rows use. */
+		if (JD.scopeIdentities(model).length !== 1 && detail && detail.repoName)
+			chips += '<span class="tag">' + esc(detail.repoName) + "</span>";
+		return (
+			'<div class="dec-detail"><div class="dec-detail-head"><a class="dec-jump" href="' +
+			memoryHref(model, cell.commitHash, cell.repoIdentity, TOPICS_ANCHOR) +
+			'" target="_blank" rel="noopener"><strong>' +
+			esc(cell.title || cell.commitHash.slice(0, 8)) +
+			"</strong></a>" +
+			chips +
+			"</div>" +
+			decisionList(model, cell, detail) +
+			"</div>"
+		);
+	}
+
+	/* The list under the head. Four states, and only one of them is silence-shaped:
+
+	   - loaded with decisions → the rows;
+	   - loaded with none → SAID, because a third of the squares are that and a blank
+	     panel would read as a failure;
+	   - still loading → said, because the click has no other feedback;
+	   - failed → said, with the memory still named above it. */
+	function decisionList(model, cell, detail) {
+		var esc = JD.esc;
+		if (!detail) {
+			return JD.decisionCellError === JD.decisionCellKey(cell)
+				? '<p class="dec-none">Could not load this memory\'s decisions.</p>'
+				: '<p class="dec-none">Loading decisions…</p>';
+		}
+		var lines = detail.decisions || [];
+		if (lines.length === 0) return '<p class="dec-none">This memory recorded no decisions.</p>';
+		/* Each row is a LINK to the memory that recorded it, so it takes a link's
+		   affordances — a hover ground, a focus ring, a pointer — rather than being a
+		   `<li>` the reader cannot act on. The leading dot is decorative and marked as
+		   such; a real list marker would be indented by the UA and would not line up
+		   with the heading above. */
+		return (
+			'<div class="dec-list">' +
+			lines
+				.map(
+					(line) =>
+						'<a class="dec-row" href="' +
+						/* ITS OWN topic, not the section header. Every row pointed at
+						   `#what-changed` while this region showed one "latest decision";
+						   listing several made that seven rows scrolling to one place. */
+						memoryHref(model, cell.commitHash, cell.repoIdentity, TOPIC_ANCHOR_PREFIX + line.topicIndex) +
+						'" target="_blank" rel="noopener"><span class="dec-dot" aria-hidden="true"></span><span>' +
+						JD.mdInline(esc(line.title)) +
+						"</span></a>",
+				)
+				.join("") +
+			"</div>"
+		);
+	}
+
+	/* One memory's detail, from whichever of the two places holds it: the payload's
+	   inlined DEFAULT selection, or the click cache. ONE function, because "is it
+	   already here?" has to have one answer — the renderer and the fetch both ask it,
+	   and a fetch that disagreed would re-request something already on screen.
+
+	   Takes the CELL, and keys on `JD.decisionCellKey`. Keyed on the hash alone this
+	   was the sharpest edge of the collision: two repos sharing a hash have one cache
+	   entry between them, so the second cell's click found the first repo's detail
+	   already "to hand", never fetched, and rendered another project's decisions under
+	   its own title. */
+	function detailForCell(model, cell) {
+		var key = JD.decisionCellKey(cell);
+		var inlined = (model.stats.decisions || {}).selected;
+		if (inlined && JD.decisionCellKey(inlined) === key) return inlined;
+		return (JD.decisionCellDetail || {})[key] || null;
+	}
+
+	/* What this card counts, and the two things a reader will otherwise get wrong.
+
+	   The scope sentence is not boilerplate: the MCPs card on this same page promises
+	   it never reads tool ARGUMENTS out of a transcript, and a card listing search
+	   text would read as that promise being broken. These are the reader's own
+	   searches, observed where Jolli answered them.
+
+	   The second is that a term is not a query. Several differently-worded searches
+	   collapse onto one label, so a reader who opens a row and finds phrasings they
+	   do not recognise as "the search" has not found a bug — that IS what a term is. */
+	var TERMS_TINT = "--accent";
+
+	var SEARCH_TERMS_HINT =
+		"What you searched your own memory for, over the range. The query text stays on this machine. " +
+		"A term is a phrase shared by several searches rather than one of them — open a row to read " +
+		"the queries behind it.";
+
+	/* Memory Top Search Terms (span4) — the one-third seat beside Decisions' span8.
+	   Its rows page nowhere: the server sends the top few and the footer states the
+	   whole, which is why this list passes no `list` to `rankedList` (no paging) and
+	   uses the click for its own expansion instead of a jump to a detail page. */
+	function searchTermsCard(model) {
+		var esc = JD.esc;
+		var terms = model.stats.searchTerms;
+		/* `--accent`, the tint the mockup gives this card. It is not one of the
+		   `--s1..--s5` series the other widgets draw from: this card is about the
+		   reader's own actions rather than a category of their work, and the accent is
+		   what the page already uses for "you did this". */
+		var icon = widgetIcon(
+			TERMS_TINT,
+			'<circle cx="11" cy="11" r="8"/><path d="m21 21-4.3-4.3"/><path d="M8 11h6"/>',
+		);
+		var open = '<section class="card span4" aria-label="Memory Top Search Terms">';
+		var head = widgetHead(icon, "Memory Top Search Terms", null, SEARCH_TERMS_HINT);
+
+		if (!terms) {
+			return (
+				open +
+				head +
+				'<div class="locked-panel"><p><b>Search needs memories to search.</b></p>' +
+				'<p class="why">Enable Jolli Memory, and the searches you run against it appear here.</p>' +
+				'<button type="button" class="cta ghost" disabled>Enable Jolli Memory</button></div></section>'
+			);
+		}
+
+		/* Both figures are the server's own COUNT/SUM, never a sum of the rows on
+		   screen: `rows` is capped, so adding up what is visible would under-report
+		   the moment a seventh term exists. Same rule as the Skills card's sub-line.
+
+		   "agent sessions", not "sessions": the count is DISTINCT over a session id
+		   that is NULL for a search typed into a plain terminal, so a bare-terminal
+		   search raises `searches` without raising this. Naming the qualifier is what
+		   keeps the two numbers from reading as a contradiction. */
+		var html =
+			open +
+			head +
+			cardHeadline(
+				esc(terms.searches) + (terms.searches === 1 ? " search" : " searches"),
+				esc(terms.distinctQueries) +
+					(terms.distinctQueries === 1 ? " distinct query · " : " distinct queries · ") +
+					esc(terms.sessions) +
+					(terms.sessions === 1 ? " agent session" : " agent sessions"),
+			);
+
+		if (terms.rows.length === 0) {
+			return (
+				html +
+				'<div class="dec-detail is-empty">No searches in this window — run <code>jolli search</code>, ' +
+				"or ask your agent to search, and they appear here.</div></section>"
+			);
+		}
+
+		html += rankedList(
+			terms.rows,
+			TERMS_TINT,
+			(row) => row.searches,
+			null,
+			(row) => row.term,
+			null,
+			"search",
+			null,
+			{
+				plainLabel: true,
+				expansionHtmlOf: searchTermExpansion,
+				/* The whole row is the toggle, so it carries the same button semantics
+				   the Skills/MCP rows use for their jump. */
+				rowAttrs: (row) =>
+					/* A term standing for ONE query has nothing to reveal — the expansion
+					   would repeat the row. Such a row is plain text, not a dead button. */
+					(row.queries || []).length < 2
+						? ""
+						: /* `rl-term` on top of `rl-click`: the term underlines on hover to
+							 say it discloses something, which the Skills/MCP rows must not
+							 do — theirs navigate, and an underline there would promise a
+							 link that opens a page rather than a panel. */
+							' class="rl-click rl-term" tabindex="0" role="button" aria-expanded="' +
+							String(JD.searchTermOpen === row.term) +
+							'" data-search-term="' +
+							JD.esc(row.term) +
+							'"',
+			},
+		);
+
+		/* `of {termCount}`, the server's own count of TERMS — not `distinctQueries`,
+		   which is the figure in the sub-line above and counts phrasings. Several
+		   phrasings collapse onto one term, so that denominator claimed rows that do
+		   not exist ("Showing 3 of 43 terms" for a window holding three terms, all of
+		   them on screen). No "Show more" — this list does not page, so a button that
+		   could only ever be pressed once would be chrome pretending to be an
+		   affordance. */
+		html +=
+			'<div class="more-row is-done"><span class="more-count">Showing ' +
+			terms.rows.length +
+			" of " +
+			esc(terms.termCount) +
+			(terms.termCount === 1 ? " term" : " terms") +
+			"</span></div>";
+		return html + "</section>";
+	}
+
+	/* One term's expansion — the queries it was extracted from.
+
+	   No fetch and no state machine: these are the same strings the card already
+	   loaded to compute the term, so a request to show them would be a round trip for
+	   something in memory. That replaced an expansion which re-ran the SEARCH, needed
+	   a per-repo Orama index, could not compare BM25 scores across repos, and answered
+	   "what would this find today" to a question about what was asked. */
+	function searchTermExpansion(row) {
+		if (JD.searchTermOpen !== row.term) return "";
+		var queries = row.queries || [];
+		/* A single-query term is its own label, so the expansion would repeat the row
+		   verbatim. `rowAttrs` already withholds the button in that case; this is the
+		   other half of it. */
+		if (queries.length < 2) return "";
+		return (
+			'<div class="rl-expand">' +
+			queries.map((query) => "<div>" + JD.esc(query) + "</div>").join("") +
+			"</div>"
 		);
 	}
 
@@ -759,9 +1053,19 @@ window.JD = window.JD || {};
 	   is escaped here for the same reason.
 
 	   Arguments run in the row's own left-to-right order (lead, label, kind,
-	   value) so a call site reads like the row it builds. */
-	function rankedList(rows, colorVar, valueOf, leadHtmlOf, labelOf, kindOf, unit, list) {
+	   value) so a call site reads like the row it builds.
+
+	   `options` is a trailing OBJECT rather than a ninth positional argument, and
+	   that is not a style preference: eight positions is already the limit of what a
+	   call site can be read against, and a ninth would be a bare function literal
+	   with nothing at the call site to say which slot it filled. It carries
+	   `expansionHtmlOf(row)` today — a block rendered INSIDE the `<li>`, after the
+	   bar. Not inside `.rl-top`: that is a flex row, and an extra child there spends
+	   one of its 8px gaps and takes the width off the only thing that gives, which is
+	   the name (see the truncation note above). */
+	function rankedList(rows, colorVar, valueOf, leadHtmlOf, labelOf, kindOf, unit, list, options) {
 		if (rows.length === 0) return "";
+		var opts = options || {};
 		// The real maximum, not `rows[0]` — that is only the biggest value when the
 		// list's rank order happens to be the metric the bars measure, and Skills
 		// deliberately ranks by adoption while printing runs (see `byAdoption` in
@@ -798,7 +1102,7 @@ window.JD = window.JD || {};
 			   `?skill=`, `data-mcp` → `?mcp=`), which is what the binder at the foot of
 			   this file reads back. The server row's own identity is `row.server`, not
 			   `row.name` — `McpServerRow` has no `name` field. */
-			var clickable = "";
+			var clickable = opts.rowAttrs ? opts.rowAttrs(row) : "";
 			if (list === "skill") {
 				clickable =
 					' class="rl-click" tabindex="0" role="button" data-skill="' +
@@ -824,7 +1128,14 @@ window.JD = window.JD || {};
 				// name 40px left of its neighbours' — the raggedness the fixed width
 				// exists to remove, reintroduced by the empty case.
 				(leadHtmlOf ? '<span class="rl-lead">' + leadHtmlOf(row) + "</span>" : "") +
-				'<span class="rl-name mono" title="' +
+				'<span class="rl-name' +
+					/* Monospace is for IDENTIFIERS — a skill name, an MCP server — where
+					   the shape of the string is part of reading it. A search term is
+					   prose someone typed, and setting it in code type makes a phrase
+					   look like a symbol. Opt-out rather than opt-in so the three
+					   existing lists keep the face they shipped with. */
+					(opts.plainLabel ? "" : " mono") +
+					'" title="' +
 				JD.esc(label) +
 				'">' +
 				JD.esc(label) +
@@ -846,7 +1157,9 @@ window.JD = window.JD || {};
 				Math.round((value / top) * 100) +
 				"%;background:var(" +
 				colorVar +
-				')"></i></div></li>';
+				')"></i></div>' +
+				(opts.expansionHtmlOf ? opts.expansionHtmlOf(row) : "") +
+				"</li>";
 		});
 		return html + "</ul>";
 	}
@@ -971,7 +1284,7 @@ window.JD = window.JD || {};
 	 * with volume is not stated anywhere.
 	 */
 
-	/* Skills (span6) — split out of the old combined "Skills & tools" card so
+	/* Skills (span4) — split out of the old combined "Skills & tools" card so
 	   each half gets its own icon, stat line and footer, matching jolli-design's
 	   per-card anatomy. Every row names the agents that ran it, rather than the
 	   fixed list this used to carry (hard-coded to Claude, stale the day Codex
@@ -1109,7 +1422,7 @@ window.JD = window.JD || {};
 		);
 	}
 
-	/* MCP servers (span6). Only some agents' transcripts can be read for tool
+	/* MCP servers (span4). Only some agents' transcripts can be read for tool
 	   calls, which is why the footer says "N of M sessions" rather than a bare
 	   count: "3 sessions" alone reads as 3 of everything rather than 3 of the
 	   sessions this build can actually see inside. Each row also names the
@@ -1932,6 +2245,151 @@ window.JD = window.JD || {};
 		);
 	}
 
+	/* Selecting a waffle cell.
+
+	   The detail region for the DEFAULT cell rides on the payload, so the first paint
+	   costs nothing; every other cell is one fetch, cached on `JD` so the 30 s repaint
+	   neither loses it nor asks again. That split is what lets the cells stay uncapped
+	   — see MemoryCell in DashboardModel.ts for why `category` and the bullets cannot
+	   travel per cell.
+
+	   ⚠ ONE listener on the waffle, never one per cell, and that follows from the same
+	   "uncapped" rule. The cell count is the window's memory count, so a year on a busy
+	   repo is a few thousand buttons — and `renderStats` rebuilds `#app` wholesale
+	   every 30 s, so a per-cell binding is that many closures allocated and assigned on
+	   every poll, for a control the reader touches once. Delegation makes the wiring
+	   cost independent of the corpus.
+
+	   No keydown handler: these are real `<button>` elements, so Enter and Space
+	   already produce a click. The pair this replaced was written for a `div` carrying
+	   `role="button"`, and against a real button it merely fired `pick` twice. */
+	function wireDecisionCells(model) {
+		var waffle = document.querySelector(".dec-waffle");
+		if (!waffle) return;
+		waffle.onclick = (event) => {
+			var target = event.target;
+			var cell = target && target.closest ? target.closest("[data-decision-cell]") : null;
+			if (!cell) return;
+			var hash = cell.getAttribute("data-decision-cell");
+			var repo = cell.getAttribute("data-decision-repo");
+			/* Both attributes, because either one alone is ambiguous across repos —
+			   the short-circuit below is a REFUSAL to select, so a key missing its
+			   repo half made the second of two same-hash cells permanently unclickable. */
+			var key = JD.decisionCellKey({ repoIdentity: repo, commitHash: hash });
+			/* Re-picking the cell already on screen is a no-op — EXCEPT when its last
+			   fetch FAILED. The region is then showing "Could not load this memory's
+			   decisions.", and clicking it again is the reader asking to retry; guarding
+			   on the key alone made that the one cell the retry could not reach, so the
+			   message sat there until they selected something else and came back. */
+			if (JD.decisionCell === key && JD.decisionCellError !== key) return;
+			JD.decisionCell = key;
+			JD.decisionCellError = null;
+			/* FETCH FIRST, paint second. The paint used to be a full `renderPage`
+			   placed AHEAD of this call, so the request did not leave until every
+			   card on the page had been rebuilt — all of that landed inside what the
+			   reader experiences as "Loading decisions…". Measured, the server side
+			   is 0.7 ms for the query and 14–35 ms for the round trip, so the wait
+			   was never the network. */
+			loadDecisionCell(model, repo, hash);
+			paintDecisionSelection(model);
+		};
+	}
+
+	/* Fetches one cell's detail, unless it is already to hand.
+
+	   "Already to hand" includes the payload's inlined default, which is why this
+	   asks `detailForCell` rather than only the cache — clicking back to the default
+	   cell must not produce a request for something already on screen. */
+	function loadDecisionCell(model, repoIdentity, commitHash) {
+		var cell = { repoIdentity: repoIdentity, commitHash: commitHash };
+		var key = JD.decisionCellKey(cell);
+		if (detailForCell(model, cell)) return;
+		JD.decisionCellDetail = JD.decisionCellDetail || {};
+		/* `detailRepo`, NOT `repo`: `JD.query` already emits `repo=` for the page's
+		   SCOPE, and a second one makes two — `URLSearchParams.get` returns the first,
+		   so the endpoint received the scope's repo TOKEN (a display name) where it
+		   expected this memory's identity and answered 404 for every click. The
+		   `/memories` deep link carries the same field under the same name for exactly
+		   this reason. */
+		fetch("/api/memory-decisions" + JD.withParams(JD.query(model, {}), { detailRepo: repoIdentity, hash: commitHash }))
+			.then((response) => (response.ok ? response.json() : Promise.reject(new Error(String(response.status)))))
+			.then((detail) => {
+				JD.decisionCellDetail[key] = detail;
+				repaintIfStillSelected(model, key);
+			})
+			.catch(() => {
+				JD.decisionCellError = key;
+				repaintIfStillSelected(model, key);
+			});
+	}
+
+	/* Paints an answer only if it is still the answer to the question on screen —
+	   a reader who clicked past this cell while the request was in flight must not
+	   have the region yanked back to an older one.
+
+	   ⚠ It asks `selectedDecisionCell`, NOT `JD.decisionCell`. Those differ for the
+	   one cell nobody clicks: the DEFAULT selection leaves `JD.decisionCell` unset,
+	   so a guard written as `JD.decisionCell === key` rejected the default
+	   cell's own response and the panel sat on "Loading decisions…" until the next
+	   30 s repaint happened to pick the cached answer up. The renderer decides what
+	   is selected; anything guarding a paint has to ask it the same way. */
+	function repaintIfStillSelected(model, key) {
+		var cell = selectedDecisionCell(model);
+		if (cell && JD.decisionCellKey(cell) === key) paintDecisionSelection(model);
+	}
+
+	/* Repaints ONLY what a selection changes: the ring, and the detail region.
+	   `JD.renderPage` rebuilds every card on the page — slower than the request it
+	   was waiting for, and destructive besides: it replaces the element under the
+	   pointer, taking the focus ring off the button the reader just activated.
+
+	   Returns quietly when the card is not on screen (another view, or a tier below
+	   memory), so a late callback cannot throw into a page that has moved on. */
+	function paintDecisionSelection(model) {
+		var cell = selectedDecisionCell(model);
+		if (!cell) return;
+		var key = JD.decisionCellKey(cell);
+		document.querySelectorAll("[data-decision-cell]").forEach((el) => {
+			if (!el.classList) return;
+			/* Rebuilt from the element's OWN two attributes, the same pair the ring is
+			   rendered from — comparing the hash attribute alone lit a ring on every
+			   repo that shares the hash, so one click showed two selections. */
+			var elKey = JD.decisionCellKey({
+				repoIdentity: el.getAttribute("data-decision-repo"),
+				commitHash: el.getAttribute("data-decision-cell"),
+			});
+			el.classList.toggle("is-selected", elKey === key);
+		});
+		var region = document.querySelector(".dec-detail");
+		if (region) region.outerHTML = decisionDetail(model, cell);
+	}
+
+	/* Expanding a search term.
+
+	   A single-open accordion: two open expansions in a span4 card push the rest of
+	   the list off the screen, and the question the expansion answers is about ONE
+	   term. Clicking the open one closes it.
+
+	   Pure view state — the queries are already on the payload, so this neither
+	   fetches nor caches. It used to do both, against an endpoint that re-ran the
+	   search; the whole machine went with it. */
+	function wireSearchTerms(model) {
+		document.querySelectorAll("[data-search-term]").forEach((rowEl) => {
+			var term = rowEl.getAttribute("data-search-term");
+			var toggle = () => {
+				JD.searchTermOpen = JD.searchTermOpen === term ? null : term;
+				JD.renderPage(model);
+			};
+			rowEl.onclick = toggle;
+			rowEl.onkeydown = (event) => {
+				if (event.key === "Enter" || event.key === " ") {
+					event.preventDefault();
+					toggle();
+				}
+			};
+		});
+	}
+
 	JD.renderStats = (model) => {
 		var stats = model.stats;
 		/* Read before anything writes to #app — see `snapshotToolScroll`. Taken even
@@ -1942,31 +2400,36 @@ window.JD = window.JD || {};
 			document.getElementById("app").innerHTML = noReposCard();
 			return;
 		}
-		/* Two bands over the feed. The equal-third band leads with the three
+		/* Three bands over the feed. The equal-third band leads with the three
 		   summary widgets — what ran, what was called, how much of the model it
-		   took — and the half-and-half band under it carries what the work banked
-		   and what it cost.
+		   took. Under it, the memory band: what the work banked, and what the reader
+		   went back and asked their memory for. Spend takes the row below that.
 
-		   Tokens and Decisions swapped seats: token volume is the figure this page
-		   is opened for, so it belongs in the band above the fold, while the
-		   decisions corpus accumulates across the range and reads the same one row
-		   down. What the swap gives up is Tokens sitting BESIDE Spend — they are
-		   one question in two units (see TOKENS_HINT, and the reason a rising
-		   cached share moves them in opposite directions), and that comparison is
-		   now a scroll apart rather than side by side. Each card takes the other's
-		   head along with the seat, because `widgetHead`'s aside only fits a
-		   `span6`-or-wider head.
+		   Spend takes the row under them, alone. It lost its seat beside Decisions when
+		   Decisions grew to two thirds, and its chart does not mind the full width (it
+		   draws with `preserveAspectRatio="none"`). It stays ABOVE the memory band
+		   rather than below it because the three cards over it are all "what ran and
+		   what it cost" — Spend closes that thought, and the memory band below opens a
+		   different one.
 
-		   Both bands are moves off the original jolli-design order, where Spend and
-		   Decisions each took a full row: Decisions was span12 only because the
-		   Recall card beside it was removed (JOLLI-2193), and neither it nor Spend
-		   draws anything that needs twelve columns. */
+		   Decisions and Search are paired because they are two halves of that second
+		   thought — what got written down, and what got looked up — and because both
+		   are memory-tier cards that go dark together. They are NOT equals: Decisions
+		   takes eight columns for a per-day chart of every memory in the window plus
+		   the selected one's decisions, Search four for six ranked rows.
+
+		   What the arrangement gives up is Tokens sitting BESIDE Spend — they are
+		   one question in two units (see TOKENS_HINT, and the reason a rising cached
+		   share moves them in opposite directions), and that comparison is a scroll
+		   apart rather than side by side. */
 		var html = skillsCard(model);
 		html += mcpCard(model);
 		html += tokensCard(model);
 
-		html += decisionsCard(model);
 		html += costCard(model);
+
+		html += decisionsCard(model); // span8
+		html += searchTermsCard(model); // span4
 
 		/* The session-activity card (heatmap, hour histogram, records, share card)
 		   was removed — `stats.heatmap` / `stats.hours` / `stats.fun` stay in the
@@ -1990,6 +2453,9 @@ window.JD = window.JD || {};
 				JD.renderPage(model);
 			};
 		});
+
+		wireDecisionCells(model);
+		wireSearchTerms(model);
 
 		/* Tokens' own split-by tabs. "By type" is local (from `tokenBreakdown`,
 		   already in the model); "By model"/"By repo" share Cost & tokens' series

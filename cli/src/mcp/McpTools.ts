@@ -38,7 +38,7 @@ import { compareSourceRefs } from "../core/SourceTimeline.js";
 import { clearSpaceBindingCache, loadSpaceBindingDisplay } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
-import { recordRecallReceipt } from "../dashboard/ProducerHooks.js";
+import { recordLookupReceipt, recordRecallReceipt } from "../dashboard/ProducerHooks.js";
 import { getStatus } from "../install/Installer.js";
 import type { LocalAgentToolId, StatusInfo } from "../Types.js";
 
@@ -50,17 +50,29 @@ export interface SearchArgs {
 }
 
 export async function runSearch(cwd: string, args: SearchArgs): Promise<{ hits: SearchHitResult[] }> {
-	return { hits: await searchHits(cwd, args, getActiveStorage()) };
+	const hits = await searchHits(cwd, args, getActiveStorage());
+	// Fire-and-forget, for the reason `runRecall` states below: a search exists only
+	// while it is being answered, so it is recorded here or not at all — and the
+	// record is worth strictly less than the latency of the answer it describes.
+	void recordLookupReceipt(cwd, { kind: "search", surface: "mcp", query: args.query, resultCount: hits.length });
+	return { hits };
 }
 
 export async function runRecall(cwd: string, args: { branch?: string }): Promise<RecallResult> {
 	const result = await resolveRecall(args.branch, cwd);
 	// Fire-and-forget: the receipt is what makes this call visible on the
-	// dashboard's Recall card at the moment it happens rather than whenever the
-	// agent's transcript is next scanned (or never, for a non-Claude agent). It
-	// is worth strictly less than the answer's latency, and it never throws, so
-	// it is deliberately not awaited.
-	void recordRecallReceipt(cwd, recallOutcomeOf(result, Date.now()), "mcp");
+	// dashboard at the moment it happens rather than whenever the agent's
+	// transcript is next scanned (or never, for a non-Claude agent). It is worth
+	// strictly less than the answer's latency, and it never throws, so it is
+	// deliberately not awaited.
+	//
+	// The branch travels separately because `RecallOutcome` describes the RESULT and
+	// the branch is part of the REQUEST — folding it in would make that type carry
+	// two different things. Absent for a bare `jolli recall`, which resolves the
+	// current branch inside `resolveRecall` where this caller cannot see it.
+	void recordRecallReceipt(cwd, recallOutcomeOf(result, Date.now()), "mcp", {
+		...(args.branch ? { branch: args.branch } : {}),
+	});
 	return result;
 }
 

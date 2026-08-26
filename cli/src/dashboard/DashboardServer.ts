@@ -143,6 +143,7 @@ import {
 	JOURNEYS_DEFAULT_RANGE,
 	MAX_CUSTOM_DAYS,
 	type QueryOptions,
+	readMemoryDecisions,
 	resolveWindow,
 	STANDUP_MAX_OFFSET,
 } from "./DashboardQuery.js";
@@ -2113,6 +2114,51 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("mcp detail read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not read that MCP server's detail" });
+			}
+			return;
+		}
+
+		// One memory's decisions, for the Decisions card's detail region.
+		//
+		// A FETCH rather than a field on every waffle cell, and the reason is CPU, not
+		// bytes. The cells are deliberately uncapped (their count IS the card's
+		// "N memories" figure, so truncating would make the picture lie) and the page
+		// re-polls `/api/model` every 30 s — while `category` and the decisions both
+		// require parsing that memory's `summary_json`. Inlining them would parse the
+		// whole window twice a minute; the feed's own `MEMORY_CARDS_LIMIT` exists for
+		// the same reason.
+		//
+		// Every selection comes through here, the card's DEFAULT one included. Inlining
+		// just that one was tried: it saves a request on first paint and costs the
+		// list its uncapped-ness, because whatever is inlined rides the poll. A brief
+		// "Loading decisions…" is the better trade — the list is what the card is for.
+		if (url.pathname === "/api/memory-decisions") {
+			// `detailRepo`, NOT `repo`: every page URL already carries `repo=` for the
+			// SCOPE, so a second one would give two and `get` returns the first — the
+			// endpoint would receive a repo display token where it expects an identity
+			// and 404 every click. `/memories` names the same field the same way.
+			const repoIdentity = (url.searchParams.get("detailRepo") ?? "").trim();
+			const hash = (url.searchParams.get("hash") ?? "").trim();
+			if (repoIdentity === "" || hash === "") {
+				sendJson(res, 400, { error: "detailRepo and hash are required" });
+				return;
+			}
+			try {
+				const detail = await withReadonlyDashboardDb((db) => readMemoryDecisions(db, repoIdentity, hash), {
+					...(options.dbPath ? { dbPath: options.dbPath } : {}),
+				});
+				// 404 rather than an empty body: a hash with no current-generation memory
+				// is a real answer (the memory was regenerated or the commit rewritten
+				// under the reader), and the page must show that rather than an empty
+				// detail region that reads as "this memory recorded nothing".
+				if (!detail) {
+					sendJson(res, 404, { error: "no memory for that hash" });
+					return;
+				}
+				sendJson(res, 200, detail);
+			} catch (err) {
+				log.warn("memory decisions read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not read that memory" });
 			}
 			return;
 		}

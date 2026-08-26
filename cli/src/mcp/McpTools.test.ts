@@ -15,7 +15,10 @@ vi.mock("../core/ContextCompiler.js", () => ({
 vi.mock("../core/TopicPageStore.js", () => ({ readTopicPage: vi.fn() }));
 // Recall writes a dashboard receipt. Mocked so this suite never touches the
 // developer's real machine-level database (see ProducerHooks' configDirFor).
-vi.mock("../dashboard/ProducerHooks.js", () => ({ recordRecallReceipt: vi.fn().mockResolvedValue(true) }));
+vi.mock("../dashboard/ProducerHooks.js", () => ({
+	recordRecallReceipt: vi.fn().mockResolvedValue(true),
+	recordLookupReceipt: vi.fn().mockResolvedValue(true),
+}));
 vi.mock("../core/SummaryStore.js", () => ({ getActiveStorage: vi.fn() }));
 vi.mock("../core/PrDescription.js", () => ({ buildPrDescription: vi.fn() }));
 vi.mock("../util/Subprocess.js", () => ({ execFileSyncHidden: vi.fn() }));
@@ -67,7 +70,7 @@ import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js
 import { clearSpaceBindingCache, loadSpaceBindingDisplay } from "../core/SpaceBindingCache.js";
 import { getActiveStorage } from "../core/SummaryStore.js";
 import { readTopicPage } from "../core/TopicPageStore.js";
-import { recordRecallReceipt } from "../dashboard/ProducerHooks.js";
+import { recordLookupReceipt, recordRecallReceipt } from "../dashboard/ProducerHooks.js";
 import { getStatus } from "../install/Installer.js";
 import type { StatusInfo } from "../Types.js";
 import { execFileSyncHidden } from "../util/Subprocess.js";
@@ -208,7 +211,19 @@ describe("runRecall receipts", () => {
 				commits: [{ hash: "a".repeat(40), date: "2026-07-25" }],
 			}),
 			"mcp",
+			// The branch travels as its own argument: `RecallOutcome` describes the
+			// RESULT, and the branch is part of the REQUEST — folding it in would make
+			// that type carry two different things.
+			{ branch: "main" },
 		);
+	});
+
+	it("records no target when the caller named no branch", async () => {
+		// A bare `recall` resolves the current branch inside `resolveRecall`, where
+		// this caller cannot see it. NULL is the honest answer rather than a guess.
+		seed("main", [{ fullHash: "a".repeat(40), commitDate: "2026-07-25" }]);
+		await runRecall("/repo", {});
+		expect(recordRecallReceipt).toHaveBeenCalledWith("/repo", expect.anything(), "mcp", {});
 	});
 
 	it("records a catalog answer as a call that served nothing", async () => {
@@ -221,7 +236,35 @@ describe("runRecall receipts", () => {
 			"/repo",
 			expect.objectContaining({ hit: false, commitCount: 0, commits: [] }),
 			"mcp",
+			{ branch: "no-such-frag" },
 		);
+	});
+});
+
+describe("runSearch receipts", () => {
+	it("records the search where it was answered, since the call exists nowhere else", async () => {
+		// The MCP tool's arguments are not in any transcript this product reads, so a
+		// search observed anywhere but here is a search nothing can ever count.
+		vi.mocked(SearchIndex.openCached).mockResolvedValue({
+			search: vi.fn().mockResolvedValue([{ id: "1" }, { id: "2" }]),
+		} as never);
+		await runSearch("/repo", { query: "rate limiter" });
+		expect(recordLookupReceipt).toHaveBeenCalledWith("/repo", {
+			kind: "search",
+			surface: "mcp",
+			query: "rate limiter",
+			resultCount: 2,
+		});
+	});
+
+	it("returns the hits even when the receipt write fails", async () => {
+		// Fire-and-forget: the receipt is worth strictly less than the answer, so a
+		// rejected write must not reach the caller.
+		vi.mocked(SearchIndex.openCached).mockResolvedValue({
+			search: vi.fn().mockResolvedValue([{ id: "1" }]),
+		} as never);
+		vi.mocked(recordLookupReceipt).mockRejectedValueOnce(new Error("db gone"));
+		await expect(runSearch("/repo", { query: "rate limiter" })).resolves.toEqual({ hits: [{ id: "1" }] });
 	});
 });
 

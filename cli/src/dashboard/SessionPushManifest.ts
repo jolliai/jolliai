@@ -82,17 +82,34 @@ export const NEVER_SYNCED_TABLES = [
 	"schema_meta",
 	"schema_migrations",
 	"sqlite_sequence",
-	// Written on every recall, read by nothing on the other side. The standalone
-	// Recall card is gone from both pages, and the server's request schema never
-	// listed this table — it strips keys it does not know, so every receipt sent
-	// was discarded on arrival. Nothing about the DATA changed (the receipts are
-	// still written locally, and the tool-usage card still counts recall calls off
-	// `session_tool_use`), so putting the table back on the wire is this line plus
-	// its `SYNCED_COLUMNS`, `SYNC_STAMP_COLUMNS`, `KEYSET_COLUMNS` and
-	// `BUSINESS_TIME_COLUMNS` entries. Its stamp column and the two indexes behind
-	// the channel's paging stay in the schema: they have already been migrated, so
-	// they are frozen rather than worth an entry to remove.
+	// Written on every recall by an OLDER dist, read by nothing on the other side.
+	// The server's request schema never listed this table — it strips keys it does not
+	// know, so every receipt sent was discarded on arrival. Nothing in THIS build
+	// writes it any more (`recall` is observed as a `memory_lookups` row of
+	// `kind = 'recall'`), and it survives only for cross-version compatibility on one
+	// machine: `run-hook` picks the highest registered dist, so a 0.99.11–0.99.15 dist
+	// still INSERTs here, and 0.99.10–0.99.12's Recall card still SELECTs from it —
+	// unconditionally, inside the one model build, so a missing table is a 500 on the
+	// WHOLE dashboard rather than one blank card. That is why the table is not dropped;
+	// see `RECALL_RECEIPTS_DDL`. It stays listed here because the partition is asserted
+	// in both directions: a table in the database and in neither list fails the build.
 	"recall_receipts",
+	// Every lookup against a repo's memory — `search` and `recall` alike. Local-only
+	// FOR NOW, and the reason is sequencing rather than privacy: the query text IS
+	// meant to reach the account eventually, but the server's request schema is a
+	// closed `z.object` that STRIPS tables it does not know, so a client that starts
+	// sending before the backend lists it uploads into a void. `recall_receipts` —
+	// the table this one replaces — spent its whole life doing exactly that.
+	//
+	// Flipping it is: move this name to `SYNCED_TABLES`, add its `SYNCED_COLUMNS` /
+	// `EXCLUDED_COLUMNS` / `SYNC_STAMP_COLUMNS` / `KEYSET_COLUMNS` / `WINDOW_SOURCES`
+	// / `BATCH_LIMITS` entries — the schema already carries the stamp column and the
+	// keyset index for it — and, because `query` holds user-authored text, WIDEN the
+	// blunt column net in `SessionPushManifest.test.ts` (today `/transcript|content|
+	// body|text/i`, which the word `query` walks straight through) and record an
+	// explicit exemption for `query`/`query_key`. The net's job is to stop the NEXT
+	// such column, not this one.
+	"memory_lookups",
 	// Derived locally and re-derivable there: a cache cut in THIS machine's
 	// timezone. Sending it would bake that zone into the server's numbers and
 	// leave the server unable to re-aggregate along any other axis. The other half
