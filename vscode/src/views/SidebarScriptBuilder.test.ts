@@ -702,10 +702,13 @@ describe("SidebarScriptBuilder", () => {
 		// so any tip currently pinned to one of them would survive past the
 		// re-render. Mirror the renderStatus / renderToolbar pattern. The regex
 		// allows line comments between `function foo() {` and `hideTextTip();`
-		// so explanatory blocks above the guard don't break the assertion.
+		// so explanatory blocks above the guard don't break the assertion — and,
+		// since nothing is torn down while deferred, also allows a single-line
+		// early-return guard ahead of it (renderBranch's branchMousePressed
+		// mid-click deferral: see the branchRenderQueued wiring).
 		const guardRe = (name: string) =>
 			new RegExp(
-				`function ${name}\\(\\) \\{(?:\\s*//[^\\n]*\\n)*\\s*hideTextTip\\(\\);`,
+				`function ${name}\\(\\) \\{(?:\\s*(?://[^\\n]*|if \\([^)]*\\) \\{[^}]*\\}))*\\s*hideTextTip\\(\\);`,
 			);
 		expect(js).toMatch(guardRe("renderBranch"));
 		expect(js).toMatch(guardRe("renderMemories"));
@@ -897,6 +900,26 @@ describe("SidebarScriptBuilder", () => {
 		expect(js).toContain("spaceAbove");
 		expect(js).toContain("hoverCardEl.style.maxHeight");
 		expect(js).toContain("hoverCardEl.style.overflowY");
+	});
+
+	it("hides the hover card on mousedown outside its command links, so a click doesn't get swallowed by a leftover card", () => {
+		const js = buildSidebarScript();
+		// positionHoverCard anchors the card at the cursor and extends downward,
+		// so a card left over from hovering a row can end up sitting on top of a
+		// control directly beneath it (e.g. the Commit Memory / Review buttons)
+		// for as long as the 200ms hide grace hasn't elapsed. .hover-card is
+		// pointer-events:auto, so a click landing on the card's plain body would
+		// otherwise reach only the 'click' handler's no-op branch — never the
+		// real control underneath, and with no toast anywhere to explain why.
+		// Hiding on mousedown (before the matching mouseup/click) removes the
+		// card from hit-testing in time for the SAME gesture's click to land on
+		// whatever is actually underneath. Must not fire for an actual
+		// [data-cmd] link mousedown, or clicking a card link would break.
+		const idx = js.indexOf("hoverCardEl.addEventListener('mousedown'");
+		expect(idx).toBeGreaterThan(-1);
+		const body = js.slice(idx, js.indexOf("hoverCardEl.addEventListener('click'", idx));
+		expect(body).toContain("e.target.closest('[data-cmd]')");
+		expect(body).toContain("hideHoverCardNow()");
 	});
 
 	it("renders a copy-recall-prompt button on each memory row", () => {
@@ -1163,6 +1186,41 @@ describe("SidebarScriptBuilder", () => {
 			expect(js).not.toMatch(
 				/command:\s*['"]jollimemory\.discardFileChanges['"]/,
 			);
+		});
+
+		it("guards the delegated row-open dispatch against clicks on CONTROLS inside .inline-actions", () => {
+			// Regression: the ✕/+ exclude-toggle button lives inside .inline-actions
+			// but (unlike discard/pin/edit/remove/...) carries no 'data-inline'
+			// marker, so it fell through the '[data-inline]' branch straight into
+			// the row-open dispatch below it. Clicking exclude-toggle on a file
+			// row therefore also fired branch:openChange (opened the file's diff)
+			// as an unwanted side effect of toggling the exclude state; same bug
+			// for openPlan/openCommit/etc. on plan/note/reference rows.
+			const js = buildSidebarScript();
+			const rowClickCommentIdx = js.indexOf("// Plain row click");
+			const openChangeIdx = js.indexOf("type: 'branch:openChange'");
+			expect(rowClickCommentIdx).toBeGreaterThan(-1);
+			expect(openChangeIdx).toBeGreaterThan(rowClickCommentIdx);
+			const segment = js.slice(rowClickCommentIdx, openChangeIdx);
+			expect(segment).toContain(".inline-actions button");
+		});
+
+		it("does NOT guard the .inline-actions container itself — its overlay area must stay clickable", () => {
+			// The container is an absolutely-positioned overlay spanning the row's
+			// full height with its own padding-left and an opaque backing (see
+			// SidebarCssBuilder's .tree-node--hover-actions .inline-actions), and
+			// renderMemoryRow emits an EMPTY one on rows with no actions. A
+			// container-level guard therefore swallowed clicks on plain overlay
+			// background — the M/A/D gs-letter it covers on a hovered Changes row,
+			// and the whole right edge of an action-less memory row — which used to
+			// open the row and would instead do nothing at all, posting no message:
+			// the same silent dead click the hover-card mousedown handler exists to
+			// remove. Only the controls may be guarded.
+			const js = buildSidebarScript();
+			const rowClickCommentIdx = js.indexOf("// Plain row click");
+			const openChangeIdx = js.indexOf("type: 'branch:openChange'");
+			const segment = js.slice(rowClickCommentIdx, openChangeIdx);
+			expect(segment).not.toContain("closest('.inline-actions')");
 		});
 
 		it("inline-discard and context-menu discard both carry indexStatus + worktreeStatus + originalPath", () => {
@@ -3850,7 +3908,10 @@ describe("SidebarScriptBuilder", () => {
 		});
 		it("clears the AI overlay when the file selection changes (stale-ranking guard)", () => {
 			const js = buildSidebarScript();
-			expect(js).toMatch(/branch:toggleFileSelection[\s\S]{0,900}?aiExcludedIds = new Set\(\)/);
+			// Window generous enough to span the optimistic branchData.changes
+			// isSelected update that now sits between the postMessage and the
+			// overlay clear.
+			expect(js).toMatch(/branch:toggleFileSelection[\s\S]{0,1600}?aiExcludedIds = new Set\(\)/);
 		});
 		it("clears the AI overlay when a summary run starts (worker consumed the ranking)", () => {
 			const js = buildSidebarScript();

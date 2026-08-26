@@ -206,7 +206,19 @@ export function buildSettingsScript(): string {
   });
 
   // ── Per-repo outbound push control (spec 306) ──
-  function renderPushControl(repos, unreadable) {
+  // Space-binding state (JOLLI-2152) arrives via a SEPARATE, later message
+  // (spaceBindingsLoaded) than the repo list itself (pushControlLoaded), so
+  // both are kept as closure state and renderPushControl() re-renders from
+  // whichever one changed — never blocking the repo list's own first paint.
+  var pushControlRepos = [];
+  var pushControlUnreadable;
+  var spaceBindings = {};
+  var spaceBindingsSignedOut = false;
+  var spaceBindingsPending = true;
+
+  function renderPushControl() {
+    var repos = pushControlRepos;
+    var unreadable = pushControlUnreadable;
     var list = document.getElementById('pushControlList');
     if (!list) return;
     list.innerHTML = '';
@@ -231,6 +243,12 @@ export function buildSettingsScript(): string {
       }
       return;
     }
+    if (spaceBindingsSignedOut) {
+      var signInHint = document.createElement('div');
+      signInHint.className = 'hint';
+      signInHint.textContent = 'Sign in to see which Jolli Space each repo pushes into.';
+      list.appendChild(signInHint);
+    }
     repos.forEach(function(repo) {
       var rowEl = document.createElement('div');
       rowEl.className = 'push-control-row';
@@ -244,6 +262,27 @@ export function buildSettingsScript(): string {
       path.textContent = repo.repoIdentity;
       meta.appendChild(name);
       meta.appendChild(path);
+      var space = document.createElement('span');
+      space.className = 'pc-space';
+      var binding = spaceBindings[repo.repoIdentity];
+      if (spaceBindingsSignedOut) {
+        space.classList.add('pc-space--unknown');
+        space.textContent = '—';
+        space.title = 'Sign in to Jolli to see which Space this repo pushes into.';
+      } else if (binding) {
+        space.classList.add('pc-space--' + binding.state);
+        if (binding.degraded) space.classList.add('pc-space--degraded');
+        space.textContent = binding.label;
+        if (binding.title) space.title = binding.title;
+      } else if (spaceBindingsPending) {
+        space.classList.add('pc-space--pending');
+        space.textContent = 'Checking…';
+      } else {
+        // spaceBindingsLoaded arrived but this repoIdentity had no entry —
+        // never leave the cell silently blank.
+        space.classList.add('pc-space--unknown');
+        space.textContent = 'Not checked';
+      }
       var toggleWrap = document.createElement('label');
       toggleWrap.className = 'pc-toggle';
       var cb = document.createElement('input');
@@ -274,6 +313,7 @@ export function buildSettingsScript(): string {
       toggleWrap.appendChild(cb);
       toggleWrap.appendChild(cbText);
       rowEl.appendChild(meta);
+      rowEl.appendChild(space);
       rowEl.appendChild(toggleWrap);
       list.appendChild(rowEl);
     });
@@ -1029,7 +1069,9 @@ export function buildSettingsScript(): string {
         // The machine-wide repo list — pushed after settingsLoaded and again
         // after each toggle so each row reflects the PERSISTED flag (this also
         // reverts an optimistic checkbox when a toggle failed).
-        renderPushControl(msg.repos, msg.unreadable);
+        pushControlRepos = msg.repos || [];
+        pushControlUnreadable = msg.unreadable;
+        renderPushControl();
         if (msg.status) {
           var pcStatus = document.getElementById('pushControlStatus');
           if (pcStatus) {
@@ -1041,6 +1083,50 @@ export function buildSettingsScript(): string {
             window.__pcStatusTimer = setTimeout(function() { pcStatus.classList.remove('visible'); }, 4000);
           }
         }
+        break;
+      case 'spaceBindingResolved':
+        // Progressive reveal (JOLLI-2152): SettingsWebviewPanel posts one of
+        // these the instant EACH row's own probe settles, well before the full
+        // batch below — merge just that entry in and re-render now, so a fast
+        // row (the current repo, say) isn't held on "Checking…" behind the
+        // slowest one in the batch. Deliberately does NOT touch
+        // spaceBindingsPending: every other row not yet in spaceBindings must
+        // keep reading as "Checking…" (pending), not "Not checked" (settled
+        // but missing) — only spaceBindingsLoaded below may flip that.
+        //
+        // It DOES clear spaceBindingsSignedOut — normally already cleared by the
+        // spaceBindingsPending message that opens the pass, but a per-row binding
+        // can only come from a signed-in pass, so its arrival is itself the proof
+        // and the flag must never be what hides it (renderPushControl checks
+        // signed-out FIRST).
+        spaceBindingsSignedOut = false;
+        spaceBindings[msg.repoIdentity] = msg.binding;
+        renderPushControl();
+        break;
+      case 'spaceBindingsPending':
+        // A fresh resolution pass is starting (panel open, or a sign-in/sign-out
+        // while it stays open). Drop the previous pass's answers and go back to
+        // "Checking…" instead of leaving stale cells — including, after a
+        // sign-in, a settled signed-out batch whose "—" cells would otherwise
+        // outlive the sign-in for the whole fan-out. Mirrors the dashboard's
+        // doSignIn/doSignOut reset of the same three fields.
+        spaceBindingsPending = true;
+        spaceBindingsSignedOut = false;
+        spaceBindings = {};
+        renderPushControl();
+        break;
+      case 'spaceBindingsLoaded':
+        // A separate, later follow-up to pushControlLoaded (JOLLI-2152) — never
+        // blocks the repo list's own first paint. Re-renders whatever repo list
+        // is already known with the newly-resolved Space bindings merged in.
+        // Belt-and-suspenders alongside spaceBindingResolved above: authoritative
+        // for the signed-out case (no per-row messages exist for it) and for any
+        // row an incremental message missed, and is what actually flips
+        // spaceBindingsPending so a still-missing row reads "Not checked".
+        spaceBindingsPending = false;
+        spaceBindingsSignedOut = !!msg.signedOut;
+        spaceBindings = msg.bindings || {};
+        renderPushControl();
         break;
       case 'setLocalFolder':
         localFolderInput.value = msg.path || '';

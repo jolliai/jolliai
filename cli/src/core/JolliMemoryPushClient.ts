@@ -537,7 +537,10 @@ export class JolliMemoryPushClient {
 	 * Resolves the repo's Space-binding state in one round-trip (see
 	 * {@link FrontDoorResult}). The server auto-binds when exactly one Space is
 	 * bindable, so callers only ever follow up with `createBinding` after an
-	 * `unbound` (several Spaces → user picked one).
+	 * `unbound` (several Spaces → user picked one) — a single-candidate repo is
+	 * bound as a side effect of this call, whether or not the caller is
+	 * actively working in it (e.g. a settings page listing every repo on a
+	 * machine): that auto-bind is accepted, not suppressed.
 	 */
 	async frontDoor(args: { repoUrl: string; repoName: string }): Promise<FrontDoorResult> {
 		const { status, json, parseFailed } = await this.call<FrontDoorResponseBody>(

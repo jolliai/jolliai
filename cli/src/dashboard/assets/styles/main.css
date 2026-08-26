@@ -1644,6 +1644,18 @@ body {
   .set-toggle-row + .set-toggle-row { border-top: 1px solid var(--border); }
   .set-toggle-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
   .set-toggle-row .set-toggle-label { font-size: 13px; font-weight: 600; color: var(--ink); }
+  /* JOLLI-2152: the per-repo Jolli Space cell, sitting between the repo's
+     identity text and its push switch — mirrors the VS Code panel's .pc-space. */
+  .set-space {
+    flex: none; max-width: 180px; font-size: 12px; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; align-self: center;
+  }
+  .set-space-pending { color: var(--ink-2); font-style: italic; }
+  .set-space-unknown, .set-space-unbound { color: var(--ink-2); }
+  .set-space-bound { color: var(--ink); font-weight: 600; }
+  /* Reserved for a bound-but-unhealthy row (no access / read-only) — never used
+     for a plain "not bound yet" state, which is normal and must not alarm. */
+  .set-space-degraded { color: var(--warn, #b26a00); }
   .set-switch {
     flex: none; appearance: none; width: 34px; height: 20px; margin-top: 2px; border-radius: 999px;
     background: var(--border); position: relative; cursor: pointer; transition: background .15s;

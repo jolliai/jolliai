@@ -2083,6 +2083,30 @@ export async function runIdeBridgeAction(action: string, cwd: string, request: J
 					: {}),
 			};
 		}
+		case "space-binding-get": {
+			// JOLLI-2152: the IntelliJ Settings dialog's read-only Space-binding
+			// line, next to the single-repo push toggle above (`push-control-get`).
+			// Mirrors the VS Code panel's / the dashboard's per-repo Space column,
+			// but scoped to exactly one repo — the project this bridge call runs
+			// in — because IntelliJ's Settings UI has no multi-repo list to fan a
+			// probe out over (unlike listPushControlRepos + resolveSpaceBindingsForRepos,
+			// which the VS Code panel and the dashboard use for their multi-repo
+			// tables). Never throws: fetchSpaceBindingStatus already degrades every
+			// failure mode to a `SpaceBindingStatus` kind, and describeSpaceBindingColumn
+			// is a pure formatter, so this always returns a display object.
+			// refresh:true — same reasoning as PushControlSpaces.ts: this dialog is
+			// re-opened and glanced back at, not a one-shot command, and it never
+			// pushes (the cache's own self-healing path), so trusting a stale
+			// cached "bound" answer here would hide an out-of-band unbind for up to
+			// SPACE_BINDING_TTL_MS.
+			const tracker = await import("../core/SessionTracker.js");
+			const config = await tracker.loadConfigFromDir(tracker.getGlobalConfigDir());
+			const { fetchSpaceBindingStatus, describeSpaceBindingColumn } = await import(
+				"../core/SpaceBindingStatus.js"
+			);
+			const status = await fetchSpaceBindingStatus(cwd, config.jolliApiKey, true);
+			return describeSpaceBindingColumn(status);
+		}
 		case "status": {
 			const { createStorage } = await import("../core/StorageFactory.js");
 			const { getStatus } = await import("../install/Installer.js");

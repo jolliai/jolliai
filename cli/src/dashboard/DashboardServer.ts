@@ -48,12 +48,17 @@
  *      request carrying a cross-origin `Origin` is rejected outright, so a
  *      hostile page cannot read the responses even if it can issue requests.
  *   3. A per-server random token, checked ONLY on mutating routes (every
- *      POST) and on the three GETs that expose more than a public read: the
+ *      POST) and on the four GETs that expose more than a public read: the
  *      two that feed a mutation or probe the filesystem (`/api/repo-probe`,
- *      `/api/settings/check-folder`) and the one that carries key-derived
- *      material (`/api/model?view=settings` — masked keys, sign-in state, the
- *      Memory Bank folder path). Every other GET page and `/api/model` view
- *      stays exactly as open as before — `http://localhost:<port>/dashboard`
+ *      `/api/settings/check-folder`) and the two that carry key-derived
+ *      material — `/api/model?view=settings` (masked keys, sign-in state, the
+ *      Memory Bank folder path) and `/api/settings/space-bindings` (which
+ *      Jolli Space this tenant's key resolves each repo into; resolving the
+ *      current repo's row also calls the real front-door probe, whose server
+ *      contract auto-binds an unbound repo the instant exactly one Space is
+ *      bindable — so this route is gated for the mutation-adjacent reason too,
+ *      not just the key-derived one). Every other GET page and `/api/model`
+ *      view stays exactly as open as before — `http://localhost:<port>/dashboard`
  *      still just works by hand, which was the original product call and is
  *      unaffected by this. The token is minted at server start, held only in
  *      process memory, and inlined into the page as
@@ -65,16 +70,17 @@
  *      read this process's memory over loopback the way they could read a
  *      file. GET-only readers (session counts, tokens, cost, commit subjects,
  *      mined insights) still need no credential — nothing there is a secret.
- *      The lone exception is the settings view, whose masked keys, sign-in
- *      state and folder path are gated by the same token above; every other
- *      model this serves is still free of key-derived material.
+ *      The settings view and the Space-bindings route are gated by the same
+ *      token above; every other model this serves is still free of
+ *      key-derived material.
  *   4. `Sec-Fetch-Site` names the initiator, which layers 1+2 cannot: they do
  *      not stop a hostile tab from ISSUING a GET (a `no-cors` request carries
  *      no `Origin` to reject and a loopback `Host` to accept), only from
- *      reading the reply. It is one half of `trusted` on `/api/model`, which
- *      is what keeps the settings view's masked keys behind our own page.
- *      An absent header is trusted as `curl` — a local process on the user's
- *      own machine.
+ *      reading the reply. It is one half of `trusted` on `/api/model` and on
+ *      `/api/settings/space-bindings`, which is what keeps the settings
+ *      view's masked keys — and the Space-bindings route's auto-bind
+ *      side effect — behind our own page. An absent header is trusted as
+ *      `curl` — a local process on the user's own machine.
  *
  *      No GET on this server spends money any more. It used to: the Stats
  *      payload fired a display-time LLM call to compress the Decisions card's
@@ -97,8 +103,10 @@ import { getProjectRootDir, readLocalGitIdentity } from "../core/GitOps.js";
 import { escapeForInlineScript } from "../core/InlineScript.js";
 import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
 import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
+import { resolveSpaceBindingsForRepos } from "../core/PushControlSpaces.js";
 import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { getGlobalConfigDir, loadConfigFromDir } from "../core/SessionTracker.js";
+import { describeSpaceBindingColumn } from "../core/SpaceBindingStatus.js";
 import { classifyScanError } from "../core/SqliteHelpers.js";
 import { trackAs } from "../core/Telemetry.js";
 import { isTelemetryEventName, type TelemetryEventName } from "../core/TelemetryEvents.js";
@@ -2322,6 +2330,57 @@ export function createDashboardServer(options: DashboardServerOptions): Server {
 			} catch (err) {
 				log.warn("push-repos read failed: %s", errMsg(err));
 				sendJson(res, 500, { error: "could not list repositories" });
+			}
+			return;
+		}
+
+		// Settings → Sync to Jolli: which Jolli Space each listed repo pushes into
+		// (JOLLI-2152's VS Code column, mirrored here). Its own endpoint, off the
+		// push-repos list's first paint, for the same reason `missing-summaries` is
+		// separate from the page load: this fans out a live-or-cached probe per
+		// repo (resolveSpaceBindingsForRepos) and must never block the fast,
+		// offline repo list. Re-derives the repo list itself rather than taking one
+		// from the caller — the two endpoints are independent HTTP round-trips, and
+		// this one owns its own repo list identically to `/push-repos` above.
+		//
+		// Gated the same way as `/api/model?view=settings` (module header, layer 3)
+		// — token AND same-site, not just a token — for two independent reasons,
+		// either one alone would be enough: the bindings it returns are key-derived
+		// material (which Jolli Space this tenant's key resolves each repo into,
+		// same category as the masked keys/sign-in state on the settings view), and
+		// resolving the CURRENT repo's row calls the real front-door probe
+		// (resolveSpaceBindingsForRepos → fetchSpaceBindingStatus), whose documented
+		// server contract auto-binds an unbound repo the instant exactly one Space
+		// is bindable. An ungated GET would let a hostile page trigger that bind —
+		// and read the Space names — just by getting this URL loaded cross-site,
+		// without needing to read the response.
+		if (url.pathname === "/api/settings/space-bindings") {
+			if (!hasValidToken(req, token) || isCrossSiteRequest(req)) {
+				sendText(res, 403, "Forbidden");
+				return;
+			}
+			try {
+				const config = await loadConfigFromDir(configDir ?? getGlobalConfigDir());
+				if (!config.jolliApiKey) {
+					sendJson(res, 200, { signedOut: true, bindings: {} });
+					return;
+				}
+				const repos = await listPushControlRepos({
+					...(config.localFolder ? { localFolder: config.localFolder } : {}),
+					currentCwd: serverCwd,
+				});
+				const resolved = await resolveSpaceBindingsForRepos(repos, config.jolliApiKey, {
+					currentCwd: serverCwd,
+					configDir,
+				});
+				const bindings: Record<string, ReturnType<typeof describeSpaceBindingColumn>> = {};
+				for (const [repoIdentity, status] of resolved) {
+					bindings[repoIdentity] = describeSpaceBindingColumn(status);
+				}
+				sendJson(res, 200, { signedOut: false, bindings });
+			} catch (err) {
+				log.warn("space-bindings read failed: %s", errMsg(err));
+				sendJson(res, 500, { error: "could not resolve space bindings" });
 			}
 			return;
 		}

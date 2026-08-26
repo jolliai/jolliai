@@ -376,7 +376,7 @@ export function buildSettingsCss(): string {
     border: 1px solid var(--vscode-panel-border, rgba(128,128,128,0.35));
     border-radius: 4px;
   }
-  .push-control-row .pc-meta { display: flex; flex-direction: column; min-width: 0; }
+  .push-control-row .pc-meta { display: flex; flex-direction: column; min-width: 0; flex: 1 1 auto; }
   .push-control-row .pc-name { font-weight: 600; }
   .push-control-row .pc-path {
     font-size: 0.85em;
@@ -385,6 +385,24 @@ export function buildSettingsCss(): string {
     text-overflow: ellipsis;
     white-space: nowrap;
   }
-  .push-control-row .pc-toggle { margin-left: auto; display: flex; align-items: center; gap: 6px; }
+  /* JOLLI-2152: the per-repo Jolli Space column. flex:1 1 auto on .pc-meta
+     (above) now claims the row's free space, so .pc-toggle no longer needs
+     margin-left:auto to sit at the trailing edge. */
+  .push-control-row .pc-space {
+    flex: 0 0 auto;
+    font-size: 0.85em;
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .push-control-row .pc-space--pending { color: var(--vscode-descriptionForeground); font-style: italic; }
+  .push-control-row .pc-space--unknown,
+  .push-control-row .pc-space--unbound { color: var(--vscode-descriptionForeground); }
+  .push-control-row .pc-space--bound { color: var(--vscode-foreground); font-weight: 600; }
+  /* Reserved for a bound-but-unhealthy row (no access / read-only) — never used
+     for a plain "not bound yet" state, which is normal and must not alarm. */
+  .push-control-row .pc-space--degraded { color: var(--vscode-editorWarning-foreground, #cca700); }
+  .push-control-row .pc-toggle { display: flex; align-items: center; gap: 6px; }
   `;
 }

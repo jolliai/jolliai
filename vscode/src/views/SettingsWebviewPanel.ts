@@ -40,11 +40,16 @@ import {
 	setRepoPushDisabledByIdentity,
 	triggerReenableDrain,
 } from "../../../cli/src/core/PushControl.js";
+import { resolveSpaceBindingsForRepos } from "../../../cli/src/core/PushControlSpaces.js";
 import {
 	getGlobalConfigDir,
 	loadConfigFromDir,
 	saveConfigScoped,
 } from "../../../cli/src/core/SessionTracker.js";
+import {
+	describeSpaceBindingColumn,
+	type SpaceBindingColumnDisplay,
+} from "../../../cli/src/core/SpaceBindingStatus.js";
 import { track } from "../../../cli/src/core/Telemetry.js";
 import {
 	installClaudeHook,
@@ -178,6 +183,33 @@ export class SettingsWebviewPanel {
 	private fullJolliApiKey = "";
 	/** Last successfully-listed push-control rows, re-posted if a later refresh fails so a transient error doesn't blank the list. */
 	private lastPushControlRepos: PushControlRepo[] = [];
+	/**
+	 * Stale-reply guard for {@link refreshSpaceBindings}. It is invoked both
+	 * once per panel open (chained after {@link refreshPushControl}) and again
+	 * on every sign-in/sign-out from {@link postAuthState} while the panel
+	 * stays open, so two calls can be in flight together — e.g. the user signs
+	 * out while the initial (network-bound) fan-out from panel open is still
+	 * resolving. Each call captures the incremented value and only posts its
+	 * result while it still matches, so a slower, now-stale call can never
+	 * overwrite a faster, more recent one's message.
+	 */
+	private spaceBindingsRequestSeq = 0;
+	/**
+	 * Coalescing guard for {@link refreshSpaceBindings}: each call is a full
+	 * per-repo network fan-out (JOLLI-2152 dropped the cache-first read — see
+	 * that method's own docstring), and it can be triggered several times in
+	 * quick succession (a sign-in immediately followed by a sign-out, e.g.,
+	 * while testing auth flows). Without this, each trigger starts its own
+	 * independent burst of `frontDoor` probes even though only the LAST one's
+	 * result will ever be shown (the stale-reply guard above already discards
+	 * every earlier one) — so an overlapping trigger is queued instead of
+	 * fanning out again immediately, and the currently-running pass's own
+	 * completion drains the queue with the freshest repo list, capping
+	 * concurrent bursts at one in flight plus one queued, however many times
+	 * this fires in between.
+	 */
+	private spaceBindingsRefreshInFlight = false;
+	private spaceBindingsRefreshQueued: ReadonlyArray<PushControlRepo> | undefined;
 
 	private constructor(
 		extensionUri: vscode.Uri,
@@ -549,6 +581,117 @@ export class SettingsWebviewPanel {
 	}
 
 	/**
+	 * Resolves each row's Jolli Space binding off the critical path (JOLLI-2152)
+	 * — mirrors {@link refreshMissingSummaryCount}: first paint (`settingsLoaded`
+	 * + `pushControlLoaded`) never waits on a network round-trip. Posts each
+	 * row's result the instant its OWN probe settles (`spaceBindingResolved`,
+	 * via `resolveSpaceBindingsForRepos`'s `onResolved`), so a fast row is not
+	 * held on "Checking…" behind the slowest one in the batch, and additionally
+	 * posts one final `spaceBindingsLoaded` batch once every lookup settles —
+	 * belt-and-suspenders for a webview that missed an incremental message
+	 * (e.g. reloaded mid-fan-out) and for the "no bindings at all" signed-out
+	 * case, which has no per-row messages to send. Runs ONCE, right after the
+	 * initial {@link refreshPushControl} call on panel open; a push on/off
+	 * toggle does not re-trigger it — see the call site in
+	 * {@link handleLoadSettings}.
+	 *
+	 * Gated on being signed in: with no `jolliApiKey` configured, posts
+	 * `signedOut: true` with no bindings and makes no network call at all, so
+	 * the column can show a single sign-in hint instead of one per row.
+	 *
+	 * Re-entrant: {@link postAuthState} calls this again on every sign-in/
+	 * sign-out while the panel stays open, so an earlier call (e.g. the
+	 * network-bound fan-out from panel open) can still be in flight when a
+	 * newer one starts. {@link spaceBindingsRequestSeq} guards against the
+	 * earlier one's result landing afterwards and overwriting the newer,
+	 * more accurate one — see its declaration. {@link spaceBindingsRefreshInFlight}
+	 * additionally coalesces an overlapping call into a single queued rerun
+	 * instead of starting a second, wasted network fan-out — see its own
+	 * declaration. That coalescing wraps ONLY the network call: the signed-out
+	 * short-circuit below makes no network call at all and must stay
+	 * immediate — queuing it behind an unrelated slow fan-out would delay the
+	 * one path that exists specifically to answer fast.
+	 */
+	private async refreshSpaceBindings(repos: ReadonlyArray<PushControlRepo>): Promise<void> {
+		const requestSeq = ++this.spaceBindingsRequestSeq;
+		let jolliApiKey: string | undefined;
+		try {
+			jolliApiKey = (await loadConfigFromDir(this.resolveConfigDir())).jolliApiKey;
+		} catch (err) {
+			log.warn("SettingsPanel", `Space bindings: global config unreadable, treating as signed out: ${err}`);
+		}
+		if (!jolliApiKey) {
+			if (SettingsWebviewPanel.currentPanel !== this || requestSeq !== this.spaceBindingsRequestSeq) return;
+			this.panel.webview.postMessage({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+			return;
+		}
+		if (this.spaceBindingsRefreshInFlight) {
+			this.spaceBindingsRefreshQueued = repos;
+			return;
+		}
+		this.spaceBindingsRefreshInFlight = true;
+		// Tell the column a fresh pass is starting, so it goes back to "Checking…"
+		// rather than keeping the PREVIOUS pass's answers on screen while this one
+		// runs. Load-bearing for the sign-in case specifically: the panel is
+		// holding a settled signed-out batch at that point (`signedOut: true`,
+		// `pending: false`), and the webview checks signed-out FIRST — so without
+		// this every incremental `spaceBindingResolved` below rendered as the
+		// "sign in to see Spaces" cell for the whole fan-out, and clearing only
+		// the signed-out flag would have swung the not-yet-resolved rows to a
+		// settled-looking "Not checked" instead. Mirrors the dashboard's own
+		// doSignIn reset (`spaceBindings = null`). Posted after the signed-out
+		// short-circuit above, which has nothing to wait for.
+		if (SettingsWebviewPanel.currentPanel === this && requestSeq === this.spaceBindingsRequestSeq) {
+			this.panel.webview.postMessage({ command: "spaceBindingsPending" });
+		}
+		const bindings: Record<string, SpaceBindingColumnDisplay> = {};
+		try {
+			const resolved = await resolveSpaceBindingsForRepos(repos, jolliApiKey, {
+				currentCwd: this.workspaceRoot || undefined,
+				// Progressive reveal: post each row the instant ITS OWN probe settles,
+				// rather than making a fast row (the current repo, say) sit on
+				// "Checking…" until the slowest row in the batch also finishes. Gated
+				// on the same seq check as the final batch message below — an
+				// incremental update from a since-superseded call must not land
+				// either.
+				onResolved: (repoIdentity, status) => {
+					if (SettingsWebviewPanel.currentPanel !== this || requestSeq !== this.spaceBindingsRequestSeq) return;
+					this.panel.webview.postMessage({
+						command: "spaceBindingResolved",
+						repoIdentity,
+						binding: describeSpaceBindingColumn(status),
+					});
+				},
+			});
+			for (const [repoIdentity, status] of resolved) {
+				bindings[repoIdentity] = describeSpaceBindingColumn(status);
+			}
+		} catch (err) {
+			// resolveSpaceBindingsForRepos degrades per-row internally and is not
+			// expected to reject; this catch is defensive so a genuinely unexpected
+			// failure still leaves every row at "Not checked" instead of stuck on
+			// "Checking…" forever.
+			log.warn("SettingsPanel", `Space-binding resolution failed: ${err}`);
+			for (const repo of repos) {
+				bindings[repo.repoIdentity] = {
+					state: "unknown",
+					label: "Not checked",
+					title: "Couldn't check this repo's Space binding — see the Jolli Memory output log.",
+				};
+			}
+		} finally {
+			this.spaceBindingsRefreshInFlight = false;
+			const queued = this.spaceBindingsRefreshQueued;
+			this.spaceBindingsRefreshQueued = undefined;
+			if (queued) {
+				void this.refreshSpaceBindings(queued);
+			}
+		}
+		if (SettingsWebviewPanel.currentPanel !== this || requestSeq !== this.spaceBindingsRequestSeq) return;
+		this.panel.webview.postMessage({ command: "spaceBindingsLoaded", signedOut: false, bindings });
+	}
+
+	/**
 	 * Toggles one listed repo's outbound-push flag, then re-pushes the refreshed
 	 * list.
 	 *
@@ -712,8 +855,14 @@ export class SettingsWebviewPanel {
 		void this.refreshMissingSummaryCount();
 
 		// Per-repo push-control list — computed off the critical path and pushed
-		// as its own message (mirrors the missing-summary-count pattern).
-		void this.refreshPushControl();
+		// as its own message (mirrors the missing-summary-count pattern). The
+		// Space-binding column is a further follow-up step, chained after the
+		// (fast, offline) repo list resolves — never on the `handleSetPushDisabled`
+		// toggle path, so flipping a push switch doesn't re-fan-out N more
+		// front-door probes.
+		void this.refreshPushControl().then(() => {
+			void this.refreshSpaceBindings(this.lastPushControlRepos);
+		});
 
 		if (this.fullJolliApiKey.length > 0) {
 			try {
@@ -752,6 +901,11 @@ export class SettingsWebviewPanel {
 			localAgentTool: config.localAgentTool ?? "claude-code",
 			jolliSiteLabel: buildJolliSiteLabel(config.jolliApiKey, config.jolliUrl),
 		});
+		// JOLLI-2152: a sign-in/sign-out here would otherwise leave the Space
+		// column stuck on whatever it showed before — "sign in to see Spaces"
+		// forever after actually signing in, or a stale bound Space forever
+		// after signing out — since nothing else re-triggers it mid-session.
+		void this.refreshSpaceBindings(this.lastPushControlRepos);
 	}
 
 	/** Saves settings, resolving masked API keys back to full values. */

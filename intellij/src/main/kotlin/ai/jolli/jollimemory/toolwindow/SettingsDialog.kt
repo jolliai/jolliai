@@ -175,7 +175,29 @@ class SettingsDialog(
     // Per-repo outbound-push control (spec 306): checked = push this repo to its
     // Jolli Space; unchecked = keep memory local only. Read/written via the CLI
     // bridge (the single source of truth), disabled until the async read lands.
-    private val pushEnabledCheckbox = JBCheckBox("Push this repository's memories to Jolli").apply { isEnabled = false }
+    // The checkbox's own text carries the bound Space's name (JOLLI-2152) once
+    // known — see [refreshPushCheckboxLabel] — rather than a separate label line,
+    // so the two facts ("will this repo push?" / "into which Space?") read as one
+    // sentence instead of a checkbox plus an orphaned line below it.
+    private val pushEnabledCheckbox = JBCheckBox(DEFAULT_PUSH_CHECKBOX_TEXT).apply { isEnabled = false }
+    // JOLLI-2152: which Jolli Space this repository pushes into, folded into
+    // [pushEnabledCheckbox]'s own label by [refreshPushCheckboxLabel] — mirrors
+    // the VS Code panel's / the dashboard's per-repo Space column, scoped to just
+    // this one repo (no multi-repo list exists here). Never offers to rebind;
+    // that stays the Binding Chooser's job, triggered from an actual push. Only a
+    // confirmed "bound" state renders a name — unbound/unknown fall back to the
+    // default text above rather than spelling "Not bound" or "Unknown" into the
+    // checkbox sentence.
+    private var spaceBindLabel: String? = null
+    private var spaceBindTooltip: String? = null
+    // Stale-reply guard for [loadSpaceBindingAsync], same pattern as
+    // [localAgentProbeTool]/[probeLocalAgentUsableAsync] below: the auth
+    // listener re-fires this fetch on every sign-in/sign-out while the dialog
+    // stays open, so two in-flight requests can resolve out of order. Each
+    // call captures the incremented value and only applies its result while
+    // it still matches — an older reply landing after a newer one is dropped
+    // instead of overwriting the checkbox with stale Space information.
+    private var spaceBindRequestId: Long = 0
 
     // ── Tab 3: Memory Bank ─────────────────────────────────────────────────
     private val kbPathField = TextFieldWithBrowseButton().apply {
@@ -237,6 +259,7 @@ class SettingsDialog(
         init()
         loadSettings()
         loadPushControlAsync()
+        loadSpaceBindingAsync()
         refreshLocalAgentToolCombo()
 
         authListenerDisposable = JolliAuthService.addAuthListener {
@@ -245,6 +268,12 @@ class SettingsDialog(
                 syncProviderCard()
                 syncSyncCard()
             }
+            // JOLLI-2152: otherwise the Space label stays stuck on whatever it
+            // showed before this sign-in/sign-out (e.g. "Not signed in to
+            // Jolli.") forever, since nothing else re-fetches it while the
+            // dialog stays open — same fix as the VS Code panel's
+            // postAuthState() and the dashboard's doSignIn/doSignOut.
+            loadSpaceBindingAsync()
         }
         Disposer.register(disposable, Disposable { Disposer.dispose(authListenerDisposable) })
     }
@@ -1517,9 +1546,114 @@ class SettingsDialog(
                     pushControlLoaded = true
                     pushEnabledCheckbox.isSelected = !disabled
                     pushEnabledCheckbox.isEnabled = true
-                    pushEnabledCheckbox.toolTipText = null
+                    pushEnabledCheckbox.toolTipText = spaceBindTooltip
                 }
             }
+        }
+    }
+
+    /**
+     * Fetches this repository's Jolli Space binding over the CLI bridge
+     * (`space-binding-get`) and folds a confirmed binding into
+     * [pushEnabledCheckbox]'s own label via [refreshPushCheckboxLabel]
+     * (JOLLI-2152), instead of a separate "Space: …" line. Purely a display:
+     * this dialog never offers to rebind — that stays the Binding Chooser's
+     * job, triggered from an actual push.
+     *
+     * Only a HEALTHY `bound` state renders a Space name. `unbound` / `unknown`
+     * (not signed in, an outdated client, offline, no local checkout, a
+     * malformed reply) all leave the checkbox at its default
+     * [DEFAULT_PUSH_CHECKBOX_TEXT] rather than spelling "Not bound" or
+     * "Unknown" into what now reads as one sentence — the detail behind an
+     * unbound/unknown state still reaches the user via the tooltip. A
+     * `degraded` bound row (`describeSpaceBindingColumn`'s "no access" /
+     * read-only cases) gets the same fallback: its `label` is either not a
+     * noun phrase at all (`"Bound (no access)"`, which read literally as
+     * `…to its Jolli Space Bound (no access)`) or a quoted Space name
+     * indistinguishable from a healthy one, silently dropping the fact that
+     * memories won't actually sync. The tooltip already carries the accurate
+     * degraded explanation regardless, so that stays the only place it's
+     * surfaced — same as the unbound/unknown case.
+     *
+     * Re-entrant: the auth listener calls this again on every sign-in/sign-out
+     * while the dialog is open, so a slower earlier request can resolve after
+     * a faster later one. [spaceBindRequestId] guards against that — see its
+     * declaration — the same way [localAgentProbeTool] guards
+     * [probeLocalAgentUsableAsync].
+     */
+    private fun loadSpaceBindingAsync() {
+        val cwd = service.mainRepoRoot ?: project.basePath
+        if (cwd == null) {
+            return
+        }
+        val requestId = ++spaceBindRequestId
+        ApplicationManager.getApplication().executeOnPooledThread {
+            val (bound, label, tooltip) = try {
+                val res = CliIntegrations.runIdeBridge(cwd, "space-binding-get")
+                val body = res.takeIf { it.isJsonObject }?.asJsonObject
+                val state = body?.get("state")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                    ?.asString
+                val text = body?.get("label")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                    ?.asString
+                val tip = body?.get("title")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isString }
+                    ?.asString
+                val degraded = body?.get("degraded")
+                    ?.takeIf { it.isJsonPrimitive && it.asJsonPrimitive.isBoolean }
+                    ?.asBoolean ?: false
+                if (state != null && text != null) {
+                    Triple(state == "bound" && !degraded, text, tip)
+                } else {
+                    LOG.warn("space-binding-get returned a malformed reply ($res)")
+                    Triple(false, null, null)
+                }
+            } catch (e: Exception) {
+                LOG.warn("space-binding-get failed", e)
+                Triple(false, null, null)
+            }
+            SwingUtilities.invokeLater {
+                // Drop the reply if a newer request has since been issued — applying
+                // it here would overwrite that newer (possibly still in-flight)
+                // request's eventual result with stale Space information.
+                if (requestId != spaceBindRequestId) {
+                    return@invokeLater
+                }
+                spaceBindLabel = if (bound) label else null
+                spaceBindTooltip = tooltip
+                refreshPushCheckboxLabel()
+                // Never clobber a disabled-reason tooltip loadPushControlAsync may have
+                // set (e.g. the push-control store being unreadable) — only apply the
+                // Space tooltip once the checkbox is actually usable.
+                if (pushEnabledCheckbox.isEnabled) {
+                    pushEnabledCheckbox.toolTipText = tooltip
+                }
+            }
+        }
+    }
+
+    /**
+     * Applies [spaceBindLabel] to [pushEnabledCheckbox]'s own text: a
+     * confirmed binding's name (already quoted by `describeSpaceBindingColumn`,
+     * e.g. `"Jolli Memory"`) is folded into "Push this repository's memories
+     * to its Jolli Space …" so the checkbox reads as one sentence instead of a
+     * checkbox plus an orphaned "Space: …" line below it. The "its Jolli
+     * Space" qualifier is not filler — a bound Space can be named anything,
+     * including (as here) something that reads exactly like the product's own
+     * name, so the bare quoted name alone ("…to "Jolli Memory"") is read as
+     * the product rather than as a specific Space a teammate could rename or
+     * rebind away from. Same reasoning as `describeSpaceBindingColumn`'s own
+     * `Space "…"` phrasing and `StatusCommand.ts`'s `Bound to Space "…"`.
+     * Falls back to [DEFAULT_PUSH_CHECKBOX_TEXT] while the binding is unknown
+     * or unbound.
+     */
+    private fun refreshPushCheckboxLabel() {
+        val label = spaceBindLabel
+        pushEnabledCheckbox.text = if (label != null) {
+            "Push this repository's memories to its Jolli Space $label"
+        } else {
+            DEFAULT_PUSH_CHECKBOX_TEXT
         }
     }
 
@@ -1982,6 +2116,9 @@ class SettingsDialog(
         private const val CARD_SYNC_SIGNEDOUT = "card.sync.out"
         private const val CARD_SYNC_NOKEY = "card.sync.nokey"
         private const val CARD_SYNC_SIGNEDIN = "card.sync.in"
+
+        /** [pushEnabledCheckbox]'s text before a bound Space name is known, or when the repo isn't bound to one. */
+        private const val DEFAULT_PUSH_CHECKBOX_TEXT = "Push this repository's memories to Jolli"
     }
 }
 

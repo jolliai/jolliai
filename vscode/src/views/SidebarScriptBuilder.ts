@@ -862,6 +862,52 @@ export function buildSidebarScript(): string {
     if (!ctxMenu.contains(e.target)) ctxMenu.classList.add('hidden');
   });
 
+  // renderBranch() rebuilds the whole Branch-tab subtree via replaceChildren
+  // (see renderBranch below), and host pushes routinely arrive in short bursts
+  // (e.g. a refresh fans out to pushStatus/pushMemories/pushPlans/pushChanges/
+  // pushCommits/pushConversations/pushPins, each its own message → its own
+  // renderBranch() call). A browser does not fire 'click' at all when the
+  // element under mousedown is removed from the DOM before mouseup — replacing
+  // the whole subtree mid-gesture drops the click silently, with no error and
+  // no message posted, which reads as "I clicked Commit Memory / Push Branch
+  // and nothing happened." This is most likely right after something just
+  // refreshed, because that is exactly when a burst of renders is still
+  // landing. Deferring a render that arrives while a mouse button is held
+  // anywhere in the panel — until the very next mouseup — keeps the clicked
+  // element in place for the whole gesture, so the SAME click reaches it
+  // instead of requiring a second one. Capture phase so this always observes
+  // press/release even if some handler downstream calls stopPropagation.
+  let branchMousePressed = false;
+  let branchRenderQueued = false;
+  function releaseBranchMousePress() {
+    branchMousePressed = false;
+    if (branchRenderQueued) {
+      branchRenderQueued = false;
+      // Deferred to the next task, not called here directly: the mouseup
+      // listener below runs in the CAPTURE phase, which fires before the
+      // browser synthesizes 'click' (that happens only once mouseup's own
+      // capture+bubble dispatch has fully finished). Calling renderBranch()
+      // synchronously here would still replaceChildren() the pressed button
+      // out from under the about-to-fire click — the same drop this deferral
+      // exists to prevent, just moved from "mid-press" to "mid-mouseup".
+      // setTimeout(0) runs after click has already reached its target.
+      // renderBranch() re-checks branchMousePressed itself, so a new press
+      // starting before the timeout fires safely re-queues instead of tearing
+      // down mid-gesture.
+      setTimeout(renderBranch, 0);
+    }
+  }
+  document.addEventListener('mousedown', function() { branchMousePressed = true; }, true);
+  document.addEventListener('mouseup', releaseBranchMousePress, true);
+  // The webview is an iframe, so a press that started here and gets released
+  // outside it (dragged out to the editor, another panel, ...) never reaches
+  // the document 'mouseup' above — branchMousePressed would stay stuck true
+  // forever and every later renderBranch() call would keep deferring with
+  // nothing left to flush it. 'blur' fires whenever focus leaves the webview,
+  // which covers that case (and anything else that ends the gesture without
+  // a mouseup landing here).
+  window.addEventListener('blur', releaseBranchMousePress);
+
   // ---- Message bus ----
   window.addEventListener('message', function(event) {
     const msg = event.data;
@@ -3684,6 +3730,24 @@ export function buildSidebarScript(): string {
     if (hoverHideTimer) { clearTimeout(hoverHideTimer); hoverHideTimer = null; }
   });
   hoverCardEl.addEventListener('mouseleave', scheduleHideHoverCard);
+  // positionHoverCard anchors the card at the cursor and extends downward, so
+  // a card left over from hovering a row (e.g. a Context row) can end up
+  // sitting on top of a control directly beneath it — the Commit Memory /
+  // Review buttons, or a Committed Memories header icon — for as long as the
+  // 200ms hide grace hasn't elapsed. .hover-card is pointer-events:auto (so its
+  // own [data-cmd] links work), so a click landing on the card's plain body
+  // reaches only the 'click' handler below, which no-ops for anything but a
+  // command link — the click never reaches the real control underneath and
+  // never posts any message, reading as "clicked, nothing happened" with no
+  // toast anywhere. Hiding on mousedown (before the matching mouseup/click)
+  // removes the card from hit-testing in time for the SAME gesture's click to
+  // land on whatever is actually underneath, instead of requiring a second
+  // click. Skipped when the mousedown targets an actual [data-cmd] link so
+  // clicking a card link still works.
+  hoverCardEl.addEventListener('mousedown', function(e) {
+    if (e.target.closest('[data-cmd]')) return;
+    hideHoverCardNow();
+  });
   hoverCardEl.addEventListener('click', function(e) {
     const link = e.target.closest('[data-cmd]');
     if (!link) return;
@@ -4184,6 +4248,10 @@ export function buildSidebarScript(): string {
   }
 
   function renderBranch() {
+    // See the branchMousePressed / branchRenderQueued wiring above: a render
+    // that lands mid-click would replace the very button the user is
+    // pressing, silently dropping the click. Defer until mouseup instead.
+    if (branchMousePressed) { branchRenderQueued = true; return; }
     hideTextTip();
     const container = tabContents.branch;
     // Plans & Notes and Changes are workspace-local — they have no meaningful
@@ -6054,6 +6122,29 @@ export function buildSidebarScript(): string {
     if (e.target.closest('[data-checkbox="1"]')) {
       return;
     }
+    // Same reasoning for any CONTROL inside .inline-actions that isn't already
+    // covered by the '[data-inline]' branch above — today that's just the
+    // ✕/+ exclude toggle (data-exclude-toggle, handled by its own listener
+    // below). Without this guard, clicking it on a file/plan/note/reference
+    // row both flipped the exclude state AND fell through to this row-open
+    // dispatch, so e.g. discarding/excluding a file also opened its diff.
+    //
+    // Scoped to the controls, NOT to the .inline-actions container: that
+    // container is an absolutely-positioned overlay spanning the row's full
+    // height (top:0;bottom:0;right:8px) with its own padding-left and an opaque
+    // backing, and it is rendered EMPTY on rows that have no actions (see
+    // renderMemoryRow). Guarding the container therefore swallowed clicks on
+    // plain overlay background — the always-visible M/A/D gs-letter it covers on
+    // a hovered Changes row, and the whole right edge of an action-less memory
+    // row — which used to open the row and would now do nothing at all, with no
+    // message posted anywhere. That is the same silent dead click the hover-card
+    // mousedown handler above exists to remove, so it must not be reintroduced
+    // here. 'button, a, [role=button]' covers every control these clusters
+    // render today (they are all <button>) plus anything a future one adds,
+    // without claiming the container's own hit area.
+    if (e.target.closest('.inline-actions button, .inline-actions a, .inline-actions [role="button"]')) {
+      return;
+    }
     const row = e.target.closest('.tree-node[data-context]');
     if (row) {
       const ctx = row.getAttribute('data-context');
@@ -6280,6 +6371,14 @@ export function buildSidebarScript(): string {
         filePath: filePath,
         selected: !!cb.checked,
       });
+      // Optimistic local update: branchData.changes only updates once the
+      // host's branch:changesData round-trip lands, and Commit Memory /
+      // Review's disabled gate (renderCommitReviewBar's selectedCount) reads
+      // straight off it — a disabled button fires no click at all, so a click
+      // during that gap reads as a silent dead click. The host's push still
+      // supersedes this on the next render.
+      var changedFile = filePath && branchData.changes.filter(function(c) { return c.relativePath === filePath; })[0];
+      if (changedFile) changedFile.isSelected = !!cb.checked;
       // The AI relevance overlay was ranked against the OLD file selection —
       // clear it so no stale strikethrough lingers. With the Review panel open
       // its debounced refresh re-ranks and re-pushes within ~400ms; with the
@@ -6288,8 +6387,8 @@ export function buildSidebarScript(): string {
       if (aiExcludedIds.size > 0) {
         aiExcludedIds = new Set();
         aiReasonById = Object.create(null);
-        if (state.activeTab === 'branch') renderBranch();
       }
+      if (state.activeTab === 'branch') renderBranch();
     }
   });
 

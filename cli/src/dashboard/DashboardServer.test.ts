@@ -93,6 +93,12 @@ vi.mock("../core/PushControl.js", () => ({
 	setRepoPushDisabledByIdentity: vi.fn(async () => ({ disabled: true })),
 	triggerReenableDrain: vi.fn(),
 }));
+// JOLLI-2152: the per-repo Space column's fan-out. Mocked so a space-bindings
+// read never fans out real front-door probes; describeSpaceBindingColumn
+// (SpaceBindingStatus.js) is left real so the response shape is end-to-end.
+vi.mock("../core/PushControlSpaces.js", () => ({
+	resolveSpaceBindingsForRepos: vi.fn(async () => new Map()),
+}));
 // Sign In opens a real browser and blocks on the OAuth callback — mocked to resolve.
 vi.mock("../auth/Login.js", () => ({ browserLogin: vi.fn(async () => {}) }));
 // Sign Out clears the machine-global auth config — mocked so a test never wipes it.
@@ -134,6 +140,7 @@ import { isLocalAgentUsable } from "../core/localagent/DetectAgents.js";
 import { rebuildMemoryBank } from "../core/MemoryBankRebuild.js";
 import { compileAllRepos } from "../core/MultiRepoCompile.js";
 import { listPushControlRepos, setRepoPushDisabledByIdentity, triggerReenableDrain } from "../core/PushControl.js";
+import { resolveSpaceBindingsForRepos } from "../core/PushControlSpaces.js";
 import { NEUTRAL_SOURCE_COLOR, SOURCE_META } from "../core/references/SourceLabels.js";
 import { initTelemetry, shutdownTelemetry } from "../core/Telemetry.js";
 import { readTelemetryEvents } from "../core/TelemetryBuffer.js";
@@ -3548,6 +3555,101 @@ describe("settings, auth and misc endpoints", () => {
 			vi.mocked(listPushControlRepos).mockRejectedValueOnce(new Error("locked"));
 			const port = await listen(svr());
 			expect((await get(port, "/api/settings/push-repos")).status).toBe(500);
+		});
+	});
+
+	// JOLLI-2152: mirrors the VS Code panel's per-repo Space column. Gated the
+	// same as `/api/model?view=settings` — token AND same-site — because the
+	// current repo's row calls the real front-door probe (auto-binds when
+	// exactly one Space is bindable) and every row's Space name is key-derived
+	// material; see the module header's layer 3.
+	describe("GET /api/settings/space-bindings", () => {
+		function writeJolliApiKeyConfig(base: string): string {
+			const configDir = join(base, "jolli-key-config");
+			mkdirSync(configDir, { recursive: true });
+			writeFileSync(join(configDir, "config.json"), JSON.stringify({ jolliApiKey: "sk-jol-test" }));
+			return configDir;
+		}
+
+		it("refuses without a token", async () => {
+			const port = await listen(svr());
+			expect((await get(port, "/api/settings/space-bindings")).status).toBe(403);
+			expect(resolveSpaceBindingsForRepos).not.toHaveBeenCalled();
+		});
+
+		it("refuses when the token is wrong", async () => {
+			const port = await listen(svr());
+			const res = await get(port, "/api/settings/space-bindings", { "X-Jolli-Dashboard-Token": "nope" });
+			expect(res.status).toBe(403);
+		});
+
+		// The half a token cannot cover: a hostile tab that somehow has the token
+		// still announces itself in `Sec-Fetch-Site`.
+		it("refuses cross-site even with a valid token", async () => {
+			const port = await listen(svr());
+			const res = await get(port, "/api/settings/space-bindings", {
+				"X-Jolli-Dashboard-Token": TOKEN,
+				"Sec-Fetch-Site": "cross-site",
+			});
+			expect(res.status).toBe(403);
+			expect(resolveSpaceBindingsForRepos).not.toHaveBeenCalled();
+		});
+
+		it("reports signedOut with no bindings and never calls the resolver when no jolliApiKey is configured", async () => {
+			const port = await listen(svr());
+			const res = await get(port, "/api/settings/space-bindings", { "X-Jolli-Dashboard-Token": TOKEN });
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({ signedOut: true, bindings: {} });
+			expect(resolveSpaceBindingsForRepos).not.toHaveBeenCalled();
+		});
+
+		it("resolves and formats bindings for each listed repo when signed in", async () => {
+			const configDir = writeJolliApiKeyConfig(dir);
+			vi.mocked(listPushControlRepos).mockResolvedValueOnce([
+				{
+					repoIdentity: "https://github.com/acme/widgets",
+					repoName: "widgets",
+					pushDisabled: false,
+					isCurrentRepo: true,
+				},
+			]);
+			vi.mocked(resolveSpaceBindingsForRepos).mockResolvedValueOnce(
+				new Map([
+					[
+						"https://github.com/acme/widgets",
+						{ kind: "bound", spaceName: "Acme Core", canPush: true, canRebind: false },
+					],
+				]),
+			);
+			const port = await listen(svr({ configDir }));
+
+			const res = await get(port, "/api/settings/space-bindings", { "X-Jolli-Dashboard-Token": TOKEN });
+
+			expect(res.status).toBe(200);
+			expect(await res.json()).toEqual({
+				signedOut: false,
+				bindings: {
+					"https://github.com/acme/widgets": {
+						state: "bound",
+						label: '"Acme Core"',
+						title: 'This repo\'s memories push into the Jolli Space "Acme Core".',
+					},
+				},
+			});
+			expect(vi.mocked(resolveSpaceBindingsForRepos).mock.calls[0]?.[1]).toBe("sk-jol-test");
+			// Must thread the server's own configDir through, like every other
+			// registry-touching route in this file — otherwise the registry lookup
+			// for non-current rows silently falls back to the machine-global dir.
+			expect(vi.mocked(resolveSpaceBindingsForRepos).mock.calls[0]?.[2]).toMatchObject({ configDir });
+		});
+
+		it("500s when the resolver fails", async () => {
+			const configDir = writeJolliApiKeyConfig(dir);
+			vi.mocked(resolveSpaceBindingsForRepos).mockRejectedValueOnce(new Error("boom"));
+			const port = await listen(svr({ configDir }));
+			expect((await get(port, "/api/settings/space-bindings", { "X-Jolli-Dashboard-Token": TOKEN })).status).toBe(
+				500,
+			);
 		});
 	});
 

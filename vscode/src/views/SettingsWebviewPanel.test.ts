@@ -215,6 +215,16 @@ vi.mock("../../../cli/src/core/PushControl.js", () => ({
 	triggerReenableDrain: mockTriggerReenableDrain,
 }));
 
+// JOLLI-2152: per-repo Space column. Only the network-bound fan-out is
+// stubbed — describeSpaceBindingColumn (SpaceBindingStatus.js) is left REAL so
+// these tests exercise the actual label/state mapping end to end.
+const { mockResolveSpaceBindingsForRepos } = vi.hoisted(() => ({
+	mockResolveSpaceBindingsForRepos: vi.fn().mockResolvedValue(new Map()),
+}));
+vi.mock("../../../cli/src/core/PushControlSpaces.js", () => ({
+	resolveSpaceBindingsForRepos: mockResolveSpaceBindingsForRepos,
+}));
+
 // ── Import under test ────────────────────────────────────────────────────────
 
 import { setManuallyDisabled } from "../../../cli/src/Logger.js";
@@ -3090,6 +3100,47 @@ describe("SettingsWebviewPanel", () => {
 				}),
 			);
 		});
+
+		it("re-resolves Space bindings after a sign-in completes (JOLLI-2152), instead of leaving the column on its stale sign-out state", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: undefined });
+			mockListPushControlRepos.mockResolvedValue([
+				{ repoIdentity: "https://github.com/acme/widgets", repoName: "widgets", pushDisabled: false, isCurrentRepo: true },
+			]);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+			expect(mockResolveSpaceBindingsForRepos).not.toHaveBeenCalled();
+			postMessage.mockClear();
+
+			// The server has just issued a Jolli API key (sign-in completed).
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			mockResolveSpaceBindingsForRepos.mockResolvedValue(
+				new Map([["https://github.com/acme/widgets", { kind: "bound", spaceName: "Acme Core", canPush: true, canRebind: false }]]),
+			);
+
+			await SettingsWebviewPanel.notifyAuthChanged();
+			await flushPromises();
+			await flushPromises();
+
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledWith(
+				[{ repoIdentity: "https://github.com/acme/widgets", repoName: "widgets", pushDisabled: false, isCurrentRepo: true }],
+				"sk-jol-test",
+				expect.objectContaining({ currentCwd: workspaceRoot }),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: {
+					"https://github.com/acme/widgets": {
+						state: "bound",
+						label: '"Acme Core"',
+						title: 'This repo\'s memories push into the Jolli Space "Acme Core".',
+					},
+				},
+			});
+		});
 	});
 
 	describe("rebuildKnowledgeBase message", () => {
@@ -4014,6 +4065,272 @@ describe("SettingsWebviewPanel", () => {
 			await flushPromises();
 
 			expect(mockSetRepoPushDisabledByIdentity).toHaveBeenCalledWith("https://github.com/acme/other", false, "vscode");
+		});
+	});
+
+	describe("space bindings per repo (JOLLI-2152)", () => {
+		const oneRepo = [
+			{ repoIdentity: "https://github.com/acme/widgets", repoName: "widgets", pushDisabled: false, isCurrentRepo: true },
+		];
+
+		beforeEach(() => {
+			mockResolveSpaceBindingsForRepos.mockReset().mockResolvedValue(new Map());
+			mockListPushControlRepos.mockReset().mockResolvedValue(oneRepo);
+		});
+
+		it("posts signedOut with no bindings and never calls the resolver when jolliApiKey is absent", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: undefined });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(mockResolveSpaceBindingsForRepos).not.toHaveBeenCalled();
+			expect(postMessage).toHaveBeenCalledWith({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+		});
+
+		it("opens a signed-in pass with spaceBindingsPending, so the column resets instead of showing the previous pass", async () => {
+			// The webview checks its signed-out flag FIRST and only the final batch
+			// updates it, so a sign-in with a settled signed-out batch on screen
+			// would keep every row on "—" for the whole fan-out.
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			const commands = postMessage.mock.calls.map((c) => (c[0] as { command?: string }).command);
+			expect(commands).toContain("spaceBindingsPending");
+			// And it must precede the batch it is resetting for.
+			expect(commands.indexOf("spaceBindingsPending")).toBeLessThan(commands.indexOf("spaceBindingsLoaded"));
+		});
+
+		it("does NOT post spaceBindingsPending on the signed-out short-circuit — there is nothing to wait for", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: undefined });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ command: "spaceBindingsPending" }));
+		});
+
+		it("posts the resolved binding for a bound repo when signed in", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			mockResolveSpaceBindingsForRepos.mockResolvedValue(
+				new Map([["https://github.com/acme/widgets", { kind: "bound", spaceName: "Acme Core", canPush: true, canRebind: false }]]),
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledWith(
+				oneRepo,
+				"sk-jol-test",
+				expect.objectContaining({ currentCwd: workspaceRoot }),
+			);
+			expect(postMessage).toHaveBeenCalledWith({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: {
+					"https://github.com/acme/widgets": {
+						state: "bound",
+						label: '"Acme Core"',
+						title: 'This repo\'s memories push into the Jolli Space "Acme Core".',
+					},
+				},
+			});
+		});
+
+		it("posts an unbound label for an unbound repo when signed in", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			mockResolveSpaceBindingsForRepos.mockResolvedValue(
+				new Map([["https://github.com/acme/widgets", { kind: "unbound", spaceCount: 3 }]]),
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			const call = postMessage.mock.calls.find((c) => (c[0] as { command?: string }).command === "spaceBindingsLoaded");
+			expect(call?.[0]).toMatchObject({
+				signedOut: false,
+				bindings: { "https://github.com/acme/widgets": { state: "unbound", label: "Not bound" } },
+			});
+		});
+
+		it("falls back to Not checked for every row when the resolver rejects outright", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			mockResolveSpaceBindingsForRepos.mockRejectedValueOnce(new Error("boom"));
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+			postMessage.mockClear();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+
+			expect(warn).toHaveBeenCalledWith("SettingsPanel", expect.stringContaining("boom"));
+			const call = postMessage.mock.calls.find((c) => (c[0] as { command?: string }).command === "spaceBindingsLoaded");
+			expect(call?.[0]).toMatchObject({
+				signedOut: false,
+				bindings: { "https://github.com/acme/widgets": { state: "unknown", label: "Not checked" } },
+			});
+		});
+
+		it("does not re-trigger the space fan-out when a push toggle is flipped", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			mockSetRepoPushDisabledByIdentity.mockResolvedValue({ disabled: true, recoveredFromCorrupt: false });
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises();
+			await flushPromises();
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(1);
+
+			dispatch({ command: "setPushDisabled", repoIdentity: "https://github.com/acme/widgets", disabled: true, isCurrent: true });
+			await flushPromises();
+			await flushPromises();
+
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(1);
+		});
+
+		it("does not post spaceBindingsLoaded when the panel is disposed before the resolver settles", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			let resolveBindings: (m: Map<string, unknown>) => void = () => {};
+			mockResolveSpaceBindingsForRepos.mockImplementation(
+				() => new Promise((res) => {
+					resolveBindings = res;
+				}),
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises(); // let refreshPushControl settle and the resolver call start
+			await flushPromises();
+			postMessage.mockClear();
+			(SettingsWebviewPanel as unknown as { currentPanel: undefined }).currentPanel = undefined;
+			resolveBindings(new Map());
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ command: "spaceBindingsLoaded" }));
+		});
+
+		it("drops a stale reply: signing out while the initial fan-out is still in flight must not let it overwrite the newer signed-out state", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			let resolveFirst: (m: Map<string, unknown>) => void = () => {};
+			mockResolveSpaceBindingsForRepos.mockImplementationOnce(
+				() =>
+					new Promise((res) => {
+						resolveFirst = res;
+					}),
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises(); // let refreshPushControl settle and the first (in-flight) call start
+			await flushPromises();
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(1);
+
+			// A newer request starts (e.g. the user signed out) and settles first —
+			// signed-out short-circuits before ever calling the resolver again.
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: undefined });
+			postMessage.mockClear();
+			await SettingsWebviewPanel.notifyAuthChanged();
+			await flushPromises();
+			await flushPromises();
+			expect(postMessage).toHaveBeenCalledWith({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+			postMessage.mockClear();
+
+			// The stale first call finally resolves — its (now outdated) "signed in
+			// and bound" result must be dropped, not overwrite the signed-out state
+			// that already reached the webview.
+			resolveFirst(
+				new Map([
+					[
+						"https://github.com/acme/widgets",
+						{ kind: "bound", spaceName: "Acme Core", canPush: true, canRebind: false },
+					],
+				]),
+			);
+			await flushPromises();
+			await flushPromises();
+
+			expect(postMessage).not.toHaveBeenCalledWith(expect.objectContaining({ command: "spaceBindingsLoaded" }));
+		});
+
+		it("coalesces an overlapping signed-in trigger into one queued rerun instead of a second network fan-out", async () => {
+			mockLoadConfigFromDir.mockResolvedValue({ jolliApiKey: "sk-jol-test" });
+			let resolveFirst: (m: Map<string, unknown>) => void = () => {};
+			mockResolveSpaceBindingsForRepos.mockImplementationOnce(
+				() =>
+					new Promise((res) => {
+						resolveFirst = res;
+					}),
+			);
+			await SettingsWebviewPanel.show(extensionUri, workspaceRoot);
+			const dispatch = captureMessageHandler();
+
+			dispatch({ command: "loadSettings" });
+			await flushPromises(); // let refreshPushControl settle and the first (in-flight) call start
+			await flushPromises();
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(1);
+
+			// A second signed-in trigger (e.g. another auth event) fires while the
+			// first fan-out is still resolving — it must NOT start a second one.
+			await SettingsWebviewPanel.notifyAuthChanged();
+			await flushPromises();
+			await flushPromises();
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(1);
+
+			// The first call finally resolves — its own result posts, and the
+			// queued second trigger now runs exactly once (not dropped, not
+			// duplicated) with a fresh network fan-out.
+			mockResolveSpaceBindingsForRepos.mockResolvedValueOnce(
+				new Map([
+					[
+						"https://github.com/acme/widgets",
+						{ kind: "bound", spaceName: "Acme Core", canPush: true, canRebind: false },
+					],
+				]),
+			);
+			resolveFirst(new Map([["https://github.com/acme/widgets", { kind: "unbound", spaceCount: 2 }]]));
+			await flushPromises();
+			await flushPromises();
+			await flushPromises();
+
+			expect(mockResolveSpaceBindingsForRepos).toHaveBeenCalledTimes(2);
+			expect(postMessage).toHaveBeenLastCalledWith({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: {
+					"https://github.com/acme/widgets": {
+						state: "bound",
+						label: '"Acme Core"',
+						title: 'This repo\'s memories push into the Jolli Space "Acme Core".',
+					},
+				},
+			});
 		});
 	});
 });

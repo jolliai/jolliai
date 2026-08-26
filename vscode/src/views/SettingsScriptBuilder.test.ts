@@ -41,6 +41,23 @@ interface FakeElement {
 	hidden: boolean;
 	addEventListener(type: string, cb: Listener): void;
 	fire(type: string): void;
+	/**
+	 * Container capabilities, added for JOLLI-2152's `renderPushControl()`
+	 * coverage: the script builds rows with `document.createElement` and
+	 * `appendChild`, and clears `#pushControlList` via `innerHTML = ''` before
+	 * each re-render. Every FakeElement supports these (not just ones the
+	 * script creates at runtime) so the SAME lazily-fabricated element `get()`
+	 * hands back for any id — including `pushControlList` itself — can act as
+	 * either a leaf (select/button) or a container without a second element type.
+	 */
+	className: string;
+	title: string;
+	type: string;
+	readonly children: ReadonlyArray<FakeElement>;
+	appendChild(child: FakeElement): void;
+	setAttribute(name: string, value: string): void;
+	getAttribute(name: string): string | null;
+	innerHTML: string;
 }
 
 function createClassList(): FakeClassList {
@@ -114,6 +131,8 @@ function createSelect(specs: readonly OptionSpec[]): FakeElement {
 		disabled: false,
 		getAttribute: (name: string) => spec.attrs?.[name] ?? null,
 	}));
+	const children: FakeElement[] = [];
+	const attributes: Record<string, string> = {};
 	return {
 		hidden: false,
 		get value() {
@@ -129,6 +148,9 @@ function createSelect(specs: readonly OptionSpec[]): FakeElement {
 		textContent: "",
 		checked: false,
 		disabled: false,
+		className: "",
+		title: "",
+		type: "",
 		get selectedIndex() {
 			return selectedIdx;
 		},
@@ -137,6 +159,23 @@ function createSelect(specs: readonly OptionSpec[]): FakeElement {
 			if (options[i]) currentValue = options[i].value;
 		},
 		options,
+		children,
+		appendChild(child: FakeElement) {
+			children.push(child);
+		},
+		setAttribute(name: string, v: string) {
+			attributes[name] = v;
+		},
+		getAttribute(name: string) {
+			return attributes[name] ?? null;
+		},
+		get innerHTML() {
+			return "";
+		},
+		set innerHTML(_v: string) {
+			// The script only ever assigns '' to clear a container before re-rendering.
+			children.length = 0;
+		},
 		classList: createClassList(),
 		addEventListener(type, cb) {
 			if (!listeners[type]) listeners[type] = [];
@@ -217,6 +256,11 @@ function runScript(scriptSource: string): ScriptHandles {
 
 	const documentStub = {
 		getElementById: (id: string) => get(id),
+		// JOLLI-2152's renderPushControl() builds every row (and its cells) via
+		// document.createElement — the same container-capable factory the
+		// pre-seeded/lazily-fabricated elements above already use, so a created
+		// node can be appended into `pushControlList` and inspected afterward.
+		createElement: (_tag: string) => createSelect([]),
 		querySelectorAll: () => ({ forEach: () => {} }),
 		querySelector: () => null,
 		addEventListener: () => {},
@@ -1071,5 +1115,207 @@ describe("local-agent model picker", () => {
 		h.localAgentModelSelect.fire("change");
 
 		expect(h.applyBtn.disabled).toBe(false);
+	});
+
+	describe("per-repo Space column (JOLLI-2152, behavioral)", () => {
+		function pushControlRows(h: ScriptHandles): ReadonlyArray<FakeElement> {
+			return h.element("pushControlList").children.filter((c) => c.className === "push-control-row");
+		}
+		/** rowEl.appendChild(meta); rowEl.appendChild(space); rowEl.appendChild(toggleWrap); */
+		function spaceCellOf(row: FakeElement): FakeElement {
+			return row.children[1];
+		}
+		function metaCellOf(row: FakeElement): FakeElement {
+			return row.children[0];
+		}
+		const oneRepo = [
+			{ repoIdentity: "https://github.com/acme/widgets", repoName: "widgets", pushDisabled: false, isCurrentRepo: true },
+		];
+
+		it("shows a pending 'Checking…' placeholder before spaceBindingsLoaded arrives", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+
+			const rows = pushControlRows(h);
+			expect(rows.length).toBe(1);
+			const space = spaceCellOf(rows[0]);
+			expect(space.textContent).toBe("Checking…");
+			expect(space.classList.contains("pc-space--pending")).toBe(true);
+		});
+
+		it("renders exactly one sign-in hint and a muted dash per row when signed out", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+
+			const list = h.element("pushControlList");
+			const hints = list.children.filter((c) => c.className === "hint");
+			expect(hints.length).toBe(1);
+			expect(hints[0].textContent).toContain("Sign in");
+
+			const space = spaceCellOf(pushControlRows(h)[0]);
+			expect(space.textContent).toBe("—");
+			expect(space.classList.contains("pc-space--unknown")).toBe(true);
+		});
+
+		it("renders a bound row with its Space name, without disturbing the existing name/path/toggle cells", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: { "https://github.com/acme/widgets": { state: "bound", label: "Acme Core" } },
+			});
+
+			const row = pushControlRows(h)[0];
+			const space = spaceCellOf(row);
+			expect(space.textContent).toBe("Acme Core");
+			expect(space.classList.contains("pc-space--bound")).toBe(true);
+
+			// Regression: the pre-existing cells are unaffected by the new column.
+			const meta = metaCellOf(row);
+			expect(meta.children[0].textContent).toBe("widgets (this repo)");
+			expect(meta.children[1].textContent).toBe("https://github.com/acme/widgets");
+			const toggle = row.children[2];
+			expect(toggle.children[0].checked).toBe(true);
+		});
+
+		it("renders an unbound row as 'Not bound'", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: { "https://github.com/acme/widgets": { state: "unbound", label: "Not bound", title: "2 Spaces available" } },
+			});
+
+			const space = spaceCellOf(pushControlRows(h)[0]);
+			expect(space.textContent).toBe("Not bound");
+			expect(space.classList.contains("pc-space--unbound")).toBe(true);
+			expect(space.title).toBe("2 Spaces available");
+		});
+
+		it("falls back to 'Not checked' — never blank — when a repoIdentity is missing from a settled bindings map", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({ command: "spaceBindingsLoaded", signedOut: false, bindings: {} });
+
+			const space = spaceCellOf(pushControlRows(h)[0]);
+			expect(space.textContent).toBe("Not checked");
+			expect(space.classList.contains("pc-space--unknown")).toBe(true);
+			expect(space.classList.contains("pc-space--pending")).toBe(false);
+		});
+
+		it("tolerates spaceBindingsLoaded arriving before pushControlLoaded, and renders correctly once both have", () => {
+			const h = runScript(script);
+			loadSettings(h);
+
+			expect(() =>
+				h.receive({
+					command: "spaceBindingsLoaded",
+					signedOut: false,
+					bindings: { "https://github.com/acme/widgets": { state: "bound", label: "Acme Core" } },
+				}),
+			).not.toThrow();
+
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+
+			const space = spaceCellOf(pushControlRows(h)[0]);
+			expect(space.textContent).toBe("Acme Core");
+			expect(space.classList.contains("pc-space--bound")).toBe(true);
+		});
+
+		it("renders a single row's result from spaceBindingResolved without waiting for the whole batch", () => {
+			const twoRepos = [
+				...oneRepo,
+				{
+					repoIdentity: "https://github.com/acme/slow",
+					repoName: "slow",
+					pushDisabled: false,
+					isCurrentRepo: false,
+				},
+			];
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: twoRepos });
+
+			// Only the FIRST repo's probe has settled so far.
+			h.receive({
+				command: "spaceBindingResolved",
+				repoIdentity: "https://github.com/acme/widgets",
+				binding: { state: "bound", label: "Acme Core" },
+			});
+
+			const rows = pushControlRows(h);
+			// The settled row shows its real answer immediately...
+			expect(spaceCellOf(rows[0]).textContent).toBe("Acme Core");
+			expect(spaceCellOf(rows[0]).classList.contains("pc-space--bound")).toBe(true);
+			// ...while the still-in-flight row must stay on "Checking…", NOT fall
+			// through to the settled-but-missing "Not checked" (only the final
+			// spaceBindingsLoaded batch may clear the pending flag).
+			expect(spaceCellOf(rows[1]).textContent).toBe("Checking…");
+			expect(spaceCellOf(rows[1]).classList.contains("pc-space--pending")).toBe(true);
+		});
+
+		// A sign-in leaves the panel holding a SETTLED signed-out batch
+		// (signedOut: true, pending: false). renderPushControl checks signed-out
+		// FIRST, so without a reset every row kept showing "—" + the sign-in hint
+		// for the whole new fan-out — defeating the progressive reveal above — and
+		// clearing only the signed-out flag would have swung the not-yet-resolved
+		// rows to a settled-looking "Not checked" instead.
+		it("spaceBindingsPending puts the column back on 'Checking…' after a settled signed-out batch", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+			expect(spaceCellOf(pushControlRows(h)[0]).textContent).toBe("—");
+
+			h.receive({ command: "spaceBindingsPending" });
+
+			const cell = spaceCellOf(pushControlRows(h)[0]);
+			expect(cell.textContent).toBe("Checking…");
+			expect(cell.classList.contains("pc-space--pending")).toBe(true);
+		});
+
+		it("spaceBindingsPending drops the previous pass's per-row answers rather than leaving them stale", () => {
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({
+				command: "spaceBindingsLoaded",
+				signedOut: false,
+				bindings: { "https://github.com/acme/widgets": { state: "bound", label: '"Acme Core"' } },
+			});
+			expect(spaceCellOf(pushControlRows(h)[0]).textContent).toBe('"Acme Core"');
+
+			h.receive({ command: "spaceBindingsPending" });
+
+			expect(spaceCellOf(pushControlRows(h)[0]).textContent).toBe("Checking…");
+		});
+
+		it("a per-row spaceBindingResolved clears a stale signed-out flag on its own", () => {
+			// Belt-and-braces for a missed spaceBindingsPending: a per-row binding
+			// can only come from a signed-in pass, so the flag must never be what
+			// hides it.
+			const h = runScript(script);
+			loadSettings(h);
+			h.receive({ command: "pushControlLoaded", repos: oneRepo });
+			h.receive({ command: "spaceBindingsLoaded", signedOut: true, bindings: {} });
+
+			h.receive({
+				command: "spaceBindingResolved",
+				repoIdentity: "https://github.com/acme/widgets",
+				binding: { state: "bound", label: '"Acme Core"' },
+			});
+
+			const cell = spaceCellOf(pushControlRows(h)[0]);
+			expect(cell.textContent).toBe('"Acme Core"');
+			expect(cell.classList.contains("pc-space--bound")).toBe(true);
+		});
 	});
 });

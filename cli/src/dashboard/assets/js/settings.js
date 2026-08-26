@@ -99,6 +99,32 @@ window.JD = window.JD || {};
 		pushRepos: null,
 		pushError: null,
 		pushStatus: null, // { repoIdentity, text, kind } — last per-repo toggle result
+		// JOLLI-2152: per-repo Jolli Space column, mirroring the VS Code panel.
+		// null = not yet fetched (renders "Checking…"); once fetched, an object
+		// (possibly empty) keyed by repoIdentity → {state,label,title,degraded}.
+		spaceBindings: null,
+		spaceBindingsSignedOut: false,
+		spaceBindingsError: null,
+		// Stale-reply guard for loadSpaceBindings(): doSignIn/doSignOut reset
+		// spaceBindings to null and re-trigger a fresh fetch while an earlier
+		// fetch (from before the sign-in/out) can still be in flight. Each call
+		// captures the incremented value and only applies its result while it
+		// still matches, so the earlier, now-stale reply can't land after the
+		// newer one and overwrite it with outdated Space data.
+		spaceBindingsRequestSeq: 0,
+		// Coalescing guard: wire()'s `spaceBindings === null` re-fires
+		// loadSpaceBindings() on every render while a fetch is in flight (same
+		// shape as loadPushRepos' own render->wire loop below), and a rapid
+		// sign-in/sign-out sequence resets spaceBindings to null again before the
+		// PREVIOUS fetch (from before that toggle) has resolved. Without this,
+		// each toggle starts its own redundant network fan-out even though only
+		// the latest one's result is ever kept (spaceBindingsRequestSeq already
+		// discards the rest). A skipped call sets spaceBindingsFetchQueued so the
+		// in-flight one's own completion starts exactly one more fetch — without
+		// that, a skipped call that turns out to be the stale one (seq mismatch)
+		// leaves spaceBindings stuck at null with nothing left to ever fetch it.
+		spaceBindingsFetchInFlight: false,
+		spaceBindingsFetchQueued: false,
 		// The machine-wide session-statistics switch. NOT part of `form`: like the
 		// per-repo toggles beside it, it writes on change instead of on Apply, so
 		// it must not count towards the form's dirty state.
@@ -531,6 +557,30 @@ window.JD = window.JD || {};
 		);
 	}
 
+	// JOLLI-2152: the per-repo Jolli Space cell, rendered between the repo's
+	// identity text and its push toggle. All state→text/class mapping happens
+	// server-side (describeSpaceBindingColumn, reached via /api/settings/space-bindings)
+	// — this only renders the already-formatted fields, mirroring the VS Code
+	// webview's renderPushControl() so the two surfaces can't drift on wording.
+	function spaceCellHtml(r) {
+		if (state.spaceBindingsSignedOut) {
+			return '<span class="set-space set-space-unknown" title="Sign in to Jolli to see which Space this repo pushes into.">—</span>';
+		}
+		var binding = state.spaceBindings && state.spaceBindings[r.repoIdentity];
+		if (binding) {
+			var cls = "set-space set-space-" + binding.state + (binding.degraded ? " set-space-degraded" : "");
+			return (
+				'<span class="' + cls + '"' + (binding.title ? ' title="' + esc(binding.title) + '"' : "") + ">" + esc(binding.label) + "</span>"
+			);
+		}
+		if (state.spaceBindings === null) {
+			return '<span class="set-space set-space-pending">Checking…</span>';
+		}
+		// spaceBindings has settled (object, possibly {}) but this repoIdentity
+		// has no entry — never leave the cell silently blank.
+		return '<span class="set-space set-space-unknown">Not checked</span>';
+	}
+
 	function syncSection(sum) {
 		// Both outbound streams are named in the sign-in verdict — the line that says
 		// what being signed in is FOR. It used to say "ready to push memories",
@@ -554,6 +604,9 @@ window.JD = window.JD || {};
 			list = '<div class="set-hint">No repositories with a git remote are tracked on this machine yet.</div>';
 		else
 			list =
+				(state.spaceBindingsSignedOut
+					? '<p class="set-hint">Sign in to see which Jolli Space each repo pushes into.</p>'
+					: "") +
 				'<div class="set-group">' +
 				state.pushRepos
 					.map((r) => {
@@ -570,7 +623,9 @@ window.JD = window.JD || {};
 							(r.isCurrentRepo ? ' <span class="set-tag">this repo</span>' : "") +
 							'</span><span class="set-hint">' +
 							esc(r.repoIdentity) +
-							'</span></span><input type="checkbox" class="set-switch" data-push="' +
+							"</span></span>" +
+							spaceCellHtml(r) +
+							'<input type="checkbox" class="set-switch" data-push="' +
 							esc(r.repoIdentity) +
 							'"' +
 							(r.pushDisabled ? "" : " checked") +
@@ -877,6 +932,7 @@ window.JD = window.JD || {};
 				state.pushError = null;
 				state.pushStatus = null;
 				state.syncStatus = null;
+				state.spaceBindingsError = null;
 				render(model);
 			};
 		});
@@ -929,6 +985,9 @@ window.JD = window.JD || {};
 		// hammering a 500ing endpoint forever. The error render sets pushError, which
 		// closes the guard until the user retries (a rail switch clears it).
 		if (state.section === "sync" && state.pushRepos === null && !state.pushError) loadPushRepos(model);
+		// Same shape, independent endpoint (JOLLI-2152) — a failed push-repos load
+		// must not also block the Space column from loading, and vice versa.
+		if (state.section === "sync" && state.spaceBindings === null && !state.spaceBindingsError) loadSpaceBindings(model);
 		if (state.section === "bank" && state.missing === undefined) loadMissing(model);
 	}
 
@@ -1046,6 +1105,23 @@ window.JD = window.JD || {};
 				state.busy = null;
 				state.notice = null;
 				state.form = null;
+				// JOLLI-2152: otherwise the Space column stays stuck on whatever it
+				// showed before sign-in (the "sign in to see Spaces" hint) forever,
+				// since nothing else re-fetches it mid-session — same fix as the VS
+				// Code panel's postAuthState(). spaceBindingsSignedOut must be cleared
+				// here too, not just spaceBindings/spaceBindingsError: spaceCellHtml
+				// checks it first, so leaving it true renders "Sign in to see…" for
+				// the render(s) between this success callback and the moment
+				// loadSpaceBindings's own response lands.
+				state.spaceBindings = null;
+				state.spaceBindingsSignedOut = false;
+				state.spaceBindingsError = null;
+				// Bump here, not just inside loadSpaceBindings(): an old in-flight
+				// fetch from before sign-in can still land after this reset but
+				// before wire() re-triggers a fresh load. Without bumping now, that
+				// stale reply's captured seq still matches state.spaceBindingsRequestSeq
+				// and it briefly renders the pre-sign-in Space for one frame.
+				state.spaceBindingsRequestSeq++;
 				refreshSettings();
 			})
 			.catch((err) => {
@@ -1063,6 +1139,13 @@ window.JD = window.JD || {};
 			.then(() => {
 				state.busy = null;
 				state.form = null;
+				// Same reasoning as doSignIn: a stale BOUND Space must not keep
+				// displaying after the user has actually signed out — including the
+				// requestSeq bump, so an old in-flight fetch from before sign-out
+				// can't render for one frame before wire() corrects it.
+				state.spaceBindings = null;
+				state.spaceBindingsError = null;
+				state.spaceBindingsRequestSeq++;
 				refreshSettings();
 			})
 			.catch((err) => {
@@ -1171,6 +1254,72 @@ window.JD = window.JD || {};
 				state.pushError = err.message || "Could not list repositories.";
 				if (state.section === "sync") render(model);
 			});
+	}
+
+	// JOLLI-2152: off the push-repos list's own first paint (own endpoint,
+	// fetched independently — see the server-side route's comment). On failure,
+	// spaceBindingsError is set so the wire() guard retries on the next visit to
+	// this section, matching loadPushRepos' own retry-on-reentry shape.
+	//
+	// Re-entrant: doSignIn/doSignOut reset spaceBindings to null and call this
+	// again while an earlier call can still be in flight (e.g. sign-out fires
+	// while the initial fetch is still resolving). requestSeq guards against
+	// the earlier, now-stale reply landing afterwards and overwriting the
+	// newer one — see the state field's own comment. spaceBindingsFetchInFlight
+	// additionally coalesces the overlapping call into a single queued rerun
+	// instead of starting a second, wasted GET — see its own comment. Unlike
+	// VS Code's twin (SettingsWebviewPanel.refreshSpaceBindings), there is no
+	// fast signed-out short-circuit to protect from the lock: the signed-out
+	// answer here still comes from this same endpoint, so it is never faster
+	// than the network fan-out it would otherwise queue behind.
+	function loadSpaceBindings(model) {
+		if (state.spaceBindingsFetchInFlight) {
+			state.spaceBindingsFetchQueued = true;
+			return;
+		}
+		state.spaceBindingsFetchInFlight = true;
+		var requestSeq = ++state.spaceBindingsRequestSeq;
+		JD.getJson("/api/settings/space-bindings")
+			.then((data) => {
+				finishSpaceBindingsFetch(model, () => {
+					if (requestSeq !== state.spaceBindingsRequestSeq) return;
+					state.spaceBindings = (data && data.bindings) || {};
+					state.spaceBindingsSignedOut = !!(data && data.signedOut);
+					state.spaceBindingsError = null;
+				});
+			})
+			.catch(() => {
+				finishSpaceBindingsFetch(model, () => {
+					if (requestSeq !== state.spaceBindingsRequestSeq) return;
+					// Settle spaceBindings to {} as well, not just the error flag.
+					// JD.getJson REJECTS on a non-2xx (including this endpoint's own
+					// 500), and spaceCellHtml reads `spaceBindings === null` as
+					// "still checking" — so leaving it null parks every cell on
+					// "Checking…" for ever, while spaceBindingsError closes the
+					// wire() retry guard behind it. An empty object falls through to
+					// the settled-but-missing branch ("Not checked"), which is what
+					// the VS Code panel's own catch already renders.
+					state.spaceBindings = {};
+					state.spaceBindingsError = "failed";
+				});
+			});
+	}
+
+	// Shared tail for both loadSpaceBindings() branches: apply the result (only
+	// while still current — the seq check inside applyResult), clear the
+	// in-flight flag, then either immediately start the queued rerun a skipped
+	// overlapping call left behind, or render. Draining the queue takes
+	// priority over rendering — no point painting a frame that a fetch already
+	// waiting to start will just repaint moments later.
+	function finishSpaceBindingsFetch(model, applyResult) {
+		state.spaceBindingsFetchInFlight = false;
+		applyResult();
+		if (state.spaceBindingsFetchQueued) {
+			state.spaceBindingsFetchQueued = false;
+			loadSpaceBindings(model);
+			return;
+		}
+		if (state.section === "sync") render(model);
 	}
 
 	function loadMissing(model) {

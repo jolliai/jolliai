@@ -182,6 +182,152 @@ describe("settings.js renderSettings", () => {
 });
 
 /**
+ * Like {@link loadJD}, but `/api/settings/push-repos` and
+ * `/api/settings/space-bindings` resolve to caller-given data instead of
+ * hanging forever — needed to drive the per-repo Space column (JOLLI-2152)
+ * past its initial "Checking…" placeholder. Passing `spaceBindingsResponse`
+ * as `undefined` leaves that one request hanging (the "still pending" case),
+ * and `"reject"` makes it REJECT the way `JD.getJson` really does on any
+ * non-2xx — including this endpoint's own 500. Every other path is unaffected
+ * (never resolves), matching {@link loadJD}.
+ */
+function loadJDForSpaceColumn(
+	repos: ReadonlyArray<Record<string, unknown>>,
+	spaceBindingsResponse?: Record<string, unknown> | "reject",
+): { renderSettings: (model: unknown) => void; app: FakeElement; rail: Map<string, FakeButton> } {
+	const app: FakeElement = { innerHTML: "", insertAdjacentHTML: () => undefined };
+	const rail = new Map<string, FakeButton>(
+		SECTION_IDS.map((id) => [id, { getAttribute: (n: string) => (n === "data-section" ? id : null) }]),
+	);
+	const doc = {
+		getElementById: (id: string) => (id === "settingsModalBody" ? app : { innerHTML: "", textContent: "" }),
+		querySelectorAll: (sel: string) => (sel.includes(".set-rail-item") ? [...rail.values()] : []),
+		querySelector: () => null,
+		addEventListener: () => undefined,
+		createElement: () => ({ innerHTML: "" }),
+		body: { innerHTML: "" },
+	};
+	const win = {
+		JD: {
+			getJson: (path: string) => {
+				if (path === "/api/settings/push-repos") return Promise.resolve({ repos });
+				if (path === "/api/settings/space-bindings") {
+					if (spaceBindingsResponse === undefined) return new Promise(() => {});
+					if (spaceBindingsResponse === "reject") {
+						return Promise.reject(new Error("request failed (500)"));
+					}
+					return Promise.resolve(spaceBindingsResponse);
+				}
+				return new Promise(() => {});
+			},
+			post: () => new Promise(() => {}),
+			refreshNow: () => undefined,
+			renderPage: () => undefined,
+		},
+		document: doc,
+		addEventListener: () => undefined,
+	} as Record<string, unknown>;
+	for (const file of ["format.js", "settings.js"]) {
+		const src = readFileSync(new URL(`./assets/js/${file}`, import.meta.url), "utf8");
+		new Function("window", "document", src)(win, doc);
+	}
+	const JD = win.JD as { renderSettings: (model: unknown) => void };
+	return { renderSettings: JD.renderSettings, app, rail };
+}
+
+describe("settings.js Space column (JOLLI-2152)", () => {
+	const REPOS = [
+		{
+			repoIdentity: "https://github.com/acme/widgets",
+			repoName: "widgets",
+			pushDisabled: false,
+			isCurrentRepo: true,
+		},
+	];
+
+	it("shows a pending 'Checking…' placeholder before space-bindings resolves", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS);
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(app.innerHTML).toContain("Checking…");
+		expect(app.innerHTML).toContain("set-space-pending");
+	});
+
+	it("shows one sign-in hint and a muted dash per row when signed out", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS, { signedOut: true, bindings: {} });
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(app.innerHTML).toContain("Sign in to see which Jolli Space");
+		expect(app.innerHTML).toContain("set-space-unknown");
+	});
+
+	it("renders a bound row with its Space name", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS, {
+			signedOut: false,
+			bindings: { "https://github.com/acme/widgets": { state: "bound", label: "Acme Core" } },
+		});
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(app.innerHTML).toContain("Acme Core");
+		expect(app.innerHTML).toContain("set-space-bound");
+	});
+
+	it("renders an unbound row as 'Not bound'", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS, {
+			signedOut: false,
+			bindings: {
+				"https://github.com/acme/widgets": {
+					state: "unbound",
+					label: "Not bound",
+					title: "2 Spaces available",
+				},
+			},
+		});
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(app.innerHTML).toContain("Not bound");
+		expect(app.innerHTML).toContain("set-space-unbound");
+	});
+
+	it("falls back to 'Not checked' — never blank — when a repoIdentity is missing from a settled bindings map", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS, { signedOut: false, bindings: {} });
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		await Promise.resolve();
+		await Promise.resolve();
+		expect(app.innerHTML).toContain("Not checked");
+		expect(app.innerHTML).toContain("set-space-unknown");
+	});
+
+	// A failed fetch settles the column instead of parking it: JD.getJson
+	// REJECTS on any non-2xx (including this endpoint's own 500), and the error
+	// flag closes wire()'s retry guard behind it — so leaving spaceBindings null
+	// would leave "Checking…" on screen for ever, with nothing left to fetch it.
+	// The VS Code panel's own catch already renders "Not checked" here.
+	it("settles to 'Not checked' rather than a permanent 'Checking…' when the request fails", async () => {
+		const { renderSettings, app, rail } = loadJDForSpaceColumn(REPOS, "reject");
+		renderSettings(MODEL);
+		rail.get("sync")?.onclick?.();
+		// A macrotask, not a fixed number of microtask ticks: the rejection
+		// travels through getJson's own .then, the .catch, finishSpaceBindingsFetch
+		// and the re-render, and it races the push-repos load's chain.
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(app.innerHTML).toContain("Not checked");
+		expect(app.innerHTML).toContain("set-space-unknown");
+		expect(app.innerHTML).not.toContain("Checking…");
+		expect(app.innerHTML).not.toContain("set-space-pending");
+	});
+});
+
+/**
  * Field-stub harness for the interaction layer (captureField → collect → doApply).
  * The rendering harness above returns [] for `[data-field]`, so it never exercises
  * edits; this returns persistent field stubs and captures the Apply POST body.

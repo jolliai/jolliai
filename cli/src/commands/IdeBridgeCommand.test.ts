@@ -330,6 +330,11 @@ vi.mock("../core/PushControl.js", async (importOriginal) => ({
 	readPushDisabledState: vi.fn().mockResolvedValue({ disabled: false }),
 }));
 
+vi.mock("../core/SpaceBindingStatus.js", async (importOriginal) => ({
+	...(await importOriginal<typeof import("../core/SpaceBindingStatus.js")>()),
+	fetchSpaceBindingStatus: vi.fn(),
+}));
+
 vi.mock("../core/SummaryMarkdownBuilder.js", () => ({
 	buildMarkdown: vi.fn().mockReturnValue("# md"),
 	buildReferencePushMarkdown: vi.fn().mockReturnValue("# ref"),
@@ -1238,6 +1243,41 @@ describe("runIdeBridgeAction — per-repo push control (spec 306)", () => {
 			pushDisabled: true,
 			pushDisabledError: "unreadable: /home/u/.jolli/jollimemory/push-control.json",
 		});
+	});
+});
+
+describe("runIdeBridgeAction — space-binding-get (JOLLI-2152)", () => {
+	it("resolves the cwd's binding using the signed-in jolliApiKey and returns the formatted display", async () => {
+		const { loadConfigFromDir } = await import("../core/SessionTracker.js");
+		const { fetchSpaceBindingStatus } = await import("../core/SpaceBindingStatus.js");
+		vi.mocked(loadConfigFromDir).mockResolvedValue({ jolliApiKey: "sk-jol-test" } as never);
+		vi.mocked(fetchSpaceBindingStatus).mockResolvedValue({
+			kind: "bound",
+			spaceName: "Acme Core",
+			canPush: true,
+			canRebind: false,
+		});
+
+		const result = await runIdeBridgeAction("space-binding-get", "/repo", {});
+
+		expect(fetchSpaceBindingStatus).toHaveBeenCalledWith("/repo", "sk-jol-test", true);
+		expect(result).toEqual({
+			state: "bound",
+			label: '"Acme Core"',
+			title: 'This repo\'s memories push into the Jolli Space "Acme Core".',
+		});
+	});
+
+	it("degrades to the 'unknown' display when signed out, without throwing", async () => {
+		const { loadConfigFromDir } = await import("../core/SessionTracker.js");
+		const { fetchSpaceBindingStatus } = await import("../core/SpaceBindingStatus.js");
+		vi.mocked(loadConfigFromDir).mockResolvedValue({} as never);
+		vi.mocked(fetchSpaceBindingStatus).mockResolvedValue({ kind: "no_key" });
+
+		const result = await runIdeBridgeAction("space-binding-get", "/repo", {});
+
+		expect(fetchSpaceBindingStatus).toHaveBeenCalledWith("/repo", undefined, true);
+		expect(result).toEqual({ state: "unknown", label: "Not checked", title: "Not signed in to Jolli." });
 	});
 });
 
