@@ -1172,7 +1172,7 @@ describe("invokePlatformTool", () => {
 });
 
 describe("pushSessions", () => {
-	const payload = { version: 1, clientId: "c1", cursor: {}, tables: {} } as const;
+	const payload = { version: 2, clientId: "c1", cursor: {}, tables: {} } as const;
 
 	it("rejects a 2xx whose body is not JSON, instead of reading it as an empty success", async () => {
 		// The failure this was found by, in production. A single-page app answers an

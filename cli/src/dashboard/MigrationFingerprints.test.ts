@@ -75,6 +75,12 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// their companion tests instead.
 	["2026-08-25-0000-memory-transcripts-covering-index", "0b4cd41295aa"],
 	["2026-08-26-0000-memory-lookups", "f6c22b277b2d"],
+	// Keyset index `(recorded_at_ms, session_event_id, bucket_ms)` for
+	// `session_activity`'s session-sync paging — the composite every sibling synced
+	// table already carries, which the frozen `SESSION_ACTIVITY_DDL` shipped without.
+	// A pure-SQL `sqlMigration`, so it is fingerprinted here rather than by a companion
+	// test. See the entry's own file.
+	["2026-08-27-0804-session-activity-keyset-index", "5fa9e542b152"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

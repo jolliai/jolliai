@@ -130,4 +130,34 @@ describe("backfillStoredActivity", () => {
 			expect(backfillStoredActivity(db)).toBe(1);
 			expect(activityFor().map((r) => r.bucket_ms)).toEqual([bucketOf(NOW), bucketOf(NOW + ACTIVITY_BUCKET_MS)]);
 		}));
+
+	it("stamps backfilled rows above every recorded_at_ms already present, so a sync cursor cannot page over them", () =>
+		inDb(() => {
+			addRepo(1, "repo-a");
+			addSession(1, "claude", "s1");
+			addTranscript(1, "t1", [{ role: "assistant", content: "ran things", timestamp: iso(NOW) }]);
+			linkTranscriptSession(1, "t1", "claude", "s1");
+
+			// A concurrent live write already recorded a bucket for another session at a
+			// stamp the keyset session-sync cursor has since paged past. `session_activity`
+			// is INSERT-ONLY, so this max is the floor every future stamp must clear.
+			addSession(1, "claude", "other"); // FK target for the pre-existing bucket
+			const cursorStamp = NOW + 5_000_000;
+			db.prepare(
+				"INSERT INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+			).run("session:repo-a:claude:other", bucketOf(NOW), cursorStamp);
+
+			// Backfill's own clock reads BELOW the table's current max — the race window
+			// (stamp captured before the CPU-heavy parse) or a plain clock step-back.
+			expect(backfillStoredActivity(db, () => NOW)).toBe(1);
+
+			const stamped = db
+				.prepare("SELECT recorded_at_ms AS ms FROM session_activity WHERE session_event_id = ?")
+				.all("session:repo-a:claude:s1") as ReadonlyArray<{ ms: number }>;
+			expect(stamped).not.toHaveLength(0);
+			// The cursor resumes with `>=` on (recorded_at_ms, session_event_id, bucket_ms);
+			// a row at or below an already-advanced cursor sits below it for ever. Every
+			// backfilled row must clear the pre-existing max.
+			for (const row of stamped) expect(row.ms).toBeGreaterThan(cursorStamp);
+		}));
 });

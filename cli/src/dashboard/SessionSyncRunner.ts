@@ -301,7 +301,7 @@ async function sync(
 		}
 		try {
 			const result = await client.pushSessions({
-				version: 1,
+				version: 2,
 				clientId: state.clientId,
 				cursor: wireCursor(cursors),
 				tables: batchTables(batch),

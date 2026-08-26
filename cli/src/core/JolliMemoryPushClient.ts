@@ -462,8 +462,18 @@ export class SessionPreconditionFailedError extends Error {
 
 /** The session channel's request envelope. `tables` carries local column names verbatim. */
 export interface SessionPushPayload {
-	/** 1 — this channel's only protocol. `cursor` is `{stamp, key}` throughout. */
-	readonly version: 1;
+	/**
+	 * 2 — the protocol this channel speaks. `cursor` is `{stamp, key}` per table,
+	 * and the version is what makes the SERVER answer in that same shape. Under
+	 * protocol 1 the server downgrades its reply through `toLegacyCursor` to a bare
+	 * stamp, dropping the `key`; for `session_activity` — where many rows share one
+	 * `recorded_at_ms` bucket — a stamp-only cursor cannot step past a millisecond
+	 * once more rows share it than a batch holds, and that table stops syncing
+	 * entirely. The request side is version-agnostic (the server's schema accepts
+	 * both shapes as a union), so there is no server-only fix: a v1 client is owed
+	 * a numeric cursor by contract.
+	 */
+	readonly version: 2;
 	readonly clientId: string;
 	/** Client progress, per table — reconciled by the server on every request. */
 	readonly cursor: Readonly<Record<string, SessionPushCursor>>;

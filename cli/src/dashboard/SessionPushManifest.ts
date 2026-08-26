@@ -50,7 +50,13 @@
  */
 
 /** Tables the session channel sends. Adding one here is a privacy decision. */
-export const SYNCED_TABLES = ["sessions", "session_model_usage", "session_tool_use", "session_usage_events"] as const;
+export const SYNCED_TABLES = [
+	"sessions",
+	"session_model_usage",
+	"session_tool_use",
+	"session_usage_events",
+	"session_activity",
+] as const;
 
 export type SyncedTable = (typeof SYNCED_TABLES)[number];
 
@@ -116,16 +122,6 @@ export const NEVER_SYNCED_TABLES = [
 	// of the no-timezone rule in this module's header: instants go up, days are
 	// cut by whoever is asking.
 	"stats_daily",
-	// The per-quarter-hour agent-activity buckets behind the LOCAL agent-concurrency
-	// figure. Collected on this branch, uploaded by nothing: cloud upload was an
-	// explicit deferral of the concurrency work (there is no front-end that reads it
-	// yet either). Its `recorded_at_ms` column was built as a sync cursor in advance
-	// (see `SESSION_ACTIVITY_DDL`), so wiring it up later is this line plus its
-	// `SYNCED_COLUMNS`, `SYNC_STAMP_COLUMNS`, `KEYSET_COLUMNS`, `WINDOW_SOURCES` and
-	// `BATCH_LIMITS` entries — but that is a privacy decision (activity timestamps
-	// leaving the machine) to make when the manager view actually consumes them, not
-	// a default to reach for on sight.
-	"session_activity",
 	// Per-entry skill history is local-only for now. It carries invocation arguments
 	// and outcomes, and no cloud page or request schema consumes it; uploading it
 	// would therefore be a privacy expansion that buys nothing. The aggregate skill
@@ -203,6 +199,7 @@ export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>
 		"est_cost_usd",
 		"updated_at_ms",
 	],
+	session_activity: ["session_event_id", "bucket_ms", "recorded_at_ms"],
 };
 
 /**
@@ -237,6 +234,7 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 		"origin_root",
 		"metadata_json",
 	],
+	session_activity: [],
 };
 
 /**
@@ -253,4 +251,5 @@ export const BATCH_LIMITS: Readonly<Record<SyncedTable, number>> = {
 	session_model_usage: 200,
 	session_tool_use: 200,
 	session_usage_events: 500,
+	session_activity: 200,
 };

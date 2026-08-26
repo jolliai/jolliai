@@ -21,6 +21,7 @@ import { MEMORY_TRANSCRIPTS_COVERING_INDEX_DDL } from "./2026-08-25-0000-memory-
 import { MEMORY_REACHABLE_DDL } from "./2026-08-25-0001-memory-reachable.js";
 import { COMMIT_REACHABLE_DDL } from "./2026-08-25-0002-commit-reachable.js";
 import { MEMORY_LOOKUPS_DDL } from "./2026-08-26-0000-memory-lookups.js";
+import { SESSION_ACTIVITY_KEYSET_INDEX_DDL } from "./2026-08-27-0804-session-activity-keyset-index.js";
 import type { DbMigration } from "./MigrationHelpers.js";
 
 export type { DbMigration } from "./MigrationHelpers.js";
@@ -142,6 +143,7 @@ export const MIGRATIONS: ReadonlyArray<DbMigration> = [
 	MEMORY_REACHABLE_DDL,
 	COMMIT_REACHABLE_DDL,
 	MEMORY_LOOKUPS_DDL,
+	SESSION_ACTIVITY_KEYSET_INDEX_DDL,
 ];
 
 /*

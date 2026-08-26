@@ -31,17 +31,23 @@
  * channel, while its stamp column and the two indexes behind the channel's paging
  * stay in the schema because they have already been migrated.
  *
- * All four are `NOT NULL DEFAULT 0`, so `WHERE <stamp> >= ?` is always a real
+ * Every stamp is `NOT NULL`, so `WHERE <stamp> >= ?` is always a real
  * comparison. Do not relax that: NULL >= anything is NULL rather than false, so
  * one nullable stamp is a row no cursor can ever select — the same silent-wrong-
- * set failure this map exists to prevent, arrived at from the other side. 0
- * means "written before we tracked this" and is what the backfill starts from.
+ * set failure this map exists to prevent, arrived at from the other side.
+ *
+ * The four legacy stamps are additionally `DEFAULT 0`, where 0 means "written
+ * before we tracked this" and is what their backfill starts from. `session_activity`
+ * is the exception: `recorded_at_ms` has NO default and no zero-backfill, because
+ * the table is new and INSERT-only — every row is stamped with its real insert
+ * time on the way in, so a 0 sentinel never arises.
  */
 export const SYNC_STAMP_COLUMNS = {
 	sessions: "written_at_ms",
 	session_model_usage: "updated_at_ms",
 	session_tool_use: "updated_at_ms",
 	session_usage_events: "updated_at_ms",
+	session_activity: "recorded_at_ms",
 } as const;
 
 /** A table that carries a sync stamp. */
@@ -92,6 +98,7 @@ export const KEYSET_COLUMNS: Readonly<Record<SyncStampTable, ReadonlyArray<strin
 	session_model_usage: ["session_event_id", "model"],
 	session_tool_use: ["session_event_id", "tool_name", "kind"],
 	session_usage_events: ["session_event_id", "dedup_key"],
+	session_activity: ["session_event_id", "bucket_ms"],
 };
 
 /**
@@ -130,6 +137,18 @@ export const WINDOW_SOURCES: Readonly<Record<SyncStampTable, WindowSource>> = {
 	session_model_usage: { parent: "session_event_id" },
 	session_tool_use: { own: "last_call_at_ms" },
 	session_usage_events: { own: "responded_at_ms" },
+	// Through the parent session, NOT on `bucket_ms`, even though `bucket_ms` is a
+	// genuine epoch-ms business time. The window applies only on a first run and its
+	// job is to stay aligned with the cursor, and here the two are decoupled: the
+	// cursor is `recorded_at_ms`, which a backfill stamps at "just now" for a bucket
+	// whose `bucket_ms` is months old (this table is INSERT-only over old
+	// transcripts). Windowing on `bucket_ms` would decline those old buckets on the
+	// first run while the cursor still advanced past their fresh `recorded_at_ms` —
+	// stranding them below every future cursor with nothing to send them, the exact
+	// silent loss `session_model_usage` routes through the parent to avoid. Safe
+	// because `bucket_ms <= sessions.updated_at_ms`, so a bucket is admitted only
+	// when its session is.
+	session_activity: { parent: "session_event_id" },
 };
 
 /** The table's own business time column, or `undefined` when it has none. */

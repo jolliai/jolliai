@@ -3535,10 +3535,12 @@ export function backfillStoredActivity(db: DashboardDbHandle, now: () => number 
 		.all() as ReadonlyArray<{ repo_identity: string; sessions_blob: Uint8Array }>;
 
 	let written = 0;
-	const recordedAtMs = now();
-	const insertBucket = db.prepare(
-		"INSERT OR IGNORE INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
-	);
+	// Parse and bucket OUTSIDE the write lock: inflate + JSON.parse over every
+	// stored transcript is pure CPU, and holding SQLite's single writer while it
+	// runs would stall every hook and the extension host (see `withDashboardDb`).
+	// The `recorded_at_ms` stamp is deliberately NOT captured here — see the
+	// transaction below for why it must be read inside the lock.
+	const pending: Array<{ eventId: string; bucket: number }> = [];
 	for (const row of blobs) {
 		let stored: StoredTranscript;
 		try {
@@ -3554,9 +3556,37 @@ export function backfillStoredActivity(db: DashboardDbHandle, now: () => number 
 			if (!uncovered.has(eventId)) continue;
 			const buckets = bucketsFrom(session.entries);
 			if (buckets.length === 0) continue;
-			for (const bucket of buckets) insertBucket.run(eventId, bucket, recordedAtMs);
+			for (const bucket of buckets) pending.push({ eventId, bucket });
 			written += 1;
 		}
 	}
+	if (pending.length === 0) return 0;
+	// ONE transaction, so this whole cohort — every row sharing the single stamp
+	// computed below — becomes visible to a concurrent cross-process session sync
+	// atomically. The sync cursor is the keyset `(recorded_at_ms, session_event_id,
+	// bucket_ms)` resumed with `>=`, so a reader that paged past a higher-key row at
+	// this stamp would never revisit a lower-key one committed after it — the row
+	// would sit below the cursor for good. The live writer gets this for free (one
+	// session, one transaction, in `projectSession`); the backfill stamps many
+	// sessions with one instant, so it must make the batch atomic explicitly.
+	const insertBucket = db.prepare(
+		"INSERT OR IGNORE INTO session_activity (session_event_id, bucket_ms, recorded_at_ms) VALUES (?, ?, ?)",
+	);
+	inTransaction(db, () => {
+		// Stamp read INSIDE the `BEGIN IMMEDIATE` lock and floored STRICTLY ABOVE the
+		// table's current max — never `now()` alone. `now()` was captured stale (the
+		// CPU-heavy parse above can outlast a concurrent live write + sync that
+		// advances the cursor) or can even step backwards (NTP), and a cohort stamped
+		// at or below an already-advanced cursor is paged straight over by the `>=`
+		// resume and never syncs. `session_activity` is INSERT-ONLY, so the cursor can
+		// only ever have reached a stamp that a row still carries: clearing the current
+		// max clears the cursor. The read is race-free only because `inTransaction`
+		// holds `BEGIN IMMEDIATE`, blocking any writer between this MAX and the inserts.
+		const maxRow = db.prepare("SELECT MAX(recorded_at_ms) AS m FROM session_activity").get() as {
+			m: number | null;
+		};
+		const recordedAtMs = Math.max(now(), (maxRow.m ?? 0) + 1);
+		for (const { eventId, bucket } of pending) insertBucket.run(eventId, bucket, recordedAtMs);
+	});
 	return written;
 }
