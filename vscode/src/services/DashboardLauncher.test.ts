@@ -1,18 +1,16 @@
 /**
  * DashboardLauncher tests.
  *
- * The subject is the command line and the terminal, not the dashboard: nothing
- * here starts a process, and `executeDashboard` is not involved at all any more —
- * the launcher's job ends when a line has been sent to a terminal.
- *
- * What is worth pinning is what this module decides on its own: the remote gate,
- * that tier 0 is a version-gated global `jolli`, tier 1 is `run-cli` and tier 2 is
- * the bundled entry run by the host's Node, that tier 1 is skipped on a shell that
- * cannot execute a bash script, that each shell's quoting and the PowerShell call
- * operator are right (a wrong quote does not fail loudly — it passes a mangled path
- * to the CLI), that the repo directory reaches the CLI ONLY as the terminal's own
- * cwd and never as a command argument, and that every click opens a NEW terminal
- * rather than reusing or revealing an earlier one.
+ * The launcher's job is to pick an executable + argv from three tiers and
+ * spawn it as a detached background process. What is worth pinning: the remote
+ * gate, that tier 0 is a version-gated global `jolli`, tier 1 is `run-cli` and
+ * tier 2 is the winning registered dist's `Cli.js` — falling back to the
+ * bundled entry — run by the host's Node, that tier 1 is skipped on win32
+ * (bash-only shebang and no shell to interpret it in a detached child), that a
+ * win32 `.cmd` shim is spawned through a shell, that the repo directory
+ * reaches the CLI only as the spawn's own cwd and never as an argument, and
+ * that the child is detached + unref'd + stdio-ignored so it survives the
+ * extension host.
  */
 
 import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
@@ -20,21 +18,9 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
-// `createTerminal` returns a usable stub rather than `undefined` because one case
-// below omits the `host` seam entirely, so that it exercises the `?? defaultHost()`
-// fallback — the only line in this module that touches `vscode.window` directly.
-const { createTerminalMock } = vi.hoisted(() => ({
-	createTerminalMock: vi.fn((options: { name: string }) => ({
-		name: options.name,
-		show: vi.fn(),
-		sendText: vi.fn(),
-	})),
-}));
-
 vi.mock("vscode", () => ({
-	env: { remoteName: undefined, shell: "/bin/zsh" },
+	env: { remoteName: undefined },
 	window: {
-		createTerminal: createTerminalMock,
 		showInformationMessage: vi.fn(),
 		showErrorMessage: vi.fn(),
 	},
@@ -55,25 +41,29 @@ import {
 	BUNDLED_CLI_VERSION,
 	CLI_ENTRY_FILE,
 	type DashboardLauncherHost,
-	detectShellFlavor,
+	type DashboardSpawn,
 	findExecutableOnPath,
 	GLOBAL_BIN_NAME,
+	INVOKED_VIA_ENV_KEY,
+	INVOKED_VIA_VALUE,
+	isShellSafePath,
 	isRemoteWorkspace,
 	launchDashboard,
-	quoteArg,
 	readWinningGlobalCliVersion,
 	REMOTE_HINT,
 	resolveDashboardCommand,
 	resolveRunCliPath,
-	type ShellFlavor,
-	TERMINAL_NAME,
-	type TerminalLike,
+	resolveWinningDistCliPath,
+	RUN_AS_NODE_ENV_KEY,
+	SPAWN_FAILED_MESSAGE,
+	type SpawnedChild,
 	UNAVAILABLE_MESSAGE,
 } from "./DashboardLauncher.js";
 
 const REPO = "/repo/root";
 const EXEC = "/Applications/Code.app/Contents/MacOS/Electron";
 const RUN_CLI = "/home/u/.jolli/jollimemory/run-cli";
+const GLOBAL_JOLLI = "/usr/local/bin/jolli";
 
 /** A dist directory that really holds a real `Cli.js`, so `existsSync` passes. */
 function distWithCli(): string {
@@ -82,44 +72,69 @@ function distWithCli(): string {
 	return dir;
 }
 
-interface FakeTerminal extends TerminalLike {
-	readonly sent: Array<string>;
-	readonly shown: Array<boolean | undefined>;
+interface FakeSpawnCall {
+	readonly executable: string;
+	readonly args: ReadonlyArray<string>;
+	readonly cwd: unknown;
+	readonly env: Readonly<Record<string, string | undefined>>;
+	readonly detached: unknown;
+	readonly stdio: unknown;
+	readonly shell: unknown;
+	readonly child: SpawnedChild;
 }
 
-function fakeTerminal(name: string = TERMINAL_NAME): FakeTerminal {
-	const terminal: FakeTerminal = {
-		name,
-		sent: [],
-		shown: [],
-		show: (preserveFocus) => {
-			terminal.shown.push(preserveFocus);
+interface FakeSpawn {
+	readonly fn: DashboardSpawn;
+	readonly calls: Array<FakeSpawnCall>;
+	/** The most recent child's `error` listener, for tests that fire it. */
+	errorListener?: (err: Error) => void;
+	/** The most recent child's `exit` listener, for tests that fire it. */
+	exitListener?: (code: number | null, signal: NodeJS.Signals | null) => void;
+	throwNextWith?: Error;
+	nextPid?: number;
+}
+
+function fakeSpawn(): FakeSpawn {
+	const state: FakeSpawn = {
+		fn: (executable, args, options) => {
+			if (state.throwNextWith) {
+				const err = state.throwNextWith;
+				state.throwNextWith = undefined;
+				throw err;
+			}
+			const child: SpawnedChild = {
+				pid: state.nextPid ?? 12345,
+				unref: vi.fn(),
+				on: vi.fn((event: string, listener: unknown) => {
+					if (event === "error") state.errorListener = listener as (err: Error) => void;
+					if (event === "exit") state.exitListener = listener as (code: number | null, signal: NodeJS.Signals | null) => void;
+				}),
+			};
+			state.calls.push({
+				executable,
+				args,
+				cwd: options.cwd,
+				env: (options.env ?? {}) as Readonly<Record<string, string | undefined>>,
+				detached: options.detached,
+				stdio: options.stdio,
+				shell: options.shell,
+				child,
+			});
+			return child;
 		},
-		sendText: (text) => {
-			terminal.sent.push(text);
-		},
+		calls: [],
 	};
-	return terminal;
+	return state;
 }
 
 interface FakeHostCalls {
-	readonly created: Array<{ name: string; cwd: string; env: Readonly<Record<string, string>> }>;
 	readonly infos: Array<string>;
 	readonly errors: Array<string>;
-	/** Every terminal handed out, in creation order. */
-	readonly terminals: Array<FakeTerminal>;
 }
 
-/** A host that records what it was asked to do and hands back fake terminals. */
 function fakeHost(): { host: DashboardLauncherHost; calls: FakeHostCalls } {
-	const calls: FakeHostCalls = { created: [], infos: [], errors: [], terminals: [] };
+	const calls: FakeHostCalls = { infos: [], errors: [] };
 	const host: DashboardLauncherHost = {
-		createTerminal: (options) => {
-			calls.created.push({ ...options });
-			const created = fakeTerminal(options.name);
-			calls.terminals.push(created);
-			return created;
-		},
 		showInfo: async (message) => {
 			calls.infos.push(message);
 		},
@@ -131,30 +146,34 @@ function fakeHost(): { host: DashboardLauncherHost; calls: FakeHostCalls } {
 }
 
 /**
- * Options that resolve to tier 1 on a POSIX shell, with nothing left to the machine.
- *
- * `globalCliVersion: null` is the load-bearing part: without it the launcher reads
- * the REAL dist-paths registry, and a developer machine with a global CLI installed
- * would silently push every one of these cases up to tier 0.
+ * Options that resolve to tier 1 on a non-win32 host, with nothing left to the
+ * machine. `globalCliVersion: null` is load-bearing: without it the launcher
+ * reads the REAL dist-paths registry, and a developer machine with a global CLI
+ * installed would silently push every one of these cases up to tier 0.
  */
 function tierOneOptions(overrides: Partial<Parameters<typeof launchDashboard>[0]> = {}) {
+	const spawn = fakeSpawn();
 	return {
-		cwd: REPO,
-		distDir: "/ext/dist",
-		platform: "darwin" as NodeJS.Platform,
-		shell: "/bin/zsh",
-		execPath: EXEC,
-		runCliPath: RUN_CLI,
-		canExecute: (path: string) => path === RUN_CLI,
-		fileExists: () => true,
-		globalCliVersion: null,
-		...overrides,
+		options: {
+			cwd: REPO,
+			distDir: "/ext/dist",
+			platform: "darwin" as NodeJS.Platform,
+			execPath: EXEC,
+			runCliPath: RUN_CLI,
+			canExecute: (path: string) => path === RUN_CLI,
+			fileExists: () => true,
+			globalCliVersion: null,
+			globalCliPath: null,
+			winningDistCliPath: null,
+			spawn: spawn.fn,
+			...overrides,
+		},
+		spawn,
 	};
 }
 
 beforeEach(() => {
 	logCalls.length = 0;
-	createTerminalMock.mockClear();
 });
 
 describe("isRemoteWorkspace", () => {
@@ -166,53 +185,6 @@ describe("isRemoteWorkspace", () => {
 		for (const name of ["ssh-remote", "wsl", "dev-container", "attached-container", "codespaces"]) {
 			expect(isRemoteWorkspace(name)).toBe(true);
 		}
-	});
-});
-
-describe("detectShellFlavor", () => {
-	it("reads PowerShell off either of its two binary names, with or without .exe", () => {
-		for (const shell of [
-			"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe",
-			"C:\\Program Files\\PowerShell\\7\\pwsh.exe",
-			"/usr/local/bin/pwsh",
-		]) {
-			expect(detectShellFlavor(shell, "win32")).toBe("powershell");
-		}
-	});
-
-	it("recognises cmd only when the path actually names it", () => {
-		expect(detectShellFlavor("C:\\Windows\\System32\\cmd.exe", "win32")).toBe("cmd");
-	});
-
-	it("classifies every POSIX shell as posix, Git Bash on Windows included", () => {
-		for (const shell of ["/bin/bash", "/bin/sh", "/bin/zsh", "/usr/bin/fish", "/bin/dash", "/bin/ksh"]) {
-			expect(detectShellFlavor(shell, "darwin")).toBe("posix");
-		}
-		// The reason the classification keys off the shell rather than the platform:
-		// Git Bash as the Windows default can run tier 1, and gets to.
-		expect(detectShellFlavor("C:\\Program Files\\Git\\bin\\bash.exe", "win32")).toBe("posix");
-	});
-
-	it("falls back to the platform default when the shell is unknown or absent", () => {
-		expect(detectShellFlavor(undefined, "win32")).toBe("powershell");
-		expect(detectShellFlavor(undefined, "darwin")).toBe("posix");
-		expect(detectShellFlavor("C:\\tools\\nushell\\nu.exe", "win32")).toBe("powershell");
-		expect(detectShellFlavor("/opt/homebrew/bin/nu", "darwin")).toBe("posix");
-	});
-});
-
-describe("quoteArg", () => {
-	it("single-quotes for POSIX so $ and backticks in a path stay literal", () => {
-		expect(quoteArg("/a/b $HOME/`x`", "posix")).toBe(`'/a/b $HOME/\`x\`'`);
-	});
-
-	it("escapes a literal quote per shell, and the two shells disagree", () => {
-		expect(quoteArg("it's", "posix")).toBe(`'it'\\''s'`);
-		expect(quoteArg("it's", "powershell")).toBe("'it''s'");
-	});
-
-	it("double-quotes for cmd, which has no literal-quoting form", () => {
-		expect(quoteArg("C:\\Program Files\\x", "cmd")).toBe(`"C:\\Program Files\\x"`);
 	});
 });
 
@@ -244,15 +216,11 @@ describe("findExecutableOnPath", () => {
 		expect(findExecutableOnPath("jolli", { platform: "darwin" })).toBeNull();
 	});
 
-	// These two assert WINDOWS behaviour from a POSIX host, which only works because
-	// the function takes its separator and its join from the `platform` argument. A
-	// `C:\npm` PATH split on the host's `:` would come back as `["C", "\\npm"]`.
 	it("tries PATHEXT suffixes on win32, which is how a .cmd shim is found", () => {
 		const found = findExecutableOnPath("jolli", {
 			pathEnv: "C:\\npm;C:\\other",
 			pathExt: ".COM;.EXE;.BAT;.CMD",
 			platform: "win32",
-			// npm installs a cmd-shim, so only the .CMD candidate exists.
 			fileExists: (path) => path === "C:\\npm\\jolli.CMD",
 		});
 		expect(found).toBe("C:\\npm\\jolli.CMD");
@@ -281,27 +249,17 @@ describe("findExecutableOnPath", () => {
 	it("uses a real exec-bit probe when none is injected", () => {
 		const dir = distWithCli();
 		chmodSync(join(dir, CLI_ENTRY_FILE), 0o755);
-		// The host's own platform, since this one touches a real path on it.
 		expect(findExecutableOnPath(CLI_ENTRY_FILE, { pathEnv: dir, platform: process.platform })).toBe(
 			join(dir, CLI_ENTRY_FILE),
 		);
 	});
 
-	// The reason that default is the exec bit and not `existsSync`: a present but
-	// unrunnable file would clear tier 0's gate and hand the shell a `command not
-	// found`, where a miss falls safely through to tier 1. Skipped on Windows,
-	// which has no exec bit for `chmod` to clear — there libuv folds X_OK down to
-	// an existence check, which is the intended behaviour on that platform.
 	it.skipIf(process.platform === "win32")("does not match a present file with no exec bit", () => {
 		const dir = distWithCli();
 		chmodSync(join(dir, CLI_ENTRY_FILE), 0o644);
 		expect(findExecutableOnPath(CLI_ENTRY_FILE, { pathEnv: dir, platform: process.platform })).toBeNull();
 	});
 
-	// The other false positive `existsSync` let through: a DIRECTORY named `jolli`
-	// early on PATH. It has the exec (search) bit, so the probe alone cannot reject
-	// it — but a directory is not a regular file, which is what `isExecutableFile`
-	// now also requires.
 	it("does not match a directory that happens to carry the binary's name", () => {
 		const dir = mkdtempSync(join(tmpdir(), "jolli-dashboard-launcher-"));
 		mkdirSync(join(dir, "jolli"));
@@ -310,20 +268,6 @@ describe("findExecutableOnPath", () => {
 });
 
 describe("readWinningGlobalCliVersion", () => {
-	/** A global config dir holding the given dist-paths entries, all pointing at real dirs. */
-	function registryWith(entries: Record<string, string>): string {
-		const globalDir = mkdtempSync(join(tmpdir(), "jolli-dashboard-registry-"));
-		const distPaths = join(globalDir, "dist-paths");
-		mkdirSync(distPaths, { recursive: true });
-		for (const [source, version] of Object.entries(entries)) {
-			// `available` is just existsSync(distDir), so any real directory will do.
-			const distDir = join(globalDir, `${source}-dist`);
-			mkdirSync(distDir, { recursive: true });
-			writeFileSync(join(distPaths, source), `${version}\n${distDir}\n`);
-		}
-		return globalDir;
-	}
-
 	it("reports the global CLI's version when it wins the competition", () => {
 		expect(readWinningGlobalCliVersion(registryWith({ cli: "1.2.3", vscode: "0.99.12" }))).toBe("1.2.3");
 	});
@@ -345,10 +289,39 @@ describe("readWinningGlobalCliVersion", () => {
 	});
 });
 
+/** A temp dist-paths registry whose entries point at real (but Cli.js-less) dist dirs. */
+function registryWith(entries: Record<string, string>): string {
+	const globalDir = mkdtempSync(join(tmpdir(), "jolli-dashboard-registry-"));
+	const distPaths = join(globalDir, "dist-paths");
+	mkdirSync(distPaths, { recursive: true });
+	for (const [source, version] of Object.entries(entries)) {
+		const distDir = join(globalDir, `${source}-dist`);
+		mkdirSync(distDir, { recursive: true });
+		writeFileSync(join(distPaths, source), `${version}\n${distDir}\n`);
+	}
+	return globalDir;
+}
+
+describe("resolveWinningDistCliPath", () => {
+	it("names the winning registered dist's Cli.js — existence checked by the resolver", () => {
+		const globalDir = registryWith({ cli: "1.2.3", vscode: "0.99.12" });
+		expect(resolveWinningDistCliPath(globalDir)).toBe(join(globalDir, "cli-dist", CLI_ENTRY_FILE));
+	});
+
+	it("is undefined when nothing is registered", () => {
+		expect(resolveWinningDistCliPath(registryWith({}))).toBeUndefined();
+	});
+
+	it("is undefined when the only entry's dist dir is gone (unavailable)", () => {
+		const globalDir = mkdtempSync(join(tmpdir(), "jolli-dashboard-registry-"));
+		const distPaths = join(globalDir, "dist-paths");
+		mkdirSync(distPaths, { recursive: true });
+		writeFileSync(join(distPaths, "cli"), `1.2.3\n${join(globalDir, "ghost-dist")}\n`);
+		expect(resolveWinningDistCliPath(globalDir)).toBeUndefined();
+	});
+});
+
 describe("resolveDashboardCommand", () => {
-	// `fileExists` is stubbed true because `/ext/dist` is a fictional path; the
-	// two cases that exercise the real probes build a real directory instead.
-	// `globalCliVersion: null` keeps tier 0 out of the way of the tier-1/2 cases.
 	const base = {
 		cwd: REPO,
 		distDir: "/ext/dist",
@@ -356,47 +329,96 @@ describe("resolveDashboardCommand", () => {
 		runCliPath: RUN_CLI,
 		fileExists: () => true,
 		globalCliVersion: null,
+		globalCliPath: null,
+		winningDistCliPath: null,
 	};
 
-	/** Tier-0-eligible: a winning global CLI at the bundle's own version, on PATH. */
-	const withGlobalCli = { ...base, globalCliVersion: BUNDLED_CLI_VERSION, globalBinOnPath: true };
+	const withGlobalCli = {
+		...base,
+		globalCliVersion: BUNDLED_CLI_VERSION,
+		globalCliPath: GLOBAL_JOLLI,
+	};
 
 	it("prefers a global jolli over run-cli when it wins and is new enough", () => {
 		const resolved = resolveDashboardCommand({
 			...withGlobalCli,
-			flavor: "posix",
-			// run-cli is present and usable — tier 0 still wins.
+			platform: "darwin",
 			canExecute: (path) => path === RUN_CLI,
 		});
 		expect(resolved).toEqual({
 			tier: "global-jolli",
-			commandLine: `${GLOBAL_BIN_NAME} dashboard`,
+			executable: GLOBAL_JOLLI,
+			args: ["dashboard"],
+			runAsNode: false,
+			shell: false,
 		});
 	});
 
-	it("sends the bare name unquoted, with no call operator on any shell", () => {
-		for (const flavor of ["posix", "powershell", "cmd"] as Array<ShellFlavor>) {
-			const resolved = resolveDashboardCommand({ ...withGlobalCli, flavor });
-			// Tier 0 is the one tier that is not platform-gated: PowerShell and cmd
-			// resolve a bare name through PATHEXT themselves.
+	it("uses the absolute global path on every platform, tier 0 is not platform-gated", () => {
+		for (const platform of ["darwin", "linux", "win32"] as Array<NodeJS.Platform>) {
+			const resolved = resolveDashboardCommand({ ...withGlobalCli, platform });
 			expect(resolved?.tier).toBe("global-jolli");
-			expect(resolved?.commandLine.startsWith(`${GLOBAL_BIN_NAME} dashboard`)).toBe(true);
+			expect(resolved?.executable).toBe(GLOBAL_JOLLI);
+			expect(resolved?.runAsNode).toBe(false);
+			expect(resolved?.shell).toBe(false);
 		}
 	});
 
-	it("never puts the repo directory in the command, on any tier or shell", () => {
-		// The directory reaches the CLI only as the terminal's own working directory
-		// (`createTerminal({ cwd })` → `process.cwd()`). Pinned because the opposite —
-		// an explicit `--cwd` — is the obvious thing to add back, and was dropped on
-		// purpose. Every tier is covered: tier 0 by the global CLI, tier 1 by run-cli,
-		// tier 2 by canExecute answering false.
+	it("spawns a win32 `.cmd` shim through a shell — Node refuses `.cmd` without one", () => {
+		const resolved = resolveDashboardCommand({
+			...withGlobalCli,
+			platform: "win32",
+			globalCliPath: "C:\\Users\\u\\AppData\\Roaming\\npm\\jolli.cmd",
+		});
+		expect(resolved).toEqual({
+			tier: "global-jolli",
+			executable: "C:\\Users\\u\\AppData\\Roaming\\npm\\jolli.cmd",
+			args: ["dashboard"],
+			runAsNode: false,
+			shell: true,
+		});
+	});
+
+	it("does not shell a win32 `.exe` global CLI", () => {
+		const resolved = resolveDashboardCommand({
+			...withGlobalCli,
+			platform: "win32",
+			globalCliPath: "C:\\Tools\\jolli.exe",
+		});
+		expect(resolved?.tier).toBe("global-jolli");
+		expect(resolved?.shell).toBe(false);
+	});
+
+	it("refuses a win32 shim path with cmd metacharacters, falling through to the host's Node", () => {
+		const resolved = resolveDashboardCommand({
+			...withGlobalCli,
+			platform: "win32",
+			globalCliPath: "C:\\Users\\a&b\\npm\\jolli.cmd",
+			canExecute: () => false,
+		});
+		expect(resolved?.tier).toBe("host-node");
+		expect(resolved?.shell).toBe(false);
+	});
+
+	it("refuses a win32 shim path with spaces, falling through to the host's Node", () => {
+		const resolved = resolveDashboardCommand({
+			...withGlobalCli,
+			platform: "win32",
+			globalCliPath: "C:\\Users\\John Doe\\AppData\\Roaming\\npm\\jolli.cmd",
+			canExecute: () => false,
+		});
+		expect(resolved?.tier).toBe("host-node");
+		expect(resolved?.shell).toBe(false);
+	});
+
+	it("never puts the repo directory in the args, on any tier or platform", () => {
 		const cwd = "/some/repo/root";
-		for (const flavor of ["posix", "powershell", "cmd"] as Array<ShellFlavor>) {
+		for (const platform of ["darwin", "linux", "win32"] as Array<NodeJS.Platform>) {
 			for (const tierDeps of [withGlobalCli, { ...base, canExecute: () => true }, base]) {
-				const resolved = resolveDashboardCommand({ ...tierDeps, cwd, flavor });
-				expect(resolved?.commandLine).not.toContain(cwd);
-				expect(resolved?.commandLine).not.toContain("--cwd");
-				expect(resolved?.commandLine.endsWith("dashboard")).toBe(true);
+				const resolved = resolveDashboardCommand({ ...tierDeps, cwd, platform });
+				expect(resolved?.args).not.toContain(cwd);
+				expect(resolved?.args).not.toContain("--cwd");
+				expect(resolved?.args.at(-1)).toBe("dashboard");
 			}
 		}
 	});
@@ -404,359 +426,460 @@ describe("resolveDashboardCommand", () => {
 	it("refuses a global CLI older than the core this bundle carries", () => {
 		const resolved = resolveDashboardCommand({
 			...withGlobalCli,
-			flavor: "posix",
+			platform: "darwin",
 			globalCliVersion: "0.97.0",
 			minGlobalCliVersion: "0.99.12",
 			canExecute: (path) => path === RUN_CLI,
 		});
-		// The whole reason presence is not the gate: 0.97 has no `dashboard` command,
-		// so a bare `jolli` there answers `unknown command` where run-cli works.
 		expect(resolved?.tier).toBe("run-cli");
 	});
 
-	it("refuses a winning global CLI that is not on PATH", () => {
+	it("refuses a winning global CLI whose path was not found on PATH", () => {
 		const resolved = resolveDashboardCommand({
 			...withGlobalCli,
-			flavor: "posix",
-			globalBinOnPath: false,
+			platform: "darwin",
+			globalCliPath: null,
 			canExecute: (path) => path === RUN_CLI,
 		});
 		expect(resolved?.tier).toBe("run-cli");
 	});
 
-	it("prefers run-cli on a POSIX shell — never a bare `jolli`", () => {
+	it("prefers run-cli on a POSIX host — never a bare `jolli`", () => {
 		const resolved = resolveDashboardCommand({
 			...base,
-			flavor: "posix",
+			platform: "linux",
 			canExecute: (path) => path === RUN_CLI,
 		});
 		expect(resolved).toEqual({
 			tier: "run-cli",
-			commandLine: `'${RUN_CLI}' dashboard`,
+			executable: RUN_CLI,
+			args: ["dashboard"],
+			runAsNode: false,
+			shell: false,
 		});
-		// The point of tier 1 existing at all: it is the version-selecting entry,
-		// and a bare CLI name would bypass that selection.
-		expect(resolved?.commandLine.startsWith("jolli ")).toBe(false);
 	});
 
-	it("falls to the bundled entry when run-cli is not executable", () => {
-		const resolved = resolveDashboardCommand({ ...base, flavor: "posix", canExecute: () => false });
+	it("falls back to the bundled entry when run-cli is not executable and nothing is registered", () => {
+		const resolved = resolveDashboardCommand({ ...base, platform: "darwin", canExecute: () => false });
 		expect(resolved).toEqual({
-			tier: "bundled-node",
-			commandLine: `'${EXEC}' '${join("/ext/dist", CLI_ENTRY_FILE)}' dashboard`,
+			tier: "host-node",
+			executable: EXEC,
+			args: [join("/ext/dist", CLI_ENTRY_FILE), "dashboard"],
+			runAsNode: true,
+			shell: false,
 		});
 	});
 
-	it("never tries run-cli on a shell that cannot execute a bash script", () => {
-		for (const flavor of ["powershell", "cmd"] as Array<ShellFlavor>) {
-			const probed: Array<string> = [];
-			const resolved = resolveDashboardCommand({
-				...base,
-				flavor,
-				canExecute: (path) => {
-					probed.push(path);
-					return true;
-				},
-			});
-			// Not even probed: `run-cli` carries a #!/bin/bash shebang and has no
-			// .cmd / .ps1 sibling, so an executable bit would not make it runnable.
-			expect(probed).toEqual([]);
-			expect(resolved?.tier).toBe("bundled-node");
-		}
+	it("prefers the winning registered dist's Cli.js over the bundled entry", () => {
+		const resolved = resolveDashboardCommand({
+			...base,
+			platform: "darwin",
+			canExecute: () => false,
+			winningDistCliPath: "/registry/winning/Cli.js",
+		});
+		expect(resolved).toEqual({
+			tier: "host-node",
+			executable: EXEC,
+			args: ["/registry/winning/Cli.js", "dashboard"],
+			runAsNode: true,
+			shell: false,
+		});
 	});
 
-	it("prefixes the PowerShell form with the call operator, and no other form", () => {
-		const ps = resolveDashboardCommand({ ...base, flavor: "powershell", canExecute: () => false });
-		expect(ps?.commandLine).toBe(
-			`& '${EXEC}' '${join("/ext/dist", CLI_ENTRY_FILE)}' dashboard`,
-		);
-		const cmd = resolveDashboardCommand({ ...base, flavor: "cmd", canExecute: () => false });
-		expect(cmd?.commandLine).toBe(
-			`"${EXEC}" "${join("/ext/dist", CLI_ENTRY_FILE)}" dashboard`,
-		);
-		expect(cmd?.commandLine.startsWith("&")).toBe(false);
+	it("falls back to the bundled entry when the winning dist's Cli.js is missing", () => {
+		const resolved = resolveDashboardCommand({
+			...base,
+			platform: "darwin",
+			canExecute: () => false,
+			winningDistCliPath: "/registry/winning/Cli.js",
+			fileExists: (path: string) => path !== "/registry/winning/Cli.js",
+		});
+		expect(resolved).toEqual({
+			tier: "host-node",
+			executable: EXEC,
+			args: [join("/ext/dist", CLI_ENTRY_FILE), "dashboard"],
+			runAsNode: true,
+			shell: false,
+		});
 	});
 
-	it("is null when the bundled entry is missing, since tier 2 has no other precondition", () => {
+	it("never tries run-cli on win32 (its shebang is bash-only)", () => {
+		const probed: Array<string> = [];
+		const resolved = resolveDashboardCommand({
+			...base,
+			platform: "win32",
+			canExecute: (path) => {
+				probed.push(path);
+				return true;
+			},
+		});
+		expect(probed).toEqual([]);
+		expect(resolved?.tier).toBe("host-node");
+	});
+
+	it("marks tier 2 with runAsNode so the launcher adds ELECTRON_RUN_AS_NODE", () => {
+		const resolved = resolveDashboardCommand({ ...base, platform: "darwin", canExecute: () => false });
+		expect(resolved?.runAsNode).toBe(true);
+	});
+
+	it("is null when the bundled entry and the winning dist are both missing", () => {
 		expect(
-			resolveDashboardCommand({ ...base, flavor: "posix", canExecute: () => false, fileExists: () => false }),
+			resolveDashboardCommand({
+				...base,
+				platform: "darwin",
+				canExecute: () => false,
+				fileExists: () => false,
+			}),
 		).toBeNull();
 	});
 
 	it("uses real filesystem probes when none are injected", () => {
 		const dir = distWithCli();
-		// `runCliPath` names a file that does not exist, so the default X_OK probe
-		// must answer false and hand over to tier 2 — whose entry really is there,
-		// so the default `existsSync` must answer true.
 		const resolved = resolveDashboardCommand({
 			cwd: REPO,
 			distDir: dir,
 			execPath: EXEC,
-			flavor: "posix",
+			platform: "darwin",
 			runCliPath: join(dir, "definitely-absent-run-cli"),
 		});
-		expect(resolved?.tier).toBe("bundled-node");
-		expect(resolved?.commandLine).toContain(join(dir, CLI_ENTRY_FILE));
+		expect(resolved?.tier).toBe("host-node");
+		expect(resolved?.args).toContain(join(dir, CLI_ENTRY_FILE));
 	});
 
 	it("treats a real executable as tier 1 through the default probe", () => {
-		// `process.execPath` is the one file every platform guarantees is
-		// executable, so it stands in for an installed `run-cli`.
 		const resolved = resolveDashboardCommand({
 			cwd: REPO,
 			distDir: "/ext/dist",
 			execPath: EXEC,
-			flavor: "posix",
+			platform: "linux",
 			runCliPath: process.execPath,
 		});
 		expect(resolved?.tier).toBe("run-cli");
 	});
 
 	it("resolves run-cli under the real home when no path is given", () => {
-		// Only the shape is asserted: whether this machine has run-cli installed
-		// decides the tier, and a test must not depend on that.
-		const resolved = resolveDashboardCommand({ ...base, runCliPath: undefined, flavor: "posix" });
-		expect(resolved === null || resolved.tier === "run-cli" || resolved.tier === "bundled-node").toBe(true);
+		const resolved = resolveDashboardCommand({ ...base, runCliPath: undefined, platform: "darwin" });
+		expect(resolved === null || resolved.tier === "run-cli" || resolved.tier === "host-node").toBe(true);
+	});
+});
+
+describe("isShellSafePath", () => {
+	it("accepts an ordinary win32 npm prefix", () => {
+		expect(isShellSafePath("C:\\Users\\me\\AppData\\Roaming\\npm\\jolli.cmd")).toBe(true);
+	});
+
+	it("rejects a path with spaces — cmd.exe does not get a quoted file", () => {
+		expect(isShellSafePath("C:\\Program Files\\Git\\bin\\bash.exe")).toBe(false);
+		expect(isShellSafePath("C:\\Users\\John Doe\\AppData\\Roaming\\npm\\jolli.cmd")).toBe(false);
+	});
+
+	it("rejects cmd metacharacters", () => {
+		expect(isShellSafePath("C:\\Users\\a&b\\npm\\jolli.cmd")).toBe(false);
+		expect(isShellSafePath("C:\\Users\\100%done\\npm\\jolli.cmd")).toBe(false);
+		expect(isShellSafePath("C:\\Users\\x|y\\npm\\jolli.cmd")).toBe(false);
+		expect(isShellSafePath("C:\\Users\\say \"hi\"\\npm\\jolli.cmd")).toBe(false);
 	});
 });
 
 describe("launchDashboard", () => {
-	it("sends the line immediately, without waiting for the shell", async () => {
-		// The launcher's whole contract: open a terminal, put the command in it,
-		// return. The cosmetic double-echo this leaves is documented at the send
-		// site, along with the two measured fixes that were reverted for costing
-		// seconds per click.
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		expect(calls.terminals[0]?.shown).toEqual([true]);
-		expect(calls.terminals[0]?.sent).toEqual([`'${RUN_CLI}' dashboard`]);
+	it("spawns the tier-1 executable detached, with stdio ignored and unref'd", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host });
+		await launchDashboard(options);
+		expect(spawn.calls).toHaveLength(1);
+		const call = spawn.calls[0];
+		expect(call?.executable).toBe(RUN_CLI);
+		expect(call?.args).toEqual(["dashboard"]);
+		expect(call?.detached).toBe(true);
+		expect(call?.stdio).toBe("ignore");
+		expect(call?.shell).toBe(false);
+		expect(call?.child.unref).toHaveBeenCalledTimes(1);
 	});
 
-	it("refuses a remote window with the hint, touching no terminal", async () => {
+	it("refuses a remote window with the hint, spawning nothing", async () => {
 		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host, remoteName: "ssh-remote" }));
+		const { options, spawn } = tierOneOptions({ host, remoteName: "ssh-remote" });
+		await launchDashboard(options);
 		expect(calls.infos).toEqual([REMOTE_HINT]);
-		expect(calls.created).toEqual([]);
+		expect(spawn.calls).toEqual([]);
 	});
 
-	it("creates the dashboard terminal at the repo root and runs the tier-1 line in it", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		expect(calls.created).toEqual([
-			{ name: TERMINAL_NAME, cwd: REPO, env: { ELECTRON_RUN_AS_NODE: "1" } },
-		]);
-		const terminal = calls.terminals[0];
-		expect(terminal?.sent).toEqual([`'${RUN_CLI}' dashboard`]);
+	it("runs the child at the repo cwd, never as a --cwd argument", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host, cwd: "/other/repo" });
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.cwd).toBe("/other/repo");
+		expect(spawn.calls[0]?.args).toEqual(["dashboard"]);
 	});
 
-	it("shows the terminal without stealing focus, before sending", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		const terminal = calls.terminals[0];
-		// `true` is preserveFocus: the click came from the sidebar, not the panel.
-		expect(terminal?.shown).toEqual([true]);
-		expect(terminal?.sent).toHaveLength(1);
+	it("marks tier 1 without ELECTRON_RUN_AS_NODE — it is a real executable", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host });
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBeUndefined();
 	});
 
-	it("carries the repo directory ONLY as the terminal's cwd, never in the command", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host, cwd: "/other/repo" }));
-		// The terminal is created there, and the command says nothing about it — so
-		// `executeDashboard` gets the directory from `process.cwd()`. That is the whole
-		// mechanism, and it is why no `cd` line is sent either.
-		expect(calls.created[0]?.cwd).toBe("/other/repo");
-		expect(calls.terminals[0]?.sent).toEqual([`'${RUN_CLI}' dashboard`]);
+	it("tags every launch with JOLLI_INVOKED_VIA so ps can tell it apart from a manual run", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host });
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.env[INVOKED_VIA_ENV_KEY]).toBe(INVOKED_VIA_VALUE);
 	});
 
-	it("opens a NEW terminal on every click, never reusing or revealing an old one", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		await launchDashboard(tierOneOptions({ host }));
-		await launchDashboard(tierOneOptions({ host }));
-		expect(calls.created).toHaveLength(3);
-		// Each terminal carries exactly its own run — no earlier one is written to
-		// again, so no click can land a second command in a terminal already busy.
-		for (const terminal of calls.terminals) {
-			expect(terminal.sent).toEqual([`'${RUN_CLI}' dashboard`]);
-			expect(terminal.shown).toEqual([true]);
+	it("starts a fresh child on every click, never reusing or waiting", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host });
+		await launchDashboard(options);
+		await launchDashboard(options);
+		await launchDashboard(options);
+		expect(spawn.calls).toHaveLength(3);
+		for (const call of spawn.calls) {
+			expect(call.executable).toBe(RUN_CLI);
+			expect(call.args).toEqual(["dashboard"]);
 		}
 	});
 
-	it("gives every terminal the same name, cwd and env", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		await launchDashboard(tierOneOptions({ host }));
-		expect(calls.created).toEqual([
-			{ name: TERMINAL_NAME, cwd: REPO, env: { ELECTRON_RUN_AS_NODE: "1" } },
-			{ name: TERMINAL_NAME, cwd: REPO, env: { ELECTRON_RUN_AS_NODE: "1" } },
-		]);
+	it("runs the bundled entry through the host's Node when run-cli is unusable and nothing is registered", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({ host, canExecute: () => false });
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(EXEC);
+		expect(spawn.calls[0]?.args).toEqual([join("/ext/dist", CLI_ENTRY_FILE), "dashboard"]);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBe("1");
+		expect(spawn.calls[0]?.shell).toBe(false);
 	});
 
-	it("runs the bundled entry through the host's Node when run-cli is unusable", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host, canExecute: () => false }));
-		expect(calls.terminals[0]?.sent).toEqual([
-			`'${EXEC}' '${join("/ext/dist", CLI_ENTRY_FILE)}' dashboard`,
-		]);
-		// The env is what makes that Electron path behave as node.
-		expect(calls.created[0]?.env).toEqual({ ELECTRON_RUN_AS_NODE: "1" });
+	it("runs the winning registered dist's Cli.js through the host's Node on win32", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			platform: "win32",
+			canExecute: () => false,
+			globalCliVersion: null,
+			globalCliPath: null,
+			winningDistCliPath: "/registry/winning/Cli.js",
+		});
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(EXEC);
+		expect(spawn.calls[0]?.args).toEqual(["/registry/winning/Cli.js", "dashboard"]);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBe("1");
+		expect(spawn.calls[0]?.shell).toBe(false);
+		expect(logCalls.some((c) => c.message.includes("host-node"))).toBe(true);
 	});
 
-	it("reports an incomplete build instead of opening an empty terminal", async () => {
+	it("falls back to the bundled entry when the winning dist's Cli.js is missing", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			canExecute: () => false,
+			winningDistCliPath: "/registry/winning/Cli.js",
+			fileExists: (path: string) => path !== "/registry/winning/Cli.js",
+		});
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(EXEC);
+		expect(spawn.calls[0]?.args).toEqual([join("/ext/dist", CLI_ENTRY_FILE), "dashboard"]);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBe("1");
+	});
+
+	it("reports an incomplete build when neither the winning dist nor the bundled entry exists", async () => {
 		const { host, calls } = fakeHost();
-		await launchDashboard(tierOneOptions({ host, canExecute: () => false, fileExists: () => false }));
+		const { options, spawn } = tierOneOptions({
+			host,
+			canExecute: () => false,
+			winningDistCliPath: "/registry/winning/Cli.js",
+			fileExists: () => false,
+		});
+		await launchDashboard(options);
 		expect(calls.errors).toEqual([UNAVAILABLE_MESSAGE]);
-		expect(calls.created).toEqual([]);
+		expect(spawn.calls).toEqual([]);
+	});
+
+	it("resolves the winning dist from the ambient registry when not injected", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			canExecute: () => false,
+			winningDistCliPath: undefined,
+		});
+		await launchDashboard(options);
+		// The path is machine-dependent (a real dist may or may not win), so only
+		// the shape is pinned: tier 2 always runs the host's Node as node.
+		expect(spawn.calls).toHaveLength(1);
+		expect(spawn.calls[0]?.executable).toBe(EXEC);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBe("1");
+		expect(logCalls.some((c) => c.message.includes("host-node"))).toBe(true);
+	});
+
+	it("reports an incomplete build instead of spawning nothing", async () => {
+		const { host, calls } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			canExecute: () => false,
+			fileExists: () => false,
+		});
+		await launchDashboard(options);
+		expect(calls.errors).toEqual([UNAVAILABLE_MESSAGE]);
+		expect(spawn.calls).toEqual([]);
 		expect(logCalls.some((c) => c.level === "error" && c.message.includes(CLI_ENTRY_FILE))).toBe(true);
 	});
 
-	it("runs the readable `jolli dashboard` when a winning global CLI is on PATH", async () => {
+	it("reports a spawn failure with a message box the user can see", async () => {
 		const { host, calls } = fakeHost();
-		await launchDashboard(
-			tierOneOptions({
-				host,
-				globalCliVersion: BUNDLED_CLI_VERSION,
-				minGlobalCliVersion: BUNDLED_CLI_VERSION,
-				pathEnv: "/usr/local/bin",
-				// Stands in for both the PATH probe and the Cli.js check.
-				fileExists: () => true,
-			}),
-		);
-		expect(calls.terminals[0]?.sent).toEqual([`${GLOBAL_BIN_NAME} dashboard`]);
+		const { options, spawn } = tierOneOptions({ host });
+		spawn.throwNextWith = new Error("EACCES");
+		await launchDashboard(options);
+		expect(calls.errors).toEqual([SPAWN_FAILED_MESSAGE]);
+		expect(logCalls.some((c) => c.level === "error" && c.message.includes("EACCES"))).toBe(true);
 	});
 
-	it("skips tier 0 without probing PATH when no global CLI wins", async () => {
-		const probed: Array<string> = [];
+	it("reports an asynchronous spawn error with a message box the user can see", async () => {
 		const { host, calls } = fakeHost();
-		await launchDashboard(
-			tierOneOptions({
-				host,
-				globalCliVersion: null,
-				pathEnv: "/usr/local/bin",
-				fileExists: (path) => {
-					probed.push(path);
-					return true;
-				},
-			}),
-		);
-		// A null version short-circuits the PATH walk entirely, so the only existence
-		// question asked is tier 2's — never `/usr/local/bin/jolli`.
+		const { options, spawn } = tierOneOptions({ host });
+		await launchDashboard(options);
+		expect(spawn.errorListener).toBeDefined();
+		spawn.errorListener?.(new Error("EINVAL"));
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(calls.errors).toEqual([SPAWN_FAILED_MESSAGE]);
+		expect(logCalls.some((c) => c.level === "error" && c.message.includes("EINVAL"))).toBe(true);
+	});
+
+	it("logs a tier-0 exit 127 so a missing shebang interpreter is not silent", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: GLOBAL_JOLLI,
+		});
+		await launchDashboard(options);
+		expect(spawn.exitListener).toBeDefined();
+		spawn.exitListener?.(127, null);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(logCalls.some((c) => c.level === "error" && c.message.includes("exited 127"))).toBe(true);
+	});
+
+	it("runs the readable `jolli dashboard` when a winning global CLI is on PATH", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: GLOBAL_JOLLI,
+		});
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(GLOBAL_JOLLI);
+		expect(spawn.calls[0]?.args).toEqual(["dashboard"]);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBeUndefined();
+		expect(spawn.calls[0]?.shell).toBe(false);
+	});
+
+	it("passes shell: true to the spawn for a win32 `.cmd` global shim", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			platform: "win32",
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: "C:\\Users\\u\\AppData\\Roaming\\npm\\jolli.cmd",
+			canExecute: () => false,
+		});
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe("C:\\Users\\u\\AppData\\Roaming\\npm\\jolli.cmd");
+		expect(spawn.calls[0]?.args).toEqual(["dashboard"]);
+		expect(spawn.calls[0]?.shell).toBe(true);
+		expect(spawn.calls[0]?.env[RUN_AS_NODE_ENV_KEY]).toBeUndefined();
+	});
+
+	it("skips PATH lookup when no global CLI wins the version competition", async () => {
+		const probed: Array<string> = [];
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			globalCliVersion: null,
+			globalCliPath: undefined,
+			pathEnv: "/usr/local/bin",
+			fileExists: (path) => {
+				probed.push(path);
+				return true;
+			},
+		});
+		await launchDashboard(options);
 		expect(probed.some((path) => path.endsWith(GLOBAL_BIN_NAME))).toBe(false);
-		expect(calls.terminals[0]?.sent[0]).toContain(RUN_CLI);
+		expect(spawn.calls[0]?.executable).toBe(RUN_CLI);
 	});
 
 	it("falls back to run-cli when the winning global CLI is not on PATH", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(
-			tierOneOptions({
-				host,
-				globalCliVersion: BUNDLED_CLI_VERSION,
-				minGlobalCliVersion: BUNDLED_CLI_VERSION,
-				pathEnv: "/usr/local/bin",
-				// Nothing named `jolli` on PATH; run-cli is still executable.
-				fileExists: (path) => !path.endsWith(GLOBAL_BIN_NAME),
-			}),
-		);
-		expect(calls.terminals[0]?.sent[0]).toContain(RUN_CLI);
-	});
-
-	it("searches the ambient PATH when no pathEnv is injected", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard(
-			tierOneOptions({
-				host,
-				globalCliVersion: BUNDLED_CLI_VERSION,
-				minGlobalCliVersion: BUNDLED_CLI_VERSION,
-				// pathEnv omitted on purpose: the walk must fall back to process.env.PATH.
-				// Nothing exists there as far as this probe is concerned, so tier 1 wins.
-				fileExists: (path) => !path.endsWith(GLOBAL_BIN_NAME),
-			}),
-		);
-		expect(calls.terminals[0]?.sent[0]).toContain(RUN_CLI);
-	});
-
-	it("reads the real registry and PATH when neither is injected", async () => {
-		const { host, calls } = fakeHost();
-		// `globalCliVersion` omitted, so `readWinningGlobalCliVersion` runs against
-		// the real machine. Only the shape is asserted — whether this machine has a
-		// global CLI decides the tier, and a test must not depend on that.
-		await launchDashboard({
-			cwd: REPO,
-			distDir: "/ext/dist",
-			host,
-			platform: "darwin",
-			shell: "/bin/zsh",
-			execPath: EXEC,
-			runCliPath: RUN_CLI,
-			canExecute: (path) => path === RUN_CLI,
-			fileExists: () => true,
-		});
-		expect(calls.terminals[0]?.sent).toHaveLength(1);
-	});
-
-	it("records the tier and the shell it chose", async () => {
 		const { host } = fakeHost();
-		await launchDashboard(tierOneOptions({ host }));
-		expect(logCalls.some((c) => c.message.includes("run-cli") && c.message.includes("posix shell"))).toBe(
-			true,
-		);
-	});
-
-	it("falls back to the ambient platform and shell when neither is injected", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard({
-			cwd: REPO,
-			distDir: "/ext/dist",
+		const { options, spawn } = tierOneOptions({
 			host,
-			remoteName: undefined,
-			execPath: EXEC,
-			runCliPath: RUN_CLI,
-			canExecute: (path) => path === RUN_CLI,
-			fileExists: () => true,
-			// Pinned for the reason `tierOneOptions` states: without it this case
-			// reads the REAL dist-paths registry, so it asserted tier 1 only while
-			// this machine happened to have no available `cli` entry. Building
-			// `cli/dist` locally flipped it to tier 0 and the case went red with
-			// nothing about its subject — the ambient platform/shell — having changed.
-			globalCliVersion: null,
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: null,
 		});
-		// The mocked `vscode.env.shell` is /bin/zsh, so tier 1 is reachable.
-		expect(calls.terminals[0]?.sent).toEqual([`'${RUN_CLI}' dashboard`]);
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(RUN_CLI);
 	});
 
-	it("reaches vscode.window when no host is injected", async () => {
-		await launchDashboard({
-			cwd: REPO,
-			distDir: "/ext/dist",
-			platform: "darwin",
-			shell: "/bin/zsh",
-			execPath: EXEC,
-			runCliPath: RUN_CLI,
-			canExecute: (path) => path === RUN_CLI,
-			fileExists: () => true,
+	it("resolves a globalCliPath from the ambient PATH when not injected", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: undefined,
+			pathEnv: "/usr/local/bin",
+			fileExists: (path) => path === join("/usr/local/bin", GLOBAL_BIN_NAME),
 		});
-		expect(createTerminalMock).toHaveBeenCalledWith({
-			name: TERMINAL_NAME,
-			cwd: REPO,
-			env: { ELECTRON_RUN_AS_NODE: "1" },
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(join("/usr/local/bin", GLOBAL_BIN_NAME));
+	});
+
+	it("records the tier it chose", async () => {
+		const { host } = fakeHost();
+		const { options } = tierOneOptions({ host });
+		await launchDashboard(options);
+		expect(logCalls.some((c) => c.message.includes("run-cli"))).toBe(true);
+	});
+
+	it("quotes argv parts with spaces in the launch log line", async () => {
+		const { host } = fakeHost();
+		const { options } = tierOneOptions({
+			host,
+			globalCliVersion: BUNDLED_CLI_VERSION,
+			minGlobalCliVersion: BUNDLED_CLI_VERSION,
+			globalCliPath: "/Users/me/Library/Application Support/jolli",
 		});
+		await launchDashboard(options);
+		expect(
+			logCalls.some((c) =>
+				c.message.includes('launching dashboard in background via global-jolli: "/Users/me/Library/Application Support/jolli" dashboard'),
+			),
+		).toBe(true);
+	});
+
+	it("falls back to the ambient platform when none is injected", async () => {
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
+			host,
+			platform: undefined,
+			globalCliVersion: null,
+			globalCliPath: null,
+		});
+		await launchDashboard(options);
+		expect(spawn.calls).toHaveLength(1);
 	});
 
 	it("uses the real execPath when none is injected", async () => {
-		const { host, calls } = fakeHost();
-		await launchDashboard({
-			cwd: REPO,
-			distDir: "/ext/dist",
+		const { host } = fakeHost();
+		const { options, spawn } = tierOneOptions({
 			host,
-			remoteName: undefined,
-			platform: "darwin",
-			shell: "/bin/zsh",
+			execPath: undefined,
 			canExecute: () => false,
 			fileExists: () => true,
-			// Same machine-independence pin as above: the subject here is tier 2's
-			// execPath default, which tier 0 would short-circuit past entirely.
 			globalCliVersion: null,
+			globalCliPath: null,
 		});
-		expect(calls.terminals[0]?.sent[0]).toContain(process.execPath);
+		await launchDashboard(options);
+		expect(spawn.calls[0]?.executable).toBe(process.execPath);
 	});
 });

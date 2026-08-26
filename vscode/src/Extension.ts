@@ -4262,20 +4262,16 @@ export function activate(context: vscode.ExtensionContext): void {
 			},
 		),
 
-		// Dashboard — the branch footer button. Runs `jolli dashboard` in an
-		// integrated terminal rather than in this process, so the command's own
-		// output (including the history import, which runs after the page is up and
-		// can take minutes) is in front of the user. DashboardLauncher decides only
-		// which CLI entry to invoke, and keeps the remote-window gate.
-		//
-		// No stop command rides beside this one: the command is a FOREGROUND server
-		// and the terminal is what owns it, so Ctrl+C is the stop — the thing an
-		// extension-owned child process had to reinvent.
+		// Dashboard — the branch footer button. Spawns `jolli dashboard` as a
+		// detached background process (no terminal, no output channel). The CLI
+		// opens the browser itself, and its own port-reclaim logic replaces any
+		// dashboard already serving on 1818 / 18118, so a second click ends the
+		// first server and takes over. DashboardLauncher decides only which CLI
+		// entry to invoke, and keeps the remote-window gate.
 		vscode.commands.registerCommand("jollimemory.openDashboard", () => {
 			log.info("cmd", "openDashboard invoked");
-			// Not awaited: launchDashboard resolves once the line has been sent to
-			// the terminal and reports its own failures, so there is nothing to wait
-			// for here.
+			// Not awaited: launchDashboard resolves once the child has been
+			// spawned and reports its own failures via a message box.
 			void launchDashboard({
 				cwd: workspaceRoot,
 				distDir: join(context.extensionPath, "dist"),
