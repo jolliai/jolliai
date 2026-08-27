@@ -47,8 +47,11 @@ Every table in the schema must appear in **exactly one** of two lists, and that 
 | --- | --- |
 | `sessions` | One row per observed conversation. |
 | `session_model_usage` | That conversation's tokens and cost split per model. |
-| `session_tool_use` | Per tool name and kind: call count, last-call instant, and the MCP server behind it. |
+| `session_tool_use` | Per tool name and kind: call count, last-call instant, the MCP server behind it, and — for skills where the agent can attribute them — input/output/cached tokens, confidence, and providing plugin. |
 | `session_usage_events` | One narrow row per counted model response. Added after the other three, and the one that makes a per-day figure correct: a session row carries its cumulative total under a single timestamp, so a conversation spanning three days would otherwise put all of its spend on the last one. |
+| `session_activity` | One immutable presence bucket per active interval. |
+| `memory_lookups` | One row per recall/search lookup, including the user-authored query and its normalized grouping key. The requested branch/target stays local. |
+| `skill_invocations` | One row per skill invocation: identity, outcome evidence, detection mode, entry path, injected-body character count, and write stamp. Raw invocation arguments are excluded. |
 
 **Never sent**, each for its own reason:
 
@@ -64,15 +67,15 @@ Every table in the schema must appear in **exactly one** of two lists, and that 
 
 Two exclusions have live consequences worth stating. **No timezone travels on this channel**: every time value on the wire is an epoch-millisecond instant, the envelope carries none, no header carries one, and the single timezone-bearing table is excluded precisely so the server can bucket days on whichever zone the *reader* asks for. And **the recall-receipt table left the channel while keeping its channel-shaped schema**: its write stamp and both of the indices behind this channel's paging remain (they have already been migrated, so they are frozen rather than worth an entry to remove), the stamp is still bumped on every receipt, and nothing reads any of it.
 
-Column coverage is asserted per synced table in both directions, and a blunt second net forbids any sent column whose **name** matches transcript, content, body or text — under any table.
+Column coverage is asserted per synced table in both directions, and a blunt second net forbids any sent column whose **name** matches transcript, content, body or text, with no exceptions. The local numeric `body_chars` length reaches the wire only under the projected name `injected_chars`; injected text itself is never selected.
 
-### Columns, and the two departures from verbatim
+### Columns, and the three projections
 
-The payload is `{table: rows}` with the database's own column names verbatim and **values untouched** — millisecond integers stay integers, a JSON-string column stays that string. One name, from local column through JSON field to server column, so a mismatch is a bug rather than a translation table to maintain.
+The payload is `{table: rows}` with **values untouched** — millisecond integers stay integers, a JSON-string column stays that string. Columns keep the database's own names except for the three explicit projections below; every other local column, JSON field and server column carries one name, so an accidental mismatch remains a bug rather than an open-ended translation table.
 
-Exactly **one** column is rewritten: the machine-local surrogate `repo_id` becomes `repo_identity`, and it is **joined out in the select** rather than mapped afterwards, so the identity rides on the row — which is what makes one request able to carry several repositories at once. The integer could not be sent: it is an autoincrement, so the same repository is one number here and another there, and the rows would attach to whichever repository happened to hold that number on the server. The identity is taken from the repository table's own column, deliberately not re-derived from the canonical-URL helper: a repository with no usable remote is a `local:` prefix plus a hash of its worktree root in that column, a substitution the schema made on purpose because the helper's own fallback is a `file://` URL carrying an absolute path and a home directory, and that must never reach this wire.
+Exactly **three** wire columns are projected. Two come from one machine-local surrogate: `repo_id` becomes both `repo_identity` and `repo_name`, and both are **joined out in the select** rather than mapped afterwards. The identity is the stable filter/grouping key; the name is the human label used by detail panes. The integer could not be sent: it is an autoincrement, so the same repository is one number here and another there, and the rows would attach to whichever repository happened to hold that number on the server. The identity is taken from the repository table's own column, deliberately not re-derived from the canonical-URL helper: a repository with no usable remote is a `local:` prefix plus a hash of its worktree root in that column, a substitution the schema made on purpose because the helper's own fallback is a `file://` URL carrying an absolute path and a home directory, and that must never reach this wire. The third projection aliases the local numeric `skill_invocations.body_chars` length to `injected_chars`, preserving the measurement without weakening the content-name privacy net.
 
-Exactly **one** column is held back: the tool-use table's `metadata_json`, dropped from the schema definition long ago but still present on older databases, with no writer and no reader. It is exempt from the "every sent column must exist" direction of the coverage check for that reason.
+Four columns are held back explicitly. From the tool-use table, `origin_root` is a machine-local skill path with no cloud reader, and `metadata_json` was dropped from the schema definition long ago but is still present on older databases, with no writer and no reader. From `memory_lookups`, `target` may carry a branch name and has no cloud reader. From `skill_invocations`, `args` can contain user-authored command/tool input and remains local.
 
 ### The privacy surface
 
@@ -80,7 +83,10 @@ Stated plainly, because it is the largest change this product has made to what l
 
 - **Session titles** are sent, and several agent hosts populate a title from the user's own first message.
 - **Tool names and MCP server names** are sent.
-- **The canonical identity of every repository** whose activity the database holds and which is not withheld — bound to a shared Space or not, and whatever the per-repository push switches say.
+- **Memory search queries and normalized query keys** are sent. These can contain words the user or agent typed; the memory results and requested branch/target are not sent.
+- **Skill token attribution and plugin names** are sent when the agent reports them. These are aggregate counts and identifiers; skill arguments and injected body text are not sent.
+- **Skill invocation outcomes, entry paths, detection mode, and injected-body character counts** are sent. The count is numeric metadata; the injected body and invocation arguments are not sent.
+- **The canonical identity and human-readable display name of every repository** whose activity the database holds and which is not withheld — bound to a shared Space or not, and whatever the per-repository push switches say.
 
 Conversation text is not sent, and the partition plus the name net are what enforce that.
 
@@ -92,11 +98,11 @@ Conversation text is not sent, and the partition plus the name net are what enfo
 | Path | `/api/push/jollimemory/sessions` |
 | Origin, credential, client/tenant/org headers, correlation header | The document push's, unchanged (94). |
 
-The body is one JSON object: a protocol `version` (`1` — this channel's only protocol), the installation's own stable `clientId`, a `cursor` map carrying **only** the tables that have one (an absent entry means "first run for this table"), and a `tables` map carrying **only** the tables that have rows.
+The body is one JSON object: protocol `version: 3`, the installation's own stable `clientId`, a `cursor` map carrying **only** the tables that have one (an absent entry means "first run for this table"), and a `tables` map carrying **only** the tables that have rows. Version 3 keeps protocol 2's full `{stamp, key}` response and adds `sessions.repo_name`. An older closed request schema therefore rejects the version instead of stripping the label while returning a 2xx that would advance the cursor.
 
 The response the client reads is an `accepted` count map and a `cursor` map holding, per table, either a cursor object, a bare number, or an explicit `null`. A bare number is accepted and read as that stamp with an empty key — deliberate wire tolerance, since the client and the backend deploy independently: a backend that echoes only a stamp keeps working at the cost of re-delivering one millisecond per pass into an upsert, and what it must not do is push the client back to stamp-only paging.
 
-Two response shapes are refused rather than read. A **non-2xx** is raised by status, with `404` and `412` each carrying their own class (below). And a **2xx whose body does not parse as JSON** is raised as the *same class as a missing endpoint*, because a single-page application answering an unknown route with its index document is otherwise indistinguishable from a deployed endpoint: the defensive parse turns that markup into an empty object, both fields read as empty, the caller falls back to its own high-water mark, and the cursor advances over rows that reached nobody.
+Three response shapes are refused rather than read. A **non-2xx** is raised by status, with `404` and `412` each carrying their own class (below). A **2xx whose body does not parse as JSON** is raised as the *same class as a missing endpoint*. Finally, a **2xx whose accepted count is absent or not exact for any non-empty table** keeps every cursor still and retries on the normal cadence; this covers rolling deployments whose older closed request schema strips a newly-added table.
 
 ### The channel state file
 
@@ -105,6 +111,7 @@ A machine-level JSON file beside the global configuration, written with owner-on
 | Field | Role |
 | --- | --- |
 | `version` | `1`. Anything else reads as absent. |
+| `payloadVersion` | Latest request protocol whose one-time cursor replay preparation has run. It is independent of the state file's `version`. |
 | `clientId` | This **installation's** stable id, generated once. Not the database's identity, which changes exactly when resuming matters most. |
 | `dbInstanceId` | The database's own instance identity as of the last recorded run — the rebuild witness. |
 | `lastAttemptAtMs` | The throttle mark. Written on failure too, unlike the cursors. |
@@ -112,6 +119,8 @@ A machine-level JSON file beside the global configuration, written with owner-on
 | `byOrigin` | Per-scope, per-table cursors. |
 
 A **scope** is the backend origin plus its optional tenant slug (`https://host[/tenant]`). The tenant is part of the key because one origin serves many and neither a cursor nor a refusal carries across them; the slug is read the same way the request's own tenant header is derived, so the key cannot disagree with the tenant the rows went to. The field name stays `byOrigin` so existing files keep their place: a **bare-origin key written by an earlier build is consulted as a legacy fallback**, and only when the scoped key is **absent**. An entry that exists but holds no cursors blocks the fallback — which is exactly what this scope's database-rebuild reset writes, so a reset scope resumes from the first-run window rather than sliding back onto a legacy position.
+
+When a protocol starts sending columns for rows an older protocol already acknowledged, replay is prepared from this state file rather than guessed by a dashboard migration. On the first protocol-3 run, existing cursors for `sessions`, `session_tool_use` and `skill_invocations` are rewound to stamp zero, while absent cursors remain absent and keep the normal 90-day first-run window. Recording `payloadVersion` makes that rewind exactly once across every persisted backend scope, including cursors higher than the current database's own maximum stamp.
 
 A cursor is a **write stamp plus the primary key of the last row sent**, in the key order this build declares. An empty key means the start of that millisecond, which is what lets a bare stamp be a valid position on the same scale without skipping a row.
 
@@ -131,9 +140,9 @@ A junk cursor reading as *absent* rather than as stamp zero is the milder of the
 
 ### The write stamps, the keyset, and the window sources
 
-Selection walks a per-table **write stamp** — bookkeeping for "when did we last write this row", bumped unconditionally to the current wall clock on every write and never to an instant carried on an event. The names are **not uniform**, and the exception is the one that matters: the session table's `updated_at_ms` is already its business clock, and the commit-summary projection deliberately does not bump it when it enriches a partial row into a full one, so a cursor keyed on it would never see the better token split it just wrote. That table therefore stamps `written_at_ms`; the three child tables stamp `updated_at_ms`, which on them is free.
+Selection walks a per-table **write stamp** — bookkeeping for "when did we last change this outbound row", set from the current wall clock and never from an event timestamp. The names are **not uniform**, and the exception that matters is the session table: it stamps `written_at_ms` because `updated_at_ms` is already its business clock. Skill invocations stamp `updated_at_ms` only when the merged row actually changes, so repeated active-session scans do not resend the whole invocation history.
 
-Three of the four are declared non-null with a zero default. The per-response table's stamp is declared non-null with **no** default, because it was part of that table's own creation rather than added to an existing one. Nullability cannot be relaxed anywhere: a comparison against null is null rather than false, so one nullable stamp is a row no cursor can ever select, for ever, with nothing reporting it. And on real databases the three that arrived by **column-addition are permanently nullable** — a database handed those columns by an earlier build has the addition recorded as already-satisfied rather than applied, so neither the non-null declaration nor its backfill ever ran, and the constraint cannot be restored afterwards. A separate **null-backfill** step exists for exactly that: it gives every such stamp a number (zero meaning "written before this was tracked", which the first run sends once), and it is what keeps those rows selectable at all.
+Four of the five are declared non-null with a zero default. The per-response table's stamp is declared non-null with **no** default, because it was part of that table's own creation rather than added to an existing one. Nullability cannot be relaxed anywhere: a comparison against null is null rather than false, so one nullable stamp is a row no cursor can ever select, for ever, with nothing reporting it. The invocation stamp arrives through its own idempotent add-column entry and gives pre-existing rows zero so their first windowed sync selects them.
 
 | Table | Write stamp | Keyset (tie-break, in key order) | First-run window source |
 | --- | --- | --- | --- |
@@ -141,6 +150,7 @@ Three of the four are declared non-null with a zero default. The per-response ta
 | `session_model_usage` | `updated_at_ms` | `session_event_id`, `model` | **parent** — the owning session's clock, via `session_event_id` |
 | `session_tool_use` | `updated_at_ms` | `session_event_id`, `tool_name`, `kind` | own — `last_call_at_ms` |
 | `session_usage_events` | `updated_at_ms` | `session_event_id`, `dedup_key` | own — `responded_at_ms` |
+| `skill_invocations` | `updated_at_ms` | `session_event_id`, `skill_name`, `at_ms` | own — `at_ms` |
 
 A stamp alone cannot page a table, and the failure is a **stand-still rather than a slowdown**: rows written together share a stamp by construction (one session's usage events are all stamped with one instant, and a bulk reconciliation projects many sessions inside one millisecond), so when more rows share a millisecond than a batch holds, every pass reads the same first page, the highest stamp it sees equals the cursor it started from, and the table stops syncing for good. The cursor is therefore the tuple, the comparison a row-value comparison, and the ordering **exactly** the tuple in exactly that order — a mismatched ordering does not error, it silently pages over rows. Every keyset column must also be on the wire, because the next cursor is read off the row that was just sent.
 
@@ -152,6 +162,7 @@ The window source is a **two-case union**, and the shape is the invariant: every
 | --- | --- |
 | Rows per request, `sessions` / `session_model_usage` / `session_tool_use` | 200 each |
 | Rows per request, `session_usage_events` | 500 — one narrow row per model response |
+| Rows per request, `skill_invocations` | 500 — one narrow row per invocation |
 | Batches per run | 10 |
 | Consecutive cursor-ahead conflicts tolerated | 2 |
 | First-run window | 90 days |
@@ -194,7 +205,7 @@ Three properties are load-bearing:
 - **Disabled-ness is asked of every live checkout, through the same predicate the import path uses**, so "which repositories do I import", "which does the database call paused" and "which do I withhold from the wire" cannot be three predicates that disagree. A registry row is one repository *identity* while the flag is per clone, so one clone still enabled means the repository is.
 - **The identities come from each repository's own profile, never from the database's disabled column.** That column is a projection only the import writes, so it stays set for a while after a re-enable — and a row skipped during that lag is skipped for ever, because the cursor pages over it.
 
-Only the session table carries the identity directly; the three child tables reach it through their parent session, spelled so that a row is withheld **only when it can be proven** to belong to a disabled repository — a child whose parent session is missing keeps the behaviour it had before, because this predicate is not the place to start dropping rows for a second reason. A synced table carrying neither column would be a privacy decision nobody has made, so it throws rather than send everything, and the caller turns that into a skipped run; **no such table exists today** and the column-coverage assertions are what keep it that way. (Unreachable.)
+Only the session table carries the identity directly; the four child tables reach it through their parent session, spelled so that a row is withheld **only when it can be proven** to belong to a disabled repository — a child whose parent session is missing keeps the behaviour it had before, because this predicate is not the place to start dropping rows for a second reason. A synced table carrying neither column would be a privacy decision nobody has made, so it throws rather than send everything, and the caller turns that into a skipped run; **no such table exists today** and the column-coverage assertions are what keep it that way. (Unreachable.)
 
 ### Database-rebuild reconciliation
 
@@ -332,7 +343,7 @@ The daemon task and the commit-path call are complementary rather than redundant
 - **There is no lock on this channel at all** — non-atomic state writes, an unsynchronised throttle, and three overlapping producers. The database side is protected instead, by opening read-only per read and never minting the instance identity. (Notable.)
 - **A rebuild resets only the scope the run is talking to.** Every other scope keeps a possibly-unreachable cursor and is repaired by the server, which is the only party that knows what it holds — which is also why an empty batch is allowed one reconciliation request per window. (Surprising; the narrower behaviour is the correct one.)
 - **A 2xx whose body does not parse is a *missing endpoint*, not a success.** Without that check a single-page application answering an unknown route with its index document is indistinguishable from a deployed endpoint, and the code records exactly that outcome: the channel reported success while nothing had ever been ingested. (Notable; this is the check whose absence was the channel's worst failure.)
-- **A success body that omits both the accepted counts and the cursor is treated as full success.** The accepted counts are read by nothing at all, and a well-formed JSON body carrying neither field yields two empty maps — so the run counts every row it sent as sent and the cursor advances to the batch's own high-water mark, over rows the server never stored. Only a body that fails to *parse* is caught.
+- **Every non-empty table needs an exact accepted count.** A missing or short count keeps every cursor still and retries on the ordinary cadence, so a rolling deployment cannot silently discard a newly-added table while advancing past its rows.
 - **A cursor-ahead conflict that omits the corrective cursor cannot be acted on.** The adoption falls back to what the client already held, so the identical batch is re-sent until the retry ceiling and the run reports failure **without silencing** — repeating in full on every later trigger.
 - **The declined-rows figure overstates itself.** It is documented as rows the table will never send, and logged as rows being skipped, while the window it reports is gone the moment that table has a cursor — so a row it counted can go out on the very next page of the same run.
 - **The withheld-repository line is keyed on a count.** The once-per-process memo key is the *number* of withheld repositories, so switching a different repository off without changing how many are off states nothing new. (Surprising.)

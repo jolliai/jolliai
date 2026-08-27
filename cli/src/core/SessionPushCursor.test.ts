@@ -16,6 +16,7 @@ import {
 	getSessionPushChannelPath,
 	isChannelSilenced,
 	loadChannelForRun,
+	preparePayloadVersion,
 	readSessionPushChannel,
 	toCursors,
 	toTableCursor,
@@ -127,6 +128,19 @@ describe("readSessionPushChannel", () => {
 		expect(state.byOrigin).toEqual({});
 	});
 
+	it("round-trips the payload version while ignoring a malformed one", () => {
+		writeFileSync(
+			getSessionPushChannelPath(dir),
+			JSON.stringify({ version: 1, clientId: "c1", payloadVersion: 3, byOrigin: {} }),
+		);
+		expect(readSessionPushChannel(dir).payloadVersion).toBe(3);
+		writeFileSync(
+			getSessionPushChannelPath(dir),
+			JSON.stringify({ version: 1, clientId: "c1", payloadVersion: "3", byOrigin: {} }),
+		);
+		expect(readSessionPushChannel(dir).payloadVersion).toBeUndefined();
+	});
+
 	it("treats a path that is not a file at all as absent, and still does not throw", () => {
 		// ENOENT is the ordinary case and is silent; anything else (a directory in
 		// the way, a permission problem) is worth a line in the log — but it is
@@ -157,6 +171,26 @@ describe("loadChannelForRun", () => {
 });
 
 describe("cursor bookkeeping", () => {
+	it("rewinds only existing affected cursors exactly once for a new payload", () => {
+		const initial = withCursors(loadChannelForRun(dir), "https://a", {
+			sessions: { stamp: 50, key: ["s1"] },
+			session_tool_use: { stamp: 60, key: ["s1", "Read", "builtin"] },
+			memory_lookups: { stamp: 70, key: ["r1"] },
+		});
+		const prepared = preparePayloadVersion(initial, 3, ["sessions", "session_tool_use", "skill_invocations"]);
+		expect(prepared.payloadVersion).toBe(3);
+		expect(cursorsFor(prepared, "https://a")).toEqual({
+			sessions: { stamp: 0, key: [] },
+			session_tool_use: { stamp: 0, key: [] },
+			memory_lookups: { stamp: 70, key: ["r1"] },
+		});
+		// No cursor is invented for a newly-added table or a never-seen scope: both
+		// retain the normal first-run window instead of uploading all history.
+		expect(cursorsFor(prepared, "https://a").skill_invocations).toBeUndefined();
+		expect(cursorsFor(prepared, "https://new")).toEqual({});
+		expect(preparePayloadVersion(prepared, 3, ["memory_lookups"])).toBe(prepared);
+	});
+
 	it("replaces one origin and leaves the others alone", () => {
 		const state = withCursors(
 			withCursors(loadChannelForRun(dir), "https://a", { sessions: { stamp: 1, key: [] } }),

@@ -71,6 +71,8 @@ INDEX ix_sessions_time ON sessions
     CREATE INDEX ix_sessions_time ON sessions(updated_at_ms)
 INDEX ix_sessions_written ON sessions
     CREATE INDEX ix_sessions_written ON sessions(written_at_ms)
+INDEX ix_si_keyset ON skill_invocations
+    CREATE INDEX ix_si_keyset ON skill_invocations(updated_at_ms, session_event_id, skill_name, at_ms)
 INDEX ix_si_skill_time ON skill_invocations
     CREATE INDEX ix_si_skill_time ON skill_invocations(skill_name, at_ms)
 INDEX ix_smu_keyset ON session_model_usage
@@ -146,7 +148,7 @@ TABLE session_usage_events
 TABLE sessions
     CREATE TABLE sessions ( event_id TEXT PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), source TEXT NOT NULL, session_id TEXT NOT NULL, title TEXT, started_at_ms INTEGER, updated_at_ms INTEGER NOT NULL, message_count INTEGER, duration_ms INTEGER, model TEXT, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, token_coverage TEXT NOT NULL DEFAULT 'sessions-only', prices_as_of TEXT, written_at_ms INTEGER NOT NULL DEFAULT 0, UNIQUE (repo_id, source, session_id) ) STRICT
 TABLE skill_invocations
-    CREATE TABLE skill_invocations ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, skill_name TEXT NOT NULL, at_ms INTEGER NOT NULL, ok INTEGER NOT NULL, ok_confidence TEXT NOT NULL, detection TEXT, entry_path TEXT, args TEXT, body_chars INTEGER, PRIMARY KEY (session_event_id, skill_name, at_ms) ) STRICT
+    CREATE TABLE skill_invocations ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, skill_name TEXT NOT NULL, at_ms INTEGER NOT NULL, ok INTEGER NOT NULL, ok_confidence TEXT NOT NULL, detection TEXT, entry_path TEXT, args TEXT, body_chars INTEGER, updated_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_event_id, skill_name, at_ms) ) STRICT
 TABLE stats_daily
     CREATE TABLE stats_daily ( repo_id INTEGER NOT NULL, tz TEXT NOT NULL, day TEXT NOT NULL, kind TEXT NOT NULL, series_key TEXT NOT NULL, value REAL NOT NULL, cost_usd REAL NOT NULL DEFAULT 0, built_at_ms INTEGER NOT NULL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (repo_id, tz, day, kind, series_key) ) STRICT, WITHOUT ROWID
 TABLE topic_pages

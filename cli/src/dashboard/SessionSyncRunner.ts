@@ -32,6 +32,7 @@ import {
 	PermissionDeniedError,
 	SessionCursorAheadError,
 	SessionEndpointMissingError,
+	SessionIncompleteAcknowledgementError,
 	SessionPreconditionFailedError,
 	type SessionPushResult,
 } from "../core/JolliMemoryPushClient.js";
@@ -39,6 +40,7 @@ import {
 	cursorsFor,
 	loadChannelForRun,
 	MIN_ATTEMPT_INTERVAL_MS,
+	preparePayloadVersion,
 	readSessionPushChannel,
 	type SessionPushChannelState,
 	type SessionPushCursors,
@@ -84,6 +86,17 @@ export const MAX_BATCHES_PER_RUN = 10;
  * backwards under us, and retrying that forever is a spin, not a recovery.
  */
 export const MAX_CURSOR_RETRIES = 2;
+
+/** Request shape spoken by this build; see `SessionPushPayload.version`. */
+const SESSION_PAYLOAD_VERSION = 3;
+
+/**
+ * Tables whose existing rows gained a wire column in protocol 3.
+ *
+ * Rewound through the persisted channel state, not a database migration: the
+ * state file is the only place that knows every backend scope's real cursor.
+ */
+const PROTOCOL_3_REPLAY_TABLES = ["sessions", "session_tool_use", "skill_invocations"] as const;
 
 export interface SessionSyncOptions {
 	/**
@@ -262,7 +275,11 @@ async function sync(
 	// request that is going to fail the same way. Written BEFORE the silence check
 	// for the same reason — a silenced scope that left this mark alone would be
 	// re-resolved on every tick instead of every throttle window.
-	let state: SessionPushChannelState = { ...initial, lastAttemptAtMs: nowMs };
+	let state = preparePayloadVersion(
+		{ ...initial, lastAttemptAtMs: nowMs },
+		SESSION_PAYLOAD_VERSION,
+		PROTOCOL_3_REPLAY_TABLES,
+	);
 	writeSessionPushChannel(state, opts.configDir);
 
 	const silencedUntil = silencedUntilFor(state, scope, nowMs);
@@ -334,7 +351,9 @@ async function sync(
 		}
 		try {
 			const result = await client.pushSessions({
-				version: 2,
+				// Keep the full keyset position in the server's response. A bare stamp
+				// cannot advance through a millisecond containing a full page of rows.
+				version: SESSION_PAYLOAD_VERSION,
 				clientId: state.clientId,
 				cursor: wireCursor(cursors),
 				tables: batchTables(batch),
@@ -483,6 +502,14 @@ function classifyAndRecord(
 			scope,
 		);
 		return "server requires a binding (412) — silenced for 24h";
+	}
+	if (err instanceof SessionIncompleteAcknowledgementError) {
+		log.warn(
+			"session sync: %s returned an incomplete acknowledgement (%s) — keeping all cursors in place",
+			scope,
+			errMsg(err),
+		);
+		return errMsg(err);
 	}
 	log.info("session sync failed against %s: %s", scope, errMsg(err));
 	return errMsg(err);

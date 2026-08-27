@@ -15,7 +15,7 @@ import { type DashboardDbHandle, withDashboardDb } from "./DashboardDb.js";
 import {
 	EXCLUDED_COLUMNS,
 	NEVER_SYNCED_TABLES,
-	REWRITTEN_COLUMNS,
+	PROJECTED_COLUMNS,
 	SYNCED_COLUMNS,
 	SYNCED_TABLES,
 	type SyncedTable,
@@ -90,13 +90,13 @@ describe("session push manifest", () => {
 		expect([...SYNC_STAMP_TABLES].sort()).toEqual([...SYNCED_TABLES].sort());
 	});
 
-	it("rewrites the machine-local surrogate key and nothing else", async () => {
+	it("projects every table's declared local columns without leaking the originals", async () => {
 		// `repos.id` is an autoincrement: the same repo has a different integer on
 		// every machine, so sending it would attach rows to whatever repo happened
 		// to hold that id on the server.
 		for (const table of SYNCED_TABLES) {
 			const local = await columnsOf(table);
-			for (const [from, to] of Object.entries(REWRITTEN_COLUMNS)) {
+			for (const [to, from] of Object.entries(PROJECTED_COLUMNS[table])) {
 				if (!local.includes(from)) continue;
 				expect(SYNCED_COLUMNS[table]).toContain(to);
 				expect(SYNCED_COLUMNS[table]).not.toContain(from);
@@ -149,6 +149,13 @@ describe("session push manifest", () => {
 				expect(TRANSCRIPT_NET.test(column), `${table}.${column} is a tier-1 column`).toBe(false);
 			}
 		}
+		// The sensitive local source stays visible to the coverage guard, while the
+		// wire uses a content-neutral name and carries only its INTEGER count.
+		expect(PROJECTED_COLUMNS.skill_invocations.injected_chars).toBe("body_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).toContain("injected_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).not.toContain("body_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).not.toContain("args");
+		expect(EXCLUDED_COLUMNS.skill_invocations).toContain("args");
 	});
 });
 

@@ -511,7 +511,7 @@ function isUnknownTypeError(err: unknown): boolean {
 function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): void {
 	switch (event.type) {
 		case "repo.enabled":
-			projectRepoEnabled(db, event);
+			projectRepoEnabled(db, event, nowMs);
 			return;
 		case "repo.disabled":
 			projectRepoDisabled(db, event);
@@ -567,7 +567,10 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): 
 	}
 }
 
-function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent): void {
+function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent, nowMs: number): void {
+	const previous = db.prepare("SELECT id, repo_name FROM repos WHERE repo_identity = ?").get(event.repoIdentity) as
+		| { id: number; repo_name: string }
+		| undefined;
 	db.prepare(
 		`INSERT INTO repos (repo_identity, repo_name, worktree_root, remote_url, enabled_at, disabled_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)
@@ -577,6 +580,18 @@ function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent): voi
 		   remote_url    = excluded.remote_url,
 		   disabled_at   = NULL`,
 	).run(event.repoIdentity, event.repoName, event.worktreeRoot, event.remoteUrl ?? null, event.enabledAt);
+	if (previous !== undefined && previous.repo_name !== event.repoName) {
+		// `repo_name` is joined into the session payload rather than stored on each
+		// session, so changing the related row would otherwise be invisible to the
+		// session cursor. Stamp every affected row above the WHOLE table's current
+		// high-water mark: the channel is table-wide and another repo may own its last
+		// cursor. `+ 1` also remains monotonic across a wall-clock rollback.
+		const highWater = db.prepare("SELECT COALESCE(MAX(written_at_ms), 0) AS value FROM sessions").get() as {
+			value: number;
+		};
+		const replayStamp = Math.max(nowMs, highWater.value) + 1;
+		db.prepare("UPDATE sessions SET written_at_ms = ? WHERE repo_id = ?").run(replayStamp, previous.id);
+	}
 }
 
 function projectRepoDisabled(db: DashboardDbHandle, event: RepoDisabledEvent): void {
@@ -1140,11 +1155,14 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 		// re-derived, so a rebuild would discard them at the first scan that can no longer
 		// see them. Converging on the (session, skill, instant) key is what makes the
 		// repeated whole-conversation re-reads idempotent instead of duplicating rows.
+		// The conflict arm also skips semantic no-ops: active sessions are projected
+		// repeatedly, and an unchanged row must not look new to the outbound cursor.
 		const insertInvocation = db.prepare(
 			`INSERT INTO skill_invocations (session_event_id, skill_name, at_ms, ok, ok_confidence,
-			                               detection, entry_path, args, body_chars)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                               detection, entry_path, args, body_chars, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(session_event_id, skill_name, at_ms) DO UPDATE SET
+			     updated_at_ms = excluded.updated_at_ms,
 			     -- Outcome evidence upgrades in one direction. A completed re-read must
 			     -- replace an optimistic fragment, while a later partial read must not erase
 			     -- an outcome already observed for this same invocation.
@@ -1163,7 +1181,19 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			     -- read no argument string or no body length has nothing better to offer than
 			     -- what is already stored.
 			     args          = COALESCE(excluded.args, skill_invocations.args),
-			     body_chars    = COALESCE(excluded.body_chars, skill_invocations.body_chars)`,
+			     body_chars    = COALESCE(excluded.body_chars, skill_invocations.body_chars)
+			 WHERE skill_invocations.ok IS NOT
+			           CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                       AND excluded.ok_confidence <> 'observed'
+			                  THEN skill_invocations.ok ELSE excluded.ok END
+			    OR skill_invocations.ok_confidence IS NOT
+			           CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                      OR excluded.ok_confidence = 'observed'
+			                THEN 'observed' ELSE excluded.ok_confidence END
+			    OR skill_invocations.detection IS NOT excluded.detection
+			    OR skill_invocations.entry_path IS NOT excluded.entry_path
+			    OR skill_invocations.args IS NOT COALESCE(excluded.args, skill_invocations.args)
+			    OR skill_invocations.body_chars IS NOT COALESCE(excluded.body_chars, skill_invocations.body_chars)`,
 		);
 		for (const tool of event.tools) {
 			// All four are written together or not at all — a partially-filled row would
@@ -1221,6 +1251,7 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 					inv.entryPath ?? null,
 					inv.args ?? null,
 					inv.bodyChars ?? null,
+					nowMs,
 				);
 			}
 		}

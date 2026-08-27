@@ -15,6 +15,7 @@ import {
 	PermissionDeniedError,
 	type PlatformToolManifestEntry,
 	SessionEndpointMissingError,
+	SessionIncompleteAcknowledgementError,
 	SessionPreconditionFailedError,
 } from "./JolliMemoryPushClient.js";
 
@@ -1172,7 +1173,7 @@ describe("invokePlatformTool", () => {
 });
 
 describe("pushSessions", () => {
-	const payload = { version: 2, clientId: "c1", cursor: {}, tables: {} } as const;
+	const payload = { version: 3, clientId: "c1", cursor: {}, tables: {} } as const;
 
 	it("rejects a 2xx whose body is not JSON, instead of reading it as an empty success", async () => {
 		// The failure this was found by, in production. A single-page app answers an
@@ -1251,6 +1252,41 @@ describe("pushSessions", () => {
 		// that answers the ping with a bare `{}` from silencing the whole channel for 24h.
 		const c = client(async () => jsonResponse(200, {}));
 		await expect(c.pushSessions(payload)).resolves.toEqual({ accepted: {}, cursor: {} });
+	});
+
+	it("rejects a partial acknowledgement that omitted a newly introduced table", async () => {
+		const withInvocations = {
+			...payload,
+			tables: { skill_invocations: [{ session_event_id: "e1", skill_name: "review", at_ms: 1 }] },
+		};
+		const c = client(async () => jsonResponse(200, { accepted: { sessions: 1 }, cursor: { sessions: 9 } }));
+
+		await expect(c.pushSessions(withInvocations)).rejects.toMatchObject({
+			name: "SessionIncompleteAcknowledgementError",
+			message: expect.stringMatching(/skill_invocations.*expected 1.*no count/),
+		});
+	});
+
+	it("rejects an accepted count smaller than the table page", async () => {
+		const withSessions = { ...payload, tables: { sessions: [{ id: "s1" }, { id: "s2" }] } };
+		const c = client(async () => jsonResponse(200, { accepted: { sessions: 1 }, cursor: { sessions: 9 } }));
+
+		await expect(c.pushSessions(withSessions)).rejects.toBeInstanceOf(SessionIncompleteAcknowledgementError);
+		await expect(c.pushSessions(withSessions)).rejects.toThrow(/sessions.*expected 2.*received 1/);
+	});
+
+	it("accepts an exact acknowledgement for every non-empty table", async () => {
+		const withRows = {
+			...payload,
+			tables: { sessions: [{ id: "s1" }], skill_invocations: [{ id: "i1" }, { id: "i2" }] },
+		};
+		const response = {
+			accepted: { sessions: 1, skill_invocations: 2 },
+			cursor: { sessions: { stamp: 9, key: ["s1"] }, skill_invocations: { stamp: 10, key: ["i2"] } },
+		};
+		const c = client(async () => jsonResponse(200, response));
+
+		await expect(c.pushSessions(withRows)).resolves.toEqual(response);
 	});
 
 	it("returns the server's counts and cursor when it answers properly", async () => {

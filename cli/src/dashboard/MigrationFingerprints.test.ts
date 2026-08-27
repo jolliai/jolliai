@@ -81,6 +81,7 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// A pure-SQL `sqlMigration`, so it is fingerprinted here rather than by a companion
 	// test. See the entry's own file.
 	["2026-08-27-0804-session-activity-keyset-index", "5fa9e542b152"],
+	["2026-08-28-0910-skill-invocation-keyset-index", "c777c90ca543"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

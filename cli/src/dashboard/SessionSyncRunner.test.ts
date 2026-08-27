@@ -10,7 +10,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type JolliMemoryPushClient, SessionCursorAheadError } from "../core/JolliMemoryPushClient.js";
+import {
+	type JolliMemoryPushClient,
+	SessionCursorAheadError,
+	SessionIncompleteAcknowledgementError,
+} from "../core/JolliMemoryPushClient.js";
 import {
 	MIN_ATTEMPT_INTERVAL_MS,
 	readSessionPushChannel,
@@ -254,13 +258,16 @@ describe("session sync runner", () => {
 			);
 			// Typed parameter so the captured call keeps its shape — `vi.fn(async () =>
 			// …)` infers an empty tuple for `calls`.
-			const push = vi.fn(async (_payload: { tables: { sessions?: Array<{ repo_identity: string }> } }) => ({
-				accepted: {},
-				cursor: {},
-			}));
+			const push = vi.fn(
+				async (_payload: { tables: { sessions?: Array<{ repo_identity: string; repo_name: string }> } }) => ({
+					accepted: {},
+					cursor: {},
+				}),
+			);
 			await run({ client: fakeClient({ pushSessions: push } as never) });
 			const sent = push.mock.calls[0]?.[0];
 			expect(sent?.tables.sessions?.map((r) => r.repo_identity)).toEqual(["https://github.com/acme/gadgets"]);
+			expect(sent?.tables.sessions?.map((r) => r.repo_name)).toEqual(["gadgets"]);
 		});
 
 		it("sends nothing when the registry cannot be read", async () => {
@@ -304,6 +311,21 @@ describe("session sync runner", () => {
 	});
 
 	describe("cursors", () => {
+		it("speaks protocol 3 so the server preserves the keyset position and repository label", async () => {
+			await seedSession();
+			const push = vi.fn(async () => ({
+				accepted: { sessions: 1 },
+				cursor: { sessions: { stamp: 4_242, key: ["e1"] } },
+			}));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(push).toHaveBeenCalledWith(expect.objectContaining({ version: 3 }));
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]).toEqual({
+				sessions: { stamp: 4_242, key: ["e1"] },
+			});
+		});
+
 		it("adopts the server's cursor after a successful batch", async () => {
 			await seedSession();
 			await run({
@@ -318,6 +340,38 @@ describe("session sync runner", () => {
 			expect(state.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(4_242) });
 		});
 
+		it("rewinds existing affected cursors once when upgrading the payload to protocol 3", async () => {
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: {
+						"https://acme.jolli.ai": {
+							sessions: at(999_999),
+							memory_lookups: at(700),
+						},
+					},
+				},
+				configDir,
+			);
+			const seen: Array<Record<string, TableCursor>> = [];
+			await run({
+				client: fakeClient({
+					pushSessions: async (payload: { cursor: Record<string, TableCursor> }) => {
+						seen.push(payload.cursor);
+						return { accepted: { sessions: 1 }, cursor: { sessions: at(1_000) } };
+					},
+				} as never),
+			});
+
+			expect(seen[0]).toEqual({ sessions: at(0), memory_lookups: at(700) });
+			const stored = readSessionPushChannel(configDir);
+			expect(stored.payloadVersion).toBe(3);
+			expect(stored.byOrigin["https://acme.jolli.ai"]?.sessions).toEqual(at(1_000));
+		});
+
 		it("walks the cursor DOWN on 409 and re-sends that range", async () => {
 			// The whole reason the mechanism exists: pushing to one backend, then
 			// pointing the install at a fresh one. The local cursor still claims the
@@ -326,6 +380,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -358,6 +413,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -563,6 +619,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { memory_lookups: at(1) } },
@@ -602,6 +659,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://dev.jolli.ai": { sessions: at(7) } },
@@ -636,6 +694,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					dbInstanceId: "a-different-database",
@@ -679,6 +738,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -831,6 +891,32 @@ describe("session sync runner", () => {
 			expect(readSessionPushChannel(configDir).lastAttemptAtMs).toBe(NOW);
 		});
 
+		it("does not silence a scope when an existing endpoint only partially acknowledges a batch", async () => {
+			await seedSession();
+			const outcome = await run({
+				client: fakeClient({
+					pushSessions: async () => {
+						throw new SessionIncompleteAcknowledgementError("skill_invocations was not acknowledged");
+					},
+				} as never),
+			});
+
+			expect(outcome.status).toBe("failed");
+			expect(readSessionPushChannel(configDir).silencedByScope).toEqual({});
+			expect(h.log.warn.mock.calls.some((call) => String(call[0]).includes("incomplete acknowledgement"))).toBe(
+				true,
+			);
+
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+			const { runSessionSync } = await import("./SessionSyncRunner.js");
+			await runSessionSync({
+				nowMs: NOW + MIN_ATTEMPT_INTERVAL_MS,
+				configDir,
+				client: fakeClient({ pushSessions: push } as never),
+			});
+			expect(push).toHaveBeenCalled();
+		});
+
 		it("silences the refusing SCOPE for a day after a 403, not the machine", async () => {
 			const { PermissionDeniedError } = await import("../core/JolliMemoryPushClient.js");
 			await seedSession();
@@ -966,6 +1052,7 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 3,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(777) } },

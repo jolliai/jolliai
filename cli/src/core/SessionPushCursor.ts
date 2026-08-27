@@ -94,6 +94,17 @@ export function toCursors(value: unknown): SessionPushCursors {
 export interface SessionPushChannelState {
 	readonly version: 1;
 	/**
+	 * Latest request payload version whose replay preparation has been applied.
+	 *
+	 * This is deliberately separate from `version`, which describes this FILE's
+	 * shape. When a request version starts sending new columns, existing per-table
+	 * cursors must move back to the start or those columns on already-acknowledged
+	 * rows can never reach the server. Recording the preparation here makes that
+	 * reset exactly-once and, unlike a database migration, gives it the actual
+	 * persisted cursors for every backend scope.
+	 */
+	readonly payloadVersion?: number;
+	/**
 	 * This INSTALLATION's stable id, generated once. Not the database's instance
 	 * id, which is the identity of the file and changes the moment it is rebuilt
 	 * — precisely when resuming matters most. Two accepted edges: copying a home
@@ -223,6 +234,9 @@ function parseChannel(configDir?: string): { state: SessionPushChannelState; sto
 			state: {
 				version: 1,
 				clientId: parsed.clientId,
+				...(typeof parsed.payloadVersion === "number" && Number.isInteger(parsed.payloadVersion)
+					? { payloadVersion: parsed.payloadVersion }
+					: {}),
 				...(typeof parsed.dbInstanceId === "string" ? { dbInstanceId: parsed.dbInstanceId } : {}),
 				...(typeof parsed.lastAttemptAtMs === "number" ? { lastAttemptAtMs: parsed.lastAttemptAtMs } : {}),
 				// A legacy machine-wide `silencedUntilMs` is read past and dropped —
@@ -294,6 +308,36 @@ export function loadChannelForRun(configDir?: string): SessionPushChannelState {
 	// handed an empty cursor forever.
 	if (!stored) writeSessionPushChannel(state, configDir);
 	return state;
+}
+
+/**
+ * Prepares existing scopes for a request payload that adds or renames columns.
+ *
+ * Only tables that ALREADY have a cursor are rewound, to `{stamp: 0}` rather
+ * than removed. Removing it would invoke the 90-day first-run window and omit
+ * older acknowledged rows whose new columns also need replaying; adding a zero
+ * cursor to a fresh scope would do the opposite and upload its whole history.
+ * Leaving absent cursors absent preserves both contracts.
+ */
+export function preparePayloadVersion(
+	state: SessionPushChannelState,
+	payloadVersion: number,
+	replayTables: ReadonlyArray<string>,
+): SessionPushChannelState {
+	if ((state.payloadVersion ?? 0) >= payloadVersion) return state;
+	const replay = new Set(replayTables);
+	const byOrigin = Object.fromEntries(
+		Object.entries(state.byOrigin).map(([scope, cursors]) => [
+			scope,
+			Object.fromEntries(
+				Object.entries(cursors).map(([table, cursor]) => [
+					table,
+					replay.has(table) ? { stamp: 0, key: [] } : cursor,
+				]),
+			),
+		]),
+	);
+	return { ...state, payloadVersion, byOrigin };
 }
 
 /**

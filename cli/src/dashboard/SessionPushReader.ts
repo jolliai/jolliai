@@ -12,8 +12,9 @@
  *     `hit` stays 0/1, `commits_json` stays the JSON string it is. Whether the
  *     sync is correct then becomes a field-by-field comparison rather than a
  *     question about two representations.
- *  2. **The only rewrite is a surrogate key** — `repo_id` becomes the repo's own
- *     `repo_identity`. See `SessionPushManifest.REWRITTEN_COLUMNS`.
+ *  2. **Three projections are explicit** — `repo_id` becomes the repo's identity
+ *     and display name, while local `body_chars` becomes wire-safe
+ *     `injected_chars`. See `SessionPushManifest.PROJECTED_COLUMNS`.
  *  3. **Selection walks the sync stamp**, never a business column, and uses
  *     `>=` rather than `>`.
  */
@@ -24,6 +25,7 @@ import type { DashboardDbHandle } from "./DashboardDb.js";
 import {
 	BATCH_LIMITS,
 	EXCLUDED_COLUMNS,
+	PROJECTED_COLUMNS,
 	SYNCED_COLUMNS,
 	SYNCED_TABLES,
 	type SyncedTable,
@@ -110,9 +112,17 @@ function selectFor(table: SyncedTable, windowSql: string | undefined, excludeSql
 	const stamp = syncStampColumn(table);
 	const keys = KEYSET_COLUMNS[table];
 	const columns = SYNCED_COLUMNS[table]
-		.map((c) => (c === "repo_identity" ? "r.repo_identity AS repo_identity" : `t.${c}`))
+		.map((column) => {
+			const local = PROJECTED_COLUMNS[table][column];
+			if (local === undefined) return `t.${column}`;
+			// `repo_id` projections read the related row; every other projection is
+			// a wire-safe alias for a column on the table itself.
+			return local === "repo_id" ? `r.${column} AS ${column}` : `t.${local} AS ${column}`;
+		})
 		.join(", ");
-	const join = SYNCED_COLUMNS[table].includes("repo_identity") ? " JOIN repos r ON r.id = t.repo_id" : "";
+	const join = SYNCED_COLUMNS[table].some((column) => PROJECTED_COLUMNS[table][column] === "repo_id")
+		? " JOIN repos r ON r.id = t.repo_id"
+		: "";
 	const window = windowSql === undefined ? "" : ` AND ${windowSql}`;
 	const exclude = excludeSql === undefined ? "" : ` AND ${excludeSql}`;
 	// A ROW VALUE comparison, which SQLite has supported since 3.15 — the tuple
@@ -207,7 +217,7 @@ function windowPredicate(table: SyncedTable): string {
  *
  *  - `sessions` already joins `repos` as `r` to put `repo_identity` on the wire,
  *    so it just tests that column.
- *  - The three child tables reach it through their parent session. Spelled as
+ *  - The four child tables reach it through their parent session. Spelled as
  *    `NOT EXISTS (… IN (excluded))` rather than `EXISTS (… NOT IN (…))` on
  *    purpose: a row is withheld only when it can be PROVEN to belong to a
  *    disabled repo, so a child whose parent session is missing keeps the
@@ -349,5 +359,5 @@ export function batchTables(batch: SessionBatch): Record<string, ReadonlyArray<R
 
 /** Every local column of `table` this build knows about — the manifest's view. */
 export function declaredLocalColumns(table: SyncedTable): ReadonlyArray<string> {
-	return [...SYNCED_COLUMNS[table].map((c) => (c === "repo_identity" ? "repo_id" : c)), ...EXCLUDED_COLUMNS[table]];
+	return [...SYNCED_COLUMNS[table].map((c) => PROJECTED_COLUMNS[table][c] ?? c), ...EXCLUDED_COLUMNS[table]];
 }

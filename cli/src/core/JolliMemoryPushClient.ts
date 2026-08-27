@@ -444,6 +444,20 @@ export class SessionEndpointMissingError extends Error {
 }
 
 /**
+ * A 2xx session response acknowledged fewer rows than this request carried.
+ *
+ * This can happen during a rolling deployment when an older closed request
+ * schema strips a newly-added table. The caller must keep every cursor still,
+ * but must not silence the scope as though the whole endpoint were missing.
+ */
+export class SessionIncompleteAcknowledgementError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = "SessionIncompleteAcknowledgementError";
+	}
+}
+
+/**
  * The server made a binding a precondition for the session channel (`412`).
  *
  * Should be unreachable — session statistics need no Space, since the API key
@@ -460,20 +474,18 @@ export class SessionPreconditionFailedError extends Error {
 	}
 }
 
-/** The session channel's request envelope. `tables` carries local column names verbatim. */
+/** The session channel's request envelope. `tables` uses the manifest's explicit wire names. */
 export interface SessionPushPayload {
 	/**
-	 * 2 — the protocol this channel speaks. `cursor` is `{stamp, key}` per table,
-	 * and the version is what makes the SERVER answer in that same shape. Under
-	 * protocol 1 the server downgrades its reply through `toLegacyCursor` to a bare
-	 * stamp, dropping the `key`; for `session_activity` — where many rows share one
-	 * `recorded_at_ms` bucket — a stamp-only cursor cannot step past a millisecond
-	 * once more rows share it than a batch holds, and that table stops syncing
-	 * entirely. The request side is version-agnostic (the server's schema accepts
-	 * both shapes as a union), so there is no server-only fix: a v1 client is owed
-	 * a numeric cursor by contract.
+	 * 3 — protocol-2 keyset cursors plus the `sessions.repo_name` projection.
+	 * The keyset remains load-bearing: a bare stamp cannot page through more rows
+	 * sharing one millisecond than fit in a batch. The version makes the server
+	 * preserve `{stamp, key}` and accept the repository label together.
+	 *
+	 * An older closed server schema rejects this version instead of silently
+	 * stripping the new field and acknowledging a row it did not store completely.
 	 */
-	readonly version: 2;
+	readonly version: 3;
 	readonly clientId: string;
 	/** Client progress, per table — reconciled by the server on every request. */
 	readonly cursor: Readonly<Record<string, SessionPushCursor>>;
@@ -789,6 +801,19 @@ export class JolliMemoryPushClient {
 				`Response from /api/push/jollimemory/sessions (HTTP ${status}) carried neither an accepted count nor a ` +
 					"cursor — treating as an unimplemented endpoint rather than advancing the cursor over unstored rows",
 			);
+		}
+		for (const [table, rows] of Object.entries(payload.tables)) {
+			if (rows.length === 0) continue;
+			const accepted = json.accepted?.[table];
+			if (accepted !== rows.length) {
+				// A healthy 2xx is not enough: an older schema can acknowledge every
+				// table it knows while silently dropping the new one. Exact per-table
+				// counts are the proof that this page reached an upsert.
+				throw new SessionIncompleteAcknowledgementError(
+					`Response from /api/push/jollimemory/sessions (HTTP ${status}) did not acknowledge all rows for ` +
+						`${table} — expected ${rows.length}, received ${accepted ?? "no count"}; refusing to advance its cursor`,
+				);
+			}
 		}
 		return { accepted: json.accepted ?? {}, cursor: json.cursor ?? {} };
 	}
