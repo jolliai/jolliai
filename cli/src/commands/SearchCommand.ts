@@ -152,12 +152,17 @@ export function registerSearchCommand(program: Command): void {
 					getActiveStorage(),
 				);
 
-				// Two records, two audiences, and they must not be confused for each
-				// other. `track` is REMOTE product telemetry, which is why it sends a
-				// length bucket and never the text (see queryLenBucket). The receipt
-				// below is LOCAL: it is what the dashboard's Search Terms card lists,
-				// so it necessarily carries the query itself, and its table is in
-				// `NEVER_SYNCED_TABLES` for exactly that reason.
+				// Two records, two destinations, and they must not be confused for each
+				// other. `track` is ANONYMOUS product telemetry — content-free by
+				// construction (see `Telemetry.ts`), which is why it sends a length
+				// bucket and never the text (see queryLenBucket). The receipt below is a
+				// row in this machine's own dashboard database: it is what the Search
+				// Terms card lists, so it necessarily carries the query itself, and the
+				// session channel syncs it to the reader's OWN account (`memory_lookups`
+				// in `SYNCED_TABLES`, where that line records the decision and the
+				// Settings copy is the disclosure). The bucket stays a bucket regardless:
+				// the two destinations do not share a consent story, so "it already goes
+				// up over there" is never a reason to widen this one.
 				track("search_performed", {
 					result_count_bucket: bucket(hits.length),
 					query_len_bucket: queryLenBucket(query),

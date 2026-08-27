@@ -657,7 +657,9 @@ window.JD = window.JD || {};
 					" off with <code>jolli disable</code> is left out, and stays out: what it recorded before you turned it" +
 					" off is not uploaded later either. <strong>Conversation text is never sent</strong> — but" +
 					" session <em>titles</em> are, and many AI tools use your first message as the title; tool names include" +
-					" any MCP servers you use." +
+					" any MCP servers you use. Your <em>memory search queries</em> are sent too — the words you type into" +
+					" <code>jolli search</code>, or your agent types for you — because the dashboard's Top Search Terms" +
+					" card is built from them." +
 					'</span></span><input type="checkbox" class="set-switch" data-sync-sessions="1"' +
 					(state.syncSessions !== false ? " checked" : "") +
 					"/></label>" +

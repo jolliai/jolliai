@@ -18,6 +18,7 @@ import {
 	writeSessionPushChannel,
 } from "../core/SessionPushCursor.js";
 import { type DashboardDbHandle, withDashboardDb } from "./DashboardDb.js";
+import { BATCH_LIMITS } from "./SessionPushManifest.js";
 
 const NOW = Date.UTC(2026, 7, 12, 12, 0, 0);
 
@@ -136,6 +137,47 @@ describe("session sync runner", () => {
 						`INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms, written_at_ms)
 						 VALUES (?, 1, 'claude', ?, ?, ?)`,
 					).run(`e${i}`, `s${i}`, NOW, 1_000 + i);
+				}
+			},
+			{ dbPath },
+		);
+	}
+
+	/** One `memory_lookups` row, so a batch carries the newest synced table. */
+	async function seedLookup(updatedAtMs = NOW): Promise<void> {
+		await withDashboardDb(
+			(db: DashboardDbHandle) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+					 VALUES ('https://github.com/acme/widgets', 'widgets', '/w', 1)`,
+				).run();
+				db.prepare(
+					`INSERT INTO memory_lookups
+					   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key,
+					    result_count, hit, updated_at_ms)
+					 VALUES ('lookup:r:search:mcp:1:45fd5fcd2b6bb6fd', 1, 'search', 'mcp', 's1', ?,
+					         'rate limiter', 'rate limiter', 3, 1, ?)`,
+				).run(NOW, updatedAtMs);
+			},
+			{ dbPath },
+		);
+	}
+
+	/** `count` lookups with strictly increasing sync stamps — enough to truncate a batch. */
+	async function seedLookups(count: number): Promise<void> {
+		await withDashboardDb(
+			(db: DashboardDbHandle) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+					 VALUES ('https://github.com/acme/widgets', 'widgets', '/w', 1)`,
+				).run();
+				for (let i = 0; i < count; i++) {
+					db.prepare(
+						`INSERT INTO memory_lookups
+						   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key,
+						    result_count, hit, updated_at_ms)
+						 VALUES (?, 1, 'search', 'mcp', 's1', ?, 'rate limiter', 'rate limiter', 3, 1, ?)`,
+					).run(`lookup:r:search:mcp:${i}:45fd5fcd2b6bb6fd`, NOW, 1_000 + i);
 				}
 			},
 			{ dbPath },
@@ -335,6 +377,226 @@ describe("session sync runner", () => {
 			expect(calls).toBe(2);
 		});
 
+		it("carries memory lookups in the same batch as the sessions", async () => {
+			// The regression that matters for this table: the server's `tables` is a
+			// closed schema, so a client sending a table the backend has not listed
+			// gets a 2xx with the rows STRIPPED — and advances its cursor over rows
+			// nobody stored. `recall_receipts`, the table this one replaces, did
+			// exactly that for its whole life. Asserting the rows leave here is the
+			// client half of that contract; the server half is its own route test.
+			await seedSession();
+			await withDashboardDb(
+				(db: DashboardDbHandle) => {
+					db.prepare(
+						`INSERT INTO memory_lookups
+						   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key,
+						    result_count, hit, updated_at_ms)
+						 VALUES ('lookup:r:search:mcp:1:45fd5fcd2b6bb6fd', 1, 'search', 'mcp', 's1', ?,
+						         'Rate  Limiter', 'rate limiter', 3, 1, ?)`,
+					).run(NOW, NOW);
+				},
+				{ dbPath },
+			);
+			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			const [payload] = push.mock.calls[0] as unknown as [
+				{ tables: Record<string, Array<Record<string, unknown>>> },
+			];
+			expect(payload.tables.memory_lookups).toHaveLength(1);
+			expect(payload.tables.memory_lookups[0]).toMatchObject({
+				query: "Rate  Limiter",
+				query_key: "rate limiter",
+				repo_identity: "https://github.com/acme/widgets",
+			});
+			// The branch a recall asked for is withheld, and no row carries the
+			// machine-local repo id.
+			expect(payload.tables.memory_lookups[0]).not.toHaveProperty("target");
+			expect(payload.tables.memory_lookups[0]).not.toHaveProperty("repo_id");
+		});
+
+		it("holds the cursor of a table the server acknowledged in no way at all", async () => {
+			// The silent half of the closed-schema hazard the case above describes. A
+			// backend that has not learned `memory_lookups` STRIPS it and answers 2xx
+			// with a cursor for everything it does know — so the rows reached nobody
+			// and the batch's own high-water mark would step over them for ever.
+			// Holding that one cursor is what makes the range survive until the
+			// backend ships, with nothing to replay by hand.
+			await seedSession(1_000);
+			await seedLookup(2_000);
+			const push = vi.fn(async () => ({ accepted: { sessions: 1 }, cursor: { sessions: 1_000 } }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			const cursors = readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"];
+			expect(cursors?.sessions).toEqual(at(1_000));
+			expect(cursors?.memory_lookups).toBeUndefined();
+			expect(h.log.warn).toHaveBeenCalledWith(
+				expect.stringContaining("acknowledged neither a row count nor a cursor"),
+				"https://acme.jolli.ai",
+				"memory_lookups",
+				// The rows the warning is about — the count the run then withholds from
+				// its "sent" total, so the two cannot disagree about what was stripped.
+				1,
+			);
+		});
+
+		it("holds the one absent table when the reply names every OTHER table it knows", async () => {
+			// ⚠ The reply below is the SHAPE A REAL BACKEND SENDS, captured from a live
+			// one rather than composed here. Probed with a batch carrying a table the
+			// server does not know:
+			//
+			//   {"accepted":{},"cursor":{"sessions":null,"session_activity":null,
+			//    "session_model_usage":null,"session_tool_use":null,
+			//    "session_usage_events":null,"memory_lookups":null}}
+			//
+			// Two things it settles, and neither is visible in a two-key mock. The
+			// server fills a key for EVERY table it knows, `null` included — so an
+			// ABSENT key really is "I do not know this table" and not "I have no
+			// opinion". And the unknown table appeared in neither field, which is the
+			// pair `unacknowledgedTables` reads.
+			//
+			// So this case is that reply with `memory_lookups` REMOVED: exactly what a
+			// backend deployed before that table would answer. The other cases in this
+			// block use a shorter reply on purpose — the wire tolerates it — but none
+			// of them proves the client survives the real one.
+			await seedSession(1_000);
+			await seedLookup(2_000);
+			const push = vi.fn(async () => ({
+				accepted: { sessions: 1 },
+				cursor: {
+					sessions: at(1_000),
+					session_activity: null,
+					session_model_usage: null,
+					session_tool_use: null,
+					session_usage_events: null,
+				},
+			}));
+
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			const cursors = readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"];
+			// The named tables are adopted — `null` means "this backend holds nothing",
+			// which CLEARS rather than holds, and is what re-sends the window to a
+			// fresh backend.
+			expect(cursors?.sessions).toEqual(at(1_000));
+			expect(cursors?.session_tool_use).toBeUndefined();
+			// The absent one is HELD, which looks identical on disk and is not: its
+			// rows were never stored, so the next run offers them from here again.
+			expect(cursors?.memory_lookups).toBeUndefined();
+			expect(outcome).toMatchObject({ held: { rows: 1, tables: ["memory_lookups"] } });
+		});
+
+		it("counts a held table's rows out of the uploaded total, and reports them separately", async () => {
+			// `rows` is what `jolli doctor` prints as "Uploaded N row(s)". A stripped
+			// table stored nothing, so counting it there is the one place this failure
+			// reads back as a success — and with only held rows to send, `rows` at 0
+			// would have printed "up to date" for a machine that uploaded nothing. The
+			// two numbers are kept apart rather than summed for exactly that reason.
+			await seedSession(1_000);
+			await seedLookup(2_000);
+			const push = vi.fn(async () => ({ accepted: { sessions: 1 }, cursor: { sessions: 1_000 } }));
+
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(outcome).toMatchObject({
+				status: "done",
+				batches: 1,
+				rows: 1,
+				// The names travel with the count: this line is only ever reached when
+				// backend-first deployment was broken, so it has to say for WHICH table.
+				held: { rows: 1, tables: ["memory_lookups"] },
+			});
+		});
+
+		it("keeps sending a held table, so it lands the day the backend learns it", async () => {
+			// Held means "do not advance", never "stop offering". The rows go up on
+			// every run; the first server that knows the name stores them.
+			await seedLookup(2_000);
+			const push = vi.fn(async () => ({ accepted: {}, cursor: { sessions: null } }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+			await run({ client: fakeClient({ pushSessions: push } as never), force: true });
+
+			expect(push).toHaveBeenCalledTimes(2);
+			for (const call of push.mock.calls) {
+				const [payload] = call as unknown as [{ tables: Record<string, unknown[]> }];
+				expect(payload.tables.memory_lookups).toHaveLength(1);
+			}
+		});
+
+		it("withholds a held table for the rest of the run rather than re-offering the same page", async () => {
+			// The server cannot learn a table between two requests seconds apart, so a
+			// re-offer can only be stripped again — while costing a full page in every
+			// later request of the run (`BATCH_LIMITS` carries what one page weighs).
+			// The rows are already safe: the same answer held their cursor, so the next
+			// RUN offers them from exactly where they are. Counting them once instead
+			// of once per attempt is the other half of it.
+			await seedMany(250);
+			await seedLookup(2_000);
+			// `accepted` names sessions and nothing names `memory_lookups`, which is the
+			// closed-schema shape: a 2xx that stripped one table. An empty cursor sends
+			// sessions to the batch's own high-water mark, so the loop still advances.
+			const push = vi.fn(async () => ({ accepted: { sessions: 200 }, cursor: {} }));
+
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(push).toHaveBeenCalledTimes(2);
+			const sent = push.mock.calls as unknown as Array<[{ tables: Record<string, unknown[]> }]>;
+			expect(sent[0][0].tables.memory_lookups).toHaveLength(1);
+			expect(sent[1][0].tables).not.toHaveProperty("memory_lookups");
+			// 200 + 51 sessions; the one held lookup is in neither total more than once.
+			expect(outcome).toMatchObject({
+				status: "done",
+				batches: 2,
+				rows: 251,
+				held: { rows: 1, tables: ["memory_lookups"] },
+			});
+		});
+
+		it("stops the run when a truncated batch moved no cursor, instead of re-sending one page", async () => {
+			// A held table with a backlog above its batch limit reports "truncated" for
+			// ever, so the loop's own end condition can never fire — it would spend the
+			// whole per-run ceiling re-sending the identical page. The cursor is already
+			// exactly where the next trigger should resume, so stopping costs nothing.
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { memory_lookups: at(1) } },
+				},
+				configDir,
+			);
+			await seedLookups(BATCH_LIMITS.memory_lookups + 1);
+			const push = vi.fn(async () => ({ accepted: { sessions: 0 }, cursor: { sessions: null } }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(push).toHaveBeenCalledTimes(1);
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]).toEqual({
+				memory_lookups: at(1),
+			});
+		});
+
+		it("advances a table the server DID acknowledge, even with no cursor of its own", async () => {
+			// An `accepted` count is an acknowledgement on its own: the wire tolerates
+			// a backend with no per-table cursor opinion, and treating that as "table
+			// unknown" would freeze a channel that is working.
+			await seedSession(1_000);
+			const push = vi.fn(async () => ({ accepted: { sessions: 1 }, cursor: {} }));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			// The batch's own high-water mark, keyset and all — the fallback the
+			// acknowledgement re-enables, not a bare stamp.
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]?.sessions).toEqual({
+				stamp: 1_000,
+				key: ["e1"],
+			});
+		});
+
 		it("keeps each backend's progress separate", async () => {
 			await seedSession();
 			writeSessionPushChannel(
@@ -399,7 +661,7 @@ describe("session sync runner", () => {
 			const push = vi.fn(async () => ({ accepted: {}, cursor: {} }));
 			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
 			expect(push).not.toHaveBeenCalled();
-			expect(outcome).toEqual({ status: "done", batches: 0, rows: 0 });
+			expect(outcome).toEqual({ status: "done", batches: 0, rows: 0, held: { rows: 0, tables: [] } });
 		});
 
 		it("binds to the database's identity on first sight, and keeps the cursor it already had", async () => {

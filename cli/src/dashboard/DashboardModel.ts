@@ -14,11 +14,12 @@
  * talking to a server newer than its own assets.
  */
 
+import { createHash } from "node:crypto";
+
 import type { TranscriptRepairState } from "../core/TranscriptRepair.js";
 import type { KnowledgeGraph } from "../graph/GraphSchema.js";
 import type {
 	LocalAgentToolId,
-	RecallOutcome,
 	SessionUsageEvent,
 	SkillEntryPath,
 	ToolCallCount,
@@ -113,44 +114,8 @@ export interface SessionUpsertedEvent {
 	readonly activityBuckets?: ReadonlyArray<number>;
 }
 
-/**
- * One recall call, observed by the surface that served it.
- *
- * ⚠ FROZEN HISTORICAL WIRE TYPE — nothing emits this any more. `recall` is now
- * observed as a {@link LookupObservedEvent} with `kind: "recall"`, and this event's
- * `projectRecallObserved` survives as a rewriting adapter onto `memory_lookups`.
- * The table it used to project into (`recall_receipts`) is deliberately still
- * there — see `RECALL_RECEIPTS_DDL` for why dropping it is an older dist's
- * problem, not a cleanup.
- *
- * It stays declared, and `projectEvent` keeps a case for it, because `events_raw`
- * can still hold un-drained rows written by an OLDER dist on the same machine
- * (`run-hook` picks the highest registered dist, which is not always the newest
- * build a user has). An unknown type throws and parks the row as `failed`
- * permanently, so removing this case would strand exactly those rows. The
- * surviving projector rewrites them onto `memory_lookups`.
- *
- * `sessionId` is the agent's own session id when the host exposes one in the
- * environment, absent otherwise (a recall typed into a plain terminal).
- */
-export interface RecallObservedEvent {
-	readonly type: "recall.observed";
-	readonly repoIdentity: string;
-	readonly surface: LookupSurface;
-	readonly atMs: number;
-	readonly sessionId?: string;
-	readonly outcome: RecallOutcome;
-}
-
 /** Which surface answered a lookup. */
 export type LookupSurface = "mcp" | "cli";
-
-/**
- * @deprecated Spelled `LookupSurface` now that `search` shares the channel. Kept as
- * an alias because {@link RecallObservedEvent} above is frozen and reads better with
- * the old name in its own signature history.
- */
-export type RecallSurface = LookupSurface;
 
 /**
  * One lookup against a repo's memory, observed by the surface that served it.
@@ -404,7 +369,6 @@ export type StatsEvent =
 	| WorktreeStatusEvent
 	| RepoEnabledEvent
 	| RepoDisabledEvent
-	| RecallObservedEvent
 	| LookupObservedEvent;
 
 /** Envelope written to `events_raw`, carrying provenance alongside the payload. */
@@ -431,6 +395,39 @@ export function sessionEventId(repoIdentity: string, source: string, sessionId: 
 }
 
 /**
+ * A search's contribution to its receipt id: a fixed-length fingerprint of the
+ * normalised query, never the query itself.
+ *
+ * ⚠ The length is the point, not the hashing. This value ends up inside
+ * `memory_lookups.receipt_id`, which is a PRIMARY KEY that TRAVELS — it is on the
+ * session-push channel, where the server caps `receipt_id` at 500 characters while
+ * capping `query` at 20 000. Interpolating the key verbatim therefore built a
+ * second, much lower ceiling out of the one column nothing clamps: a search past
+ * roughly 430 characters (the budget left after the repo identity, the surface and
+ * the millisecond) produced a row the server answers 400 to, and that channel is
+ * all-or-nothing and neither silences a 400 nor steps past it — so ONE such lookup
+ * wedged every table on that machine for ever. `LOOKUP_QUERY_MAX` cannot reach this
+ * case: it bounds the text at 2 000, four times the cap the id has to fit.
+ *
+ * A hash rather than a truncation, because truncating re-opens the collision the
+ * segment exists to close: two long queries that share a prefix would land on one
+ * id and the second would OVERWRITE the first, which is exactly the loss
+ * {@link statsEventId} documents. 16 hex characters is 64 bits against a collision
+ * domain of "two different queries, same repo, same surface, same millisecond".
+ *
+ * It hashes the KEY, not the raw query, so two spellings of one search still
+ * converge on one row exactly as they do in the read path.
+ *
+ * A side effect worth keeping: the id no longer carries user-authored text at all,
+ * so `SessionPushManifest`'s column net has nothing to miss here — `receipt_id` is
+ * an opaque name that would have matched neither of its tiers while carrying the
+ * reader's own words.
+ */
+function lookupQueryFingerprint(queryKey: string): string {
+	return createHash("sha256").update(queryKey, "utf-8").digest("hex").slice(0, 16);
+}
+
+/**
  * Deterministic primary key for an event's projected row.
  *
  * Determinism is the whole idempotency story: bootstrap, gap recovery and a
@@ -450,19 +447,12 @@ export function statsEventId(event: StatsEvent): string {
 			return `commit-summary:${event.repoIdentity}:${event.hash}`;
 		case "worktree.status":
 			return `worktree:${event.repoIdentity}:${event.branch ?? ""}`;
-		case "recall.observed":
-			// A call is identified by WHEN it happened, because that is the only
-			// thing that distinguishes two of them: same repo, same surface, same
-			// session, possibly the same result. Two calls in the same millisecond
-			// would collide into one row — accepted, since the alternative (a
-			// random id) would make a re-drained event duplicate instead.
-			//
-			// Frozen along with the event: an old dist's un-drained row must still
-			// resolve to the id it would have had, or a re-drain writes a second row.
-			return `recall:${event.repoIdentity}:${event.surface}:${event.atMs}`;
 		case "lookup.observed":
-			// Same rule as above, plus `kind` — and, for a search, the query's own
-			// bucket key.
+			// A call is identified by WHEN it happened, plus `kind` — and, for a search,
+			// a FINGERPRINT of the query's own bucket key (see `lookupQueryFingerprint`:
+			// the key itself is unbounded and this id has a 500-character wire cap). The
+			// timestamp is the only thing that distinguishes two otherwise identical
+			// calls: same repo, same surface, same session, possibly the same result.
 			//
 			// ⚠ The key is not decoration. An agent firing several `search` calls at
 			// once is the ORDINARY shape of this event (unlike recall, which a turn
@@ -470,9 +460,9 @@ export function statsEventId(event: StatsEvent): string {
 			// surface is a real case — and `projectLookupObserved` restates every
 			// column in its UPDATE arm, so a shared id does not merge them, the second
 			// OVERWRITES the first: one query gone, one search uncounted, nothing
-			// anywhere to say so. `queryKey` rather than `query` because it is the
-			// bucket the card groups on, so two spellings of one search still converge
-			// exactly as they do in the read path.
+			// anywhere to say so. It is derived from `queryKey` rather than `query`
+			// because that is the bucket the card groups on, so two spellings of one
+			// search still converge exactly as they do in the read path.
 			//
 			// **It separates DIFFERENT queries, and that is all it can do.** Two calls
 			// that agree on repo, surface, millisecond AND normalised text still share
@@ -485,7 +475,16 @@ export function statsEventId(event: StatsEvent): string {
 			// only fixes are a disambiguator STORED IN the event — a nonce, which
 			// permanently opts this event out of the "several producers converge on one
 			// row" guarantee the whole id scheme exists for — or a re-keying, which the
-			// frozen-id rule below forbids.
+			// frozen-id rule above forbids.
+			//
+			// ⚠ The fingerprint IS a re-keying, and it was legal for exactly one
+			// reason: this event and this id shape were introduced on the same
+			// unreleased branch, so no dist has ever written a `lookup:` id and no
+			// `events_raw` row on any machine but a developer's carries one. That is
+			// the last moment it is true. From the first release that ships this the id
+			// is FROZEN — a shape change would leave an un-drained event projecting a
+			// SECOND row beside the one it already wrote, so a future bound has to be
+			// expressed inside the fingerprint rather than around it.
 			//
 			// What bounds the damage: `events_raw` is keyed on `seq`, not on this id, so
 			// BOTH calls are durably logged and only the projected row is lost. The
@@ -493,9 +492,9 @@ export function statsEventId(event: StatsEvent): string {
 			//
 			// `recall` keeps the timestamp alone: its only argument is a branch, which
 			// two calls in one millisecond would almost certainly share, so there is
-			// nothing to add and the shape stays the frozen event's.
+			// nothing to add — and a turn makes one recall, not several.
 			return event.kind === "search"
-				? `lookup:${event.repoIdentity}:search:${event.surface}:${event.atMs}:${event.queryKey}`
+				? `lookup:${event.repoIdentity}:search:${event.surface}:${event.atMs}:${lookupQueryFingerprint(event.queryKey)}`
 				: `lookup:${event.repoIdentity}:recall:${event.surface}:${event.atMs}`;
 		case "repo.enabled":
 		case "repo.disabled":

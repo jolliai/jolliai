@@ -23,13 +23,13 @@
  *
  * The map is exactly `SYNCED_TABLES`, and `SessionPushManifest.test.ts` asserts
  * that: a stamped table that is not sent is either a missing decision or a stale
- * stamp. `memory_lookups` is the not-yet case and has no entry here — it carries a
- * stamp column and a keyset index built in advance, but the backend has not listed
- * the table yet, so sending would upload into a void (its own entry in
- * `NEVER_SYNCED_TABLES` carries the full flip checklist). Its predecessor
- * `recall_receipts` is the stale case and has no entry here either — it left the
- * channel, while its stamp column and the two indexes behind the channel's paging
- * stay in the schema because they have already been migrated.
+ * stamp. `memory_lookups` joined the list once the backend listed the table — before
+ * that, sending would have uploaded into a void, which is what its predecessor
+ * `recall_receipts` did for its whole life. That one is the stale case and has no
+ * entry here: it left the channel while staying in the schema for cross-version
+ * compatibility (see its entry in `NEVER_SYNCED_TABLES`), and its own stamp column
+ * and the two indexes behind the channel's paging stay behind with it, already
+ * migrated.
  *
  * Every stamp is `NOT NULL`, so `WHERE <stamp> >= ?` is always a real
  * comparison. Do not relax that: NULL >= anything is NULL rather than false, so
@@ -37,10 +37,12 @@
  * set failure this map exists to prevent, arrived at from the other side.
  *
  * The four legacy stamps are additionally `DEFAULT 0`, where 0 means "written
- * before we tracked this" and is what their backfill starts from. `session_activity`
- * is the exception: `recorded_at_ms` has NO default and no zero-backfill, because
- * the table is new and INSERT-only — every row is stamped with its real insert
- * time on the way in, so a 0 sentinel never arises.
+ * before we tracked this" and is what their backfill starts from. Neither newer
+ * table relies on that sentinel: both are INSERT-only and every row is stamped with
+ * its real insert time on the way in, so there is nothing to backfill. Hence
+ * `session_activity` gives `recorded_at_ms` no default at all, while
+ * `memory_lookups` keeps `DEFAULT 0` on `updated_at_ms` purely as the guard against
+ * a nullable stamp above — never a value a row is expected to carry.
  */
 export const SYNC_STAMP_COLUMNS = {
 	sessions: "written_at_ms",
@@ -48,6 +50,7 @@ export const SYNC_STAMP_COLUMNS = {
 	session_tool_use: "updated_at_ms",
 	session_usage_events: "updated_at_ms",
 	session_activity: "recorded_at_ms",
+	memory_lookups: "updated_at_ms",
 } as const;
 
 /** A table that carries a sync stamp. */
@@ -99,6 +102,7 @@ export const KEYSET_COLUMNS: Readonly<Record<SyncStampTable, ReadonlyArray<strin
 	session_tool_use: ["session_event_id", "tool_name", "kind"],
 	session_usage_events: ["session_event_id", "dedup_key"],
 	session_activity: ["session_event_id", "bucket_ms"],
+	memory_lookups: ["receipt_id"],
 };
 
 /**
@@ -149,6 +153,12 @@ export const WINDOW_SOURCES: Readonly<Record<SyncStampTable, WindowSource>> = {
 	// because `bucket_ms <= sessions.updated_at_ms`, so a bucket is admitted only
 	// when its session is.
 	session_activity: { parent: "session_event_id" },
+	// ⚠ `own`, and `{parent}` here is not merely worse — it is BROKEN. The parent
+	// predicate joins `sessions.event_id`, while this table's `session_id` holds a
+	// `sessions.session_id` (a different column) and is NULL for every `jolli
+	// search` typed into a plain terminal. An `EXISTS` over it would silently drop
+	// every one of those rows from the first sync's window, for ever.
+	memory_lookups: { own: "at_ms" },
 };
 
 /** The table's own business time column, or `undefined` when it has none. */

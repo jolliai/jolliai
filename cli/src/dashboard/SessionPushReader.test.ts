@@ -340,6 +340,140 @@ describe("session push reader", () => {
 		expect(wire).not.toContain(dir);
 	});
 
+	/**
+	 * `memory_lookups` — the newest table on this channel, and the only one whose
+	 * rows carry text a person typed.
+	 */
+	describe("memory lookups", () => {
+		/** Seeds one lookup receipt against the same repo `seed` uses. */
+		async function seedLookup(over: Record<string, unknown> = {}): Promise<void> {
+			const identity = String(over.identity ?? "https://github.com/acme/widgets");
+			await withDb((db) => {
+				db.prepare(
+					`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
+					 VALUES (?, 'widgets', '/w', 1)`,
+				).run(identity);
+				const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as {
+					id: number;
+				};
+				db.prepare(
+					`INSERT INTO memory_lookups
+					   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key,
+					    target, result_count, hit, updated_at_ms)
+					 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+				).run(
+					// Fingerprint suffix, matching the shape `statsEventId` actually emits —
+					// the key is derived from the query but never carries it.
+					String(over.receiptId ?? "lookup:r:search:mcp:1000:45fd5fcd2b6bb6fd"),
+					repo.id,
+					String(over.kind ?? "search"),
+					String(over.surface ?? "mcp"),
+					over.sessionId === null ? null : String(over.sessionId ?? "s1"),
+					Number(over.atMs ?? NOW),
+					over.query === null ? null : String(over.query ?? "Rate  Limiter"),
+					over.queryKey === null ? null : String(over.queryKey ?? "rate limiter"),
+					over.target === null ? null : String(over.target ?? "feat/acme-merger"),
+					Number(over.resultCount ?? 3),
+					Number(over.hit ?? 1),
+					Number(over.updatedAtMs ?? NOW),
+				);
+			});
+		}
+
+		it("joins the machine-local repo id out to the identity", async () => {
+			// `repos.id` is an autoincrement local to one machine, so the integer
+			// would attach rows to whatever repo happened to hold it on the server.
+			await seedLookup();
+
+			const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
+			const row = batch.memory_lookups.rows[0];
+
+			expect(row.repo_identity).toBe("https://github.com/acme/widgets");
+			expect(row).not.toHaveProperty("repo_id");
+		});
+
+		it("never puts the recall target on the wire", async () => {
+			// A branch name can carry a customer or an unannounced feature, and
+			// nothing on the other side reads it. The recall ROW still goes up.
+			await seedLookup({ kind: "recall", receiptId: "lookup:r:recall:cli:1000", target: "feat/acme-merger" });
+
+			const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
+			const wire = JSON.stringify(batchTables(batch));
+
+			expect(batch.memory_lookups.rows).toHaveLength(1);
+			expect(wire).not.toContain("acme-merger");
+			expect(batch.memory_lookups.rows[0]).not.toHaveProperty("target");
+		});
+
+		it("sends the query verbatim, beside the key the producer normalised", async () => {
+			// Two spellings of one string, and the card needs both: the key is the
+			// bucket it groups on, the query is what it prints.
+			await seedLookup();
+
+			const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
+			const row = batch.memory_lookups.rows[0];
+
+			expect(row.query).toBe("Rate  Limiter");
+			expect(row.query_key).toBe("rate limiter");
+		});
+
+		it("keeps a plain-terminal search, which has no session at all", async () => {
+			// NULL `session_id` is the ordinary shape for `jolli search` typed into a
+			// terminal. A window predicate that joined `sessions` would drop every one
+			// of them — which is why WINDOW_SOURCES uses this table's own clock.
+			await seedLookup({ sessionId: null, atMs: NOW });
+
+			const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
+
+			expect(batch.memory_lookups.rows).toHaveLength(1);
+			expect(batch.memory_lookups.rows[0].session_id).toBeNull();
+		});
+
+		it("filters the first run's window on the business clock, not the sync stamp", async () => {
+			// A row the client wrote today about a search from a year ago is outside
+			// the 90-day window, and reading the stamp instead would pull it in.
+			const longAgo = NOW - 200 * 24 * 60 * 60 * 1000;
+			await seedLookup({ receiptId: "old", atMs: longAgo, updatedAtMs: NOW });
+
+			const slice = await withDb((db) => readTableSlice(db, "memory_lookups", { cursors: {}, nowMs: NOW }));
+
+			expect(slice.rows).toEqual([]);
+			expect(slice.skipped).toBe(1);
+		});
+
+		it("withholds a disabled repo's lookups", async () => {
+			await seedLookup();
+			await seedLookup({
+				identity: "https://github.com/acme/off",
+				receiptId: "lookup:off:search:mcp:1000:x",
+			});
+
+			const batch = await withDb((db) =>
+				readSessionBatch(db, {
+					cursors: {},
+					nowMs: NOW,
+					excludedIdentities: new Set(["https://github.com/acme/off"]),
+				}),
+			);
+
+			expect(batch.memory_lookups.rows.map((r) => r.repo_identity)).toEqual(["https://github.com/acme/widgets"]);
+		});
+
+		it("advances by receipt id when a whole batch shares one stamp", async () => {
+			// An agent firing several searches at once is the ORDINARY shape of this
+			// event, so a stamp-only cursor would stall on the first millisecond.
+			await seedLookup({ receiptId: "a", updatedAtMs: 5_000, atMs: NOW });
+			await seedLookup({ receiptId: "b", updatedAtMs: 5_000, atMs: NOW });
+
+			const slice = await withDb((db) =>
+				readTableSlice(db, "memory_lookups", { cursors: { memory_lookups: at(5_000) }, nowMs: NOW }),
+			);
+
+			expect(slice.rows).toHaveLength(2);
+			expect(slice.next).toEqual({ stamp: 5_000, key: ["b"] });
+		});
+	});
+
 	it("reads the database identity without minting one", async () => {
 		// This whole path is read-only. `ensureInstanceId` creates the id when it is
 		// missing, which is right for a writer and wrong here — the sync must never

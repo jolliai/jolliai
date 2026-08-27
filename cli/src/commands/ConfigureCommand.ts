@@ -380,7 +380,7 @@ const CONFIG_KEY_INFO: ReadonlyArray<{ key: ConfigKey; type: string; description
 		// is a thin opt-out for the one channel that uploads from repositories the
 		// user never connected to anything.
 		description:
-			"Sync session statistics (tokens, cost, tool names, session titles) to your Jolli organization, for every repo on this machine (default: true)",
+			"Sync session statistics (tokens, cost, tool names, session titles, memory search queries) to your Jolli organization, for every repo on this machine (default: true)",
 	},
 	{
 		key: "syncOnPush",

@@ -1101,6 +1101,41 @@ describe("Memory Top Search Terms card", () => {
 		expect(html).toContain("queue depth");
 	});
 
+	it("still opens a one-query term whose label the clamp cut, and shows the whole query", () => {
+		// `SEARCH_TERM_MAX` is 48 and a query is a sentence, so most single-query
+		// labels come back ellipsised. Withholding the button on query COUNT alone
+		// made the three longest rows on the card the only ones a reader could not
+		// open — precisely the rows whose text was not already on screen. Keyed on
+		// the ellipsis rather than on `queries[0] !== term`, because the clamp also
+		// trims: a query with a leading space would otherwise read as clamped.
+		const rows = [
+			{
+				term: "how did we handle rate limiter bursts in the ga…",
+				searches: 1,
+				queries: ["how did we handle rate limiter bursts in the gateway"],
+			},
+		];
+		expect(searchHtml({ ...TERMS, rows })).toContain('class="rl-click rl-term"');
+		JD.searchTermOpen = rows[0].term;
+		try {
+			// The full text lives in `queries[0]` and the row itself cannot show it.
+			expect(searchHtml({ ...TERMS, rows })).toContain("how did we handle rate limiter bursts in the gateway");
+		} finally {
+			JD.searchTermOpen = null;
+		}
+	});
+
+	it("pluralises the row's own unit instead of appending an s to it", () => {
+		// `rankedList` takes the unit as a parameter, so it has to build the plural
+		// itself — and `search` is the one unit this page ever passed where `+ "s"`
+		// is wrong. The sub-line's "11 searches" says nothing about this path: every
+		// headline on the page spells both forms out by hand, so the ROW's own count
+		// is the only thing that exercises it.
+		const html = searchHtml(TERMS);
+		expect(html).toContain("7 searches");
+		expect(html).not.toContain("searchs");
+	});
+
 	it("renders nothing extra while the row is closed", () => {
 		expect(searchHtml(TERMS)).not.toContain("rl-expand");
 	});

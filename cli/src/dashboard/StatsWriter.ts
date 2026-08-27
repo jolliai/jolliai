@@ -54,7 +54,6 @@ import {
 	type CommitSummaryEvent,
 	type LookupObservedEvent,
 	type ProducerKind,
-	type RecallObservedEvent,
 	type RepoDisabledEvent,
 	type RepoEnabledEvent,
 	type SessionUpsertedEvent,
@@ -468,13 +467,6 @@ const KNOWN_EVENT_TYPES = [
 	"commit.summary",
 	"worktree.status",
 	"lookup.observed",
-	// Legacy inbound, and its membership here is load-bearing rather than tidy:
-	// nothing emits it any more, but an older dist on the same machine still can,
-	// and this list is the allowlist `reviveStuckEvents` reads. Dropping the name
-	// would leave such a row parked as `failed` with nothing offering it a second
-	// attempt. See `RecallObservedEvent`'s docstring and `projectEvent`'s own
-	// legacy section.
-	"recall.observed",
 ] as const satisfies ReadonlyArray<StatsEvent["type"]>;
 
 /**
@@ -540,17 +532,21 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): 
 			projectLookupObserved(db, event, nowMs);
 			return;
 
-		// ── Legacy inbound events ─────────────────────────────────────────────
-		// Nothing in this build emits these. They are here because `events_raw` is
-		// machine-global and an OLDER dist can still be writing into it — a plugin
-		// bundle execs its own `dist/` and never passes through `run-hook`'s version
-		// race, so this is an ongoing inbound path rather than a bounded backlog.
-		// Deleting a case does not make such rows ignored, it makes them PERMANENT
-		// `failed` rows (see the default branch), and drops the type out of
-		// KNOWN_EVENT_TYPES so `reviveStuckEvents` never retries it either.
-		case "recall.observed":
-			projectRecallObserved(db, event, nowMs);
-			return;
+		// ⚠ `recall.observed` used to have a case here, projecting an older dist's
+		// legacy event onto `memory_lookups`. It was REMOVED deliberately, and the
+		// cost is real rather than theoretical: 0.99.15 — the current release, not
+		// merely an old one — still emits that event, and a plugin bundle execs its
+		// own `dist/` without passing through `run-hook`'s version race, so such
+		// rows keep arriving on a mixed-version machine. What happens to them now is
+		// the default branch below: parked `failed` with `failed_kind =
+		// 'unknown-type'`, which is the FORWARD-COMPATIBLE park rather than a loss —
+		// the row survives in `events_raw`, and whichever dist knows the type revives
+		// and projects it (`reviveStuckEvents` gates on that dist's own
+		// KNOWN_EVENT_TYPES). The accepted consequence is narrower: a recall served
+		// by an old dist lands in ITS table (`recall_receipts`) and not in
+		// `memory_lookups`, so this build's lookup figures under-count those calls
+		// until every surface on the machine is upgraded. Do NOT re-add the case to
+		// "fix" a mixed-version count without re-deciding that trade.
 		default: {
 			// Two guarantees, both needed.
 			//
@@ -1307,44 +1303,6 @@ function projectLookupObserved(db: DashboardDbHandle, event: LookupObservedEvent
 		isSearch ? null : (event.target ?? null),
 		event.resultCount,
 		(isSearch ? event.resultCount > 0 : event.hit) ? 1 : 0,
-		nowMs,
-	);
-}
-
-/**
- * Projects a legacy `recall.observed` row onto {@link projectLookupObserved}.
- *
- * Nothing emits that event any more (see `RecallObservedEvent`), but `events_raw`
- * can hold un-drained rows an older dist wrote — `run-hook` picks the highest
- * REGISTERED dist, which is not always the newest build on the machine. An unknown
- * event type throws and parks the row as `failed`, so dropping this case would
- * strand exactly those rows rather than merely ignore them.
- *
- * It keeps `statsEventId(event)` — the `recall:` form — rather than re-deriving a
- * `lookup:` id: the id IS the idempotency key, and re-keying would let a row that
- * has already been projected under the old id be written a second time under a new
- * one. `target` is NULL because the legacy event never carried a branch.
- */
-function projectRecallObserved(db: DashboardDbHandle, event: RecallObservedEvent, nowMs: number): void {
-	const repoId = ensureRepoRow(db, event.repoIdentity);
-	const outcome = event.outcome;
-	db.prepare(
-		`INSERT INTO memory_lookups
-		   (receipt_id, repo_id, kind, surface, session_id, at_ms, query, query_key, target,
-		    result_count, hit, updated_at_ms)
-		 VALUES (?, ?, 'recall', ?, ?, ?, NULL, NULL, NULL, ?, ?, ?)
-		 ON CONFLICT(receipt_id) DO UPDATE SET
-		   result_count  = excluded.result_count,
-		   hit           = excluded.hit,
-		   updated_at_ms = excluded.updated_at_ms`,
-	).run(
-		statsEventId(event),
-		repoId,
-		event.surface,
-		event.sessionId ?? null,
-		event.atMs,
-		outcome.commitCount,
-		outcome.hit ? 1 : 0,
 		nowMs,
 	);
 }

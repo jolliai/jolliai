@@ -56,6 +56,14 @@ export const SYNCED_TABLES = [
 	"session_tool_use",
 	"session_usage_events",
 	"session_activity",
+	// ⚠ The first user-authored FREE TEXT on this channel, and that is the decision
+	// this line records. `query` is what the reader typed; the Memory Top Search
+	// Terms card IS that text — the clustering picks each row's label out of it — so
+	// withholding it withholds the feature rather than trimming it. The Settings
+	// copy and `jolli configure`'s summary were changed to say so in the same
+	// release that started sending it; that disclosure is the consent mechanism and
+	// cannot lag a version behind.
+	"memory_lookups",
 ] as const;
 
 export type SyncedTable = (typeof SYNCED_TABLES)[number];
@@ -100,22 +108,6 @@ export const NEVER_SYNCED_TABLES = [
 	// see `RECALL_RECEIPTS_DDL`. It stays listed here because the partition is asserted
 	// in both directions: a table in the database and in neither list fails the build.
 	"recall_receipts",
-	// Every lookup against a repo's memory — `search` and `recall` alike. Local-only
-	// FOR NOW, and the reason is sequencing rather than privacy: the query text IS
-	// meant to reach the account eventually, but the server's request schema is a
-	// closed `z.object` that STRIPS tables it does not know, so a client that starts
-	// sending before the backend lists it uploads into a void. `recall_receipts` —
-	// the table this one replaces — spent its whole life doing exactly that.
-	//
-	// Flipping it is: move this name to `SYNCED_TABLES`, add its `SYNCED_COLUMNS` /
-	// `EXCLUDED_COLUMNS` / `SYNC_STAMP_COLUMNS` / `KEYSET_COLUMNS` / `WINDOW_SOURCES`
-	// / `BATCH_LIMITS` entries — the schema already carries the stamp column and the
-	// keyset index for it — and, because `query` holds user-authored text, WIDEN the
-	// blunt column net in `SessionPushManifest.test.ts` (today `/transcript|content|
-	// body|text/i`, which the word `query` walks straight through) and record an
-	// explicit exemption for `query`/`query_key`. The net's job is to stop the NEXT
-	// such column, not this one.
-	"memory_lookups",
 	// Derived locally and re-derivable there: a cache cut in THIS machine's
 	// timezone. Sending it would bake that zone into the server's numbers and
 	// leave the server unable to re-aggregate along any other axis. The other half
@@ -200,6 +192,26 @@ export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>
 		"updated_at_ms",
 	],
 	session_activity: ["session_event_id", "bucket_ms", "recorded_at_ms"],
+	memory_lookups: [
+		// ⚠ The primary key, and it is DERIVED from the query — `lookup:<repo>:search:
+		// <surface>:<atMs>:<fingerprint>`. It carries a fixed-length hash rather than
+		// the text (see `lookupQueryFingerprint`), which is what keeps it out of the
+		// free-text review below: an opaque column NAME matches neither tier of the
+		// net, so a key that interpolated the reader's own words would have travelled
+		// unreviewed — and, being capped at 500 on the wire while `query` is capped at
+		// 20 000, would have wedged this channel long before the text did.
+		"receipt_id",
+		"repo_identity",
+		"kind",
+		"surface",
+		"session_id",
+		"at_ms",
+		"query",
+		"query_key",
+		"result_count",
+		"hit",
+		"updated_at_ms",
+	],
 };
 
 /**
@@ -235,6 +247,18 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 		"metadata_json",
 	],
 	session_activity: [],
+	// The branch a `recall` asked for. Held back on the discriminator this list is
+	// for: a bounded integer discloses nothing about content, while a free-text
+	// string needs a reader on the other side to justify it — and nothing there
+	// consumes this one. A branch name can also carry a customer or an unannounced
+	// feature (`feat/acme-merger`). The recall ROW still goes up, so the count, the
+	// recency and the hit survive; only the string is withheld, and flipping it
+	// later is one line here plus one column there.
+	//
+	// ⚠ `result_count` and `hit` are deliberately NOT here. `hit` is not derivable
+	// from `result_count` on a recall, and "did memory answer" is the most likely
+	// next card.
+	memory_lookups: ["target"],
 };
 
 /**
@@ -252,4 +276,13 @@ export const BATCH_LIMITS: Readonly<Record<SyncedTable, number>> = {
 	session_tool_use: 200,
 	session_usage_events: 500,
 	session_activity: 200,
+	// ⚠ 200 and not 500, and the arithmetic is the reason rather than caution.
+	// These rows are narrow but carry the channel's only variable-length free text,
+	// and they carry it TWICE — `query` and `query_key` are two spellings of one
+	// string, so a row's worst case is 2 × the 2 000-character producer clamp. 200 of
+	// those is roughly 800 KB, well under the server's 10 MB body limit, while 500 at
+	// the 20 000-character wire ceiling is 10 MB in one column alone — a 413 the
+	// client cannot tell apart from a transient failure. `receipt_id` no longer
+	// enters this sum: it is a fixed-length fingerprint, not a third copy.
+	memory_lookups: 200,
 };

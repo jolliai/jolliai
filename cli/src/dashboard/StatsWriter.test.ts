@@ -1297,94 +1297,44 @@ describe("skill_invocations projection", () => {
 	});
 });
 
-/* The FROZEN legacy event, kept because `events_raw` can still hold un-drained rows
-   an older dist wrote — an unknown type throws and parks the row `failed` for ever.
-   Nothing emits it any more; its projector is now a rewriting adapter onto
-   `memory_lookups`. */
-describe("recall.observed projection (legacy adapter)", () => {
-	const recallEvent = (over: Record<string, unknown> = {}) =>
-		({
-			event: {
-				type: "recall.observed" as const,
-				repoIdentity: "repo-1",
-				surface: "mcp" as const,
-				atMs: 1_700_000_000_000,
-				outcome: { hit: true, commitCount: 1, commits: [{ hash: "a".repeat(40), date: "2026-07-01" }] },
-				...over,
+/* The legacy `recall.observed` event no longer has a projection — see `projectEvent`.
+   What replaces its projection tests is one assertion about where such a row GOES,
+   because that is the whole accepted cost of the removal: it must park revivably, so
+   the dist that still understands the type can pick it up. Not `error` (which
+   `REVIVABLE_PREDICATE` excludes, reachable only by a manual `jolli doctor --fix`),
+   and above all not silently `projected` — `pruneProjectedEvents` deletes those. */
+describe("recall.observed — the retired legacy event", () => {
+	it("parks revivably instead of failing the drain or being swallowed", async () => {
+		await withDashboardDb(
+			(db) => {
+				db.prepare(
+					`INSERT INTO events_raw (event_id, type, schema_version, received_at, data_json)
+					 VALUES ('legacy-recall', 'recall.observed', ?, 't', ?)`,
+				).run(
+					STATS_EVENT_SCHEMA_VERSION,
+					JSON.stringify({
+						type: "recall.observed",
+						repoIdentity: "repo-1",
+						surface: "mcp",
+						atMs: 1_700_000_000_000,
+						outcome: { hit: true, commitCount: 1, commits: [] },
+					}),
+				);
 			},
-			producerKind: "cli" as const,
-		}) as StatsEventEnvelope;
-
-	const receipts = async () =>
-		withDashboardDb(
-			(db) =>
-				db
-					.prepare(
-						"SELECT receipt_id, kind, at_ms, surface, session_id, hit, result_count, query, query_key, target FROM memory_lookups ORDER BY at_ms",
-					)
-					.all() as Array<Record<string, unknown>>,
 			{ dbPath },
 		);
 
-	it("rewrites a legacy call onto memory_lookups, keeping its original id", async () => {
-		await applyStatsEvents([recallEvent({ sessionId: "s1" })], { producerKind: "cli", dbPath });
-		expect(await receipts()).toEqual([
-			{
-				// The `recall:` id, NOT a re-derived `lookup:` one. It is the idempotency
-				// key, so re-keying would let a row already projected under the old id be
-				// written a second time under a new one.
-				receipt_id: "recall:repo-1:mcp:1700000000000",
-				kind: "recall",
-				at_ms: 1_700_000_000_000,
-				surface: "mcp",
-				session_id: "s1",
-				hit: 1,
-				result_count: 1,
-				// The legacy event carries no branch, and `commits_json` had no reader —
-				// so both are legitimately absent rather than lost.
-				query: null,
-				query_key: null,
-				target: null,
-			},
-		]);
-	});
+		// The attempt budget, like the unknown-type test above: `failed` is where a
+		// row lands after it, not on the first drain.
+		for (let i = 0; i < 5; i++) await applyStatsEvents([], { producerKind: "cli", dbPath });
 
-	it("stores a miss", async () => {
-		await applyStatsEvents([recallEvent({ outcome: { hit: false, commitCount: 0, commits: [] } })], {
-			producerKind: "cli",
-			dbPath,
-		});
-		expect(await receipts()).toEqual([expect.objectContaining({ hit: 0, result_count: 0, session_id: null })]);
-	});
-
-	it("keeps calls from the two surfaces apart even at the same instant", async () => {
-		await applyStatsEvents([recallEvent(), recallEvent({ surface: "cli" })], { producerKind: "cli", dbPath });
-		expect((await receipts()).map((r) => r.surface).sort()).toEqual(["cli", "mcp"]);
-	});
-
-	it("converges on one row when the same event is applied twice", async () => {
-		// The drain can replay a claimed-but-uncommitted row; a receipt must not
-		// become two calls because of it.
-		await applyStatsEvents([recallEvent()], { producerKind: "cli", dbPath });
-		await applyStatsEvents([recallEvent({ outcome: { hit: false, commitCount: 0, commits: [] } })], {
-			producerKind: "cli",
-			dbPath,
-		});
-		const rows = await receipts();
-		expect(rows).toHaveLength(1);
-		expect(rows[0]).toMatchObject({ hit: 0, result_count: 0 });
-	});
-
-	it("seeds a repos row for a repo nothing else has registered yet", async () => {
-		await applyStatsEvents([recallEvent({ repoIdentity: "brand-new" })], { producerKind: "cli", dbPath });
-		const row = await withDashboardDb(
-			(db) =>
-				db.prepare("SELECT repo_identity FROM repos WHERE repo_identity = 'brand-new'").get() as
-					| Record<string, unknown>
-					| undefined,
-			{ dbPath },
-		);
-		expect(row).toEqual({ repo_identity: "brand-new" });
+		expect(
+			await query<{ projection_status: string; failed_kind: string | null }>(
+				"SELECT projection_status, failed_kind FROM events_raw WHERE event_id = 'legacy-recall'",
+			),
+		).toEqual([{ projection_status: "failed", failed_kind: "unknown-type" }]);
+		// And nothing was invented on this build's table out of an event it cannot read.
+		expect(await query<{ n: number }>("SELECT COUNT(*) AS n FROM memory_lookups")).toEqual([{ n: 0 }]);
 	});
 });
 
@@ -1420,8 +1370,12 @@ describe("lookup.observed projection", () => {
 		await applyStatsEvents([searchEvent({ sessionId: "s1" })], { producerKind: "cli", dbPath });
 		expect(await lookups()).toEqual([
 			{
-				// The query's bucket key is part of the id — see statsEventId.
-				receipt_id: "lookup:repo-1:search:mcp:1700000000000:rate limiter",
+				// A FINGERPRINT of the query's bucket key is part of the id, never the
+				// key itself — see `lookupQueryFingerprint`: this column is a primary
+				// key that travels, and the wire caps it far below what `query` allows.
+				// Pinned as a literal because the hash is part of the idempotency
+				// contract, not an implementation detail a re-derivation could absorb.
+				receipt_id: "lookup:repo-1:search:mcp:1700000000000:45fd5fcd2b6bb6fd",
 				kind: "search",
 				surface: "mcp",
 				session_id: "s1",
@@ -2574,16 +2528,22 @@ describe("sync stamps", () => {
 		expect(rows[0]?.updated_at_ms).toBe(4_000);
 	});
 
-	it("stamps recall receipts", async () => {
+	it("stamps a lookup receipt from the drain clock, not from the call's own", async () => {
+		// The two are different columns on purpose: `at_ms` is when the lookup
+		// happened and `updated_at_ms` is when this row was last written, which is
+		// what every sync cursor pages on. Writing the business time into the stamp
+		// would make a backfilled row invisible to a cursor that had passed it.
 		await applyStatsEvents(
 			[
 				{
 					event: {
-						type: "recall.observed",
+						type: "lookup.observed",
+						kind: "recall",
 						repoIdentity: "repo-1",
 						atMs: 1_700_000_300_000,
 						surface: "mcp",
-						outcome: { hit: true, commitCount: 1, commits: [{ hash: "abc123", date: "2026-08-01" }] },
+						hit: true,
+						resultCount: 1,
 					},
 					producerKind: "cli",
 				} as unknown as StatsEventEnvelope,

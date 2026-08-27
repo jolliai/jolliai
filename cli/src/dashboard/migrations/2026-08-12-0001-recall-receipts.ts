@@ -35,9 +35,17 @@ import { type DbMigration, sqlMigration } from "./MigrationHelpers.js";
  * ## Nothing in this build writes it, and it must NOT be dropped
  *
  * `recall` is now observed as a `memory_lookups` row of `kind = 'recall'`
- * (`MEMORY_LOOKUPS_DDL`), and `projectRecallObserved` survives only as a rewriting
- * adapter onto that table. This one is therefore write-dead HERE — and retained on
- * purpose, because "here" is one dist among several on the same machine.
+ * (`MEMORY_LOOKUPS_DDL`), and the `recall.observed` event that used to feed THIS table
+ * has no projection left at all — a row carrying it parks `unknown-type`, revivable by
+ * whichever dist still understands the type. This table is therefore write-dead HERE —
+ * and retained on purpose, because "here" is one dist among several on the same machine.
+ *
+ * ⚠ Those two questions are independent, and conflating them is how this docblock gets
+ * misread. Retiring the event's PROJECTION is a decision about what this build computes;
+ * dropping the TABLE is a decision about what an older dist finds when it runs. The
+ * measurements below answer only the second, so they do not carry over to the first —
+ * and, going the other way, the projection's removal is no argument for dropping the
+ * table.
  *
  * A `2026-08-26-0001-drop-recall-receipts` entry existed on a branch and was removed
  * before it merged. Two measurements killed it, both about an OLDER dist that

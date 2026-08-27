@@ -888,9 +888,9 @@ window.JD = window.JD || {};
 				/* The whole row is the toggle, so it carries the same button semantics
 				   the Skills/MCP rows use for their jump. */
 				rowAttrs: (row) =>
-					/* A term standing for ONE query has nothing to reveal — the expansion
-					   would repeat the row. Such a row is plain text, not a dead button. */
-					(row.queries || []).length < 2
+					/* A row with nothing to reveal is plain text, not a dead button — see
+					   `searchTermRevealsMore` for what counts as nothing. */
+					!searchTermRevealsMore(row)
 						? ""
 						: /* `rl-term` on top of `rl-click`: the term underlines on hover to
 							 say it discloses something, which the Skills/MCP rows must not
@@ -928,13 +928,32 @@ window.JD = window.JD || {};
 	   something in memory. That replaced an expansion which re-ran the SEARCH, needed
 	   a per-repo Orama index, could not compare BM25 scores across repos, and answered
 	   "what would this find today" to a question about what was asked. */
+	/* Whether opening a row would show anything the row is not already showing.
+	   Both halves of the disclosure ask this, so neither can offer a panel the other
+	   renders empty.
+
+	   Several phrasings: always. One phrasing: normally NOT — a lone query IS its own
+	   label, so the panel would repeat the row verbatim. The exception is the case
+	   this predicate exists for: `SEARCH_TERM_MAX` is 48 characters and a query is a
+	   sentence, so `clampLabel` cuts most single-query labels and appends `…`. The
+	   full text is right there in `queries[0]` and the row cannot show it — which
+	   made the three longest rows on the card the only ones a reader could not open,
+	   the exact opposite of where the text was. Keyed on the ellipsis rather than on
+	   `queries[0] !== row.term`: `clampLabel` also trims, so a query with a leading
+	   space would otherwise read as clamped. A query whose own text ends in `…` opens
+	   a panel repeating it, which is the harmless direction to be wrong in. */
+	function searchTermRevealsMore(row) {
+		var queries = row.queries || [];
+		if (queries.length > 1) return true;
+		return queries.length === 1 && /…$/.test(row.term);
+	}
+
 	function searchTermExpansion(row) {
 		if (JD.searchTermOpen !== row.term) return "";
 		var queries = row.queries || [];
-		/* A single-query term is its own label, so the expansion would repeat the row
-		   verbatim. `rowAttrs` already withholds the button in that case; this is the
-		   other half of it. */
-		if (queries.length < 2) return "";
+		/* The other half of the button `rowAttrs` withholds — see
+		   `searchTermRevealsMore`. */
+		if (!searchTermRevealsMore(row)) return "";
 		return (
 			'<div class="rl-expand">' +
 			queries.map((query) => "<div>" + JD.esc(query) + "</div>").join("") +
@@ -1063,6 +1082,25 @@ window.JD = window.JD || {};
 	   bar. Not inside `.rl-top`: that is a flex row, and an extra child there spends
 	   one of its 8px gaps and takes the width off the only thing that gives, which is
 	   the name (see the truncation note above). */
+	/* The plural of a row's unit, for the ONE place the page derives one instead of
+	   writing both forms out.
+
+	   Everywhere else — every headline, every sub-line, `standup.js` — spells the
+	   singular and the plural as two literals, so English is the author's problem
+	   and this function is not needed. `rankedList` cannot do that: it takes the
+	   unit as a parameter, so it has to build the plural itself, and a bare `+ "s"`
+	   is right for `run`, `call`, `tool` and `server` and wrong for the fifth unit
+	   the page ever passed. The Search Terms card read `3 searchs`.
+
+	   Sibilants only (`s`, `sh`, `ch`, `x`, `z` → `es`). Deliberately not an English
+	   pluralizer: no `-y → -ies`, no irregulars. A unit that needs one of those is a
+	   unit whose call site should pass the plural explicitly rather than grow a rule
+	   table into a dashboard asset. */
+	function pluralUnit(unit, value) {
+		if (value === 1) return unit;
+		return /(s|sh|ch|x|z)$/.test(unit) ? unit + "es" : unit + "s";
+	}
+
 	function rankedList(rows, colorVar, valueOf, leadHtmlOf, labelOf, kindOf, unit, list, options) {
 		if (rows.length === 0) return "";
 		var opts = options || {};
@@ -1150,8 +1188,7 @@ window.JD = window.JD || {};
 				'<span class="rl-val num">' +
 				value +
 				" " +
-				unit +
-				(value === 1 ? "" : "s") +
+				pluralUnit(unit, value) +
 				"</span></div>" +
 				'<div class="rl-bar"><i style="width:' +
 				Math.round((value / top) * 100) +

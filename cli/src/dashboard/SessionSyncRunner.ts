@@ -33,6 +33,7 @@ import {
 	SessionCursorAheadError,
 	SessionEndpointMissingError,
 	SessionPreconditionFailedError,
+	type SessionPushResult,
 } from "../core/JolliMemoryPushClient.js";
 import {
 	cursorsFor,
@@ -53,7 +54,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { createLogger, errMsg } from "../Logger.js";
 import { canUseDashboardDb, getDashboardDbPath, withReadonlyDashboardDb } from "./DashboardDb.js";
 import { isRepoDisabled, readRepoRegistryStrict } from "./RepoRegistry.js";
-import { SYNCED_TABLES } from "./SessionPushManifest.js";
+import { SYNCED_TABLES, type SyncedTable } from "./SessionPushManifest.js";
 import {
 	batchSize,
 	batchTables,
@@ -62,6 +63,7 @@ import {
 	readDbInstanceId,
 	readSessionBatch,
 	type SessionBatch,
+	type TableSlice,
 } from "./SessionPushReader.js";
 
 const log = createLogger("SessionSync");
@@ -107,7 +109,28 @@ export interface SessionSyncOptions {
 
 export type SessionSyncOutcome =
 	| { readonly status: "skipped"; readonly reason: string }
-	| { readonly status: "done"; readonly batches: number; readonly rows: number }
+	| {
+			readonly status: "done";
+			readonly batches: number;
+			/** Rows the server acknowledged. Held rows are NOT in here — see `held`. */
+			readonly rows: number;
+			/**
+			 * What the server did not take, and which tables it did not take it for.
+			 *
+			 * Kept out of `rows` because a caller that adds the two together turns the
+			 * one failure this channel cannot report on its own back into a success
+			 * line — see {@link unacknowledgedTables}.
+			 *
+			 * ⚠ One field rather than two, so the count cannot be printed without the
+			 * names. Backend-first deployment is the policy, so this fires only when
+			 * that policy was BROKEN — which makes it rare, and a rare signal has to be
+			 * legible the one time someone sees it. "200 row(s) held" is not something
+			 * a reader can act on; the table name is the whole actionable half, and it
+			 * is what says which deploy is missing. The bug this PR fixed was already
+			 * one number printed without the context that made it mean anything.
+			 */
+			readonly held: { readonly rows: number; readonly tables: ReadonlyArray<SyncedTable> };
+	  }
 	| { readonly status: "failed"; readonly reason: string };
 
 /**
@@ -281,13 +304,23 @@ async function sync(
 
 	let batches = 0;
 	let rows = 0;
+	let heldRows = 0;
 	let cursorRetries = 0;
 	let reconciled = false;
+	// Tables this server stripped earlier in THIS run — see `unacknowledgedTables`.
+	// A backend does not learn a table between two requests seconds apart, so
+	// re-offering one costs a full page in every later request of the run and can
+	// only be stripped again; the rows are already safe, because the same answer
+	// held their cursor. Withholding them is also what keeps `heldRows` a count of
+	// ROWS rather than of attempts.
+	const heldTables = new Set<SyncedTable>();
 	while (batches < MAX_BATCHES_PER_RUN) {
 		const cursors = cursorsFor(state, scope, legacyKey);
-		const batch = await withReadonlyDashboardDb(
-			(db) => readSessionBatch(db, { cursors, nowMs, excludedIdentities }),
-			{ dbPath },
+		const batch = withoutHeldTables(
+			await withReadonlyDashboardDb((db) => readSessionBatch(db, { cursors, nowMs, excludedIdentities }), {
+				dbPath,
+			}),
+			heldTables,
 		);
 		// An empty batch still gets ONE request per run, and only the first one.
 		// Reconciliation happens on requests, so a client whose cursor sits above
@@ -306,25 +339,54 @@ async function sync(
 				cursor: wireCursor(cursors),
 				tables: batchTables(batch),
 			});
-			rows += batchSize(batch);
 			batches++;
 			cursorRetries = 0;
+			// A table this server does not know keeps its cursor where it is, so its
+			// rows are offered again on the next RUN instead of being stepped over —
+			// and are withheld for the rest of THIS one.
+			const unknown = unacknowledgedTables(batch, result);
+			for (const table of unknown) heldTables.add(table);
+			const stripped = rowsIn(batch, unknown);
+			// ⚠ Held rows are counted OUT of the total, never into it. `rows` is what
+			// `jolli doctor` prints as "Uploaded N row(s)", so counting rows the server
+			// stripped is the one place this failure reads back as a success — which is
+			// the whole thing `unacknowledgedTables` exists to stop.
+			rows += batchSize(batch) - stripped;
+			heldRows += stripped;
+			if (unknown.size > 0) {
+				log.warn(
+					"session sync: %s acknowledged neither a row count nor a cursor for %s — holding that cursor; " +
+						"the %d row(s) stay queued until the backend implements the table",
+					scope,
+					[...unknown].join(", "),
+					stripped,
+				);
+			}
 			// The server's answer wins where it has one — it is the authority on what
 			// it holds, and taking its word is what lets a restored-from-backup server
 			// pull the client back. Where it says nothing, the batch's own high-water
 			// mark is used, which is what guarantees the loop advances: a server that
 			// echoes no cursor would otherwise leave the same rows selected forever
 			// and burn the whole per-run ceiling re-sending them.
-			state = withCursors(
-				state,
-				scope,
-				adoptCursor(cursorsFor(state, scope, legacyKey), result.cursor, localMaxima(batch)),
-			);
+			const before = cursorsFor(state, scope, legacyKey);
+			const adopted = adoptCursor(before, result.cursor, localMaxima(batch), unknown);
+			state = withCursors(state, scope, adopted);
 			writeSessionPushChannel(state, opts.configDir);
 			// Nothing was truncated, so this batch WAS the remainder. Selection is
 			// `>=`, so looping again would re-read the boundary row and keep doing so
 			// until the per-run ceiling — see `isBatchTruncated`.
 			if (!isBatchTruncated(batch)) break;
+			// Truncated, but nothing moved: the next read returns the identical rows.
+			// Still load-bearing after {@link withoutHeldTables}, and for the case that
+			// function CANNOT cover — a table is only withheld once it has been
+			// stripped, so the FIRST batch of a run whose only backlog is a held table
+			// arrives here truncated with every cursor where it started. Withholding
+			// removes the repeat; this is what ends the run. The other producer left is
+			// a server echoing a cursor it has already given us, since a keyset cursor
+			// otherwise advances by at least one row per pass. Breaking costs nothing a
+			// later run does not do: the cursor is exactly where the next trigger
+			// should resume.
+			if (!cursorsAdvanced(before, adopted)) break;
 		} catch (err) {
 			if (err instanceof SessionCursorAheadError) {
 				cursorRetries++;
@@ -344,8 +406,16 @@ async function sync(
 			return { status: "failed", reason: classifyAndRecord(err, state, nowMs, scope, opts) };
 		}
 	}
-	if (batches > 0) log.info("session sync: sent %d row(s) in %d batch(es)", rows, batches);
-	return { status: "done", batches, rows };
+	const held = { rows: heldRows, tables: [...heldTables] };
+	if (batches > 0) {
+		log.info(
+			"session sync: sent %d row(s) in %d batch(es)%s",
+			rows,
+			batches,
+			held.rows === 0 ? "" : `; ${held.rows} row(s) held for ${held.tables.join(", ")}`,
+		);
+	}
+	return { status: "done", batches, rows, held };
 }
 
 /**
@@ -487,6 +557,97 @@ function wireCursor(cursors: SessionPushCursors): Record<string, TableCursor> {
 }
 
 /**
+ * The batch minus every table this run has already seen stripped.
+ *
+ * ⚠ Withheld for the REST OF THIS RUN only — never persisted, and never a reason
+ * to stop reading the table. The next trigger offers it again from the same
+ * cursor, and it starts landing the day the backend learns the name with nothing
+ * to replay by hand. See {@link unacknowledgedTables} for what "stripped" means
+ * and why holding the cursor is what makes the rows safe.
+ *
+ * ⚠ Its reason is CORRECTNESS, and reading it as a bandwidth optimisation is how
+ * it gets deleted. `held.rows` has to count rows, and without this it counts
+ * ATTEMPTS: a held table with a backlog above its batch limit reports
+ * `isBatchTruncated` for ever, so while a SECOND table was still draining, the
+ * run re-read the identical page in every pass and added it to the total again
+ * each time. The number then over-reports exactly the way `rows` used to.
+ *
+ * The bandwidth it also saves — one full page per later request in the run
+ * (`BATCH_LIMITS` carries what one weighs on this table), bounded only by
+ * `MAX_BATCHES_PER_RUN` — is real but is NOT what justifies it. Backend-first
+ * deployment is the policy, so the state this function optimises should exist
+ * only inside a deploy window; measured against that, saving the bytes alone
+ * would not be worth the mechanism.
+ */
+function withoutHeldTables(batch: SessionBatch, held: ReadonlySet<SyncedTable>): SessionBatch {
+	if (held.size === 0) return batch;
+	const next = { ...batch } as Record<SyncedTable, TableSlice>;
+	// No `next` keyset: an empty slice must contribute nothing to `localMaxima`,
+	// or the cursor this whole mechanism is holding would advance anyway.
+	for (const table of held) next[table] = { rows: [], skipped: 0 };
+	return next;
+}
+
+/** Rows this batch carried for the named tables. */
+function rowsIn(batch: SessionBatch, tables: ReadonlySet<string>): number {
+	return SYNCED_TABLES.reduce((sum, table) => (tables.has(table) ? sum + batch[table].rows.length : sum), 0);
+}
+
+/**
+ * Tables this batch SENT that the server acknowledged in no way at all.
+ *
+ * ⚠ The one failure this channel cannot report on its own. A request schema is a
+ * closed object: a table the backend has not learned is STRIPPED, and the batch
+ * still answers 2xx with a cursor for everything else — so the rows were never
+ * stored, nothing was refused, and `localMaxima` would step the cursor over them
+ * for ever. This repo has already paid for that once, from the other direction:
+ * `recall_receipts` uploaded into a schema that never listed it for its whole
+ * life (see `NEVER_SYNCED_TABLES`). Client and backend deploy independently, so
+ * every new table spends some window in exactly this state.
+ *
+ * Two signals, and either one counts as an acknowledgement:
+ *  - `accepted[table]` — the row count the server says it wrote.
+ *  - a KEY in the cursor reply. The backend fills one for every table it knows,
+ *    `null` included ("I know it, I hold nothing"), so an ABSENT key is the
+ *    server saying it does not know the table rather than having no opinion. That
+ *    has been true of every deployed version of this endpoint, which is what makes
+ *    reading it this way safe rather than a new protocol rule.
+ *
+ * Only tables with rows IN THIS BATCH: nothing was at risk for the rest, and a
+ * reconcile ping sends none at all.
+ *
+ * ⚠ PARTIAL acknowledgement only — a reply that names no table at all is left
+ * alone, and that is deliberate rather than an oversight. "Named some, not this
+ * one" is a statement ABOUT this table; "named nothing" is the wholesale case the
+ * fallback below exists for, and reading it as a refusal would hold every cursor
+ * for ever against a backend that simply echoes no per-table detail. The absent
+ * shape of that case is already fatal upstream: `pushSessions` raises
+ * `SessionEndpointMissingError` when rows were sent and BOTH fields are missing.
+ * The residual is the empty-but-present `{accepted: {}, cursor: {}}`, which stays
+ * the fallback's; tightening it belongs to that guard, where the whole response
+ * is in view.
+ */
+function unacknowledgedTables(batch: SessionBatch, result: SessionPushResult): ReadonlySet<SyncedTable> {
+	const unknown = new Set<SyncedTable>();
+	if (Object.keys(result.accepted).length === 0 && Object.keys(result.cursor).length === 0) return unknown;
+	for (const table of SYNCED_TABLES) {
+		if (batch[table].rows.length === 0) continue;
+		if (result.accepted[table] === undefined && !(table in result.cursor)) unknown.add(table);
+	}
+	return unknown;
+}
+
+/** True when any table's cursor moved — the loop's proof that it can make progress. */
+function cursorsAdvanced(before: SessionPushCursors, after: SessionPushCursors): boolean {
+	return SYNCED_TABLES.some((table) => !sameCursor(before[table], after[table]));
+}
+
+function sameCursor(a: TableCursor | undefined, b: TableCursor | undefined): boolean {
+	if (a === undefined || b === undefined) return a === b;
+	return a.stamp === b.stamp && a.key.length === b.key.length && a.key.every((k, i) => k === b.key[i]);
+}
+
+/**
  * Applies the server's cursor.
  *
  * A cursor replaces. An explicit `null` CLEARS — "this backend has no record"
@@ -495,6 +656,15 @@ function wireCursor(cursors: SessionPushCursors): Record<string, TableCursor> {
  * that backend. A table the server did not mention falls back to `fallback` (the
  * batch's own last row on success, nothing on a rejection), then to what the
  * client already had.
+ *
+ * ⚠ `held` overrides that fallback, and it is the only thing standing between a
+ * table the backend has not deployed yet and a cursor stepping over rows nobody
+ * stored — see {@link unacknowledgedTables}. Held means "keep what the client
+ * had": not cleared (that would re-push the whole 90-day window once the backend
+ * lands) and not advanced. It is deliberately NOT a reason to stop READING the
+ * table: {@link withoutHeldTables} withholds it for the rest of the current run
+ * only, so the rows are offered again on the next one and start landing the day
+ * the backend learns the name, with nothing to replay by hand.
  *
  * ⚠ A server answering with a bare NUMBER is read as `{stamp, key: []}` — the
  * start of that millisecond. A backend that has not learned the keyset yet
@@ -506,9 +676,15 @@ function adoptCursor(
 	current: SessionPushCursors,
 	server: Readonly<Record<string, TableCursor | number | null>>,
 	fallback: Readonly<Record<string, TableCursor>> = {},
+	held: ReadonlySet<string> = new Set(),
 ): SessionPushCursors {
 	const next: Record<string, TableCursor> = {};
 	for (const table of SYNCED_TABLES) {
+		if (held.has(table)) {
+			const kept = current[table];
+			if (kept !== undefined) next[table] = kept;
+			continue;
+		}
 		const answered = table in server ? server[table] : (fallback[table] ?? current[table] ?? null);
 		const cursor = answered === null ? undefined : toTableCursor(answered);
 		if (cursor !== undefined) next[table] = cursor;

@@ -1166,10 +1166,23 @@ export async function runSessionSyncNow(): Promise<void> {
 	const outcome = await runSessionSync({ force: true });
 	if (outcome.status === "done") {
 		console.log(
-			outcome.rows === 0
+			outcome.rows === 0 && outcome.held.rows === 0
 				? "✓ Session statistics are up to date — nothing new to upload."
 				: `✓ Uploaded ${outcome.rows} row(s) in ${outcome.batches} batch(es).`,
 		);
+		// ⚠ Its own line, and part of the branch above. Held rows were offered and
+		// stored nowhere, so adding them to `rows` would print the one failure the
+		// channel cannot report on its own as an upload — and with `rows` at 0 the
+		// first branch would call a machine that uploaded nothing up to date.
+		//
+		// It NAMES the tables. Backend-first deployment is the policy here, so this
+		// line only ever prints when that policy was broken — and then the table is
+		// the one thing a reader can act on, because it says which deploy is behind.
+		if (outcome.held.rows > 0) {
+			console.log(
+				`  ${outcome.held.rows} row(s) held for ${outcome.held.tables.join(", ")}: this server does not list that table yet. They stay queued and upload once it does.`,
+			);
+		}
 		return;
 	}
 	// Not an exception and not silent: every reason here is either the user's own

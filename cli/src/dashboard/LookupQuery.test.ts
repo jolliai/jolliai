@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { clusterSearchTerms, normalizeLookupQuery, type QueryTally } from "./LookupQuery.js";
+import {
+	clampLookupQuery,
+	clusterSearchTerms,
+	LOOKUP_QUERY_MAX,
+	normalizeLookupQuery,
+	type QueryTally,
+} from "./LookupQuery.js";
 
 const tally = (query: string, searches = 1, lastAtMs = 0): QueryTally => ({
 	query,
@@ -14,6 +20,50 @@ describe("normalizeLookupQuery", () => {
 		// Deliberately conservative: stemming or punctuation-stripping would merge
 		// queries a reader typed differently on purpose.
 		expect(normalizeLookupQuery("retry-after")).toBe("retry-after");
+	});
+});
+
+describe("clampLookupQuery", () => {
+	it("leaves any query a person or an agent would actually compose alone", () => {
+		expect(clampLookupQuery("how did we handle rate limiter bursts")).toBe("how did we handle rate limiter bursts");
+	});
+
+	it("bounds a pasted blob, because nothing else does", () => {
+		// The bound is not about storage. This table rides the session-push channel,
+		// which is all-or-nothing, and the client neither silences a 400 nor steps
+		// past it — so ONE row the server refuses makes that machine retry the same
+		// unsendable batch for ever, on every table. An agent pasting a stack trace
+		// into `search` is the realistic way to produce one.
+		const clamped = clampLookupQuery("x".repeat(LOOKUP_QUERY_MAX + 500));
+
+		expect(clamped).toHaveLength(LOOKUP_QUERY_MAX);
+	});
+
+	it("drops a surrogate pair whole rather than splitting it at the boundary", () => {
+		// A UTF-16 slice can land between the two units of one emoji. The orphan is not
+		// a wire fault — it travels as the ASCII escape `\ud83d` and parses fine — but it
+		// is a mangled character in the text the card prints, so the trim takes both
+		// units and comes back one shorter than the bound.
+		const clamped = clampLookupQuery(`${"x".repeat(LOOKUP_QUERY_MAX - 1)}\u{1F600} bursts`);
+
+		expect(clamped).toHaveLength(LOOKUP_QUERY_MAX - 1);
+		expect(clamped.endsWith("x")).toBe(true);
+	});
+
+	it("stays far below the server's own ceiling, so the two can never meet", () => {
+		// The server refuses at 20 000. Keeping the producer an order of magnitude
+		// under that is what makes the refusal unreachable rather than merely rare.
+		expect(LOOKUP_QUERY_MAX).toBeLessThan(20_000);
+	});
+
+	it("keys the bucket off the CLAMPED text, so the two cannot describe different strings", () => {
+		// `ProducerHooks` clamps before both the stored query and its key. Deriving
+		// the key from the unclamped text would make the card group by a string it
+		// never shows.
+		const long = `${"Rate  Limiter ".repeat(400)}`;
+
+		expect(normalizeLookupQuery(clampLookupQuery(long))).toBe(normalizeLookupQuery(clampLookupQuery(long)));
+		expect(normalizeLookupQuery(clampLookupQuery(long)).length).toBeLessThanOrEqual(LOOKUP_QUERY_MAX);
 	});
 });
 
@@ -42,6 +92,67 @@ describe("clusterSearchTerms", () => {
 			tally("what is the queue depth"),
 		]);
 		expect(rows[0].term).toBe("rate limiter");
+	});
+
+	it("names a subject spelled singular and plural, rather than the filler around it", () => {
+		// The card shipped a row labelled `to`. Without the singular fold `desicions`
+		// and `desicion` are unrelated tokens, so these two questions share no content
+		// word at all; the best phrase left was `how to`, and trimming the article off
+		// it left one filler word standing as the label.
+		const rows = clusterSearchTerms([tally("How to get desicions"), tally("how to make desicion")]);
+
+		expect(rows).toHaveLength(1);
+		expect(rows[0].term).toBe("desicion");
+		expect(rows[0].queries).toHaveLength(2);
+	});
+
+	it("refuses a term whose phrase is filler all the way through", () => {
+		// `is the` covers both and explains more characters than `is` or `the` alone,
+		// so nothing in the scoring can reject it — the words themselves have to. Two
+		// questions sharing only function words are not one subject, and standing
+		// alone with their own text is the honest answer.
+		const rows = clusterSearchTerms([tally("where is the cache"), tally("what is the queue depth")]);
+
+		expect([...rows.map((row) => row.term)].sort()).toEqual(["what is the queue depth", "where is the cache"]);
+	});
+
+	it("folds the two spellings onto the SAME string, not merely a shorter plural", () => {
+		// The fold's whole mechanism: `query` reaches `singularize` unchanged, so a
+		// plural rule that produced anything but `query` would leave the pair in two
+		// groups — the failure it exists to remove, wearing the shape of a feature.
+		// `-ies` fell through to the bare `-s` arm as `querie` and met nothing, and
+		// `-ses` was taken as `-s` plus `es`, so `cases` became a `cas` that the `case`
+		// beside it never matched.
+		for (const [singular, plural] of [
+			["query", "queries"],
+			["entries", "entry"],
+			["repositories", "repository"],
+			["case", "cases"],
+			["releases", "release"],
+			["responses", "response"],
+		]) {
+			const rows = clusterSearchTerms([tally(`${singular} alpha`), tally(`${plural} beta`)]);
+
+			expect(rows, `${singular} / ${plural}`).toHaveLength(1);
+			expect(rows[0].queries, `${singular} / ${plural}`).toHaveLength(2);
+		}
+	});
+
+	it("folds plurals only — a word family is several subjects, not one", () => {
+		// The bound on the fold, from both sides: a real stemmer would merge `limiter`
+		// with `limiting`, and would cut `status` down to a `statu` no reader typed.
+		const rows = clusterSearchTerms([
+			tally("rate limiter alpha"),
+			tally("rate limiter beta"),
+			tally("rate limiting gamma"),
+			tally("migration status one"),
+			tally("migration status two"),
+		]);
+
+		const terms = rows.map((row) => row.term);
+		expect(terms).toContain("rate limiter");
+		expect(terms).toContain("migration status");
+		expect(terms).toContain("rate limiting gamma");
 	});
 
 	it("counts SEARCHES, not distinct phrasings", () => {

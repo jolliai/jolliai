@@ -2174,6 +2174,14 @@ export interface JolliMemoryConfig {
 	 * they belong. Sessions carry a `title`, which several agents populate with the
 	 * user's own first message, and tool names include MCP server names.
 	 *
+	 * ⚠ It also carries the reader's own SEARCH QUERIES, verbatim — the words typed
+	 * into `jolli search` (or typed by an agent on their behalf), because the Memory
+	 * Top Search Terms card IS that text. That is the first user-authored free text on
+	 * this channel, and the two surfaces that offer the switch — the dashboard
+	 * Settings copy and `jolli configure`'s summary — say so in those words. Keep this
+	 * list and that copy together: the disclosure is the consent mechanism, so a
+	 * column added here without it is the one change this switch cannot survive.
+	 *
 	 * Do NOT fold this into {@link syncOnPush} or a per-repo push toggle. Those
 	 * mean "push this repo's memories", and the decision here is precisely that
 	 * statistics do not follow that rule — sharing the switch would make the

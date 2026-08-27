@@ -46,7 +46,7 @@ import type {
 	ProducerKind,
 	StatsEvent,
 } from "./DashboardModel.js";
-import { normalizeLookupQuery } from "./LookupQuery.js";
+import { clampLookupQuery, normalizeLookupQuery } from "./LookupQuery.js";
 import { ensureWorktreeListed, readRepoRegistry, registerRepo, resolveRepoIdentity } from "./RepoRegistry.js";
 import { applyStatsEvents, observeWorktree } from "./StatsWriter.js";
 
@@ -227,6 +227,23 @@ export type LookupObservation = { readonly surface: LookupSurface; readonly atMs
 );
 
 /**
+ * A search receipt's two query fields, both derived from ONE clamped string.
+ *
+ * ⚠ They are returned together rather than assigned separately because they must be
+ * two spellings of the same query — the card prints `query` and groups on
+ * `queryKey`, so a pair derived from different strings makes it list a term whose
+ * tally cannot be found. Clamping at each assignment gives the same answer today and
+ * is a shape in which they CAN disagree; this one is a shape in which they cannot.
+ *
+ * See {@link LOOKUP_QUERY_MAX} for why the bound exists at all — nothing else stands
+ * between a pasted stack trace and a row this table's sync channel cannot send.
+ */
+function searchQueryFields(rawQuery: string): { readonly query: string; readonly queryKey: string } {
+	const query = clampLookupQuery(rawQuery);
+	return { query, queryKey: normalizeLookupQuery(query) };
+}
+
+/**
  * Records one lookup against this repo's memory, from the surface that served it.
  *
  * Called by the MCP `search`/`recall` tools and the `jolli search`/`jolli recall`
@@ -265,8 +282,7 @@ export async function recordLookupReceipt(
 					? {
 							kind: "search" as const,
 							surface: observation.surface,
-							query: observation.query,
-							queryKey: normalizeLookupQuery(observation.query),
+							...searchQueryFields(observation.query),
 							resultCount: observation.resultCount,
 						}
 					: {

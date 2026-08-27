@@ -18,6 +18,7 @@ import {
 	REWRITTEN_COLUMNS,
 	SYNCED_COLUMNS,
 	SYNCED_TABLES,
+	type SyncedTable,
 } from "./SessionPushManifest.js";
 import { declaredLocalColumns } from "./SessionPushReader.js";
 import { SYNC_STAMP_TABLES, syncStampColumn } from "./SyncColumns.js";
@@ -105,11 +106,85 @@ describe("session push manifest", () => {
 
 	it("never sends a transcript column, under any name", async () => {
 		// A blunt second net under the per-table lists: the one thing the product
-		// promises never leaves this machine is the conversation text.
+		// promises never leaves this machine is the conversation text. ⚠ NOTHING
+		// exempts a match here — that is what separates tier 1 from tier 2 below.
 		for (const table of SYNCED_TABLES) {
 			for (const column of SYNCED_COLUMNS[table]) {
-				expect(column).not.toMatch(/transcript|content|body|text/i);
+				expect(column).not.toMatch(TRANSCRIPT_NET);
+			}
+		}
+	});
+
+	// The second tier. `query` walked straight through the net above — the word is
+	// not in it — so adding `memory_lookups` was not a matter of widening tier 1 but
+	// of giving the guard a way to catch the NEXT such column. Matching this net is
+	// not a failure; it is a requirement to have written down why.
+	it("has a recorded reason for every free-text column it sends", async () => {
+		for (const table of SYNCED_TABLES) {
+			for (const column of SYNCED_COLUMNS[table]) {
+				if (!FREE_TEXT_NET.test(column)) continue;
+				const reason = FREE_TEXT_EXEMPTIONS[table]?.[column];
+				expect(reason, `${table}.${column} needs a FREE_TEXT_EXEMPTIONS entry`).toBeDefined();
+				// A stub cannot pass. The entry exists to make somebody state the case,
+				// not to be a checkbox — an allowlist of one-word reasons is a rubber
+				// stamp, which is the failure mode this whole tier has to avoid.
+				expect((reason ?? "").length, `${table}.${column}`).toBeGreaterThanOrEqual(40);
+			}
+		}
+	});
+
+	it("carries no exemption that has stopped meaning anything", async () => {
+		// The reverse direction, so the list cannot quietly become a pile of
+		// pre-approvals for columns nobody is sending any more — or, worse, for ones
+		// nobody has added yet.
+		for (const [table, exemptions] of Object.entries(FREE_TEXT_EXEMPTIONS)) {
+			expect(SYNCED_TABLES as ReadonlyArray<string>, `${table} is exempted but is not synced`).toContain(table);
+			for (const column of Object.keys(exemptions)) {
+				expect(SYNCED_COLUMNS[table as SyncedTable], `${table}.${column}`).toContain(column);
+				expect(FREE_TEXT_NET.test(column), `${table}.${column} is exempted but the net never matched it`).toBe(
+					true,
+				);
+				// ⚠ The tiers cannot be crossed. Tier 1 is the promise; an exemption
+				// naming one of its columns would turn that promise into a preference.
+				expect(TRANSCRIPT_NET.test(column), `${table}.${column} is a tier-1 column`).toBe(false);
 			}
 		}
 	});
 });
+
+/** Tier 1: the conversation text, under any name. No exemption reaches it. */
+const TRANSCRIPT_NET = /transcript|content|body|text/i;
+
+/**
+ * Tier 2: names that plausibly hold prose a human or a model wrote.
+ *
+ * ⚠ Deliberately short. Every token here that never names a real column costs a
+ * meaningless exemption entry on the next column that trips it, and a list of
+ * meaningless entries is exactly the rubber stamp the 40-character reason above
+ * exists to prevent. Add a token when a real column makes the case, not on
+ * speculation. `message_count` already sits here as a false positive, which is
+ * the net working rather than a leak — but it is also the reason not to grow the
+ * list on a hunch.
+ */
+const FREE_TEXT_NET = /query|prompt|message|title|term|snippet|excerpt|description|instruction/i;
+
+/**
+ * Every tier-2 column the channel sends, and why it is sent anyway.
+ *
+ * ⚠ Lives in the TEST, not in the manifest: nothing reads it at runtime, and an
+ * allowlist belongs to the guard that consults it rather than to the thing being
+ * guarded. `JolliMemorySessionColumns.test.ts` in the server repository carries
+ * the mirror image, so a column added on either side has to be justified twice.
+ */
+const FREE_TEXT_EXEMPTIONS: Readonly<Record<string, Readonly<Record<string, string>>>> = {
+	sessions: {
+		title: "The session's own title. Several agent hosts derive it from the user's FIRST MESSAGE, so it is conversation-adjacent text; the Settings copy discloses it in those words.",
+		message_count:
+			"An integer count of messages, never their content. It matches only because 'message' is in the net, which is the net doing its job rather than a leak.",
+	},
+	memory_lookups: {
+		query: "The reader's own search string, verbatim. The Memory Top Search Terms card IS this text — the clustering picks each row's label out of it — so withholding it would withhold the feature, not trim it.",
+		query_key:
+			"The same string, lower-cased with whitespace collapsed. It is the bucket the card groups on, so it has to travel with the query it keys or the card lists terms whose tally cannot be found.",
+	},
+};

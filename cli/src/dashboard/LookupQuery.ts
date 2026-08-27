@@ -29,6 +29,62 @@ export function normalizeLookupQuery(query: string): string {
 }
 
 /**
+ * Longest query text a receipt records.
+ *
+ * ⚠ A bound on what is WRITTEN, not a wire rewrite — the same kind of thing
+ * {@link normalizeLookupQuery} is, applied at the same place, so the verbatim
+ * text and its bucket key stay derived from one string.
+ *
+ * It exists because nothing else bounds `query` anywhere: an agent pasting a
+ * stack trace into `search` produces a row of arbitrary size, and this table is
+ * on the session-push channel. That channel is all-or-nothing and the client
+ * neither silences a 400 nor steps past it, so a single row the server refuses
+ * would make that machine retry the same unsendable batch for ever — on EVERY
+ * table, not just this one. 2 000 characters is far above any query a person or
+ * an agent composes, and far below the server's own 20 000-character ceiling, so
+ * the two cannot meet.
+ *
+ * ⚠ That holds for rows THIS build writes, and the read path clamps nothing —
+ * `clampLookupQuery` runs once, in `ProducerHooks`, so a row written before it
+ * existed goes up exactly as long as it was stored. Adding a read-side clamp
+ * would be the wrong fix and is deliberately not here: no release tag has ever
+ * carried `MEMORY_LOOKUPS_DDL` (checked across every `release-*-v0.99.1*`), so
+ * the table and its bound ship together and no user database can hold an
+ * unclamped row. The machines that can are the ones that built this branch
+ * before the clamp landed, which is the situation AGENTS.md's migration rule
+ * ① already answers: repair your own database by hand rather than shipping the
+ * repair to everyone.
+ *
+ * ⚠ It is not the only bound the wire needs, and reading it as one is how the
+ * hazard above came back through a different column. The row's PRIMARY KEY is
+ * derived from this text and travels with it, under a cap of 500 rather than
+ * 20 000 — so `statsEventId` interpolates a fixed-length fingerprint rather than
+ * the query's bucket key (see `lookupQueryFingerprint`). A future column derived
+ * from a query needs its own answer to the same question; this constant cannot
+ * give it one.
+ */
+export const LOOKUP_QUERY_MAX = 2000;
+
+/** The query as it is recorded: trimmed to {@link LOOKUP_QUERY_MAX}. */
+export function clampLookupQuery(query: string): string {
+	if (query.length <= LOOKUP_QUERY_MAX) return query;
+	const cut = query.slice(0, LOOKUP_QUERY_MAX);
+	// ⚠ A UTF-16 slice can land BETWEEN a surrogate pair, leaving a lone high
+	// surrogate as the last unit — one emoji straddling the boundary is enough.
+	//
+	// It is NOT the wire hazard it looks like, and reading it as one is how the
+	// all-or-nothing bound above gets restated about the wrong thing. Measured end
+	// to end: `JSON.stringify` emits the orphan as the ASCII escape `\ud83d`, so the
+	// body stays valid UTF-8, Node's `JSON.parse` accepts it, and the Postgres write
+	// replaces it with U+FFFD. Nothing 400s, and nothing wedges. What it does produce
+	// is a mangled final character in the text the card prints and in every copy of
+	// it downstream — the pair is ONE character the reader typed, so dropping both
+	// units is the honest trim and half of one never is.
+	const last = cut.charCodeAt(cut.length - 1);
+	return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut;
+}
+
+/**
  * One row of the Search Terms card: a label, and the raw queries behind it.
  *
  * `term` is EXTRACTED, not a query — several differently-worded searches about one
@@ -102,6 +158,24 @@ const EDGE_FILLER = new Set([
 	"or",
 ]);
 
+/**
+ * True when a phrase is filler all the way through, so it can never be a label.
+ *
+ * ⚠ This does NOT make {@link EDGE_FILLER} a filter over candidate phrases — the
+ * design `clusterSearchTerms` warns against. It rejects one specific winner: a
+ * phrase with no content word in it at all. That distinction is what keeps the
+ * scoring objective in charge of grouping, and it is also why the rejection is
+ * right rather than merely tidy. `how to get desicions` and `how to make desicion`
+ * share exactly `how to`, which explains 12 characters and won — so two unrelated
+ * questions were grouped, and {@link trimLabel} then peeled `how` off and printed
+ * the survivor: a row labelled `to`. Its "keep at least one word" floor guarantees
+ * a non-empty label, never a meaningful one, and nothing downstream could tell the
+ * difference.
+ */
+function isAllFiller(phrase: string): boolean {
+	return phrase.split(" ").every((word) => EDGE_FILLER.has(word));
+}
+
 /** Strips filler from a label's ends, keeping at least one word. */
 function trimLabel(phrase: string): string {
 	const words = phrase.split(" ");
@@ -124,6 +198,70 @@ const MIN_TERM_CHARS = 2;
 const CJK_RUN = /[㐀-䶿一-鿿豈-﫿぀-ヿ가-힯]+/g;
 
 /**
+ * The form a Latin word lends to a candidate phrase: its singular.
+ *
+ * ⚠ Read this against {@link normalizeLookupQuery}, which refuses stemming for
+ * reasons that still hold — the two operate on different things. That one derives
+ * the BUCKET KEY, so folding there would merge searches a reader typed apart and
+ * the card would report a count for a query nobody sent. This folds only the
+ * candidate LABEL, downstream of every tally, so no search moves between buckets
+ * and no count changes; the sole effect is that one subject spelled two ways can
+ * be named. Without it `desicions` and `desicion` are unrelated tokens, the pair
+ * shares no content word at all, and the best phrase left is filler — see
+ * {@link isAllFiller} for what that produced.
+ *
+ * Deliberately the shallowest rule that answers plurals, not a stemmer: a real one
+ * conflates `limit` with `limiter` and `limiting`, which are three different
+ * subjects on this card. It also skips {@link EDGE_FILLER}, so `does` stays `does`
+ * rather than becoming a `doe` that trimming no longer recognises.
+ *
+ * A label may therefore print a spelling no query used (`decision` for two
+ * searches that both said `decisions`). That is what a term IS — the phrasings
+ * ride along on `SearchTermCluster.queries`.
+ *
+ * ⚠ Every arm has to fold the SINGULAR and the PLURAL onto the same string, not
+ * merely shorten the plural. That is the whole mechanism: `query` reaches this
+ * unchanged, so a rule that turned `queries` into anything other than `query`
+ * would leave the two spellings in different groups — the exact failure the fold
+ * exists to remove, dressed up as a working feature. Both suffix rules below are
+ * written against that test rather than against English.
+ */
+function singularize(word: string): string {
+	if (word.length < 4 || !word.endsWith("s") || EDGE_FILLER.has(word)) return word;
+	// `class`, `status`, `analysis`: an `s` that is part of the word, not a plural.
+	if (/(ss|us|is)$/.test(word)) return word;
+	// `-ies` → `-y`, which nothing else here reaches: `queries` fell through to the
+	// bare `-s` arm as `querie` and so never met the `query` a reader also typed.
+	// This card's own vocabulary is full of the family — `entries`, `policies`,
+	// `categories`, `repositories`, `dependencies`.
+	//
+	// The consonant guard keeps a stem that merely ENDS that way out of it, and the
+	// length floor keeps the short ones (`ties`, `dies`, `lies`) whole. Known misses,
+	// both label-only and both outside this vocabulary: `series` (its own plural)
+	// prints `sery`, and an `-ie` stem like `movies` prints `movy`. Naming them is the
+	// fix; a word list of exceptions is the design `EDGE_FILLER` warns against.
+	if (word.length >= 6 && /[^aeiou]ies$/.test(word)) return `${word.slice(0, -3)}y`;
+	// ⚠ `ss`, not `s`. In this vocabulary `-ses` is `-se` plus `s` far more often
+	// than it is `-s` plus `es` — `cases`, `releases`, `responses`, `databases`,
+	// `phases`, `uses`, `closes`, `licenses` — and taking two characters there both
+	// cut the stem short and broke the fold: `case` arrives unchanged while `cases`
+	// became `cas`, so the pair landed in different groups. Nothing orthographic
+	// separates those from `buses` / `lenses` / `statuses`, which now keep a trailing
+	// `e` and stop folding onto their own singular — the milder half of the trade, on
+	// the rarer words. (`status` itself is unaffected: the guard above takes it before
+	// either suffix rule.)
+	//
+	// The bare arm's own known misses, named for the same reason `series` is: a word
+	// that merely ENDS in `s` without being a plural folds anyway — `news` → `new`,
+	// `sales` → `sale` — so an unrelated search can print under that label. The guard
+	// above already takes the ones orthography can separate (`ss` / `us` / `is`); what
+	// is left needs a word list, which is the design `EDGE_FILLER` warns against. As
+	// with every arm here this is label-only — downstream of every tally, so no query
+	// changes bucket and no count moves.
+	return /(ch|sh|x|z|ss)es$/.test(word) ? word.slice(0, -2) : word.slice(0, -1);
+}
+
+/**
  * Every phrase a query could be labelled by.
  *
  * Latin text yields contiguous WORD n-grams, so a label never starts or ends
@@ -143,7 +281,10 @@ function candidatePhrases(query: string): Set<string> {
 	const words = query
 		.replace(CJK_RUN, " ")
 		.split(/[^\p{L}\p{N}_'-]+/u)
-		.filter(Boolean);
+		.filter(Boolean)
+		// Only the Latin path folds: a CJK run is character n-grams with no plural
+		// suffix to shed, and `singularize` would not know where a word ended anyway.
+		.map(singularize);
 	for (let start = 0; start < words.length; start++) {
 		for (let size = 1; size <= MAX_TERM_TOKENS && start + size <= words.length; size++) {
 			const phrase = words.slice(start, start + size).join(" ");
@@ -309,6 +450,13 @@ export function clusterSearchTerms(tallies: ReadonlyArray<QueryTally>): Readonly
 			const cover = coverage.get(top.phrase);
 			// Deleted above or emptied by a claim: it is out of the running for good.
 			if (!cover) continue;
+			// No content word, so it cannot name a subject and the queries it covers
+			// share nothing that makes them one. Dropped rather than skipped: the
+			// verdict is about the phrase's own words and can never change.
+			if (isAllFiller(top.phrase)) {
+				coverage.delete(top.phrase);
+				continue;
+			}
 			const score = top.phrase.length * cover.searches;
 			if (score === top.score) {
 				best = top.phrase;

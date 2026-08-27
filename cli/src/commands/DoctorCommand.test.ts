@@ -1388,6 +1388,9 @@ describe("doctor --sync-sessions", () => {
 		process.exitCode = undefined;
 	});
 
+	/** Nothing was withheld — the shape every case that is not about holding wants. */
+	const NO_HELD = { rows: 0, tables: [] };
+
 	/** Captures stdout for one call and hands back what was printed. */
 	async function run(outcome: unknown): Promise<string> {
 		const { runSessionSyncNow } = await import("./DoctorCommand.js");
@@ -1407,7 +1410,7 @@ describe("doctor --sync-sessions", () => {
 		// run probes hooks, the registry and the queue, and none of that is what a
 		// user typing `--sync-sessions` is waiting for. It also returns straight
 		// after, so no diagnostic output follows the upload's one line.
-		h.runSessionSync.mockResolvedValue({ status: "done", batches: 0, rows: 0 });
+		h.runSessionSync.mockResolvedValue({ status: "done", batches: 0, rows: 0, held: NO_HELD });
 		const lines = await runDoctor(["--sync-sessions", "--cwd", "/repo"]);
 		// No cwd on the call: the channel is cross-repo, so this covers the whole
 		// machine and withholds the disabled repos row by row rather than skipping
@@ -1417,16 +1420,50 @@ describe("doctor --sync-sessions", () => {
 	});
 
 	it("forces the run, so a fixed backend does not have to wait out its silence", async () => {
-		await run({ status: "done", batches: 2, rows: 40 });
+		await run({ status: "done", batches: 2, rows: 40, held: NO_HELD });
 		expect(h.runSessionSync).toHaveBeenCalledWith({ force: true });
 	});
 
 	it("reports what was uploaded", async () => {
-		expect(await run({ status: "done", batches: 2, rows: 40 })).toContain("Uploaded 40 row(s) in 2 batch(es)");
+		expect(await run({ status: "done", batches: 2, rows: 40, held: NO_HELD })).toContain(
+			"Uploaded 40 row(s) in 2 batch(es)",
+		);
 	});
 
 	it("says so when there was nothing to send, rather than printing a bare success", async () => {
-		expect(await run({ status: "done", batches: 0, rows: 0 })).toContain("up to date");
+		expect(await run({ status: "done", batches: 0, rows: 0, held: NO_HELD })).toContain("up to date");
+	});
+
+	it("never calls a run that only offered held rows up to date", async () => {
+		// The one failure this channel cannot report on its own: a backend that has
+		// not learned a table STRIPS it and still answers 2xx. Held rows stored
+		// nowhere, so they are not "uploaded" — and folding them into `rows` would
+		// have printed a machine that uploaded nothing as up to date, which is the
+		// exact reading the hold exists to prevent.
+		const out = await run({
+			status: "done",
+			batches: 1,
+			rows: 0,
+			held: { rows: 200, tables: ["memory_lookups"] },
+		});
+		expect(out).not.toContain("up to date");
+		expect(out).toContain("Uploaded 0 row(s)");
+		// Named, not just counted. Backend-first deployment is the policy, so this
+		// line prints only when that policy broke — and then the table is the one
+		// thing a reader can act on, because it says which deploy is behind.
+		expect(out).toContain("200 row(s) held for memory_lookups");
+	});
+
+	it("names held rows beside a partial upload rather than adding them to it", async () => {
+		const out = await run({
+			status: "done",
+			batches: 2,
+			rows: 40,
+			held: { rows: 200, tables: ["memory_lookups"] },
+		});
+		expect(out).toContain("Uploaded 40 row(s) in 2 batch(es)");
+		expect(out).toContain("200 row(s) held for memory_lookups");
+		expect(out).not.toContain("240");
 	});
 
 	it("names a skip reason instead of exiting quietly", async () => {
