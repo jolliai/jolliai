@@ -11,15 +11,16 @@
  * it when it enriches a `sessions-only` row into a `full` one — so a sync keyed
  * on it would never see the better token split it just wrote. `sessions` therefore
  * stamps `written_at_ms` (the same concept `memories.written_at_ms` already
- * carries) and the other three stamp `updated_at_ms`, which on them is free.
+ * carries) and the child tables stamp `updated_at_ms`, which on them is free.
  *
- * Writing `WHERE updated_at_ms >= ?` against all four compiles, runs, and reads
+ * Writing `WHERE updated_at_ms >= ?` against every table compiles, runs, and reads
  * the WRONG column on `sessions`. Go through this map instead. `SyncColumns.test.ts`
  * pins every entry against the real schema so a rename cannot pass silently.
  *
- * These columns are bookkeeping: bumped unconditionally on every write, to the
- * current wall clock — never to a timestamp carried on the event, which would
- * make them a second business clock and reintroduce the problem above.
+ * These columns are bookkeeping, set from the current wall clock — never from a
+ * timestamp carried on the event, which would make them a second business clock
+ * and reintroduce the problem above. Skill invocations deliberately leave the
+ * stamp alone when their conflict arm would merge to identical values.
  *
  * The map is exactly `SYNCED_TABLES`, and `SessionPushManifest.test.ts` asserts
  * that: a stamped table that is not sent is either a missing decision or a stale
@@ -37,12 +38,14 @@
  * set failure this map exists to prevent, arrived at from the other side.
  *
  * The four legacy stamps are additionally `DEFAULT 0`, where 0 means "written
- * before we tracked this" and is what their backfill starts from. Neither newer
- * table relies on that sentinel: both are INSERT-only and every row is stamped with
- * its real insert time on the way in, so there is nothing to backfill. Hence
- * `session_activity` gives `recorded_at_ms` no default at all, while
+ * before we tracked this" and is what their backfill starts from. The insert-only
+ * `session_activity` and `session_turns` tables do not rely on that sentinel:
+ * every row is stamped with its real insert time on the way in, so there is
+ * nothing to backfill and `recorded_at_ms` has no default. Meanwhile,
  * `memory_lookups` keeps `DEFAULT 0` on `updated_at_ms` purely as the guard against
- * a nullable stamp above — never a value a row is expected to carry.
+ * a nullable stamp above — never a value a row is expected to carry. Skill
+ * invocations also use `DEFAULT 0` because the column was added over existing rows;
+ * their writer supplies a real wall-clock value on every semantic insert/update.
  */
 export const SYNC_STAMP_COLUMNS = {
 	sessions: "written_at_ms",
@@ -52,6 +55,10 @@ export const SYNC_STAMP_COLUMNS = {
 	session_activity: "recorded_at_ms",
 	memory_lookups: "updated_at_ms",
 	session_turns: "recorded_at_ms",
+	// A later transcript read can upgrade an old invocation's outcome, detection,
+	// entry path or body-size metadata. `at_ms` remains its business clock and
+	// identity; this independent stamp is what lets sync observe the correction.
+	skill_invocations: "updated_at_ms",
 } as const;
 
 /** A table that carries a sync stamp. */
@@ -69,7 +76,6 @@ export const SYNC_STAMP_TABLES = Object.keys(SYNC_STAMP_COLUMNS) as ReadonlyArra
 export function syncStampColumn(table: SyncStampTable): string {
 	return SYNC_STAMP_COLUMNS[table];
 }
-
 /**
  * The PRIMARY KEY columns that break a tie inside one sync stamp, in key order.
  *
@@ -105,6 +111,9 @@ export const KEYSET_COLUMNS: Readonly<Record<SyncStampTable, ReadonlyArray<strin
 	session_activity: ["session_event_id", "bucket_ms"],
 	memory_lookups: ["receipt_id"],
 	session_turns: ["session_event_id", "slice_id", "seq"],
+	// The complete primary key. Different skills can legitimately be invoked in
+	// the same session at the same millisecond.
+	skill_invocations: ["session_event_id", "skill_name", "at_ms"],
 };
 
 /**
@@ -168,6 +177,9 @@ export const WINDOW_SOURCES: Readonly<Record<SyncStampTable, WindowSource>> = {
 	// re-stamps every row of a re-parsed slice at "just now", so windowing on the
 	// parent session's clock keeps the window aligned with the advancing cursor.
 	session_turns: { parent: "session_event_id" },
+	// The first-run window follows the invocation's event clock while the cursor
+	// independently follows its write stamp.
+	skill_invocations: { own: "at_ms" },
 };
 
 /** The table's own business time column, or `undefined` when it has none. */

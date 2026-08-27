@@ -20,12 +20,8 @@ interface FakeRect {
 /**
  * The rows region, as `draw` sees it. `scrollTop` is what the page carries across a
  * repaint and `rect` is the box a row's own is compared against — neither exists without a
- * layout, so the harness supplies both.
- *
- * There used to be an `offsetHeight` here as well: the page measured the region's own
- * height and wrote it back as a `max-height` cap once the rest of the list landed. The
- * fixed frame took that over (the region's height comes from the flex chain now), so
- * nothing reads it and the field is gone with the mechanism.
+ * layout, so the harness supplies both. There used to be an `offsetHeight` here as
+ * well; height synchronization now belongs to the two cards rather than the list tag.
  */
 interface FakeList {
 	scrollTop: number;
@@ -371,6 +367,15 @@ function loadHarness(): Harness {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("Skills page asset", () => {
+	it("lets the page scroll while the chooser follows the content-sized detail pane", () => {
+		const css = readFileSync(new URL("./assets/styles/main.css", import.meta.url), "utf8");
+		const source = readFileSync(new URL("./assets/js/skills.js", import.meta.url), "utf8");
+
+		expect(css).toContain(".jd:has(.browser-page) { height: auto; overflow: visible; }");
+		expect(css).toMatch(/\.jd \.sk-pane \{[^}]*overflow: visible;/s);
+		expect(source).toContain("new window.ResizeObserver(() => syncBottomCardHeights(app))");
+	});
+
 	it("renders detail dates in the dashboard time zone without masking render exceptions as request failures", async () => {
 		const h = loadHarness();
 		h.render(model([row(0)], 1));
@@ -769,11 +774,9 @@ describe("Skills page asset", () => {
 		});
 		h.render(model(all.slice(0, TOOL_ROWS_LIMIT), all.length));
 
-		/* ONE SHAPE, BOTH PAINTS. The region used to be laid out free on the model's own
-		   page and then re-emitted with a MEASURED `max-height` (plus an `sk-scroll` marker)
-		   once the tail landed, because the page scrolled and the rows had to earn a window
-		   of their own. The page is a fixed frame now: `.sk-list` takes its height from the
-		   flex chain, scrolls unconditionally, and there is no pixel value for JS to write.
+		/* ONE SHAPE, BOTH PAINTS. The region used to be re-emitted with a MEASURED
+		   `max-height` (plus an `sk-scroll` marker) once the tail landed. The chooser card
+		   now follows the reading pane, so the list flexes inside a stable opening tag.
 		   Asserted before the fetch as well as after, because "the tag changed when the tail
 		   arrived" is exactly the old behaviour. */
 		expect(h.html()).toContain('<div class="sk-list">');
@@ -958,7 +961,7 @@ describe("Skills page asset", () => {
 	/* There was a sibling of the test above here: "leaves the rows region uncapped when the
 	   first page measured nothing", which set the harness list's `offsetHeight` to 0 to stand
 	   in for a page that had never been laid out and asserted that no cap was recorded. Both
-	   the measurement and the guard are gone with the fixed frame, and its assertions are the
+	   the measurement and the guard are gone with card-level height synchronization, and its assertions are the
 	   ones the test above now makes unconditionally.
 	 *
 	 * NOT COVERED HERE: the pane's two clamped paragraphs (`proseBlock` / `bindProse`) and the

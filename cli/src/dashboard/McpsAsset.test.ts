@@ -370,6 +370,14 @@ function loadHarness(): Harness {
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
 
 describe("MCPs page asset", () => {
+	it("keeps the content-sized detail pane out of an internal scroll region", () => {
+		const css = readFileSync(new URL("./assets/styles/main.css", import.meta.url), "utf8");
+		const source = readFileSync(new URL("./assets/js/mcps.js", import.meta.url), "utf8");
+
+		expect(css).toMatch(/\.jd \.sk-pane \{[^}]*overflow: visible;/s);
+		expect(source).toContain("new window.ResizeObserver(() => syncBottomCardHeights(app))");
+	});
+
 	it("anchors its detail request and charts every server-side day, including zero days", async () => {
 		const h = loadHarness();
 		h.render(model());

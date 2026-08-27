@@ -282,7 +282,7 @@ Jolli won't overwrite commits that only exist on the remote. Requires the `gh` C
 
 ### Open Dashboard
 
-The **Current Branch** view's footer bar carries a **Dashboard** button next to **Create PR** (**Share in Jolli** moved into the `…` overflow menu beside them). It opens Jolli's private local dashboard — your memories, per-repo stats, and a daily standup, all served from your own machine and never uploaded. The same action is available as **Jolli Memory: Open Dashboard** in the Command Palette.
+The **Current Branch** view's footer bar carries a **Dashboard** button next to **Create PR** (**Share in Jolli** moved into the `…` overflow menu beside them). It opens Jolli's private local dashboard — your memories, per-repo stats, and a daily standup, all served from your own machine. Derived session statistics can also sync to your Jolli organization when the machine-wide setting is enabled; the [Privacy](#privacy) section lists that channel's exact boundary. The same action is available as **Jolli Memory: Open Dashboard** in the Command Palette.
 
 The dashboard runs in an **integrated terminal** rather than inside the editor, which means you see its output as it happens — including the history import, which keeps going for a while after your browser opens — and you stop it the way you stop any terminal command, with **Ctrl+C**. Each click opens a new terminal; a second dashboard takes the port from the first rather than running beside it, so you always land on a fresh one. The button works whether you have the CLI installed globally or only this extension: it uses the newest Jolli runtime registered on your machine, falling back to the copy bundled here.
 
@@ -340,6 +340,7 @@ Most settings live behind the gear icon in the view's title bar. `authToken` is 
 | `wikiRebuild` | enum | `manual` | When the knowledge wiki and graph rebuild. `manual` (the default) records what is pending on each commit and waits for you — use the banner's **Rebuild** action, the **Build Knowledge Wiki** toolbar button, or `jolli compile` — so a commit never spends AI credits on its own. `auto` rebuilds in the background after every commit and merge, the way earlier versions did. Set via `jolli configure`. |
 | `excludePatterns` | string[] | — | Glob patterns for hiding files from the Changes section in the Branch tab |
 | `syncTranscripts` | boolean | `false` | When syncing, also mirror raw conversation transcripts (not just summaries) into the personal vault. Off by default so transcripts stay local unless you opt in. |
+| `syncSessions` | boolean | `true` | Upload derived session statistics to your Jolli organization. Raw transcripts, diffs, injected skill text, and skill arguments are excluded. Set via `jolli configure` or the local dashboard. |
 | `dcoSignoff` | boolean | `false` | Append `Signed-off-by: <user.name> <user.email>` to commits created by **AI Commit**. Off by default; turn on if your project's CI gates merges on a DCO sign-off. Set via Settings → Others. |
 
 ---
@@ -391,7 +392,9 @@ Only the **generated summary** (Markdown + properties) and any **associated plan
 
 ### Session metadata
 
-Session IDs, transcript file paths, and timestamps are stored locally in `<projectDir>/.jolli/jollimemory/sessions.json` (per-project, gitignored). Never uploaded anywhere.
+The per-project registry at `<projectDir>/.jolli/jollimemory/sessions.json` is gitignored and is never uploaded as a file. Transcript paths and transcript text stay local.
+
+When you are signed in and the machine-wide `syncSessions` setting is enabled (the default), Jolli separately uploads derived session statistics for repositories that are not manually disabled. Those statistics include stable session and repository identifiers, human-readable repository display names, agent/session titles and timestamps, token and cost totals, tool/skill/MCP names, memory search queries, and per-skill invocation outcome, entry-path and injected-character-count metadata. Skill arguments, injected skill text, raw transcripts and diffs are not part of this channel. Run `jolli configure --set syncSessions=false` to disable it.
 
 ### What stays 100% local
 

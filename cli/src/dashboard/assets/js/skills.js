@@ -22,18 +22,15 @@
  * The Stats card keeps its button (`stats.js`), where the list is one of three sharing
  * a band and the reader came for something else.
  *
- * THE ROWS STILL LIVE IN A WINDOW, and it is now the page's ONLY one. The whole view is
- * a fixed frame — the page does not scroll, the two columns are the same height, and the
- * reading pane holds its whole skill without scrolling — so the rows are the one region
- * with a scrollbar. `main.css`'s `.browser-page` header owns that rule and the measurements
- * behind it; what matters here is that the height comes from a flex chain rather than from
- * anything this file computes. The MEASURED inline cap that used to create the window
- * (`listCapPx`, read off the first page) is gone with it.
+ * THE ROWS STILL LIVE IN A WINDOW. The reading pane grows naturally and makes the page
+ * scroll; its rendered height is measured back onto the chooser card, whose unbounded
+ * row list is the only card-internal scroll region. The MEASURED inline cap that used to
+ * live on the list itself (`listCapPx`) remains retired.
  *
  * WHY THE ROWS AND NOT THE PANE: the corpus is unbounded while a skill's detail is not.
  * A machine can hold hundreds of skills, but the server caps the outcome strip at 50
- * entries, `agents` is an enum, and `The record` is five fixed fields — so the pane's
- * height has a ceiling that the frame can be sized against, and the column's does not.
+ * entries, `agents` is an enum, and `The record` is five fixed fields. The column has no
+ * equivalent ceiling, so it alone keeps an internal scroll region.
  *
  * THE FIGURES ARE THE SERVER'S, never a sum over the rows on screen: `usage.skills`
  * is ONE PAGE, so a header line computed from it changes every time more rows arrive
@@ -189,6 +186,35 @@
 	/* The skill the column has already been scrolled to, so a selection is revealed ONCE
 	   rather than on every repaint — see `revealSelectedRow`. */
 	var scrolledToSkill = null;
+	var paneHeightObserver = null;
+
+	/**
+	 * Makes the chooser card follow the reading pane's natural border-box height. The
+	 * pane is deliberately not a scroll container: when its async detail or expandable
+	 * prose changes size, the page grows and owns the scroll instead. The chooser keeps
+	 * its own rows scroller because that corpus is unbounded.
+	 */
+	function syncBottomCardHeights(app) {
+		var nav = app.querySelector(".sk-nav");
+		var pane = app.querySelector(".sk-pane");
+		if (!nav || !pane || !nav.style || !pane.getBoundingClientRect) return;
+		if (window.matchMedia && window.matchMedia("(max-width: 899px)").matches) {
+			nav.style.height = "";
+			return;
+		}
+		var height = pane.getBoundingClientRect().height || pane.offsetHeight || 0;
+		if (height > 0) nav.style.height = height + "px";
+	}
+
+	function observeBottomCardHeights(app) {
+		if (paneHeightObserver) paneHeightObserver.disconnect();
+		paneHeightObserver = null;
+		syncBottomCardHeights(app);
+		var pane = app.querySelector(".sk-pane");
+		if (!pane || !window.ResizeObserver) return;
+		paneHeightObserver = new window.ResizeObserver(() => syncBottomCardHeights(app));
+		paneHeightObserver.observe(pane);
+	}
 
 	/** The selected skill, read from the address rather than from a variable. */
 	function selectedSkill() {
@@ -242,7 +268,7 @@
 	 * a corpus that fits in one page at zero requests.
 	 *
 	 * There was a third, `isExpanded`, asking "has the tail landed, so the rows region needs
-	 * its measured cap". The fixed frame retired both it and the cap — see `listOpenTag`.
+	 * its measured cap". The shared card-height measurement retired both it and the cap.
 	 */
 	function modelFirstPage(model) {
 		var usage = (model.stats && model.stats.toolUsage) || {};
@@ -545,11 +571,9 @@
 	 *
 	 * NOTHING TO DECIDE ANY MORE, and that is the point. This used to choose between an
 	 * uncapped region and one carrying a MEASURED inline `max-height` (plus an `sk-scroll`
-	 * marker class), because the page was what scrolled and the rows had to earn a window
-	 * of their own by outgrowing the model's first page. The page is now a fixed frame and
-	 * `.sk-list` takes its height from the flex chain, so the region is always the same
-	 * shape and there is no pixel value for JS to measure. `isExpanded` went with it — its
-	 * only reader was the branch here.
+	 * marker class). The chooser card now takes the reading pane's measured height, and the
+	 * list flexes inside that card, so its opening tag never changes when the tail arrives.
+	 * `isExpanded` went with the old branch here.
 	 *
 	 * Kept as a function rather than inlined into `draw`'s template so the region stays one
 	 * named thing that `main.css` and this file can be read against together.
@@ -565,7 +589,7 @@
 	 * so a row can be far outside it while the page looks fine — that is the common case,
 	 * since the column holds every skill. The viewport check then covers the case where the
 	 * region ITSELF is off screen, which is what the ≤899px breakpoint produces: there the
-	 * fixed frame comes off, the columns stack and the page scrolls again, so the list can
+	 * columns stack and the list can
 	 * sit an arbitrary distance below the fold. Inside the desktop frame the second check is
 	 * always satisfied — the region cannot leave a viewport the frame is pinned to — and it
 	 * is kept rather than dropped because that is true of the frame, not of the page.
@@ -654,6 +678,7 @@
 		var usage = (model.stats && model.stats.toolUsage) || {};
 		pane.innerHTML = paneHtml(usage, model.timeZone);
 		bindProse(app);
+		syncBottomCardHeights(app);
 	}
 
 	/**
@@ -774,8 +799,7 @@
 		   returning fewer rows) is clamped by the browser, so this cannot leave the column
 		   past its own content.
 		 *
-		 * There used to be a MEASUREMENT here too, reading the uncapped region's height back
-		 * to use as its own cap. The flex chain supplies that height now — see `listOpenTag`. */
+		 * The card-level observer owns height synchronization; the list itself has no cap. */
 		var list = app.querySelector(".sk-list");
 		if (list) {
 			if (offset > 0) list.scrollTop = offset;
@@ -787,6 +811,7 @@
 		bindSelection(app, model);
 		bindProse(app);
 		applyBandActive(app);
+		observeBottomCardHeights(app);
 	}
 
 	// ── The band ────────────────────────────────────────────────────────────────
@@ -1549,8 +1574,8 @@
 	/**
 	 * Rows of the agent split shown in full before the rest are rolled into one line.
 	 *
-	 * THE ONLY UNBOUNDED-ENOUGH LIST IN THE PANE. Every other section has a ceiling the
-	 * fixed frame can be sized against — the outcome strip is capped at 50 ticks by the
+	 * THE ONLY UNBOUNDED-ENOUGH LIST IN THE PANE. Every other section has a ceiling — the
+	 * outcome strip is capped at 50 ticks by the
 	 * server, `The record` is five fixed fields — but this one is one row per agent that
 	 * ran the skill, and the product recognises a dozen-odd of them. Measured with 12 rows
 	 * at 1440x900 the pane overflowed its frame by 54px; capped at 5 it fits with room.
@@ -1653,6 +1678,7 @@
 			var toggle = () => {
 				openProse[key] = openProse[key] !== true;
 				element.setAttribute("aria-expanded", openProse[key] ? "true" : "false");
+				syncBottomCardHeights(app);
 			};
 			element.onclick = toggle;
 			element.onkeydown = (event) => {

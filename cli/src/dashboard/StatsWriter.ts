@@ -511,7 +511,7 @@ function isUnknownTypeError(err: unknown): boolean {
 function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): void {
 	switch (event.type) {
 		case "repo.enabled":
-			projectRepoEnabled(db, event);
+			projectRepoEnabled(db, event, nowMs);
 			return;
 		case "repo.disabled":
 			projectRepoDisabled(db, event);
@@ -567,7 +567,10 @@ function projectEvent(db: DashboardDbHandle, event: StatsEvent, nowMs: number): 
 	}
 }
 
-function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent): void {
+function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent, nowMs: number): void {
+	const previous = db.prepare("SELECT id, repo_name FROM repos WHERE repo_identity = ?").get(event.repoIdentity) as
+		| { id: number; repo_name: string }
+		| undefined;
 	db.prepare(
 		`INSERT INTO repos (repo_identity, repo_name, worktree_root, remote_url, enabled_at, disabled_at)
 		 VALUES (?, ?, ?, ?, ?, NULL)
@@ -577,6 +580,18 @@ function projectRepoEnabled(db: DashboardDbHandle, event: RepoEnabledEvent): voi
 		   remote_url    = excluded.remote_url,
 		   disabled_at   = NULL`,
 	).run(event.repoIdentity, event.repoName, event.worktreeRoot, event.remoteUrl ?? null, event.enabledAt);
+	if (previous !== undefined && previous.repo_name !== event.repoName) {
+		// `repo_name` is joined into the session payload rather than stored on each
+		// session, so changing the related row would otherwise be invisible to the
+		// session cursor. Stamp every affected row above the WHOLE table's current
+		// high-water mark: the channel is table-wide and another repo may own its last
+		// cursor. `+ 1` also remains monotonic across a wall-clock rollback.
+		const highWater = db.prepare("SELECT COALESCE(MAX(written_at_ms), 0) AS value FROM sessions").get() as {
+			value: number;
+		};
+		const replayStamp = Math.max(nowMs, highWater.value) + 1;
+		db.prepare("UPDATE sessions SET written_at_ms = ? WHERE repo_id = ?").run(replayStamp, previous.id);
+	}
 }
 
 function projectRepoDisabled(db: DashboardDbHandle, event: RepoDisabledEvent): void {
@@ -982,18 +997,35 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 	// actually spanned; `sessions` and `session_model_usage` are totals derived
 	// from the same numbers, kept because a KPI should not pay for a GROUP BY.
 	if (event.usageEvents !== undefined) {
+		type UsageEventRow = {
+			dedup_key: string;
+			responded_at_ms: number;
+			model: string;
+			input_tokens: number;
+			output_tokens: number;
+			cached_tokens: number;
+			est_cost_usd: number | null;
+			updated_at_ms: number | null;
+		};
+		const previousUsageEvents = new Map<string, UsageEventRow>();
+		for (const row of db
+			.prepare(
+				`SELECT dedup_key, responded_at_ms, model, input_tokens, output_tokens,
+				        cached_tokens, est_cost_usd, updated_at_ms
+				   FROM session_usage_events WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<UsageEventRow>) {
+			previousUsageEvents.set(row.dedup_key, row);
+		}
 		// A response that stops existing takes its day's cached total with it, and
 		// leaves no write stamp for the rollup to notice — the replacement rows
 		// only expire the days that still have responses. Read the old days before
 		// emptying the set, and forget them; a day that kept its rows is rebuilt
 		// anyway, so over-forgetting here costs one recomputation and never a
 		// wrong number.
-		const previousDays = db
-			.prepare("SELECT DISTINCT responded_at_ms FROM session_usage_events WHERE session_event_id = ?")
-			.all(eventId) as ReadonlyArray<{ responded_at_ms: number }>;
 		forgetRollupDays(
 			db,
-			previousDays.map((row) => row.responded_at_ms),
+			[...previousUsageEvents.values()].map((row) => row.responded_at_ms),
 		);
 		db.prepare("DELETE FROM session_usage_events WHERE session_event_id = ?").run(eventId);
 		// Plain INSERT, no ON CONFLICT: the DELETE above just emptied this session's
@@ -1023,6 +1055,32 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 				nowMs,
 			);
 		}
+		// Replacement is still required so removed responses disappear, but an
+		// identical surviving response is not a new outbound fact. Restore its old
+		// stamp after the complete set has landed, exactly like the model/tool splits.
+		const restoreStamp = db.prepare(
+			"UPDATE session_usage_events SET updated_at_ms = ? WHERE session_event_id = ? AND dedup_key = ?",
+		);
+		for (const row of db
+			.prepare(
+				`SELECT dedup_key, responded_at_ms, model, input_tokens, output_tokens,
+				        cached_tokens, est_cost_usd, updated_at_ms
+				   FROM session_usage_events WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<UsageEventRow>) {
+			const previous = previousUsageEvents.get(row.dedup_key);
+			if (
+				typeof previous?.updated_at_ms === "number" &&
+				previous.responded_at_ms === row.responded_at_ms &&
+				previous.model === row.model &&
+				previous.input_tokens === row.input_tokens &&
+				previous.output_tokens === row.output_tokens &&
+				previous.cached_tokens === row.cached_tokens &&
+				previous.est_cost_usd === row.est_cost_usd
+			) {
+				restoreStamp.run(previous.updated_at_ms, eventId, row.dedup_key);
+			}
+		}
 	}
 
 	// Replace the model split wholesale — a partial update would leave a stale
@@ -1039,6 +1097,23 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 	// tokens while the model-dimension series reports none. `models: []` is an
 	// accepted producer shape, so the gap was one producer away from shipping.
 	if (hasUsage && event.models !== undefined) {
+		type ModelUsageRow = {
+			model: string;
+			input_tokens: number;
+			output_tokens: number;
+			cached_tokens: number;
+			est_cost_usd: number | null;
+			updated_at_ms: number | null;
+		};
+		const previousModels = new Map<string, ModelUsageRow>();
+		for (const row of db
+			.prepare(
+				`SELECT model, input_tokens, output_tokens, cached_tokens, est_cost_usd, updated_at_ms
+				   FROM session_model_usage WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<ModelUsageRow>) {
+			previousModels.set(row.model, row);
+		}
 		db.prepare("DELETE FROM session_model_usage WHERE session_event_id = ?").run(eventId);
 		const insertModel = db.prepare(MODEL_USAGE_UPSERT);
 		for (const m of models) {
@@ -1051,6 +1126,28 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 				m.estCostUsd ?? null,
 				nowMs,
 			);
+		}
+		// The set is replaced wholesale, so compare the fully merged rows after all
+		// duplicate model segments have landed and restore only unchanged stamps.
+		const restoreStamp = db.prepare(
+			"UPDATE session_model_usage SET updated_at_ms = ? WHERE session_event_id = ? AND model = ?",
+		);
+		for (const row of db
+			.prepare(
+				`SELECT model, input_tokens, output_tokens, cached_tokens, est_cost_usd, updated_at_ms
+				   FROM session_model_usage WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<ModelUsageRow>) {
+			const previous = previousModels.get(row.model);
+			if (
+				typeof previous?.updated_at_ms === "number" &&
+				previous.input_tokens === row.input_tokens &&
+				previous.output_tokens === row.output_tokens &&
+				previous.cached_tokens === row.cached_tokens &&
+				previous.est_cost_usd === row.est_cost_usd
+			) {
+				restoreStamp.run(previous.updated_at_ms, eventId, row.model);
+			}
 		}
 	}
 
@@ -1067,6 +1164,8 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 		type PreviousTool = {
 			tool_name: string;
 			kind: string;
+			server: string | null;
+			calls: number;
 			last_call_at_ms: number | null;
 			input_tokens: number | null;
 			output_tokens: number | null;
@@ -1074,12 +1173,13 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			usage_confidence: string | null;
 			plugin: string | null;
 			origin_root: string | null;
+			updated_at_ms: number | null;
 		};
 		const previousTools = new Map<string, PreviousTool>();
 		for (const row of db
 			.prepare(
-				`SELECT tool_name, kind, last_call_at_ms, input_tokens, output_tokens,
-				        cached_tokens, usage_confidence, plugin, origin_root
+				`SELECT tool_name, kind, server, calls, last_call_at_ms, input_tokens, output_tokens,
+				        cached_tokens, usage_confidence, plugin, origin_root, updated_at_ms
 				   FROM session_tool_use WHERE session_event_id = ?`,
 			)
 			.all(eventId) as ReadonlyArray<PreviousTool>) {
@@ -1140,11 +1240,18 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 		// re-derived, so a rebuild would discard them at the first scan that can no longer
 		// see them. Converging on the (session, skill, instant) key is what makes the
 		// repeated whole-conversation re-reads idempotent instead of duplicating rows.
+		// The conflict arm is additionally guarded against a semantic no-op: active
+		// sessions are projected every minute, and bumping the outbound write stamp
+		// for an identical row would re-send the whole invocation history each time.
 		const insertInvocation = db.prepare(
 			`INSERT INTO skill_invocations (session_event_id, skill_name, at_ms, ok, ok_confidence,
-			                               detection, entry_path, args, body_chars)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+			                               detection, entry_path, args, body_chars, updated_at_ms)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT(session_event_id, skill_name, at_ms) DO UPDATE SET
+			     -- A conflict is still a write. The outbound cursor walks this stamp,
+			     -- so every correction must move it even though the invocation's own
+			     -- at_ms identity remains fixed.
+			     updated_at_ms = excluded.updated_at_ms,
 			     -- Outcome evidence upgrades in one direction. A completed re-read must
 			     -- replace an optimistic fragment, while a later partial read must not erase
 			     -- an outcome already observed for this same invocation.
@@ -1163,7 +1270,19 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 			     -- read no argument string or no body length has nothing better to offer than
 			     -- what is already stored.
 			     args          = COALESCE(excluded.args, skill_invocations.args),
-			     body_chars    = COALESCE(excluded.body_chars, skill_invocations.body_chars)`,
+			     body_chars    = COALESCE(excluded.body_chars, skill_invocations.body_chars)
+			 WHERE skill_invocations.ok IS NOT
+			           CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                       AND excluded.ok_confidence <> 'observed'
+			                  THEN skill_invocations.ok ELSE excluded.ok END
+			    OR skill_invocations.ok_confidence IS NOT
+			           CASE WHEN skill_invocations.ok_confidence = 'observed'
+			                      OR excluded.ok_confidence = 'observed'
+			                THEN 'observed' ELSE excluded.ok_confidence END
+			    OR skill_invocations.detection IS NOT excluded.detection
+			    OR skill_invocations.entry_path IS NOT excluded.entry_path
+			    OR skill_invocations.args IS NOT COALESCE(excluded.args, skill_invocations.args)
+			    OR skill_invocations.body_chars IS NOT COALESCE(excluded.body_chars, skill_invocations.body_chars)`,
 		);
 		for (const tool of event.tools) {
 			// All four are written together or not at all — a partially-filled row would
@@ -1221,7 +1340,37 @@ function projectSession(db: DashboardDbHandle, event: SessionUpsertedEvent, nowM
 					inv.entryPath ?? null,
 					inv.args ?? null,
 					inv.bodyChars ?? null,
+					nowMs,
 				);
+			}
+		}
+		// Compare after every duplicate-key merge; deciding per input row could restore
+		// an old stamp even when another occurrence changed the final aggregate.
+		const restoreStamp = db.prepare(
+			`UPDATE session_tool_use SET updated_at_ms = ?
+			  WHERE session_event_id = ? AND tool_name = ? AND kind = ?`,
+		);
+		for (const row of db
+			.prepare(
+				`SELECT tool_name, kind, server, calls, last_call_at_ms, input_tokens, output_tokens,
+				        cached_tokens, usage_confidence, plugin, origin_root, updated_at_ms
+				   FROM session_tool_use WHERE session_event_id = ?`,
+			)
+			.all(eventId) as ReadonlyArray<PreviousTool>) {
+			const previous = previousTools.get(`${row.kind}\u0000${row.tool_name}`);
+			if (
+				typeof previous?.updated_at_ms === "number" &&
+				previous.server === row.server &&
+				previous.calls === row.calls &&
+				previous.last_call_at_ms === row.last_call_at_ms &&
+				previous.input_tokens === row.input_tokens &&
+				previous.output_tokens === row.output_tokens &&
+				previous.cached_tokens === row.cached_tokens &&
+				previous.usage_confidence === row.usage_confidence &&
+				previous.plugin === row.plugin &&
+				previous.origin_root === row.origin_root
+			) {
+				restoreStamp.run(previous.updated_at_ms, eventId, row.tool_name, row.kind);
 			}
 		}
 	}

@@ -40,6 +40,7 @@ describe("session push reader", () => {
 	let seq = 0;
 	async function seed(opts: {
 		identity?: string;
+		name?: string;
 		eventId?: string;
 		updatedAtMs?: number;
 		writtenAtMs?: number;
@@ -50,8 +51,8 @@ describe("session push reader", () => {
 		await withDb((db) => {
 			db.prepare(
 				`INSERT OR IGNORE INTO repos (repo_identity, repo_name, worktree_root, enabled_at)
-				 VALUES (?, 'widgets', '/w', 1)`,
-			).run(identity);
+				 VALUES (?, ?, '/w', 1)`,
+			).run(identity, opts.name ?? "widgets");
 			const repo = db.prepare("SELECT id FROM repos WHERE repo_identity = ?").get(identity) as { id: number };
 			db.prepare(
 				`INSERT INTO sessions (event_id, repo_id, source, session_id, title, updated_at_ms, written_at_ms,
@@ -76,6 +77,16 @@ describe("session push reader", () => {
 		expect(batch.sessions.rows[0]).not.toHaveProperty("repo_id");
 	});
 
+	it("projects the repository display name alongside its filtering identity", async () => {
+		await seed({ identity: "local:9f2a1c", name: "qidian" });
+
+		const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
+		expect(batch.sessions.rows[0]).toMatchObject({
+			repo_identity: "local:9f2a1c",
+			repo_name: "qidian",
+		});
+	});
+
 	it("passes values through untouched", async () => {
 		await seed({});
 
@@ -89,6 +100,23 @@ describe("session push reader", () => {
 		expect(row.input_tokens).toBe(100);
 		expect(row.est_cost_usd).toBe(0.5);
 		expect(row.title).toBe("Refactor the push executor");
+	});
+
+	it("projects the injected character count without exposing a content-shaped wire name", async () => {
+		await seed({ eventId: "e1" });
+		await withDb((db) =>
+			db
+				.prepare(
+					`INSERT INTO skill_invocations
+					   (session_event_id, skill_name, at_ms, ok, ok_confidence, body_chars, updated_at_ms)
+					 VALUES ('e1', 'review', ?, 1, 'observed', 321, ?)`,
+				)
+				.run(NOW, NOW),
+		);
+
+		const slice = await withDb((db) => readTableSlice(db, "skill_invocations", { cursors: {}, nowMs: NOW }));
+		expect(slice.rows[0]).toMatchObject({ injected_chars: 321 });
+		expect(slice.rows[0]).not.toHaveProperty("body_chars");
 	});
 
 	it("selects on the SYNC stamp, not the business clock", async () => {
@@ -145,6 +173,39 @@ describe("session push reader", () => {
 		// 200-row batch. Against the stamp-only cursor this saw the first 200 rows
 		// three times and `seen.size` stayed at 200.
 		expect(seen.size).toBe(201);
+	});
+
+	it("pages an invocation timestamp key numerically inside one write stamp", async () => {
+		// `at_ms` is the numeric PRIMARY KEY component on this table. The wire
+		// cursor stores it as text, while SQLite must still compare the INTEGER
+		// column numerically. 501 rows is the smallest overflow of its 500-row page.
+		await seed({ eventId: "e1" });
+		const sharedStamp = 7_000;
+		await withDb((db) => {
+			const insert = db.prepare(
+				`INSERT INTO skill_invocations
+				   (session_event_id, skill_name, at_ms, ok, ok_confidence, updated_at_ms)
+				 VALUES ('e1', 'review', ?, 1, 'observed', ?)`,
+			);
+			for (let atMs = 1; atMs <= 501; atMs++) insert.run(atMs, sharedStamp);
+		});
+
+		let cursor: TableCursor = at(sharedStamp);
+		const seen = new Set<number>();
+		for (let pass = 0; pass < 3; pass++) {
+			const slice = await withDb((db) =>
+				readTableSlice(db, "skill_invocations", {
+					cursors: { skill_invocations: cursor },
+					nowMs: NOW,
+				}),
+			);
+			for (const row of slice.rows) seen.add(Number(row.at_ms));
+			expect(slice.next).toBeDefined();
+			cursor = slice.next as TableCursor;
+		}
+
+		expect(seen.size).toBe(501);
+		expect(cursor.key).toEqual(["e1", "review", "501"]);
 	});
 
 	it("applies the first-run window to the BUSINESS clock, never to the stamp", async () => {
@@ -255,7 +316,7 @@ describe("session push reader", () => {
 
 	it("withholds every table's rows for a disabled repo, and keeps the other repo's", async () => {
 		// The promise the Settings page makes. `sessions` carries the repo itself;
-		// the three child tables can only reach it through their parent session, so
+		// the four synced child tables can only reach it through their parent session, so
 		// each shape has to be exercised — a filter that covered `sessions` alone
 		// would still ship the usage rows the charts are built from.
 		await seed({ identity: "https://github.com/acme/off", eventId: "off" });
@@ -277,6 +338,11 @@ describe("session push reader", () => {
 					                                   input_tokens, output_tokens, cached_tokens, updated_at_ms)
 					 VALUES (?, ?, ?, 'sonnet', 1, 2, 3, ?)`,
 				).run(eventId, `${eventId}:1`, NOW, NOW);
+				db.prepare(
+					`INSERT INTO skill_invocations
+					   (session_event_id, skill_name, at_ms, ok, ok_confidence, updated_at_ms)
+					 VALUES (?, 'review', ?, 1, 'observed', ?)`,
+				).run(eventId, NOW, NOW);
 			}
 		});
 
@@ -289,7 +355,12 @@ describe("session push reader", () => {
 		);
 
 		expect(batch.sessions.rows.map((r) => r.repo_identity)).toEqual(["https://github.com/acme/on"]);
-		for (const table of ["session_model_usage", "session_tool_use", "session_usage_events"] as const) {
+		for (const table of [
+			"session_model_usage",
+			"session_tool_use",
+			"session_usage_events",
+			"skill_invocations",
+		] as const) {
 			expect(batch[table].rows.map((r) => r.session_event_id)).toEqual(["on"]);
 		}
 	});
@@ -330,12 +401,13 @@ describe("session push reader", () => {
 		// `local:<hash>` is what the schema stores on purpose — the alternative puts
 		// a home directory into every table. `getCanonicalRepoUrl`'s `file:///…`
 		// fallback still exists elsewhere and must not reach this wire.
-		await seed({ identity: "local:9f2a1c", eventId: "session:local:claude:s9" });
+		await seed({ identity: "local:9f2a1c", name: "qidian", eventId: "session:local:claude:s9" });
 
 		const batch = await withDb((db) => readSessionBatch(db, { cursors: {}, nowMs: NOW }));
 		const wire = JSON.stringify(batchTables(batch));
 
 		expect(wire).toContain("local:9f2a1c");
+		expect(wire).toContain('"repo_name":"qidian"');
 		expect(wire).not.toContain("file://");
 		expect(wire).not.toContain(dir);
 	});

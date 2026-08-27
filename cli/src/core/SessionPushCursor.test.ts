@@ -12,14 +12,18 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
+	completeReplayForScope,
 	cursorsFor,
 	getSessionPushChannelPath,
 	isChannelSilenced,
 	loadChannelForRun,
+	prepareReplayForScope,
 	readSessionPushChannel,
+	replayForScope,
 	toCursors,
 	toTableCursor,
 	withCursors,
+	withReplayCursors,
 	withSilence,
 	writeSessionPushChannel,
 } from "./SessionPushCursor.js";
@@ -127,6 +131,19 @@ describe("readSessionPushChannel", () => {
 		expect(state.byOrigin).toEqual({});
 	});
 
+	it("round-trips the payload version while ignoring a malformed one", () => {
+		writeFileSync(
+			getSessionPushChannelPath(dir),
+			JSON.stringify({ version: 1, clientId: "c1", payloadVersion: 3, byOrigin: {} }),
+		);
+		expect(readSessionPushChannel(dir).payloadVersion).toBe(3);
+		writeFileSync(
+			getSessionPushChannelPath(dir),
+			JSON.stringify({ version: 1, clientId: "c1", payloadVersion: "3", byOrigin: {} }),
+		);
+		expect(readSessionPushChannel(dir).payloadVersion).toBeUndefined();
+	});
+
 	it("treats a path that is not a file at all as absent, and still does not throw", () => {
 		// ENOENT is the ordinary case and is silent; anything else (a directory in
 		// the way, a permission problem) is worth a line in the log — but it is
@@ -157,6 +174,98 @@ describe("loadChannelForRun", () => {
 });
 
 describe("cursor bookkeeping", () => {
+	it("starts every affected table at zero for an existing scope without changing normal cursors", () => {
+		const initial = withCursors(loadChannelForRun(dir), "https://a", {
+			sessions: { stamp: 50, key: ["s1"] },
+			session_tool_use: { stamp: 60, key: ["s1", "Read", "builtin"] },
+			memory_lookups: { stamp: 70, key: ["r1"] },
+		});
+		const prepared = prepareReplayForScope(initial, "https://a", undefined, "skills-v1", [
+			"sessions",
+			"session_tool_use",
+			"skill_invocations",
+		]);
+		expect(replayForScope(prepared, "https://a", "skills-v1")).toEqual({
+			generation: "skills-v1",
+			completed: false,
+			completedTables: [],
+			cursors: {
+				sessions: { stamp: 0, key: [] },
+				session_tool_use: { stamp: 0, key: [] },
+				skill_invocations: { stamp: 0, key: [] },
+			},
+		});
+		expect(cursorsFor(prepared, "https://a")).toEqual({
+			sessions: { stamp: 50, key: ["s1"] },
+			session_tool_use: { stamp: 60, key: ["s1", "Read", "builtin"] },
+			memory_lookups: { stamp: 70, key: ["r1"] },
+		});
+	});
+
+	it("marks a genuinely new scope complete so it keeps the 90-day first-run window", () => {
+		const prepared = prepareReplayForScope(loadChannelForRun(dir), "https://new", undefined, "skills-v1", [
+			"sessions",
+			"session_tool_use",
+			"skill_invocations",
+		]);
+		expect(replayForScope(prepared, "https://new", "skills-v1")).toEqual({
+			generation: "skills-v1",
+			completed: true,
+			completedTables: ["sessions", "session_tool_use", "skill_invocations"],
+			cursors: {},
+		});
+		expect(cursorsFor(prepared, "https://new")).toEqual({});
+	});
+
+	it("recognises legacy bare-origin progress but records replay state on the tenant scope", () => {
+		const initial = withCursors(loadChannelForRun(dir), "https://a", { sessions: { stamp: 9, key: [] } });
+		const prepared = prepareReplayForScope(initial, "https://a/tenant", "https://a", "skills-v1", ["sessions"]);
+		expect(replayForScope(prepared, "https://a/tenant", "skills-v1")?.completed).toBe(false);
+		expect(replayForScope(prepared, "https://a", "skills-v1")).toBeUndefined();
+	});
+
+	it("persists replay progress and completion independently for each scope", () => {
+		let state = prepareReplayForScope(
+			withCursors(loadChannelForRun(dir), "https://a", { sessions: { stamp: 9, key: [] } }),
+			"https://a",
+			undefined,
+			"skills-v1",
+			["sessions"],
+		);
+		state = withReplayCursors(state, "https://a", "skills-v1", { sessions: { stamp: 5, key: ["e5"] } });
+		state = completeReplayForScope(state, "https://a", "skills-v1", { sessions: { stamp: 8, key: ["e8"] } }, [
+			"sessions",
+		]);
+		state = prepareReplayForScope(state, "https://b", undefined, "skills-v1", ["sessions"]);
+		writeSessionPushChannel(state, dir);
+		const stored = readSessionPushChannel(dir);
+		expect(replayForScope(stored, "https://a", "skills-v1")).toMatchObject({
+			completed: true,
+			cursors: { sessions: { stamp: 8, key: ["e8"] } },
+		});
+		expect(replayForScope(stored, "https://b", "skills-v1")?.completed).toBe(true);
+	});
+
+	it("ignores a completed marker for an older replay generation", () => {
+		const initial = withCursors(loadChannelForRun(dir), "https://a", { sessions: { stamp: 9, key: [] } });
+		const old = completeReplayForScope(initial, "https://a", "old", { sessions: { stamp: 9, key: [] } }, [
+			"sessions",
+		]);
+		const prepared = prepareReplayForScope(old, "https://a", undefined, "new", ["sessions"]);
+		expect(replayForScope(prepared, "https://a", "new")).toEqual({
+			generation: "new",
+			completed: false,
+			completedTables: [],
+			cursors: { sessions: { stamp: 0, key: [] } },
+		});
+	});
+
+	it("keeps the legacy payload-version parser compatible without using it as replay state", () => {
+		const state = readSessionPushChannel(dir);
+		expect(state.payloadVersion).toBeUndefined();
+		expect(state.replayByScope).toEqual({});
+	});
+
 	it("replaces one origin and leaves the others alone", () => {
 		const state = withCursors(
 			withCursors(loadChannelForRun(dir), "https://a", { sessions: { stamp: 1, key: [] } }),

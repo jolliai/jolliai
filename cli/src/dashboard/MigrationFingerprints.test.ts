@@ -92,6 +92,7 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// with `recorded_at_ms`). The `session_turns` sibling of the `session_activity`
 	// keyset entry above; a pure-SQL `sqlMigration`, so fingerprinted here.
 	["2026-08-28-0516-session-turns-keyset-index", "b86033388ec4"],
+	["2026-08-28-0910-skill-invocation-keyset-index", "c777c90ca543"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

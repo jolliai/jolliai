@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type JolliMemoryPushClient, SessionCursorAheadError } from "../core/JolliMemoryPushClient.js";
+import { JolliMemoryPushClient, SessionCursorAheadError } from "../core/JolliMemoryPushClient.js";
 import {
 	MIN_ATTEMPT_INTERVAL_MS,
 	readSessionPushChannel,
@@ -31,6 +31,15 @@ const NOW = Date.UTC(2026, 7, 12, 12, 0, 0);
  * echoes no tie-breaker, and that path must keep working.
  */
 const at = (stamp: number): TableCursor => ({ stamp, key: [] });
+
+const completedReplay = (scope = "https://acme.jolli.ai") => ({
+	[scope]: {
+		generation: "skills-mcps-fields-v1",
+		completed: true,
+		completedTables: ["sessions", "session_tool_use", "skill_invocations"],
+		cursors: {},
+	},
+});
 
 const h = vi.hoisted(() => ({
 	loadConfig: vi.fn(),
@@ -254,13 +263,16 @@ describe("session sync runner", () => {
 			);
 			// Typed parameter so the captured call keeps its shape — `vi.fn(async () =>
 			// …)` infers an empty tuple for `calls`.
-			const push = vi.fn(async (_payload: { tables: { sessions?: Array<{ repo_identity: string }> } }) => ({
-				accepted: {},
-				cursor: {},
-			}));
+			const push = vi.fn(
+				async (_payload: { tables: { sessions?: Array<{ repo_identity: string; repo_name: string }> } }) => ({
+					accepted: {},
+					cursor: {},
+				}),
+			);
 			await run({ client: fakeClient({ pushSessions: push } as never) });
 			const sent = push.mock.calls[0]?.[0];
 			expect(sent?.tables.sessions?.map((r) => r.repo_identity)).toEqual(["https://github.com/acme/gadgets"]);
+			expect(sent?.tables.sessions?.map((r) => r.repo_name)).toEqual(["gadgets"]);
 		});
 
 		it("sends nothing when the registry cannot be read", async () => {
@@ -304,6 +316,21 @@ describe("session sync runner", () => {
 	});
 
 	describe("cursors", () => {
+		it("keeps protocol 3 and preserves keyset positions", async () => {
+			await seedSession();
+			const push = vi.fn(async () => ({
+				accepted: { sessions: 1 },
+				cursor: { sessions: { stamp: 4_242, key: ["e1"] } },
+			}));
+
+			await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(push).toHaveBeenCalledWith(expect.objectContaining({ version: 3 }));
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]).toEqual({
+				sessions: { stamp: 4_242, key: ["e1"] },
+			});
+		});
+
 		it("adopts the server's cursor after a successful batch", async () => {
 			await seedSession();
 			await run({
@@ -318,6 +345,161 @@ describe("session sync runner", () => {
 			expect(state.byOrigin["https://acme.jolli.ai"]).toEqual({ sessions: at(4_242) });
 		});
 
+		it("replays affected tables from zero without changing unrelated normal cursors", async () => {
+			await seedSession(1_000);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					payloadVersion: 3,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: {
+						"https://acme.jolli.ai": {
+							sessions: at(999_999),
+							memory_lookups: at(700),
+						},
+					},
+				},
+				configDir,
+			);
+			const seen: Array<Record<string, TableCursor>> = [];
+			await run({
+				client: fakeClient({
+					pushSessions: async (payload: { cursor: Record<string, TableCursor> }) => {
+						seen.push(payload.cursor);
+						// Deliberately higher than this local page. Replay pagination must
+						// ignore it or the remaining historical range would be skipped.
+						return { accepted: { sessions: 1 }, cursor: { sessions: at(999_999) } };
+					},
+				} as never),
+			});
+
+			expect(seen[0]).toEqual({
+				sessions: at(0),
+				session_tool_use: at(0),
+				skill_invocations: at(0),
+			});
+			const stored = readSessionPushChannel(configDir);
+			expect(stored.replayByScope?.["https://acme.jolli.ai"]?.completed).toBe(true);
+			expect(stored.byOrigin["https://acme.jolli.ai"]?.sessions).toEqual({ stamp: 1_000, key: ["e1"] });
+			expect(stored.byOrigin["https://acme.jolli.ai"]?.memory_lookups).toEqual(at(700));
+		});
+
+		it("replays more than one page from zero and advances only to each accepted page maximum", async () => {
+			await seedMany(250);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					payloadVersion: 3,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: {
+						"https://acme.jolli.ai": {
+							sessions: at(999_999),
+							session_tool_use: at(999_999),
+						},
+					},
+				},
+				configDir,
+			);
+
+			const seen: Array<{
+				readonly cursor: Record<string, TableCursor>;
+				readonly eventIds: ReadonlyArray<string>;
+			}> = [];
+			const push = vi.fn(
+				async (payload: {
+					readonly version: number;
+					readonly cursor: Record<string, TableCursor>;
+					readonly tables: { readonly sessions?: ReadonlyArray<Record<string, unknown>> };
+				}) => {
+					const rows = payload.tables.sessions ?? [];
+					const last = rows.at(-1);
+					expect(payload.version).toBe(3);
+					expect(last).toBeDefined();
+					seen.push({
+						cursor: payload.cursor,
+						eventIds: rows.map((row) => String(row.event_id)),
+					});
+					return {
+						accepted: { sessions: rows.length },
+						// The pre-existing high server cursor must not control local replay paging.
+						cursor: { sessions: { stamp: 999_999, key: ["server-high"] } },
+					};
+				},
+			);
+
+			const outcome = await run({ client: fakeClient({ pushSessions: push } as never) });
+
+			expect(outcome).toMatchObject({ status: "done", batches: 2 });
+			expect(seen.map(({ cursor }) => cursor)).toEqual([
+				{
+					sessions: at(0),
+					session_tool_use: at(0),
+					skill_invocations: at(0),
+				},
+				{
+					sessions: { stamp: 1_199, key: ["e199"] },
+					session_tool_use: at(0),
+					skill_invocations: at(0),
+				},
+			]);
+			expect(seen.map(({ eventIds }) => eventIds.length)).toEqual([200, 51]);
+			expect(new Set(seen.flatMap(({ eventIds }) => eventIds)).size).toBe(250);
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]?.sessions).toEqual({
+				stamp: 1_249,
+				key: ["e249"],
+			});
+			expect(readSessionPushChannel(configDir).replayByScope?.["https://acme.jolli.ai"]?.completed).toBe(true);
+		});
+
+		it("persists replay progress at the run ceiling and resumes instead of starting over", async () => {
+			await seedMany(2_100);
+			writeSessionPushChannel(
+				{
+					version: 1,
+					clientId: "c1",
+					silencedByScope: {},
+					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
+				},
+				configDir,
+			);
+			const seen: Array<Record<string, TableCursor>> = [];
+			const push = vi.fn(
+				async (payload: {
+					readonly cursor: Record<string, TableCursor>;
+					readonly tables: { readonly sessions?: ReadonlyArray<Record<string, unknown>> };
+				}) => {
+					seen.push(payload.cursor);
+					return {
+						accepted: { sessions: payload.tables.sessions?.length ?? 0 },
+						cursor: { sessions: { stamp: 999_999_999, key: ["server-high"] } },
+					};
+				},
+			);
+
+			const first = await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(first).toMatchObject({ status: "done", batches: 10 });
+			const pending = readSessionPushChannel(configDir);
+			expect(pending.replayByScope?.["https://acme.jolli.ai"]).toMatchObject({
+				completed: false,
+				cursors: { sessions: { stamp: 2_990, key: ["e1990"] } },
+			});
+			// Normal progress stays untouched until replay completion is committed.
+			expect(pending.byOrigin["https://acme.jolli.ai"]?.sessions).toEqual(at(999_999));
+
+			const secondStart = seen.length;
+			const second = await run({ client: fakeClient({ pushSessions: push } as never) });
+			expect(second).toMatchObject({ status: "done", batches: 1 });
+			expect(seen[secondStart]?.sessions).toEqual({ stamp: 2_990, key: ["e1990"] });
+			const completed = readSessionPushChannel(configDir);
+			expect(completed.replayByScope?.["https://acme.jolli.ai"]?.completed).toBe(true);
+			expect(completed.byOrigin["https://acme.jolli.ai"]?.sessions).toEqual({
+				stamp: 3_099,
+				key: ["e2099"],
+			});
+		});
+
 		it("walks the cursor DOWN on 409 and re-sends that range", async () => {
 			// The whole reason the mechanism exists: pushing to one backend, then
 			// pointing the install at a fresh one. The local cursor still claims the
@@ -326,6 +508,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -358,6 +542,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -488,6 +674,48 @@ describe("session sync runner", () => {
 			expect(outcome).toMatchObject({ held: { rows: 1, tables: ["memory_lookups"] } });
 		});
 
+		it("reaches the held-table path through the real client when an older backend strips a table", async () => {
+			// This uses JolliMemoryPushClient rather than `fakeClient`: the regression was
+			// precisely that the real client threw before this runner could inspect the
+			// partial response, while every held-table test stopped at a fake boundary.
+			await seedSession(1_000);
+			await seedLookup(2_000);
+			const fetchImpl = vi.fn(
+				async () =>
+					new Response(
+						JSON.stringify({
+							accepted: { sessions: 1 },
+							cursor: {
+								sessions: { stamp: 1_000, key: ["e1"] },
+								session_activity: null,
+								session_model_usage: null,
+								session_tool_use: null,
+								session_usage_events: null,
+							},
+						}),
+						{ status: 200, headers: { "content-type": "application/json" } },
+					),
+			);
+			const client = new JolliMemoryPushClient({
+				fetchImpl,
+				baseUrlOverride: "https://acme.jolli.ai",
+				apiKeyProvider: async () => "sk-jol-test",
+			});
+
+			const outcome = await run({ client });
+
+			expect(fetchImpl).toHaveBeenCalledTimes(1);
+			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai"]?.sessions).toEqual({
+				stamp: 1_000,
+				key: ["e1"],
+			});
+			expect(outcome).toMatchObject({
+				status: "done",
+				rows: 1,
+				held: { rows: 1, tables: ["memory_lookups"] },
+			});
+		});
+
 		it("counts a held table's rows out of the uploaded total, and reports them separately", async () => {
 			// `rows` is what `jolli doctor` prints as "Uploaded N row(s)". A stripped
 			// table stored nothing, so counting it there is the one place this failure
@@ -563,6 +791,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { memory_lookups: at(1) } },
@@ -602,6 +832,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://dev.jolli.ai": { sessions: at(7) } },
@@ -636,6 +868,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					dbInstanceId: "a-different-database",
@@ -679,6 +913,8 @@ describe("session sync runner", () => {
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
+					replayByScope: completedReplay(),
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(999_999) } },
@@ -961,11 +1197,12 @@ describe("session sync runner", () => {
 			expect(state.byOrigin["https://one.jolli.ai/beta"]).toEqual({ sessions: at(22) });
 		});
 
-		it("resumes from a legacy bare-origin cursor on the first scoped run", async () => {
+		it("uses legacy bare-origin progress as proof that the scoped destination needs replay", async () => {
 			await seedSession(1_000);
 			writeSessionPushChannel(
 				{
 					version: 1,
+					payloadVersion: 4,
 					clientId: "c1",
 					silencedByScope: {},
 					byOrigin: { "https://acme.jolli.ai": { sessions: at(777) } },
@@ -982,9 +1219,13 @@ describe("session sync runner", () => {
 					},
 				} as never),
 			});
-			// Read from the legacy key, written under the scoped one.
-			expect(seen[0]).toEqual({ sessions: at(777) });
+			// The old origin cursor proves this is an upgrade, so the dedicated replay
+			// starts all affected tables at zero and writes completion on the scope.
+			expect(seen[0]).toEqual({ sessions: at(0), session_tool_use: at(0), skill_invocations: at(0) });
 			expect(readSessionPushChannel(configDir).byOrigin["https://acme.jolli.ai/tenant"]).toBeDefined();
+			expect(readSessionPushChannel(configDir).replayByScope?.["https://acme.jolli.ai/tenant"]?.completed).toBe(
+				true,
+			);
 		});
 
 		it("does not run again inside the throttle window", async () => {

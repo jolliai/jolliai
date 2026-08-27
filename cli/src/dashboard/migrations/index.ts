@@ -23,7 +23,9 @@ import { COMMIT_REACHABLE_DDL } from "./2026-08-25-0002-commit-reachable.js";
 import { MEMORY_LOOKUPS_DDL } from "./2026-08-26-0000-memory-lookups.js";
 import { SESSION_ACTIVITY_KEYSET_INDEX_DDL } from "./2026-08-27-0804-session-activity-keyset-index.js";
 import { SESSION_TURNS_DDL } from "./2026-08-27-0824-session-turns.js";
+import { SKILL_INVOCATION_SYNC_STAMP_DDL } from "./2026-08-27-0922-skill-invocation-sync-stamp.js";
 import { SESSION_TURNS_KEYSET_INDEX_DDL } from "./2026-08-28-0516-session-turns-keyset-index.js";
+import { SKILL_INVOCATION_KEYSET_INDEX_DDL } from "./2026-08-28-0910-skill-invocation-keyset-index.js";
 import type { DbMigration } from "./MigrationHelpers.js";
 
 export type { DbMigration } from "./MigrationHelpers.js";
@@ -147,7 +149,9 @@ export const MIGRATIONS: ReadonlyArray<DbMigration> = [
 	MEMORY_LOOKUPS_DDL,
 	SESSION_ACTIVITY_KEYSET_INDEX_DDL,
 	SESSION_TURNS_DDL,
+	SKILL_INVOCATION_SYNC_STAMP_DDL,
 	SESSION_TURNS_KEYSET_INDEX_DDL,
+	SKILL_INVOCATION_KEYSET_INDEX_DDL,
 ];
 
 /*

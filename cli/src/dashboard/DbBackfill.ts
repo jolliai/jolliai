@@ -44,7 +44,7 @@ import type { SessionSourceDefinition } from "../core/sessions/SessionSourceDefi
 import { DAEMON_RESCAN_SOURCES, SESSION_SOURCES } from "../core/sessions/SessionSources.js";
 import { skillOutcomeConfidence } from "../core/skills/SkillOutcomeConfidence.js";
 import { createLogger, errMsg, ORPHAN_BRANCH } from "../Logger.js";
-import type { StoredTranscript, ToolCallCount, TranscriptSource } from "../Types.js";
+import type { SessionUsageEvent, StoredTranscript, ToolCallCount, TranscriptSource } from "../Types.js";
 import { bucketsFrom } from "./ActivityBuckets.js";
 import {
 	collectCommitEvents,
@@ -1160,6 +1160,17 @@ interface StoredToolRow {
 	readonly cachedTokens: number | null;
 	readonly usageConfidence: string | null;
 	readonly plugin: string | null;
+	readonly originRoot: string | null;
+}
+
+/** A `session_usage_events` row, in the shape {@link sameUsageEventSet} compares. */
+interface StoredUsageEventRow {
+	readonly respondedAtMs: number;
+	readonly model: string;
+	readonly input: number;
+	readonly output: number;
+	readonly cached: number;
+	readonly cost: number | null;
 }
 
 /**
@@ -1182,13 +1193,13 @@ interface StoredInvocationRow {
 }
 
 /**
- * One session as it is currently stored: its own row plus ALL FOUR child tables.
+ * One session as it is currently stored: its own row plus ALL FIVE child tables.
  *
  * The child maps are keyed the way their table is keyed — `session_model_usage`
- * by `model`, `session_tool_use` by `(tool_name, kind)`, `skill_invocations` by
- * `(skill_name, at_ms)` — so a comparison that walks them cannot accidentally merge
- * two rows the schema keeps apart (a skill and a builtin may share a name; see that
- * table's DDL).
+ * by `model`, `session_tool_use` by `(tool_name, kind)`, `session_usage_events`
+ * by `dedup_key`, and `skill_invocations` by `(skill_name, at_ms)` — so a
+ * comparison that walks them cannot accidentally merge two rows the schema keeps
+ * apart (a skill and a builtin may share a name; see that table's DDL).
  *
  * `buckets` is a bare set because `session_activity` has no payload beyond its own
  * key: a `(session, bucket)` pair either exists or does not.
@@ -1197,6 +1208,7 @@ interface StoredSession {
 	readonly row: Record<string, unknown>;
 	readonly models: ReadonlyMap<string, StoredModelRow>;
 	readonly tools: ReadonlyMap<string, StoredToolRow>;
+	readonly usageEvents: ReadonlyMap<string, StoredUsageEventRow>;
 	readonly buckets: ReadonlySet<number>;
 	readonly invocations: ReadonlyMap<string, StoredInvocationRow>;
 }
@@ -1225,7 +1237,14 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 	const sessions = new Map<string, StoredSession>(
 		rows.map((r) => [
 			`${r.source}\0${r.session_id}`,
-			{ row: r, models: new Map(), tools: new Map(), buckets: new Set<number>(), invocations: new Map() },
+			{
+				row: r,
+				models: new Map(),
+				tools: new Map(),
+				usageEvents: new Map(),
+				buckets: new Set<number>(),
+				invocations: new Map(),
+			},
 		]),
 	);
 
@@ -1262,7 +1281,7 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 	const toolRows = db
 		.prepare(
 			`SELECT s.source, s.session_id, t.tool_name, t.kind, t.server, t.calls, t.last_call_at_ms,
-			        t.input_tokens, t.output_tokens, t.cached_tokens, t.usage_confidence, t.plugin
+			        t.input_tokens, t.output_tokens, t.cached_tokens, t.usage_confidence, t.plugin, t.origin_root
 			   FROM session_tool_use t
 			   JOIN sessions s ON s.event_id = t.session_event_id
 			   JOIN repos r    ON r.id = s.repo_id
@@ -1277,6 +1296,7 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 		calls: number;
 		last_call_at_ms: number | null;
 		plugin: string | null;
+		origin_root: string | null;
 		input_tokens: number | null;
 		output_tokens: number | null;
 		cached_tokens: number | null;
@@ -1293,6 +1313,39 @@ function storedSessionRows(db: DashboardDbHandle, repoIdentity: string): Map<str
 			cachedTokens: r.cached_tokens,
 			usageConfidence: r.usage_confidence,
 			plugin: r.plugin,
+			originRoot: r.origin_root,
+		});
+	}
+
+	const usageEventRows = db
+		.prepare(
+			`SELECT s.source, s.session_id, u.dedup_key, u.responded_at_ms, u.model,
+			        u.input_tokens, u.output_tokens, u.cached_tokens, u.est_cost_usd
+			   FROM session_usage_events u
+			   JOIN sessions s ON s.event_id = u.session_event_id
+			   JOIN repos r    ON r.id = s.repo_id
+			  WHERE r.repo_identity = ?`,
+		)
+		.all(repoIdentity) as ReadonlyArray<{
+		source: string;
+		session_id: string;
+		dedup_key: string;
+		responded_at_ms: number;
+		model: string;
+		input_tokens: number;
+		output_tokens: number;
+		cached_tokens: number;
+		est_cost_usd: number | null;
+	}>;
+	for (const r of usageEventRows) {
+		const target = sessions.get(`${r.source}\0${r.session_id}`);
+		(target?.usageEvents as Map<string, StoredUsageEventRow>)?.set(r.dedup_key, {
+			respondedAtMs: r.responded_at_ms,
+			model: r.model,
+			input: r.input_tokens,
+			output: r.output_tokens,
+			cached: r.cached_tokens,
+			cost: r.est_cost_usd,
 		});
 	}
 
@@ -1472,6 +1525,31 @@ function sameToolSet(tools: ReadonlyArray<ToolCallCount>, stored: ReadonlyMap<st
 		// row. Comparing an absent one against a stored label would report a change the
 		// projection cannot make and re-project the session on every pass forever.
 		if (tool.plugin !== undefined && row.plugin !== tool.plugin) return false;
+		// Same COALESCE contract as `plugin`, but unlike a plugin label the root may
+		// legitimately move when the host resolves a newer skill location.
+		if (tool.originRoot !== undefined && row.originRoot !== tool.originRoot) return false;
+	}
+	return true;
+}
+
+/** True when replacing the stored per-response usage rows would be a semantic no-op. */
+function sameUsageEventSet(
+	usageEvents: ReadonlyArray<SessionUsageEvent>,
+	stored: ReadonlyMap<string, StoredUsageEventRow>,
+): boolean {
+	if (usageEvents.length !== stored.size) return false;
+	const seen = new Set<string>();
+	for (const [i, usage] of usageEvents.entries()) {
+		const key = usage.dedupKey ?? `line:${i}`;
+		// The writer deliberately throws on a duplicate key. Treat it as changed so
+		// this comparison never hides the producer invariant violation.
+		if (seen.has(key)) return false;
+		seen.add(key);
+		const row = stored.get(key);
+		if (!row) return false;
+		if (row.respondedAtMs !== usage.respondedAtMs || row.model !== usage.model) return false;
+		if (row.input !== usage.input || row.output !== usage.output || row.cached !== usage.cached) return false;
+		if (row.cost !== (usage.estCostUsd ?? null)) return false;
 	}
 	return true;
 }
@@ -1538,7 +1616,7 @@ function sameSkillInvocations(
  * 14 of the 17 had not been touched for a day — the carve-out WAS the remaining
  * churn, because a real session almost always carries both.
  *
- * MIRRORS `projectSession`, including both child tables. It compares against the
+ * MIRRORS `projectSession`, including every child table. It compares against the
  * ROWS THOSE WRITES WOULD PRODUCE, never against the merge rules that produce
  * them — the rules (the `hasUsage` gate `models: []` once fell through, the
  * MAX/NULLIF on the tool timestamp) are exactly what a restatement would drift
@@ -1561,10 +1639,10 @@ function sameSkillInvocations(
  *    `hasUsage`: it falls back to the event's own `estCostUsd` before the stored
  *    value, so a token-less event carrying a price still writes it, and its
  *    comparison has to happen ahead of the carry-forward return.
- *  - Both child tables are replace-when-observed, under the same predicate
- *    `projectSession` uses to decide it wrote at all.
- *  - `session_activity` is the THIRD child and the one exception to that shape: it
- *    is insert-only, so it is compared by containment rather than equality. Adding
+ *  - The model, tool and per-response usage tables are replace-when-observed,
+ *    under the same predicate `projectSession` uses to decide it wrote at all.
+ *  - `session_activity` is the insert-only exception to that shape, so it is
+ *    compared by containment rather than equality. Adding
  *    a derived output to `projectSession` without adding it here is silent — the
  *    event is judged unchanged and dropped before the projection ever runs, so the
  *    new table simply stays empty for every session that was already stored. That
@@ -1593,6 +1671,7 @@ function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSessio
 	// "unobserved", and the projection leaves the stored split alone.
 	if (hasUsage && event.models !== undefined && !sameModelSplit(models, stored.models)) return false;
 	if (event.tools !== undefined && !sameToolSet(event.tools, stored.tools)) return false;
+	if (event.usageEvents !== undefined && !sameUsageEventSet(event.usageEvents, stored.usageEvents)) return false;
 	// CONTAINMENT, not set equality — the one comparison here that does not mirror a
 	// replace. `session_activity` is insert-only (see `SESSION_ACTIVITY_DDL`), so the
 	// question is only "would the INSERT OR IGNORE add a row", and a stored bucket the
@@ -1605,7 +1684,7 @@ function unchangedSessionEvent(event: SessionUpsertedEvent, stored: StoredSessio
 	// agent but Claude — reaches that return, so gating this behind it would mean their
 	// presence never reached the table.
 	if (event.activityBuckets?.some((bucket) => !stored.buckets.has(bucket))) return false;
-	// The fourth child table, under the same replace-when-observed guard. Omitting it
+	// The add-or-update child table. Omitting it
 	// left the table permanently empty when it shipped — the projection re-read every
 	// transcript and this function threw the result away, which is the same trap the
 	// token fields on `StoredToolRow` document.

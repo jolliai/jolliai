@@ -2251,6 +2251,56 @@ describe("dbBackfillRepo — sessions sweep", () => {
 		expect(await loggedSessions("s1")).toBe(1);
 	});
 
+	const usageSession: SessionUpsertedEvent = {
+		...sessionEvent,
+		usageEvents: [
+			{
+				dedupKey: "response-1",
+				respondedAtMs: 1_700_000_010_000,
+				model: "claude-opus-5",
+				input: 100,
+				output: 20,
+				cached: 5,
+				estCostUsd: 0.25,
+			},
+		],
+	};
+
+	it("does not re-enqueue a session whose per-response usage is unchanged", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([usageSession]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(1);
+	});
+
+	it("still projects a session whose only change is per-response usage", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([usageSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		const [usage] = usageSession.usageEvents ?? [];
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...usageSession, usageEvents: [{ ...usage, output: 99 }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query("SELECT output_tokens FROM session_usage_events")).toEqual([{ output_tokens: 99 }]);
+	});
+
+	it("still projects a session that removed a per-response usage row", async () => {
+		vi.mocked(collectSessionEvents).mockResolvedValue([usageSession]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...usageSession, usageEvents: [] }]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query("SELECT * FROM session_usage_events")).toEqual([]);
+	});
+
 	it("does not re-enqueue a session whose tool calls are unchanged", async () => {
 		vi.mocked(collectSessionEvents).mockResolvedValue([toolSession]);
 		await dbBackfillRepo({ repo, dbPath });
@@ -2337,6 +2387,31 @@ describe("dbBackfillRepo — sessions sweep", () => {
 		expect(await loggedSessions("s1")).toBe(2);
 		const row = await query<{ server: string }>("SELECT server FROM session_tool_use WHERE kind = 'mcp'");
 		expect(row).toEqual([{ server: "jollimemory-remote" }]);
+	});
+
+	it("preserves an absent skill origin root and projects a changed one", async () => {
+		const rooted = {
+			name: "code-review",
+			kind: "skill" as const,
+			calls: 1,
+			originRoot: "repo-agents" as const,
+		};
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: [rooted] }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		const { originRoot: _missing, ...sparse } = rooted;
+		vi.mocked(collectSessionEvents).mockResolvedValue([{ ...sessionEvent, tools: [sparse] }]);
+		await dbBackfillRepo({ repo, dbPath });
+		expect(await loggedSessions("s1")).toBe(1);
+
+		vi.mocked(collectSessionEvents).mockResolvedValue([
+			{ ...sessionEvent, tools: [{ ...rooted, originRoot: "repo-cursor" }] },
+		]);
+		await dbBackfillRepo({ repo, dbPath });
+
+		expect(await loggedSessions("s1")).toBe(2);
+		expect(await query("SELECT origin_root FROM session_tool_use")).toEqual([{ origin_root: "repo-cursor" }]);
 	});
 
 	it("does not re-enqueue sparse tool evidence that the writer would preserve", async () => {

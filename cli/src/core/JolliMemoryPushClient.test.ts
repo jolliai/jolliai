@@ -1172,7 +1172,7 @@ describe("invokePlatformTool", () => {
 });
 
 describe("pushSessions", () => {
-	const payload = { version: 2, clientId: "c1", cursor: {}, tables: {} } as const;
+	const payload = { version: 3, clientId: "c1", cursor: {}, tables: {} } as const;
 
 	it("rejects a 2xx whose body is not JSON, instead of reading it as an empty success", async () => {
 		// The failure this was found by, in production. A single-page app answers an
@@ -1228,6 +1228,47 @@ describe("pushSessions", () => {
 		// server acknowledged.
 		const c = client(async () => jsonResponse(200, { accepted: {} }));
 		await expect(c.pushSessions(payload)).resolves.toEqual({ accepted: {}, cursor: {} });
+	});
+
+	it("returns a partial acknowledgement so the runner can hold only the omitted table", async () => {
+		// The rolling-deploy failure: an older Zod object strips the unknown table,
+		// then truthfully acknowledges the tables it did understand. The runner has
+		// the batch and can hold this one table while advancing the others; throwing
+		// here would keep every cursor still and make that path production-dead.
+		const withInvocations = {
+			...payload,
+			tables: { skill_invocations: [{ session_event_id: "e1", skill_name: "review", at_ms: 1 }] },
+		};
+		const response = { accepted: { sessions: 1 }, cursor: { sessions: 9 } };
+		const c = client(async () => jsonResponse(200, response));
+
+		await expect(c.pushSessions(withInvocations)).resolves.toEqual(response);
+	});
+
+	it("does not require accepted to count a deliberately re-sent boundary row", async () => {
+		// A backend may report newly inserted/upserted rows rather than submitted rows.
+		// On every non-first `>=` page that makes the count one smaller because the
+		// boundary row already exists. Treat the table key as acknowledgement and let
+		// the server cursor decide progress instead of wedging on that valid meaning.
+		const withSessions = { ...payload, tables: { sessions: [{ id: "s1" }, { id: "s2" }] } };
+		const response = { accepted: { sessions: 1 }, cursor: { sessions: 9 } };
+		const c = client(async () => jsonResponse(200, response));
+
+		await expect(c.pushSessions(withSessions)).resolves.toEqual(response);
+	});
+
+	it("accepts an exact acknowledgement for every non-empty table", async () => {
+		const withRows = {
+			...payload,
+			tables: { sessions: [{ id: "s1" }], skill_invocations: [{ id: "i1" }, { id: "i2" }] },
+		};
+		const response = {
+			accepted: { sessions: 1, skill_invocations: 2 },
+			cursor: { sessions: { stamp: 9, key: ["s1"] }, skill_invocations: { stamp: 10, key: ["i2"] } },
+		};
+		const c = client(async () => jsonResponse(200, response));
+
+		await expect(c.pushSessions(withRows)).resolves.toEqual(response);
 	});
 
 	it("rejects a 2xx that carries NEITHER an accepted map nor a cursor when rows WERE sent", async () => {

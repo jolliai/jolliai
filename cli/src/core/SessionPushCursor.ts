@@ -60,6 +60,18 @@ export interface TableCursor {
  */
 export type SessionPushCursors = Readonly<Record<string, TableCursor>>;
 
+/** One scope's durable progress through a one-time historical replay. */
+export interface SessionReplayProgress {
+	/** Stable identifier for the replay this build knows how to perform. */
+	readonly generation: string;
+	/** True only after every affected local table has been drained. */
+	readonly completed: boolean;
+	/** Affected tables already drained; lets a later run resume without boundary replays. */
+	readonly completedTables: ReadonlyArray<string>;
+	/** Local keyset progress, independent of the server's possibly-higher cursor. */
+	readonly cursors: SessionPushCursors;
+}
+
 /**
  * Reads one table's cursor out of anything that might be stored or received:
  * this build's shape, a bare stamp with no tie-breaker, or junk.
@@ -93,6 +105,25 @@ export function toCursors(value: unknown): SessionPushCursors {
 
 export interface SessionPushChannelState {
 	readonly version: 1;
+	/**
+	 * Legacy machine-wide replay marker written by earlier builds.
+	 *
+	 * Kept readable so an existing state file round-trips without churn, but no
+	 * longer used to decide replay completion. One global number cannot describe
+	 * several backend scopes; `replayByScope` is the current authority.
+	 */
+	readonly payloadVersion?: number;
+	/**
+	 * One-time historical replay state, per backend scope.
+	 *
+	 * This cannot be one machine-wide payload marker: one installation may talk to
+	 * several tenants, and replaying one says nothing about what another received.
+	 * The cursors are deliberately separate from `byOrigin`. During a replay the
+	 * server may already hold a higher transport cursor, but the client still has
+	 * to walk every local page from zero without adopting that high value and
+	 * skipping the pages between.
+	 */
+	readonly replayByScope?: Readonly<Record<string, SessionReplayProgress>>;
 	/**
 	 * This INSTALLATION's stable id, generated once. Not the database's instance
 	 * id, which is the identity of the file and changes the moment it is rebuilt
@@ -188,7 +219,7 @@ export function getSessionPushChannelPath(configDir: string = getGlobalConfigDir
 }
 
 function emptyState(): SessionPushChannelState {
-	return { version: 1, clientId: randomUUID(), silencedByScope: {}, byOrigin: {} };
+	return { version: 1, clientId: randomUUID(), replayByScope: {}, silencedByScope: {}, byOrigin: {} };
 }
 
 /**
@@ -223,8 +254,12 @@ function parseChannel(configDir?: string): { state: SessionPushChannelState; sto
 			state: {
 				version: 1,
 				clientId: parsed.clientId,
+				...(typeof parsed.payloadVersion === "number" && Number.isInteger(parsed.payloadVersion)
+					? { payloadVersion: parsed.payloadVersion }
+					: {}),
 				...(typeof parsed.dbInstanceId === "string" ? { dbInstanceId: parsed.dbInstanceId } : {}),
 				...(typeof parsed.lastAttemptAtMs === "number" ? { lastAttemptAtMs: parsed.lastAttemptAtMs } : {}),
+				replayByScope: toReplayByScope(parsed.replayByScope),
 				// A legacy machine-wide `silencedUntilMs` is read past and dropped —
 				// see `silencedByScope` for why it must not be folded onto the scopes.
 				silencedByScope: toSilences(parsed.silencedByScope),
@@ -262,6 +297,31 @@ function toSilences(value: unknown): Record<string, number> {
 	return out;
 }
 
+/** Normalises stored replay progress, dropping malformed scopes independently. */
+function toReplayByScope(value: unknown): Record<string, SessionReplayProgress> {
+	if (!isRecord(value)) return {};
+	const out: Record<string, SessionReplayProgress> = {};
+	for (const [scope, raw] of Object.entries(value)) {
+		if (
+			!isRecord(raw) ||
+			typeof raw.generation !== "string" ||
+			raw.generation.length === 0 ||
+			typeof raw.completed !== "boolean"
+		) {
+			continue;
+		}
+		out[scope] = {
+			generation: raw.generation,
+			completed: raw.completed,
+			completedTables: Array.isArray(raw.completedTables)
+				? raw.completedTables.filter((table): table is string => typeof table === "string")
+				: [],
+			cursors: toCursors(raw.cursors),
+		};
+	}
+	return out;
+}
+
 /** Writes the state. Best effort: a failure here must not fail a caller. */
 export function writeSessionPushChannel(state: SessionPushChannelState, configDir?: string): void {
 	const path = getSessionPushChannelPath(configDir);
@@ -294,6 +354,92 @@ export function loadChannelForRun(configDir?: string): SessionPushChannelState {
 	// handed an empty cursor forever.
 	if (!stored) writeSessionPushChannel(state, configDir);
 	return state;
+}
+
+/** Whether this state proves the installation has already used this destination. */
+export function hasScopeProgress(state: SessionPushChannelState, scope: string, legacyKey?: string): boolean {
+	if (Object.getOwnPropertyDescriptor(state.byOrigin, scope) !== undefined) return true;
+	return (
+		legacyKey !== undefined &&
+		legacyKey !== scope &&
+		Object.getOwnPropertyDescriptor(state.byOrigin, legacyKey) !== undefined
+	);
+}
+
+/** Matching replay state for one scope; an older generation is intentionally ignored. */
+export function replayForScope(
+	state: SessionPushChannelState,
+	scope: string,
+	generation: string,
+): SessionReplayProgress | undefined {
+	const replay = state.replayByScope?.[scope];
+	return replay?.generation === generation ? replay : undefined;
+}
+
+/**
+ * Starts a replay for an existing scope, or records a new scope as complete.
+ *
+ * A genuinely new destination keeps the ordinary 90-day first-run contract.
+ * Only progress already stored for this scope (including its legacy origin key)
+ * proves that historical rows may have been acknowledged before their new
+ * fields existed and therefore need the one-time full replay.
+ */
+export function prepareReplayForScope(
+	state: SessionPushChannelState,
+	scope: string,
+	legacyKey: string | undefined,
+	generation: string,
+	replayTables: ReadonlyArray<string>,
+): SessionPushChannelState {
+	if (replayForScope(state, scope, generation) !== undefined) return state;
+	const existing = hasScopeProgress(state, scope, legacyKey);
+	const cursors = existing ? Object.fromEntries(replayTables.map((table) => [table, { stamp: 0, key: [] }])) : {};
+	return {
+		...state,
+		replayByScope: {
+			...(state.replayByScope ?? {}),
+			[scope]: {
+				generation,
+				completed: !existing,
+				completedTables: existing ? [] : [...replayTables],
+				cursors,
+			},
+		},
+	};
+}
+
+/** Persists one scope's local replay keysets without touching normal sync cursors. */
+export function withReplayCursors(
+	state: SessionPushChannelState,
+	scope: string,
+	generation: string,
+	cursors: SessionPushCursors,
+	completedTables: ReadonlyArray<string> = [],
+): SessionPushChannelState {
+	return {
+		...state,
+		replayByScope: {
+			...(state.replayByScope ?? {}),
+			[scope]: { generation, completed: false, completedTables, cursors },
+		},
+	};
+}
+
+/** Marks one scope's replay complete while retaining its final local position. */
+export function completeReplayForScope(
+	state: SessionPushChannelState,
+	scope: string,
+	generation: string,
+	cursors: SessionPushCursors,
+	completedTables: ReadonlyArray<string>,
+): SessionPushChannelState {
+	return {
+		...state,
+		replayByScope: {
+			...(state.replayByScope ?? {}),
+			[scope]: { generation, completed: true, completedTables, cursors },
+		},
+	};
 }
 
 /**

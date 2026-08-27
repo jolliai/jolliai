@@ -152,6 +152,24 @@ describe("applyStatsEvents — projection", () => {
 		expect(totals[0]).toEqual({ n: 1, input_tokens: 100 });
 	});
 
+	it("keeps the model-usage sync stamp stable for an unchanged replay", async () => {
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath, now: () => 1_000 });
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath, now: () => 2_000 });
+		expect(await query("SELECT input_tokens, updated_at_ms FROM session_model_usage")).toEqual([
+			{ input_tokens: 100, updated_at_ms: 1_000 },
+		]);
+
+		const changed = session({
+			models: [
+				{ model: "claude-opus-5", provider: "anthropic", inputTokens: 101, outputTokens: 50, cachedTokens: 25 },
+			],
+		});
+		await applyStatsEvents([envelope(changed)], { producerKind: "cli", dbPath, now: () => 3_000 });
+		expect(await query("SELECT input_tokens, updated_at_ms FROM session_model_usage")).toEqual([
+			{ input_tokens: 101, updated_at_ms: 3_000 },
+		]);
+	});
+
 	it("replaces the model split wholesale on re-upsert", async () => {
 		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
 		await applyStatsEvents(
@@ -295,9 +313,10 @@ describe("applyStatsEvents — projection", () => {
 	});
 
 	it("upgrades a placeholder repo row when the registry projection arrives later", async () => {
-		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath });
+		await applyStatsEvents([envelope(session())], { producerKind: "cli", dbPath, now: () => 100 });
 		let rows = await query<{ repo_name: string }>("SELECT repo_name FROM repos");
 		expect(rows[0].repo_name).toBe("repo-1"); // placeholder = identity
+		const before = await query<{ written_at_ms: number }>("SELECT written_at_ms FROM sessions");
 		await applyStatsEvents(
 			[
 				{
@@ -311,10 +330,14 @@ describe("applyStatsEvents — projection", () => {
 					producerKind: "cli",
 				},
 			],
-			{ producerKind: "cli", dbPath },
+			// Deliberately below the session's existing stamp: a wall-clock rollback
+			// must not put the replay behind the table-wide cursor.
+			{ producerKind: "cli", dbPath, now: () => 50 },
 		);
 		rows = await query<{ repo_name: string }>("SELECT repo_name FROM repos");
 		expect(rows[0].repo_name).toBe("jolli");
+		const after = await query<{ written_at_ms: number }>("SELECT written_at_ms FROM sessions");
+		expect(after[0].written_at_ms).toBeGreaterThan(before[0].written_at_ms);
 	});
 
 	it("lands sessions and commits on the same repo, spanning both timestamps", async () => {
@@ -767,6 +790,31 @@ describe("session_tool_use projection", () => {
 		expect(await tools()).toEqual([{ tool_name: "Bash", kind: "builtin", server: null, calls: 5 }]);
 	});
 
+	it("keeps the tool-usage sync stamp stable for an unchanged replay", async () => {
+		await applyStatsEvents([sessionEvent({ tools: [{ name: "Bash", kind: "builtin", calls: 3 }] })], {
+			producerKind: "cli",
+			dbPath,
+			now: () => 1_000,
+		});
+		await applyStatsEvents([sessionEvent({ tools: [{ name: "Bash", kind: "builtin", calls: 3 }] })], {
+			producerKind: "cli",
+			dbPath,
+			now: () => 2_000,
+		});
+		expect(await query("SELECT calls, updated_at_ms FROM session_tool_use")).toEqual([
+			{ calls: 3, updated_at_ms: 1_000 },
+		]);
+
+		await applyStatsEvents([sessionEvent({ tools: [{ name: "Bash", kind: "builtin", calls: 4 }] })], {
+			producerKind: "cli",
+			dbPath,
+			now: () => 3_000,
+		});
+		expect(await query("SELECT calls, updated_at_ms FROM session_tool_use")).toEqual([
+			{ calls: 4, updated_at_ms: 3_000 },
+		]);
+	});
+
 	it("leaves rows alone when tools are absent — a tool-blind producer must not erase them", async () => {
 		await applyStatsEvents([sessionEvent({ tools: [{ name: "Bash", kind: "builtin", calls: 3 }] })], {
 			producerKind: "cli",
@@ -1021,10 +1069,14 @@ describe("skill_invocations projection", () => {
 
 	it("converges on the same row when the same entry is read again", async () => {
 		// The producing scan is whole-conversation, so every pass re-reads every entry it
-		// already saw. Keyed on the instant they land back on their own row.
-		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
-		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath });
+		// already saw. Keyed on the instant they land back on their own row, and an
+		// identical replay does not move the outbound stamp.
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath, now: () => 1_000 });
+		await applyStatsEvents([sessionEvent([skillBucket()])], { producerKind: "cli", dbPath, now: () => 2_000 });
 		expect(await invocations()).toHaveLength(1);
+		expect(await query<{ updated_at_ms: number }>("SELECT updated_at_ms FROM skill_invocations")).toEqual([
+			{ updated_at_ms: 1_000 },
+		]);
 	});
 
 	it("corrects an optimistic outcome on the next read", async () => {
@@ -1045,7 +1097,7 @@ describe("skill_invocations projection", () => {
 					}),
 				]),
 			],
-			{ producerKind: "cli", dbPath },
+			{ producerKind: "cli", dbPath, now: () => 1_000 },
 		);
 		await applyStatsEvents(
 			[
@@ -1062,9 +1114,12 @@ describe("skill_invocations projection", () => {
 					}),
 				]),
 			],
-			{ producerKind: "cli", dbPath },
+			{ producerKind: "cli", dbPath, now: () => 2_000 },
 		);
 		expect(await invocations()).toMatchObject([{ ok: 0, ok_confidence: "observed" }]);
+		expect(await query<{ updated_at_ms: number }>("SELECT updated_at_ms FROM skill_invocations")).toEqual([
+			{ updated_at_ms: 2_000 },
+		]);
 	});
 
 	it("does not let a later unresolved read downgrade an observed outcome", async () => {
@@ -1077,7 +1132,7 @@ describe("skill_invocations projection", () => {
 					}),
 				]),
 			],
-			{ producerKind: "cli", dbPath },
+			{ producerKind: "cli", dbPath, now: () => 1_000 },
 		);
 		await applyStatsEvents(
 			[
@@ -1087,9 +1142,12 @@ describe("skill_invocations projection", () => {
 					}),
 				]),
 			],
-			{ producerKind: "cli", dbPath },
+			{ producerKind: "cli", dbPath, now: () => 2_000 },
 		);
 		expect(await invocations()).toMatchObject([{ ok: 0, ok_confidence: "observed" }]);
+		expect(await query<{ updated_at_ms: number }>("SELECT updated_at_ms FROM skill_invocations")).toEqual([
+			{ updated_at_ms: 1_000 },
+		]);
 	});
 
 	it("keeps a stored body size when a later read reports none", async () => {
@@ -2314,7 +2372,7 @@ describe("session_usage_events — spend lands on the day it happened", () => {
 		expect(s?.updated_at_ms).toBe(DAY3);
 	});
 
-	it("converges on re-read instead of doubling", async () => {
+	it("converges on re-read without refreshing an unchanged sync stamp", async () => {
 		const events = [
 			{ respondedAtMs: DAY1, model: "claude-opus-5", input: 100, output: 10, cached: 0, dedupKey: "a" },
 		];
@@ -2327,7 +2385,46 @@ describe("session_usage_events — spend lands on the day it happened", () => {
 		}
 		const rows = await query<{ updated_at_ms: number }>("SELECT * FROM session_usage_events");
 		expect(rows).toHaveLength(1);
-		expect(rows[0]?.updated_at_ms).toBe(2_000);
+		expect(rows[0]?.updated_at_ms).toBe(1_000);
+	});
+
+	it("refreshes only the per-response usage row whose final content changed", async () => {
+		const first = { respondedAtMs: DAY1, model: "claude-opus-5", input: 100, output: 10, cached: 0 };
+		const second = { respondedAtMs: DAY3, model: "claude-opus-5", input: 200, output: 20, cached: 0 };
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						usageEvents: [
+							{ ...first, dedupKey: "a" },
+							{ ...second, dedupKey: "b" },
+						],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath, now: at(1_000) },
+		);
+
+		await applyStatsEvents(
+			[
+				envelope(
+					session({
+						usageEvents: [
+							{ ...first, dedupKey: "a" },
+							{ ...second, output: 99, dedupKey: "b" },
+						],
+					}),
+				),
+			],
+			{ producerKind: "cli", dbPath, now: at(2_000) },
+		);
+
+		expect(
+			await query("SELECT dedup_key, output_tokens, updated_at_ms FROM session_usage_events ORDER BY dedup_key"),
+		).toEqual([
+			{ dedup_key: "a", output_tokens: 10, updated_at_ms: 1_000 },
+			{ dedup_key: "b", output_tokens: 99, updated_at_ms: 2_000 },
+		]);
 	});
 
 	// `undefined` means "this source cannot report per-response usage" — every

@@ -2,10 +2,10 @@
  * What leaves this machine on the session channel — the two lists, and nothing
  * else.
  *
- * The channel sends TABLES: the payload is `{table: rows}` with the local column
- * names verbatim (snake_case, no camelCase rewrite), so the local column, the
- * JSON field and the server column all carry one name and a mismatch is a bug
- * rather than a translation table to maintain.
+ * The channel sends TABLES: the payload is `{table: rows}` with snake_case
+ * column names. Apart from the small, explicit set in `PROJECTED_COLUMNS`, the
+ * local column, JSON field and server column all carry one name, so a mismatch
+ * is a bug rather than an open-ended translation table.
  *
  * ⚠ That format removes the step that used to decide what is sent. Picking
  * fields by hand is tedious, but it also quietly withheld everything nobody had
@@ -65,6 +65,10 @@ export const SYNCED_TABLES = [
 	// cannot lag a version behind.
 	"memory_lookups",
 	"session_turns",
+	// Per-invocation metadata is what lets the Web Skills detail pane render the
+	// local page's outcomes and record facts. The injected text and invocation
+	// arguments remain local; see the explicit column exclusion below.
+	"skill_invocations",
 ] as const;
 
 export type SyncedTable = (typeof SYNCED_TABLES)[number];
@@ -115,11 +119,6 @@ export const NEVER_SYNCED_TABLES = [
 	// of the no-timezone rule in this module's header: instants go up, days are
 	// cut by whoever is asking.
 	"stats_daily",
-	// Per-entry skill history is local-only for now. It carries invocation arguments
-	// and outcomes, and no cloud page or request schema consumes it; uploading it
-	// would therefore be a privacy expansion that buys nothing. The aggregate skill
-	// counts already travel through session_tool_use.
-	"skill_invocations",
 	// The memory half. It travels on the commit-push channel, which has its own
 	// binding rules, and `commit_aliases` answers a rebase-matching question that
 	// does not exist on a server where commits and memories arrive together.
@@ -143,13 +142,14 @@ export const NEVER_SYNCED_TABLES = [
  * The columns sent for each table, in wire order.
  *
  * Two kinds of local column are deliberately absent and are listed in
- * {@link REWRITTEN_COLUMNS} / {@link EXCLUDED_COLUMNS} instead, so the test can
+ * {@link PROJECTED_COLUMNS} / {@link EXCLUDED_COLUMNS} instead, so the test can
  * account for every column the schema has.
  */
 export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>> = {
 	sessions: [
 		"event_id",
 		"repo_identity",
+		"repo_name",
 		"source",
 		"session_id",
 		"title",
@@ -175,7 +175,20 @@ export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>
 		"est_cost_usd",
 		"updated_at_ms",
 	],
-	session_tool_use: ["session_event_id", "tool_name", "kind", "server", "calls", "last_call_at_ms", "updated_at_ms"],
+	session_tool_use: [
+		"session_event_id",
+		"tool_name",
+		"kind",
+		"server",
+		"calls",
+		"last_call_at_ms",
+		"input_tokens",
+		"output_tokens",
+		"cached_tokens",
+		"usage_confidence",
+		"plugin",
+		"updated_at_ms",
+	],
 	// Added after the three tables above were listed, and it is the one that makes
 	// a per-DAY number correct: a session row carries its cumulative total under
 	// a single timestamp, so a conversation spanning three days puts all of its
@@ -214,19 +227,43 @@ export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>
 		"updated_at_ms",
 	],
 	session_turns: ["session_event_id", "slice_id", "seq", "role", "ts_ms", "kind", "recorded_at_ms"],
+	// Event time is the invocation's identity; the independent write stamp lets a
+	// later transcript read upgrade an old outcome or injected-size measurement.
+	skill_invocations: [
+		"session_event_id",
+		"skill_name",
+		"at_ms",
+		"ok",
+		"ok_confidence",
+		"detection",
+		"entry_path",
+		// Wire name deliberately avoids the Tier-1 content-name net. The projection
+		// below reads the local INTEGER `body_chars`; no injected text is sent.
+		"injected_chars",
+		"updated_at_ms",
+	],
 };
-
 /**
- * Integer surrogate keys, replaced by the natural key they stand for. This is
- * the ONLY rewrite the format allows.
+ * Wire columns projected from a different local column.
  *
- * `repos.id` is an autoincrement local to one machine: the same repo is 3 here
- * and 17 there, so sending the integer would attach rows to whichever repo
- * happened to take that id on the server. `session_event_id` needs no rewrite —
- * an `event_id` already embeds repo, source and session id.
+ * `sessions.repo_id` is an autoincrement local to one machine: the same repo is
+ * 3 here and 17 there, so it never leaves the machine. The join projects both
+ * the stable identity used for filtering and the human display name used by
+ * detail panes. Two wire columns may therefore share one local source.
+ *
+ * `skill_invocations.body_chars` is a numeric length, but its local name matches
+ * the channel's no-exceptions content-name guard. The wire calls that value
+ * `injected_chars`, which states what is counted without weakening Tier 1.
  */
-export const REWRITTEN_COLUMNS: Readonly<Record<string, string>> = {
-	repo_id: "repo_identity",
+export const PROJECTED_COLUMNS: Readonly<Record<SyncedTable, Readonly<Record<string, string>>>> = {
+	sessions: { repo_identity: "repo_id", repo_name: "repo_id" },
+	session_model_usage: {},
+	session_tool_use: {},
+	session_usage_events: {},
+	session_activity: {},
+	memory_lookups: { repo_identity: "repo_id" },
+	session_turns: {},
+	skill_invocations: { injected_chars: "body_chars" },
 };
 
 /** Local columns held back per table, with the reason each one is held back. */
@@ -234,20 +271,10 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 	sessions: [],
 	session_model_usage: [],
 	session_usage_events: [],
-	// The skill-detail additions stay local until the cloud request schema and UI
-	// consume them. Listing them here preserves the channel's current payload rather
-	// than silently uploading every column a local dashboard feature adds. The legacy
-	// metadata_json column is also still present on databases created before it was
-	// dropped from the schema definition; no writer or reader uses it.
-	session_tool_use: [
-		"input_tokens",
-		"output_tokens",
-		"cached_tokens",
-		"usage_confidence",
-		"plugin",
-		"origin_root",
-		"metadata_json",
-	],
+	// `origin_root` is a machine path and has no cloud reader. The legacy
+	// `metadata_json` column is also still present on databases created before it
+	// was dropped from the schema definition; no writer or reader uses it.
+	session_tool_use: ["origin_root", "metadata_json"],
 	session_activity: [],
 	// The branch a `recall` asked for. Held back on the discriminator this list is
 	// for: a bounded integer discloses nothing about content, while a free-text
@@ -262,6 +289,9 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 	// next card.
 	memory_lookups: ["target"],
 	session_turns: [],
+	// Arguments can contain user-authored command/tool input. The Web detail pane
+	// consumes only the numeric injected-body length, never the body or arguments.
+	skill_invocations: ["args"],
 };
 
 /**
@@ -289,4 +319,5 @@ export const BATCH_LIMITS: Readonly<Record<SyncedTable, number>> = {
 	// enters this sum: it is a fixed-length fingerprint, not a third copy.
 	memory_lookups: 200,
 	session_turns: 200,
+	skill_invocations: 500,
 };

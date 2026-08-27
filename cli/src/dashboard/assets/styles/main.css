@@ -2011,14 +2011,9 @@ body {
    Only the two page-specific hooks are separate — `.mcp-page` narrows the third
    column and adds the tool list, both at the end of this block.
 
-   Every height budget below was derived against the SKILLS pane, and the MCPs pane is
-   held inside it by a cap of its OWN rather than by being smaller in general. Most of it
-   is a subset — no cost figures, no outcome strip, no inferred caveat — but its tool
-   list is the one section whose length belongs to the SERVER, and a real 12-tool
-   registration overran the pane by 10px before it was capped. So `MCP_DETAIL_TOOL_LIMIT`
-   is a height budget in disguise and carries that measurement; at the top end the two
-   panes are within a few pixels of each other rather than one sitting comfortably inside
-   the other. Re-derive both if either pane grows a section.
+   THE READING PANE OWNS THE DESKTOP ROW'S HEIGHT. It grows with its content and the page
+   owns the resulting scroll. `skills.js` and `mcps.js` observe that border box and mirror
+   it onto the chooser card; only the chooser's unbounded rows may scroll inside a card.
 
    THE WRAP'S 1200px CAP STAYS HERE, which is where this page parts from
    `.memories-page`. Releasing it is what a full-bleed browser needs, and this page
@@ -2027,64 +2022,18 @@ body {
    of pane in the mockup against 982px full-bleed at a 1600px viewport, which is
    wider than the 560px the pane's own figures and caveat are capped at.
 
-   ONE FIXED FRAME, AND EXACTLY ONE SCROLL REGION: THE CHOOSER'S ROWS. The page does
-   not scroll, the two columns are the same height, the rows scroll inside their own
-   card, and the reading pane holds its whole skill without scrolling. That is the
-   height rule the rest of this section is written against, and every value below
-   exists to keep the pane's content under the frame it is given.
-
-   THIS IS THE SECOND ATTEMPT AT A FIXED FRAME AND IT IS NOT THE FIRST ONE RESTORED.
-   The first was three viewport-height boxes summing to exactly 100vh — a declared
-   `--sk-band-h`, a `--sk-col-h` deriving the rest from `100vh`, and a scroll region
-   inside EACH column from the first paint. It was removed because it charged the
-   reader three scroll regions to find: measured at 1440x900, the wheel over the rows
-   moved the WINDOW 3px while the list itself stayed put, the pane carried a second bar
-   of its own, and anything at the end of either box (the paging control, the coverage
-   foot, the pane's basis line) was reachable only by discovering which box it lived in.
-   Two things differ here and both are what make the outcome different. The heights come
-   from a FLEX CHAIN (`.main` → `.wrap` → `#app` → the grid's second row), never from
-   `100vh` arithmetic, so the band's real height is subtracted rather than declared —
-   that arithmetic being 3px off the truth is what left the window scrollable. And the
-   PANE DOES NOT SCROLL: the rows are the only region with a bar, so there is no longer
-   a box whose end the reader has to go looking for.
+   ONE PAGE SCROLLER, AND NO DETAIL-PANE SCROLLER. A long detail extends the document;
+   changing the selected row or expanding its prose re-measures both bottom cards so
+   their borders stay aligned without clipping the reading pane.
 
    WHY THE ROWS ARE THE ONE REGION THAT KEEPS A BAR: the corpus is unbounded (a machine
-   can hold hundreds of skills) while a skill's detail is not — the server caps the
-   outcome strip at 50 entries, agents are an enum, and `The record` is five fixed
-   fields. So the rows are the only content whose height cannot be bounded by design,
-   and the flex chain hands them whatever the frame has left instead of the measured
-   pixel cap `listOpenTag` used to write inline.
+   can hold hundreds of skills), while the reading pane has a finite detail response.
+   Its measured height gives the chooser a window; the list uses whatever remains after
+   the chooser's head, loading line, and coverage foot.
 
-   THE BAND'S CHART IS SIZED FROM THE VIEWPORT'S HEIGHT, which is the one thing that
-   makes the pane fit on a short window. It is the chart's OWN HEIGHT that `clamp()`
-   trades against pane room — 256px on a tall window, shrinking as the window does,
-   floored at 68px where the short-window budget below takes over. Its width is free and
-   simply follows the page. The `728px` the budget is built on is measured, not guessed —
-   61 topbar + 20 wrap top + 12 wrap bottom + 6 gap + 24 band padding + 575 for the WORST
-   pane + 30 slack.
-
-   THAT USED TO BE A `max-width`, and the reason is worth keeping: `JD.stackedBars` draws
-   7 `<text>` nodes inside its 660x238 viewBox, which rules out `preserveAspectRatio="none"`
-   + a pinned height (the trick `.sk-daybars` uses), so the box could only scale uniformly
-   and width was the only handle there was on height. The chart therefore ignored the page's
-   width entirely and paid for a short window in width instead — 240px of chart at 1280x800,
-   its labels scaled to ~5px with it. `JD.stackedBarsFrame` moves that text out to the HTML
-   beside the plot, which is what lets the height be pinned directly; `.sk-band .chart-box`
-   carries the term-by-term translation of the old expression into the new one.
-   That 575 is not the tallest real skill (574, jolli-recall) but a FORCED worst case: the
-   skill-detail response stubbed with 12 agents and `detection: "heuristic"`, so the agent
-   roll-up and the inferred caveat are both on at once. Sizing to the tallest real row
-   would leave the frame 5px short the first time a skill is shared across a machine's
-   whole agent set.
-
-   Re-derive it the same way if the pane grows a section, or if any of those terms change:
-   stub the response at its worst, then shave the constant until `.sk-pane`'s `scrollHeight`
-   stops exceeding its `clientHeight`, and leave slack. Three earlier passes are worth
-   knowing about — 696 was 9px short because the two clamped paragraphs come to 41px
-   between them rather than the ~30 the arithmetic assumed (each carries a border and
-   padding its one visible line does not reveal); 710 cleared every real skill while still
-   missing the forced case by 5px; and 716 was correct until the wrap grew its 12px bottom
-   padding, which this budget pays for one-for-one.
+   THE BAND'S CHART IS SIZED FROM AVAILABLE WIDTH, bounded between 180px and 256px.
+   Detail height no longer competes with it for a viewport budget, so a short browser
+   keeps a readable chart and lets the page continue below the fold.
 
    THE WRAP'S 1200px CAP STAYS HERE, which is where this page parts from
    `.memories-page`. It survived the chart's width becoming free, and the reason narrowed
@@ -2098,23 +2047,11 @@ body {
    BOTH columns and never shared the width with the list. Not enough to trade the page's
    alignment with every other view for. Revisit it if the pane's own caps ever come off. */
 /* `#app`, NOT `.grid`: main.js sets `#app.className = view.grid ? "grid" : ""`, and both
-   `skills` and `mcps` are declared `grid: false` there — so `#app` carries NO class here
-   and the `.grid:has(…)` rule this replaces never matched anything. It was inert for as
-   long as it shipped (harmless while the page was `display: block` by default, and a
-   silent no-op the moment the flex chain below started depending on it). */
-.jd:has(.browser-page) { height: 100vh; overflow: hidden; }
+   `skills` and `mcps` are declared `grid: false` there. */
+.jd:has(.browser-page) { height: auto; overflow: visible; }
 .jd .main:has(.browser-page) {
-	padding-bottom: 0; display: flex; flex-direction: column; height: 100vh; min-height: 0;
+	padding-bottom: 48px; display: block; height: auto; min-height: 0;
 }
-/* Deliberately NOT hidden the way Knowledge hides its own: this note is empty on this
-   view today, and `.main`'s flex column simply gives it its natural height if it ever
-   fills — which shortens the frame and is absorbed by the pane's fallback bar rather
-   than pushing the page past the fold. */
-/* `padding-bottom` so the two column cards do not sit flush against the window's bottom
-   edge — the base `.wrap` rule ends in `0` because a scrolling page has `.main`'s 48px
-   below it, and this frame has nothing. It comes out of the SAME vertical budget as
-   everything else (see the chart's `clamp()`), so the 12px is 33px of chart width; that
-   trade is why it is 12 and not the 20 that would mirror the padding above. */
 /* `width: 100%` is what pins the layout at every pane state — MEASURED THE HARD
    WAY. `.wrap` is a flex item in `.main`'s flex column with `margin: 0 auto`,
    so with no explicit width it takes its `max-content` inline size. That size
@@ -2130,23 +2067,15 @@ body {
    because `width: 100%` still yields to `max-width`. */
 .jd .wrap:has(.browser-page) {
 	width: 100%;
-	flex: 1; min-height: 0; display: flex; flex-direction: column; padding-bottom: 12px;
+	display: block; padding-bottom: 0;
 }
-.jd #app:has(.browser-page) { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.jd #app:has(.browser-page) { display: block; }
 
 .jd .browser-page {
 	display: grid; grid-template-columns: 344px minmax(0, 1fr); gap: 6px;
-	/* The band takes its own height; the columns take everything left. `minmax(0, 1fr)`
-	   rather than `1fr` so the row can be SHORTER than its content — a bare `1fr` floors
-	   at max-content, which is exactly how a nested scroll region fails to appear. */
-	grid-template-rows: auto minmax(0, 1fr);
-	flex: 1; min-height: 0;
-	/* `stretch` (the default, restated because this used to be `start`): the columns are
-	   now a frame rather than two cards sized to their own content, so they must be the
-	   same height. What `start` was protecting against — a short card stretched tall with
-	   its foot floating mid-card — is handled instead by the foot being pinned to the
-	   bottom of a flex column. */
-	align-items: stretch;
+	grid-template-rows: auto auto;
+	/* The pane keeps its natural height; JS mirrors that measurement onto the chooser. */
+	align-items: start;
 }
 
 /* Same chrome as the chooser column, spanning both. */
@@ -2155,48 +2084,14 @@ body {
 	border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
 	box-shadow: 0 2px 5px rgba(20, 30, 50, .05); padding: 14px 20px 10px;
 	display: flex; flex-direction: column;
-	/* The plot's height, and the band's whole vertical budget. Declared HERE rather than
+	/* The plot's height. Declared HERE rather than
 	   on `.chart-box` because `.sk-key` is the chart box's SIBLING, not its descendant, and
-	   caps its own height against this — a custom property only inherits downwards, so on
-	   the chart box the key would silently read it as invalid and lose its cap. Every term
-	   is derived where `.chart-box` is defined below. */
-	--sk-band-plot-h: clamp(68px, 100vh - 746px, 256px);
+	   caps its own height against this — a custom property only inherits downwards. */
+	--sk-band-plot-h: clamp(180px, 18vw, 256px);
 }
 .jd .sk-bandrow { display: flex; gap: 28px; align-items: flex-start; min-height: 0; }
-/* The plot stretches to the page; its HEIGHT is what the window's height buys.
- *
- * THIS WAS A `max-width`, AND THAT WAS THE PROBLEM. `JD.stackedBars` keeps its axis text
- * inside its viewBox, so the SVG can only scale uniformly — which left `max-width` as the
- * only handle this frame had on the chart's HEIGHT. Two costs followed. A wider browser
- * did nothing for the chart (pinned at 477px however much page it was given), and a
- * shorter window was paid for in WIDTH: 240px of chart at 1280x800, with the axis labels
- * scaled down to ~5px along with it.
- *
- * `JD.stackedBarsFrame` takes the text out of the viewBox (see `charts.js` for why that
- * is a second entry point and not a flag), so the SVG carries `preserveAspectRatio="none"`
- * and the two axes come apart. The height below keeps the budget the `max-width` used to
- * encode; the width just follows the page.
- *
- * THE HEIGHT IS THE OLD EXPRESSION RESTATED IN THE AXIS IT WAS ALWAYS ABOUT. The old
- * chart rendered at width × 238/660, so `clamp(240px, (100vh - 728px) * 2.773, 760px)`
- * WAS `clamp(86.5px, 100vh - 728px, 274px)` of height wearing a width's clothes — which
- * is why the slope here is 1 rather than 2.773. Each term is the old one less the 18px the
- * endpoint labels now take as HTML (`.sk-axis`: a 14px line plus its 4px margin):
- *     floor   86.5 - 18  ->  68px    at 1280x800, where the short-window budget below
- *                                    takes over as the binding constraint, exactly as it
- *                                    did when the floor was 240px of width
- *     base     728 + 18  -> 746px    the section header has how 728 was measured
- *     cap      274 - 18  -> 256px    reached at 1002px of window height and up
- * So the pane's room is unchanged at every window height, while the chart goes from 477px
- * to ~900px wide at this page's 1200px cap — the band spans BOTH grid columns, so it never
- * had to share the width with the 344px list. Re-derive the base the way the section
- * header says if the pane grows a section; the other two terms follow from it.
- *
- * The 760px width cap is gone rather than raised. It existed to stop the chart eating the
- * key's room back when stretching it also made it taller; with the height pinned, the key
- * wraps into columns against this same height and takes only the width it needs.
- *
- * The declaration itself lives on `.sk-band` above, because the key reads it too. */
+/* `JD.stackedBarsFrame` keeps text outside the SVG, so width and height can respond
+   independently. The width follows the page; the bounded height is declared above. */
 .jd .sk-band .chart-box { flex: 1; min-width: 0; }
 /* The tick column beside the plot. `flex-start`, so the ticks are as tall as the PLOT and
    not as tall as the plot plus the endpoint row underneath it. */
@@ -2285,12 +2180,9 @@ body {
 /* Recessed, not recoloured: a dimmed series must stay recognisably itself. */
 .jd .sk-dim { opacity: .38; }
 
-/* The chooser column: `.mem-navigator`'s chrome, filling the frame's second row. Head,
-   rows, the (usually absent) loading line and coverage foot stack; the rows are the one
-   member that flexes, so head and foot stay pinned to the card's own edges whatever the
-   window's height. `min-height: 0` is what lets the rows shrink below their content —
-   without it a flex item floors at max-content and the card grows past the frame
-   instead. `overflow: hidden` is here for the rounded corners. */
+/* The chooser column uses `.mem-navigator`'s chrome. Its measured card height is a flex
+   column: head, optional loading line and coverage foot stay pinned, while the rows take
+   the remaining space. `overflow:hidden` preserves the rounded card edge. */
 .jd .sk-nav {
 	min-width: 0; overflow: hidden; min-height: 0;
 	border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
@@ -2303,12 +2195,9 @@ body {
 	border-bottom: 1px solid var(--grid);
 }
 .jd .sk-nav-head b { color: var(--ink); font-weight: 600; }
-/* Every row, and THE PAGE'S ONE SCROLL REGION. It takes whatever height the frame has
-   left and scrolls inside it — unconditionally, where this used to become a scroller
-   only once the list outgrew the model's first page, at a MEASURED pixel cap written
-   inline by `listOpenTag`. Both the cap and the `sk-scroll` marker class are gone: the
-   flex chain now supplies the height, so there is no number for JS to measure and no
-   second state to mark.
+/* Every chooser row. The list takes whatever height remains inside the pane-sized card
+   and scrolls only when its unbounded corpus needs more room. The old measured inline
+   cap and `sk-scroll` marker remain gone.
  *
  * THE THIN BAR IS NOT DECORATION, and it is copied off `.ranklist.rl-scroll` so the
  * dashboard's scrollers read alike. macOS overlay bars are absent until a scroll is
@@ -2379,46 +2268,15 @@ body {
 .jd .sk-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
 .jd .sk-tok { font-size: 11.5px; color: var(--ink-2); }
 
-/* The reading pane: recessed on `--page` against the chooser's `--surface` so the two
-   columns read as chooser and reader, filling the frame's second row beside the rows.
- *
- * `overflow-y: auto` IS A FALLBACK, NOT THE DESIGN — and it may not become `hidden`.
- * Everything else (the band's height budget, the short-window budget, the compressions
- * below, the two clamped prose blocks, the capped agent list) exists so this bar never
- * appears, and measured it does not: every skill fits at 1440x900 and at 1280x800, the
- * forced worst case included. It still CAN — a reader at 150% browser zoom, a window
- * shorter than the budget was derived against, or a future section added to the pane.
- * `hidden` there would silently cut the end off a section with nothing on screen saying
- * so, which is strictly worse than a bar this page otherwise never shows. Opening one of
- * the clamped paragraphs can also summon it, and that is correct: the reader asked for
- * more text. */
-/* THE PADDING IS PART OF THE HEIGHT BUDGET, which is why it is tighter than a card's.
-   `clamp()` hands this pane a CONSTANT height — it is tuned so the chart absorbs every
-   spare pixel, so the pane gets `716 - 139 = 577px` at every window height in range — but
-   the pane's CONTENT height depends on the window's WIDTH, which that budget cannot see.
-   Narrower columns wrap more lines: the tallest skill measured 570px at 1440 wide and
-   579px at 1280. 577 clears the first and misses the second, which showed up as a 5px
-   overflow at 1280x817. Trimming 20/28 to 16/20 buys 12px and covers every width; the
-   alternative was raising the height constant, which would have cost EVERY window 22px of
-   chart to fix one width. */
-/* `scrollbar-gutter: stable` reserves the scrollbar's space at every state, so
-   the two-column reading in `.sk-panebody` does not reflow when the pane goes
-   from empty ("Select a skill…") to full detail — the width the reader is
-   halfway through would otherwise shift by ~10px the instant the fetch lands.
-   Same rule as `.sk-list` above; both are the fallback for the same reason. */
+/* The reading pane is recessed on `--page` against the chooser's `--surface`. It is
+   content-sized and never scrolls internally; its height is the source measurement for
+   the chooser card beside it. */
 .jd .sk-pane {
-	min-width: 0; min-height: 0; overflow-y: auto; scrollbar-gutter: stable;
+	align-self: start; width: 100%; min-width: 0; min-height: 0; overflow: visible;
 	border: 1px solid var(--border); border-radius: 10px; padding: 16px 24px 20px; background: var(--page);
 }
-/* TWO COLUMNS, PINNED — not `repeat(auto-fit, minmax(300px, 1fr))`, which made the pane's
-   HEIGHT a function of its width in a way a fixed frame cannot absorb. The pane is 802px
-   at 1440 and 670px at 1280; against a 300px floor plus the 32px gap, the second track
-   drops out somewhere between them, and the same skill that needed 727px at 1440 needed
-   892px at 1280 (both measured). A frame sized for the two-column reading would then be
-   165px short for one viewport width — with nothing about the window's HEIGHT having
-   changed. Pinning trades ~6px of column width at 1280 for a height that only depends on
-   the content. The identity row, the figures, the caveat and the basis line still span
-   both because they are about the whole skill rather than one reading of it. */
+/* Two stable reading columns. The identity row, figures, caveat and basis span both
+   because they describe the whole skill rather than one section of its detail. */
 .jd .sk-panebody { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 0 32px; align-items: start; }
 .jd .sk-panebody > .sk-title,
 .jd .sk-panebody > .sk-figs,
@@ -2429,9 +2287,7 @@ body {
 .jd .sk-title { font-size: 14px; font-weight: 600; color: var(--ink); word-break: break-all; }
 .jd .sk-kind { display: inline-block; margin-left: 6px; font-size: 11px; color: var(--ink-2); font-weight: 400; }
 
-/* Two across, because four figures on one row at this width wrapped their labels. The
-   gaps are tighter than a card's would be — see the section header: every vertical
-   measurement in this pane is spending the frame's fixed budget. */
+/* Two across, because four figures on one row at this width wrapped their labels. */
 .jd .sk-figs { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 12px; margin-top: 8px; }
 .jd .sk-fig b { display: block; font-size: 17px; font-weight: 600; color: var(--ink); line-height: 1.2; }
 .jd .sk-fig span { display: block; font-size: 11px; color: var(--ink-2); margin-top: 2px; }
@@ -2535,8 +2391,7 @@ body {
  * paragraph a one-line flex box. Both keywords are unprefixed-equivalent in every engine
  * this dashboard runs in (it is a local page in the viewer's own browser).
  *
- * Opening one can push the pane past its frame and summon the fallback bar above. That is
- * correct: the reader asked for more text, and the bar is a truthful response to it. */
+ * Opening one grows the pane, re-measures the chooser, and lets the page scroll. */
 .jd .sk-clamp {
 	display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 1;
 	overflow: hidden; cursor: pointer;
@@ -2597,57 +2452,9 @@ body {
    by and what the row is read for, so the second number recedes rather than competing. */
 .jd .mcp-tool .mcp-tool-sess { font-size: 11px; }
 
-/* ── THE SHORT-WINDOW BUDGET ────────────────────────────────────────────────────────
-   Two rules that only make sense together: on a window this short the band's chart has
-   already bottomed out on its `clamp()` floor, so the last pixels the pane needs have to
-   come from somewhere that is not the chart. Both give up WHITESPACE, never a measurement
-   or a word.
-
-   THERE WERE THREE, AND THE THIRD IS NOW UNCONDITIONAL. Lying the key down was the
-   largest single saving here (14px, below); `.sk-key` caps its own height against the
-   plot's at every window size instead, so the key can no longer be what the band's height
-   is made of and there is nothing left for this breakpoint to reclaim from it. That rule
-   carries why a wrapping ROW became the wrong shape once the chart's width was freed.
-
-   IT MUST STAY BELOW ANY RULE IT OVERRIDES. A media query adds no specificity, so between
-   two `.jd .sk-band` rules source order is the only thing deciding the winner. Written
-   next to `.sk-key` — its most interesting member — this block sat ABOVE `.sk-pane`, and
-   the pane's padding silently did not apply while the band's did: the shape of bug that
-   looks like the whole block working.
-
-   816px WAS DERIVED, NOT PICKED, and it is worth keeping the derivation even though what
-   it was derived FOR has moved. The chart's height then reduced to `100vh - 712px` (its
-   `clamp()` slope was `2.773` = 660/238 and its height was width × 238/660 — exact
-   reciprocals). Stacked, the key is 104px, five rows plus its margin. Set the two equal
-   and the crossover is 816px: above it the chart was the taller of the pair and lying the
-   key down saved nothing, below it the KEY was what the band's height was made of. The
-   key's own cap now holds on both sides of that line, so this is no longer the crossover
-   of anything — it survives as the measured threshold for the two whitespace trims, which
-   were tuned against 1280x800 and are not needed above it.
-
-   A height media query, which this stylesheet has none of otherwise — and it has to be
-   one: the quantity being traded IS vertical space, and the same window at twice the
-   width has exactly the same problem.
-
-   MEASURED AT 1280x800, on the two skills that were overflowing the pane by 21px:
-     key lying down    band 154 → 140   (−14, and this was the whole of it — the key was
-                                         104 against the chart box's 90, so only the
-                                         difference was ever available. NOW UNCONDITIONAL
-                                         and larger: the key's cap is the plot's height,
-                                         so it gives back everything, not the difference)
-     band padding      band 140 → 134   (−6, 14/10 → 10/8)
-     wrap bottom       12px → 8px       (−4, the last 2px the pane was missing at 800)
-   …and the pane's own padding, now trimmed at every width (see `.sk-pane`), covers the
-   rest. Dropping the chart's floor to 220px was the other way to find those pixels and
-   was rejected: padding is whitespace, a narrower chart is less of the thing the band
-   exists to show.
-
-   The bottom gap narrows rather than disappearing: by this point the chart is already on
-   its floor, so the pixels have to come from somewhere, and 8px still reads as a gap
-   while 0 reads as a card welded to the window's edge. */
+/* A short window trims only band whitespace; detail content remains intact below. */
 @media (max-height: 816px) {
 	.jd .sk-band { padding: 10px 20px 8px; }
-	.jd .wrap:has(.browser-page) { padding-bottom: 8px; }
 }
 
 /* No wrap-padding overrides at either breakpoint: the wrap keeps its own 24px and
@@ -2656,18 +2463,8 @@ body {
 	.jd .browser-page { grid-template-columns: 320px minmax(0, 1fr); }
 }
 @media (max-width: 899px) {
-	/* THE WHOLE FIXED FRAME COMES OFF HERE, not just the second column. Once the columns
-	   stack there is no frame worth holding: the two cards are above and below each other
-	   rather than side by side, so pinning them to a shared height would make the reader
-	   scroll INSIDE a card to reach content that has the whole page below it. A scroll
-	   region nested in a scrolling page is awkward under a mouse and worse under a thumb,
-	   and at this width there is no second column beside the list for a short one to be
-	   keeping room for. So every rule the desktop frame installs is reversed and the page
-	   scrolls again, which is also what the `.main` bottom padding is back for.
-	 *
-	 * `.sk-list`'s cap needs no `!important` any more: it used to be an inline pixel value
-	   written by `listOpenTag`, which nothing but `!important` outranks, and the flex chain
-	   replaced it with a stylesheet rule this block can simply override. */
+	/* Once the columns stack, release the synchronized desktop height and put both cards
+	   into the page's normal document flow. */
 	.jd:has(.browser-page) { height: auto; overflow: visible; }
 	.jd .main:has(.browser-page) { display: block; height: auto; padding-bottom: 48px; }
 	.jd .wrap:has(.browser-page) { display: block; flex: none; }

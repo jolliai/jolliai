@@ -44,7 +44,7 @@ async function isNotNull(table: string, column: string): Promise<boolean> {
 
 describe("sync stamp columns", () => {
 	// The map is the only thing standing between a caller and `WHERE
-	// updated_at_ms >= ?` against all four tables — which compiles, runs, and
+	// updated_at_ms >= ?` against all five outbound tables — which compiles, runs, and
 	// reads the wrong column on `sessions`. Pin every entry against the real
 	// schema so a rename cannot pass silently.
 	it("names a column that actually exists on each table", async () => {
@@ -163,6 +163,26 @@ describe("keyset columns", () => {
 
 	it("covers every synced table", () => {
 		expect(Object.keys(KEYSET_COLUMNS).sort()).toEqual([...SYNC_STAMP_TABLES].sort());
+	});
+
+	it("drives skill-invocation paging from the full keyset index", async () => {
+		await withDashboardDb(
+			(db) => {
+				const plan = db
+					.prepare(
+						`EXPLAIN QUERY PLAN
+						 SELECT * FROM skill_invocations t
+						  WHERE (t.updated_at_ms, t.session_event_id, t.skill_name, t.at_ms) >= (?, ?, ?, ?)
+						  ORDER BY t.updated_at_ms, t.session_event_id, t.skill_name, t.at_ms
+						  LIMIT ?`,
+					)
+					.all(0, "", "", "", 500) as Array<{ detail: string }>;
+				const details = plan.map((row) => row.detail).join("\n");
+				expect(details).toContain("ix_si_keyset");
+				expect(details).not.toMatch(/SCAN t|USE TEMP B-TREE/);
+			},
+			{ dbPath },
+		);
 	});
 });
 

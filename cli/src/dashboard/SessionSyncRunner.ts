@@ -36,10 +36,13 @@ import {
 	type SessionPushResult,
 } from "../core/JolliMemoryPushClient.js";
 import {
+	completeReplayForScope,
 	cursorsFor,
 	loadChannelForRun,
 	MIN_ATTEMPT_INTERVAL_MS,
+	prepareReplayForScope,
 	readSessionPushChannel,
+	replayForScope,
 	type SessionPushChannelState,
 	type SessionPushCursors,
 	SILENCE_MS,
@@ -47,6 +50,7 @@ import {
 	type TableCursor,
 	toTableCursor,
 	withCursors,
+	withReplayCursors,
 	withSilence,
 	writeSessionPushChannel,
 } from "../core/SessionPushCursor.js";
@@ -54,7 +58,7 @@ import { loadConfig } from "../core/SessionTracker.js";
 import { createLogger, errMsg } from "../Logger.js";
 import { canUseDashboardDb, getDashboardDbPath, withReadonlyDashboardDb } from "./DashboardDb.js";
 import { isRepoDisabled, readRepoRegistryStrict } from "./RepoRegistry.js";
-import { SYNCED_TABLES, type SyncedTable } from "./SessionPushManifest.js";
+import { BATCH_LIMITS, SYNCED_TABLES, type SyncedTable } from "./SessionPushManifest.js";
 import {
 	batchSize,
 	batchTables,
@@ -85,6 +89,19 @@ export const MAX_BATCHES_PER_RUN = 10;
  */
 export const MAX_CURSOR_RETRIES = 2;
 
+/** Request shape spoken by this build; see `SessionPushPayload.version`. */
+const SESSION_PAYLOAD_VERSION = 3;
+
+/**
+ * Tables whose existing rows gained wire data and need one client-owned replay.
+ *
+ * This does not change the wire protocol and does not reset the server cursor.
+ * The upgraded client walks these local tables independently from zero, so an
+ * older client can continue writing its own server cursor without racing it.
+ */
+const HISTORICAL_REPLAY_TABLES = ["sessions", "session_tool_use", "skill_invocations"] as const;
+const HISTORICAL_REPLAY_GENERATION = "skills-mcps-fields-v1";
+
 export interface SessionSyncOptions {
 	/**
 	 * No `cwd`: this run has no repo of its own. The channel is cross-repo, so
@@ -106,7 +123,6 @@ export interface SessionSyncOptions {
 	 */
 	readonly force?: boolean;
 }
-
 export type SessionSyncOutcome =
 	| { readonly status: "skipped"; readonly reason: string }
 	| {
@@ -301,6 +317,8 @@ async function sync(
 	const dbPath = getDashboardDbPath();
 	const instanceId = await withReadonlyDashboardDb(readDbInstanceId, { dbPath });
 	state = reconcileInstance(state, instanceId, scope);
+	state = prepareReplayForScope(state, scope, legacyKey, HISTORICAL_REPLAY_GENERATION, HISTORICAL_REPLAY_TABLES);
+	writeSessionPushChannel(state, opts.configDir);
 
 	let batches = 0;
 	let rows = 0;
@@ -314,6 +332,126 @@ async function sync(
 	// held their cursor. Withholding them is also what keeps `heldRows` a count of
 	// ROWS rather than of attempts.
 	const heldTables = new Set<SyncedTable>();
+
+	// Drain the one-time replay before ordinary incremental work. Its keysets are
+	// local-only: a server may already hold a much higher cursor, and adopting that
+	// response here would jump directly over the historical pages this pass exists
+	// to resend. The server accepts a client behind its cursor and upserts the rows;
+	// every acknowledged page is therefore advanced by the page's own local maximum.
+	let replay = replayForScope(state, scope, HISTORICAL_REPLAY_GENERATION);
+	const replayWasPending = replay !== undefined && !replay.completed;
+	while (replay !== undefined && !replay.completed && batches < MAX_BATCHES_PER_RUN) {
+		const completedTables = new Set(replay.completedTables);
+		const includedTables = new Set<SyncedTable>(
+			HISTORICAL_REPLAY_TABLES.filter((table) => !completedTables.has(table)),
+		);
+		if (includedTables.size === 0) {
+			state = finishHistoricalReplay(state, scope, legacyKey, replay.cursors, completedTables);
+			writeSessionPushChannel(state, opts.configDir);
+			break;
+		}
+		const batch = await withReadonlyDashboardDb(
+			(db) =>
+				readSessionBatch(db, {
+					cursors: replay?.cursors ?? {},
+					nowMs,
+					excludedIdentities,
+					includedTables,
+				}),
+			{ dbPath },
+		);
+
+		// Empty affected tables need no acknowledgement. Recording them as drained
+		// avoids manufacturing a request whose only purpose would be an empty cursor.
+		for (const table of includedTables) {
+			if (batch[table].rows.length === 0) completedTables.add(table);
+		}
+		if (isBatchEmpty(batch)) {
+			state = finishHistoricalReplay(state, scope, legacyKey, replay.cursors, completedTables);
+			writeSessionPushChannel(state, opts.configDir);
+			break;
+		}
+
+		try {
+			const result = await client.pushSessions({
+				version: SESSION_PAYLOAD_VERSION,
+				clientId: state.clientId,
+				cursor: wireCursor(replay.cursors),
+				tables: batchTables(batch),
+			});
+			batches++;
+			cursorRetries = 0;
+			const unknown = unacknowledgedTables(batch, result);
+			const stripped = rowsIn(batch, unknown);
+			rows += batchSize(batch) - stripped;
+			heldRows += stripped;
+			for (const table of unknown) heldTables.add(table);
+
+			const maxima = localMaxima(batch);
+			const nextReplayCursors: Record<string, TableCursor> = { ...replay.cursors };
+			for (const table of includedTables) {
+				if (unknown.has(table)) continue;
+				const maximum = maxima[table];
+				if (maximum !== undefined) nextReplayCursors[table] = maximum;
+				if (batch[table].rows.length < BATCH_LIMITS[table]) completedTables.add(table);
+			}
+
+			if (HISTORICAL_REPLAY_TABLES.every((table) => completedTables.has(table))) {
+				state = finishHistoricalReplay(state, scope, legacyKey, nextReplayCursors, completedTables);
+			} else {
+				state = withReplayCursors(state, scope, HISTORICAL_REPLAY_GENERATION, nextReplayCursors, [
+					...completedTables,
+				]);
+			}
+			writeSessionPushChannel(state, opts.configDir);
+
+			if (unknown.size > 0) {
+				log.warn(
+					"session sync: historical replay is waiting for %s to be acknowledged by %s; its cursor remains queued",
+					[...unknown].join(", "),
+					scope,
+				);
+				break;
+			}
+			replay = replayForScope(state, scope, HISTORICAL_REPLAY_GENERATION);
+		} catch (err) {
+			if (err instanceof SessionCursorAheadError) {
+				cursorRetries++;
+				if (cursorRetries > MAX_CURSOR_RETRIES) {
+					log.warn(
+						"session sync: the server kept moving behind the historical replay — stopping until the next trigger",
+					);
+					return { status: "failed", reason: "cursor kept moving backwards" };
+				}
+				// A server cursor can only be below this dedicated replay after external
+				// cursor loss. Restarting the three local walks is safe and prevents the
+				// replay from claiming completion over a range the server forgot.
+				const reset = replayOrigin();
+				state = withReplayCursors(state, scope, HISTORICAL_REPLAY_GENERATION, reset);
+				writeSessionPushChannel(state, opts.configDir);
+				replay = replayForScope(state, scope, HISTORICAL_REPLAY_GENERATION);
+				continue;
+			}
+			return { status: "failed", reason: classifyAndRecord(err, state, nowMs, scope, opts) };
+		}
+	}
+
+	replay = replayForScope(state, scope, HISTORICAL_REPLAY_GENERATION);
+	if (replay !== undefined && !replay.completed) {
+		if (batches > 0) {
+			log.info(
+				"session sync: historical replay sent %d row(s) in %d batch(es); more remains queued",
+				rows,
+				batches,
+			);
+		}
+		return { status: "done", batches, rows, held: { rows: heldRows, tables: [...heldTables] } };
+	}
+	if (replayWasPending && batches > 0) {
+		log.info("session sync: historical replay completed after %d row(s) in %d batch(es)", rows, batches);
+		return { status: "done", batches, rows, held: { rows: heldRows, tables: [...heldTables] } };
+	}
+
 	while (batches < MAX_BATCHES_PER_RUN) {
 		const cursors = cursorsFor(state, scope, legacyKey);
 		const batch = withoutHeldTables(
@@ -334,7 +472,9 @@ async function sync(
 		}
 		try {
 			const result = await client.pushSessions({
-				version: 2,
+				// Keep the full keyset position in the server's response. A bare stamp
+				// cannot advance through a millisecond containing a full page of rows.
+				version: SESSION_PAYLOAD_VERSION,
 				clientId: state.clientId,
 				cursor: wireCursor(cursors),
 				tables: batchTables(batch),
@@ -546,6 +686,38 @@ function reconcileInstance(
 	return { ...state, dbInstanceId: instanceId };
 }
 
+/** Zero keysets for every table in the one-time historical replay. */
+function replayOrigin(): SessionPushCursors {
+	return Object.fromEntries(HISTORICAL_REPLAY_TABLES.map((table) => [table, { stamp: 0, key: [] }]));
+}
+
+/**
+ * Atomically publishes the replay's final local positions as normal progress and
+ * records the generation complete. The positions remain local maxima rather
+ * than the server's reply: a higher server cursor may have been written by an
+ * old client, and using it here would reintroduce the range-skipping race this
+ * replay is designed to avoid.
+ */
+function finishHistoricalReplay(
+	state: SessionPushChannelState,
+	scope: string,
+	legacyKey: string | undefined,
+	replayCursors: SessionPushCursors,
+	completedTables: ReadonlySet<string>,
+): SessionPushChannelState {
+	const normal: Record<string, TableCursor> = { ...cursorsFor(state, scope, legacyKey) };
+	for (const table of HISTORICAL_REPLAY_TABLES) {
+		normal[table] = replayCursors[table] ?? { stamp: 0, key: [] };
+	}
+	return completeReplayForScope(
+		withCursors(state, scope, normal),
+		scope,
+		HISTORICAL_REPLAY_GENERATION,
+		replayCursors,
+		[...completedTables],
+	);
+}
+
 /** Only the tables that have a cursor — an absent one means "first run". */
 function wireCursor(cursors: SessionPushCursors): Record<string, TableCursor> {
 	const wire: Record<string, TableCursor> = {};
@@ -606,7 +778,10 @@ function rowsIn(batch: SessionBatch, tables: ReadonlySet<string>): number {
  * every new table spends some window in exactly this state.
  *
  * Two signals, and either one counts as an acknowledgement:
- *  - `accepted[table]` — the row count the server says it wrote.
+ *  - an `accepted[table]` KEY — the server says it processed this table. The
+ *    count itself is deliberately not compared with the page length: selection
+ *    is `>=`, so every non-first page re-sends one already-stored boundary row,
+ *    and a backend may report newly inserted rows rather than submitted rows.
  *  - a KEY in the cursor reply. The backend fills one for every table it knows,
  *    `null` included ("I know it, I hold nothing"), so an ABSENT key is the
  *    server saying it does not know the table rather than having no opinion. That

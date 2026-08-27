@@ -86,6 +86,32 @@
 	/* The server the column has already been scrolled to, so a selection is revealed
 	   ONCE rather than on every repaint. */
 	var scrolledToServer = null;
+	var paneHeightObserver = null;
+
+	/** Mirrors the reading pane's natural height onto the chooser card. The page, not
+	 *  the detail card, owns vertical scrolling; only the chooser's unbounded row list
+	 *  may scroll inside its measured card. */
+	function syncBottomCardHeights(app) {
+		var nav = app.querySelector(".sk-nav");
+		var pane = app.querySelector(".sk-pane");
+		if (!nav || !pane || !nav.style || !pane.getBoundingClientRect) return;
+		if (window.matchMedia && window.matchMedia("(max-width: 899px)").matches) {
+			nav.style.height = "";
+			return;
+		}
+		var height = pane.getBoundingClientRect().height || pane.offsetHeight || 0;
+		if (height > 0) nav.style.height = height + "px";
+	}
+
+	function observeBottomCardHeights(app) {
+		if (paneHeightObserver) paneHeightObserver.disconnect();
+		paneHeightObserver = null;
+		syncBottomCardHeights(app);
+		var pane = app.querySelector(".sk-pane");
+		if (!pane || !window.ResizeObserver) return;
+		paneHeightObserver = new window.ResizeObserver(() => syncBottomCardHeights(app));
+		paneHeightObserver.observe(pane);
+	}
 
 	/** The selected server, read from the address rather than from a variable. */
 	function selectedServer() {
@@ -400,6 +426,7 @@
 		var usage = (model.stats && model.stats.toolUsage) || {};
 		pane.innerHTML = paneHtml(usage, model.timeZone);
 		bindProse(app);
+		syncBottomCardHeights(app);
 	}
 
 	/** Chart/list linking helper: marks bar rects belonging to the selected series with
@@ -497,6 +524,7 @@
 		bindSelection(app, model);
 		bindProse(app);
 		applyBandActive(app);
+		observeBottomCardHeights(app);
 	}
 
 	// ── The band ────────────────────────────────────────────────────────────────
@@ -1063,6 +1091,7 @@
 			var toggle = () => {
 				openProse["sk-basis"] = openProse["sk-basis"] !== true;
 				element.setAttribute("aria-expanded", openProse["sk-basis"] ? "true" : "false");
+				syncBottomCardHeights(app);
 			};
 			element.onclick = toggle;
 			element.onkeydown = (event) => {

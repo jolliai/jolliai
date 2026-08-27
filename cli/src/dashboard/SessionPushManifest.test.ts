@@ -15,7 +15,7 @@ import { type DashboardDbHandle, withDashboardDb } from "./DashboardDb.js";
 import {
 	EXCLUDED_COLUMNS,
 	NEVER_SYNCED_TABLES,
-	REWRITTEN_COLUMNS,
+	PROJECTED_COLUMNS,
 	SYNCED_COLUMNS,
 	SYNCED_TABLES,
 	type SyncedTable,
@@ -69,14 +69,18 @@ describe("session push manifest", () => {
 	for (const table of SYNCED_TABLES) {
 		it(`accounts for every column of ${table}`, async () => {
 			const actual = await columnsOf(table);
+			const declared = declaredLocalColumns(table);
+			// A local schema is a set of columns. Two wire projections may share one
+			// source, but that source must appear exactly once in this local declaration.
+			expect(new Set(declared).size).toBe(declared.length);
 			// Nothing the schema has may be unaccounted for — that is the added-column
 			// alarm, and the reason this is a set comparison rather than a length check.
-			expect(actual.filter((c) => !declaredLocalColumns(table).includes(c))).toEqual([]);
+			expect(actual.filter((c) => !declared.includes(c))).toEqual([]);
 			// And every column the manifest SENDS must exist. (The excluded ones are
 			// exempt in this direction on purpose: `metadata_json` is gone from the
 			// definition but still present on older databases, so it is legitimately
 			// absent here while still worth holding back.)
-			const sent = declaredLocalColumns(table).filter((c) => !EXCLUDED_COLUMNS[table].includes(c));
+			const sent = declared.filter((c) => !EXCLUDED_COLUMNS[table].includes(c));
 			expect(sent.filter((c) => !actual.includes(c))).toEqual([]);
 		});
 	}
@@ -90,13 +94,13 @@ describe("session push manifest", () => {
 		expect([...SYNC_STAMP_TABLES].sort()).toEqual([...SYNCED_TABLES].sort());
 	});
 
-	it("rewrites the machine-local surrogate key and nothing else", async () => {
+	it("projects every table's declared local columns without leaking the originals", async () => {
 		// `repos.id` is an autoincrement: the same repo has a different integer on
 		// every machine, so sending it would attach rows to whatever repo happened
 		// to hold that id on the server.
 		for (const table of SYNCED_TABLES) {
 			const local = await columnsOf(table);
-			for (const [from, to] of Object.entries(REWRITTEN_COLUMNS)) {
+			for (const [to, from] of Object.entries(PROJECTED_COLUMNS[table])) {
 				if (!local.includes(from)) continue;
 				expect(SYNCED_COLUMNS[table]).toContain(to);
 				expect(SYNCED_COLUMNS[table]).not.toContain(from);
@@ -149,6 +153,13 @@ describe("session push manifest", () => {
 				expect(TRANSCRIPT_NET.test(column), `${table}.${column} is a tier-1 column`).toBe(false);
 			}
 		}
+		// The sensitive local source stays visible to the coverage guard, while the
+		// wire uses a content-neutral name and carries only its INTEGER count.
+		expect(PROJECTED_COLUMNS.skill_invocations.injected_chars).toBe("body_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).toContain("injected_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).not.toContain("body_chars");
+		expect(SYNCED_COLUMNS.skill_invocations).not.toContain("args");
+		expect(EXCLUDED_COLUMNS.skill_invocations).toContain("args");
 	});
 });
 
