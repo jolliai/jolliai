@@ -1447,7 +1447,10 @@ describe("doctor --sync-sessions", () => {
 			held: { rows: 200, tables: ["memory_lookups"] },
 		});
 		expect(out).not.toContain("up to date");
-		expect(out).toContain("Uploaded 0 row(s)");
+		// No "Uploaded 0 row(s)" summary either: nothing was stored, so a "✓ Uploaded"
+		// line would read as a success for a run that uploaded nothing. The held line
+		// carries this case alone.
+		expect(out).not.toContain("Uploaded");
 		// Named, not just counted. Backend-first deployment is the policy, so this
 		// line prints only when that policy broke — and then the table is the one
 		// thing a reader can act on, because it says which deploy is behind.

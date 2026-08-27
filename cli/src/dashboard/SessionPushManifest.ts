@@ -64,6 +64,7 @@ export const SYNCED_TABLES = [
 	// release that started sending it; that disclosure is the consent mechanism and
 	// cannot lag a version behind.
 	"memory_lookups",
+	"session_turns",
 ] as const;
 
 export type SyncedTable = (typeof SYNCED_TABLES)[number];
@@ -212,6 +213,7 @@ export const SYNCED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string>>
 		"hit",
 		"updated_at_ms",
 	],
+	session_turns: ["session_event_id", "slice_id", "seq", "role", "ts_ms", "kind", "recorded_at_ms"],
 };
 
 /**
@@ -259,6 +261,7 @@ export const EXCLUDED_COLUMNS: Readonly<Record<SyncedTable, ReadonlyArray<string
 	// from `result_count` on a recall, and "did memory answer" is the most likely
 	// next card.
 	memory_lookups: ["target"],
+	session_turns: [],
 };
 
 /**
@@ -285,4 +288,5 @@ export const BATCH_LIMITS: Readonly<Record<SyncedTable, number>> = {
 	// client cannot tell apart from a transient failure. `receipt_id` no longer
 	// enters this sum: it is a fixed-length fingerprint, not a third copy.
 	memory_lookups: 200,
+	session_turns: 200,
 };

@@ -53,6 +53,7 @@ import { resolveTranscriptIdsFiltered } from "../core/SummaryTree.js";
 import { createLogger } from "../Logger.js";
 import type { CommitSummary, FileWrite, StoredTranscript, SummaryIndex } from "../Types.js";
 import { type DashboardDbHandle, inTransaction } from "./DashboardDb.js";
+import { deleteSliceSessionTurns, projectSessionTurns } from "./SessionTurnsProjection.js";
 import {
 	commitDateMs,
 	markdownTitle,
@@ -478,6 +479,10 @@ function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, n
 		db.prepare("DELETE FROM transcript_sessions WHERE repo_id = ? AND transcript_id = ?").run(repoId, id);
 		db.prepare("DELETE FROM memory_transcripts WHERE repo_id = ? AND transcript_id = ?").run(repoId, id);
 		db.prepare("DELETE FROM transcripts WHERE repo_id = ? AND transcript_id = ?").run(repoId, id);
+		// `session_turns` does not cascade from `transcripts` (its only FK is on
+		// `sessions`), so the slice's turns must be cleared explicitly or they linger
+		// and keep syncing for a transcript that no longer exists.
+		deleteSliceSessionTurns(db, repoId, id);
 	}
 	for (const { id, content } of c.transcriptWrites) {
 		const parsed = tryParse<StoredTranscript>(content);
@@ -498,6 +503,13 @@ function landTranscripts(db: DashboardDbHandle, repoId: number, c: Classified, n
 				 ON CONFLICT(repo_id, transcript_id, session_id) DO UPDATE SET source = excluded.source`,
 			).run(repoId, id, session.sessionId, session.source ?? null);
 		}
+		// Clear the whole slice before reprojecting: `projectSessionTurns` only
+		// deletes rows for the sessions it is given, so a rewrite whose session list
+		// shrank would strand the dropped sessions' turns. The write path always holds
+		// the complete session set, so a whole-slice wipe here is safe (the backfill,
+		// which narrows to uncovered sessions, must never do this).
+		deleteSliceSessionTurns(db, repoId, id);
+		projectSessionTurns(db, repoId, id, parsed.sessions, nowMs);
 		landed.add(id);
 	}
 	return landed;

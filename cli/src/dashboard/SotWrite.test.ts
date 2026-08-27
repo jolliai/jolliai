@@ -459,6 +459,68 @@ describe("links", () => {
 	});
 });
 
+// `session_turns` has no FK cascade from `transcripts` (only from `sessions`) and
+// `projectSessionTurns` deletes only the sessions it re-projects — so both the
+// delete path and a shrinking rewrite must clear the slice explicitly or leave
+// rows that keep syncing for a slice/session that is gone.
+describe("session_turns lifecycle", () => {
+	const seedSession = (source: string, sessionId: string): Promise<void> =>
+		withDashboardDb(
+			(db) =>
+				db
+					.prepare(
+						"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms) VALUES (?, ?, ?, ?, ?)",
+					)
+					.run(`session:1:${source}:${sessionId}`, 1, source, sessionId, 1),
+			{ dbPath },
+		) as Promise<void>;
+	const turnCount = async (): Promise<number> =>
+		(await rows<{ n: number }>("SELECT count(*) AS n FROM session_turns"))[0].n;
+	const sess = (sessionId: string, content: string, ts: string) => ({
+		sessionId,
+		source: "claude",
+		entries: [{ role: "human", content, timestamp: ts }],
+	});
+
+	it("removes a slice's turns when the transcript is deleted", async () => {
+		await seedSession("claude", "s1");
+		await storage.writeFiles(
+			[file("transcripts/t-1.json", { sessions: [sess("s1", "hi", "2026-07-01T00:00:00.000Z")] })],
+			"m",
+		);
+		expect(await turnCount()).toBe(1);
+
+		await storage.writeFiles([{ path: "transcripts/t-1.json", content: "", delete: true }], "m");
+		expect(await turnCount()).toBe(0);
+	});
+
+	it("drops a removed session's turns when a transcript is rewritten smaller", async () => {
+		await seedSession("claude", "s1");
+		await seedSession("claude", "s2");
+		await storage.writeFiles(
+			[
+				file("transcripts/t-1.json", {
+					sessions: [
+						sess("s1", "a", "2026-07-01T00:00:00.000Z"),
+						sess("s2", "b", "2026-07-01T00:00:01.000Z"),
+					],
+				}),
+			],
+			"m",
+		);
+		expect(await turnCount()).toBe(2);
+
+		// Same slice re-written without s2: its turns must not linger.
+		await storage.writeFiles(
+			[file("transcripts/t-1.json", { sessions: [sess("s1", "a", "2026-07-01T00:00:00.000Z")] })],
+			"m",
+		);
+		expect(await rows("SELECT session_event_id FROM session_turns")).toEqual([
+			{ session_event_id: "session:1:claude:s1" },
+		]);
+	});
+});
+
 describe("no-op writes that still harvest", () => {
 	it("index.json contributes treeHash and nothing else", async () => {
 		await storage.writeFiles(

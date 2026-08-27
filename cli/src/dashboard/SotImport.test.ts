@@ -1251,6 +1251,63 @@ describe("importRepoMemory — catch-up on a fenced repo (post-fence SQLite rows
 		]);
 	});
 
+	it("stamps catch-up session_turns above the sync cursor, not at the fence", async () => {
+		// `session_turns.recorded_at_ms` is the session-sync keyset cursor, NOT a
+		// protect-guard column (nothing reads it to decide whether a source may win —
+		// the transcript body's guard is `written_at_ms`). On a fenced repo the cursor
+		// has already advanced to "now" via post-cutover live projections, so a catch-up
+		// that re-projects turns at the `written_at_ms`-semantics `stampMs` (fence-1)
+		// would land them BELOW that cursor, where the keyset scan pages straight over
+		// them — a silent, permanent sync loss, the exact failure the backfill's own
+		// `Math.max(now, max+1)` floor exists to prevent.
+		const files = fixture({
+			// Real entries: an empty `entries[]` projects zero rows, hiding the bug.
+			"transcripts/t-root.json": JSON.stringify({
+				sessions: [
+					{
+						sessionId: "s1",
+						source: "claude",
+						entries: [
+							{ role: "human", timestamp: "2026-07-01T00:00:00.000Z" },
+							{ role: "assistant", timestamp: "2026-07-01T00:01:00.000Z" },
+						],
+					},
+				],
+			}),
+		});
+		// Pre-fence import: writes the transcript at written_at_ms = 2_000 (< fence), so
+		// the catch-up below is NOT protected away and actually re-projects it. The `s1`
+		// sessions row does not exist yet, so no turns are written on this pass.
+		await runImport(files, 2_000);
+		await withDashboardDb(
+			(db) => {
+				const repoId = (db.prepare("SELECT id FROM repos").get() as { id: number }).id;
+				// The row `projectSessionTurns` joins on to resolve s1 → event_id.
+				db.prepare(
+					"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms) VALUES (?, ?, 'claude', 's1', ?)",
+				).run("evt-s1", repoId, 2_000);
+				// An already-advanced cursor: a live post-cutover projection at 9_000.
+				db.prepare(
+					"INSERT INTO sessions (event_id, repo_id, source, session_id, updated_at_ms) VALUES (?, ?, 'claude', 'live', ?)",
+				).run("evt-live", repoId, 9_000);
+				db.prepare(
+					`INSERT INTO session_turns (session_event_id, slice_id, seq, role, ts_ms, kind, recorded_at_ms)
+					 VALUES ('evt-live', 'live-slice', 0, 'human', 9000, 'turn', 9000)`,
+				).run();
+			},
+			{ dbPath },
+		);
+		// Catch-up on the fenced repo: stampMs = min(6_000, fenceMs - 1) = 3_999.
+		const { query } = await runImport(files, 6_000, "catch-up", fenceMs);
+		const [row] = await query<{ lo: number | null; n: number }>(
+			"SELECT MIN(recorded_at_ms) AS lo, COUNT(*) AS n FROM session_turns WHERE session_event_id = 'evt-s1'",
+		);
+		expect(row.n).toBe(2); // the projection actually ran
+		// Every re-projected turn sits at or above the cursor it found (9_000), never
+		// at the fence-derived 3_999.
+		expect(row.lo).toBeGreaterThanOrEqual(9_000);
+	});
+
 	it("fills a genuinely missing node by mounting against the STORED tree", async () => {
 		const files = fixture();
 		await runImport(files);

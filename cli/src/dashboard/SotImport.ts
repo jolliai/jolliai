@@ -47,6 +47,7 @@ import { type DashboardDbHandle, inTransaction } from "./DashboardDb.js";
 import { importTakesPath } from "./ImportablePaths.js";
 import { cursorFingerprint, type ImportCursor, readImportStateRow, writeImportState } from "./ImportState.js";
 import { existingWorktrees, type RegisteredRepo } from "./RepoRegistry.js";
+import { deleteSliceSessionTurns, projectSessionTurns } from "./SessionTurnsProjection.js";
 import { REORDER_OFFSET } from "./SotSchema.js";
 import { forgetRollupDays } from "./StatsRollup.js";
 import { MEMORY_LANDED_AT_SQL } from "./StatsSeries.js";
@@ -1263,7 +1264,18 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 	const claimedTranscripts = new Set<string>();
 	let transcripts = 0;
 
-	const writeTranscript = (id: string, content: string | null): void => {
+	// The `recorded_at_ms` a batch of projected turns should carry: strictly above
+	// the table's current max, so a fenced import's `stampMs` (clamped to the fence)
+	// cannot strand rows below the already-advanced session-sync cursor. The same
+	// floor `backfillStoredSessionTurns` uses; `MAX` over the leading column of
+	// `ix_turns_keyset` is O(1). Recomputed per transaction so successive batches
+	// stay monotonically above one another.
+	const flooredTurnStampMs = (): number => {
+		const max = (db.prepare("SELECT MAX(recorded_at_ms) AS m FROM session_turns").get() as { m: number | null }).m;
+		return Math.max(nowMs, (max ?? 0) + 1);
+	};
+
+	const writeTranscript = (id: string, content: string | null, sessionTurnStampMs: number): void => {
 		const parsed = tryParse<StoredTranscript>(content);
 		if (!parsed || !Array.isArray(parsed.sessions)) {
 			skip("transcript", `transcripts/${id}.json`);
@@ -1303,6 +1315,18 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 				 ON CONFLICT(repo_id, transcript_id, session_id) DO UPDATE SET source = excluded.source`,
 			).run(repoId, id, session.sessionId, session.source ?? null);
 		});
+		// Whole-slice wipe before reprojecting, mirroring the live write path: a
+		// re-imported blob that dropped a session would otherwise leave that session's
+		// turns behind, since `projectSessionTurns` only clears the sessions it projects.
+		deleteSliceSessionTurns(db, repoId, id);
+		// NOT `stampMs`: `session_turns.recorded_at_ms` is the session-sync keyset
+		// cursor, not a protect-guard column (unlike the transcript body's
+		// `written_at_ms` above). A protected import clamps `stampMs` to the fence,
+		// which on a cut-over repo sits BELOW the cursor the live path has already
+		// advanced to — so those rows would page straight over and never sync. The
+		// caller floors `sessionTurnStampMs` above the table's current max instead,
+		// the same floor the historical backfill uses for exactly this reason.
+		projectSessionTurns(db, repoId, id, parsed.sessions, sessionTurnStampMs);
 		transcripts++;
 	};
 
@@ -1475,7 +1499,11 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 
 		inTransaction(db, () => {
 			db.exec("PRAGMA defer_foreign_keys = ON");
-			for (const id of wanted) writeTranscript(id, transcriptBodies.get(`transcripts/${id}.json`) ?? null);
+			// One floored `recorded_at_ms` for every turn this batch projects (see
+			// `flooredTurnStampMs`), computed inside the transaction.
+			const sessionTurnStampMs = flooredTurnStampMs();
+			for (const id of wanted)
+				writeTranscript(id, transcriptBodies.get(`transcripts/${id}.json`) ?? null, sessionTurnStampMs);
 			for (const hash of slice) {
 				const summary = batchSummaries.get(hash);
 				// Unparsable body: counted as a skip above. Its row is simply not
@@ -1566,7 +1594,7 @@ async function runRepoImport(db: DashboardDbHandle, opts: SotImportOptions): Pro
 			unclaimed.map((id) => `transcripts/${id}.json`),
 		);
 		inChunkedTransactions(db, unclaimed, (id) =>
-			writeTranscript(id, orphanBodies.get(`transcripts/${id}.json`) ?? null),
+			writeTranscript(id, orphanBodies.get(`transcripts/${id}.json`) ?? null, flooredTurnStampMs()),
 		);
 	}
 

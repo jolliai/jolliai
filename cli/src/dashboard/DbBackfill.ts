@@ -78,6 +78,7 @@ import {
 	type RegisteredRepo,
 	readRepoCutoverFence,
 } from "./RepoRegistry.js";
+import { projectSessionTurns, type SessionTurnInput, uncoveredSessionsForSlice } from "./SessionTurnsProjection.js";
 import {
 	countMemoriesAbsentFromListing,
 	EMPTY_IMPORT_RESULT,
@@ -2850,6 +2851,19 @@ export async function dbBackfillRepos(
 	} catch (err) {
 		log.warn("activity backfill failed: %s", errMsg(err));
 	}
+	// Route A': the `session_turns` sibling of the activity backfill above — same
+	// shape (persisted transcripts, whole DB once, after every repo is imported so
+	// the sessions rows these turns hang off already exist), same idempotence, same
+	// warn-not-fail policy. Kept a separate open so one failing backfill cannot mask
+	// the other.
+	try {
+		const rows = await withDashboardDb((db) => backfillStoredSessionTurns(db), {
+			...(rest.dbPath ? { dbPath: rest.dbPath } : {}),
+		});
+		if (rows > 0) log.info("backfilled %d session-turn rows from stored transcripts", rows);
+	} catch (err) {
+		log.warn("session-turns backfill failed: %s", errMsg(err));
+	}
 	// Appended, not prepended: a caller reading the list in order should see the
 	// repos that were worked on first, and these carry no per-repo detail to
 	// interleave with them.
@@ -3589,4 +3603,129 @@ export function backfillStoredActivity(db: DashboardDbHandle, now: () => number 
 		for (const { eventId, bucket } of pending) insertBucket.run(eventId, bucket, recordedAtMs);
 	});
 	return written;
+}
+
+/**
+ * Reprojects `session_turns` for stored transcripts that carry none — the
+ * `session_turns` sibling of {@link backfillStoredActivity}, and needed for the
+ * same reason: the migration only creates the empty table, and the live writer
+ * ({@link projectSessionTurns}, called from `SotWrite`/`SotImport`) fires only
+ * when a transcript is (re)written, so every transcript persisted BEFORE this
+ * table existed has no turns until something happens to rewrite it.
+ *
+ * Reads the SUMMARY PIPELINE's persisted `transcripts.sessions_blob` (never the
+ * live 7-day discovery window) and hands each blob's sessions straight to
+ * {@link projectSessionTurns}, the SOLE writer of this table — no private copy
+ * of the projection rule, so a backfilled row cannot drift from a live one.
+ *
+ * Coverage is per `(session_event_id, slice_id)`, NOT per session: `slice_id` is
+ * the transcript id and one session can span several transcripts, so a
+ * per-session "already has turns" test would wrongly skip a slice it is missing.
+ * A transcript is selected when it has a resolvable session (`transcript_sessions
+ * ⋈ sessions`, the same join {@link backfillStoredActivity} uses) that carries NO
+ * `session_turns` row for this slice. Scoping through `sessions` is what
+ * disambiguates two repos sharing a commit hash: `session_turns` has no
+ * `repo_id`, only `session_event_id`, which encodes the repo identity.
+ *
+ * Idempotent, and inserts only: a blob is SELECTED when any of its sessions is
+ * uncovered, but it can carry already-covered sessions too, so each blob is
+ * narrowed by {@link uncoveredSessionsForSlice} before projection — otherwise
+ * `projectSessionTurns`' delete-then-insert would rewrite covered rows with this
+ * run's fresh, higher `recorded_at_ms` and re-upload them. A transcript whose
+ * session resolves but projects zero rows (no entries and no instants — a shape a
+ * stored session essentially never has) stays selected and is re-parsed each run;
+ * it inserts nothing, so the returned count is still 0 and the pass reads as
+ * converged.
+ *
+ * @returns how many `session_turns` rows this run inserted (0 once converged).
+ */
+export function backfillStoredSessionTurns(db: DashboardDbHandle, now: () => number = Date.now): number {
+	const blobs = db
+		.prepare(
+			// `COALESCE(ts.source, 'claude')`, NOT a bare `s.source = ts.source`: a
+			// legacy session persisted before `source` was recorded is a NULL in
+			// `transcript_sessions` (SotImport writes `session.source ?? null`) but a
+			// `claude` row in `sessions`, and `'claude' = NULL` is never true — so the
+			// bare equality never selected those blobs and their archived turns stayed
+			// unbackfilled. This mirrors `eventIdFor`'s `session.source ?? "claude"`, so
+			// selection and projection agree on the same legacy default. (The
+			// `session_activity` sibling instead skips sourceless sessions outright in
+			// its per-session loop, so it needs no such coalescing.)
+			`SELECT DISTINCT t.repo_id AS repo_id, t.transcript_id AS transcript_id, t.sessions_blob AS sessions_blob
+			   FROM transcripts t
+			   JOIN transcript_sessions ts ON ts.repo_id = t.repo_id AND ts.transcript_id = t.transcript_id
+			   JOIN sessions s ON s.repo_id = ts.repo_id
+			                  AND s.source = COALESCE(ts.source, 'claude')
+			                  AND s.session_id = ts.session_id
+			  WHERE NOT EXISTS (
+			    SELECT 1 FROM session_turns st
+			     WHERE st.session_event_id = s.event_id AND st.slice_id = t.transcript_id
+			  )`,
+		)
+		.all() as ReadonlyArray<{ repo_id: number; transcript_id: string; sessions_blob: Uint8Array }>;
+	if (blobs.length === 0) return 0;
+
+	// Parse OUTSIDE the write lock: inflate + JSON.parse over every stored
+	// transcript is pure CPU, and holding SQLite's single writer while it runs
+	// would stall every hook and the extension host (see backfillStoredActivity).
+	// Holds only what `projectSessionTurns` reads (`SessionTurnInput`), NOT the full
+	// `StoredSession`: every parsed blob lives in `pending` until the one transaction
+	// below commits, so keeping each entry's `content` here would hold the whole
+	// inflated corpus at once — hundreds of MB on a transcript-heavy machine. The
+	// `session_activity` sibling avoids this by pending bare `{eventId, bucket}`
+	// tuples; turns need one row per entry, so the minimum is `{role, timestamp}`.
+	const pending: Array<{
+		repoId: number;
+		transcriptId: string;
+		sessions: ReadonlyArray<SessionTurnInput>;
+	}> = [];
+	for (const row of blobs) {
+		let stored: StoredTranscript;
+		try {
+			stored = JSON.parse(inflateSync(Buffer.from(row.sessions_blob)).toString("utf8")) as StoredTranscript;
+		} catch {
+			// One unreadable blob is one unbackfilled transcript, never a failed run.
+			log.warn("session-turns backfill: unreadable transcript %s", row.transcript_id);
+			continue;
+		}
+		// Project down to `SessionTurnInput` HERE, dropping `content`, so the inflated
+		// JSON string and its parsed object are both eligible for GC before the next blob.
+		const sessions: SessionTurnInput[] = (stored.sessions ?? []).map((s) => ({
+			sessionId: s.sessionId,
+			...(s.source !== undefined ? { source: s.source } : {}),
+			entries: (s.entries ?? []).map((e) => ({
+				role: e.role,
+				...(e.timestamp !== undefined ? { timestamp: e.timestamp } : {}),
+			})),
+			...(s.compactions !== undefined ? { compactions: s.compactions } : {}),
+			...(s.turnAborts !== undefined ? { turnAborts: s.turnAborts } : {}),
+			...(s.testRuns !== undefined ? { testRuns: s.testRuns } : {}),
+		}));
+		pending.push({ repoId: row.repo_id, transcriptId: row.transcript_id, sessions });
+	}
+	if (pending.length === 0) return 0;
+
+	// ONE transaction sharing ONE stamp floored STRICTLY ABOVE the table's current
+	// max — the identical sync-cursor invariant backfillStoredActivity documents:
+	// `recorded_at_ms` is the session-sync keyset cursor, resumed with `>=`, so a
+	// cohort stamped at or below an already-advanced cursor is paged straight over
+	// and never syncs. `projectSessionTurns` stamps every row it writes with the
+	// `nowMs` we pass, so the floored stamp is computed here and threaded in. The
+	// cohort is uncovered by construction (pure inserts), so — like
+	// `session_activity` — clearing the current max clears the reachable cursor.
+	return inTransaction(db, () => {
+		const before = (db.prepare("SELECT count(*) AS c FROM session_turns").get() as { c: number }).c;
+		const maxRow = db.prepare("SELECT MAX(recorded_at_ms) AS m FROM session_turns").get() as { m: number | null };
+		const recordedAtMs = Math.max(now(), (maxRow.m ?? 0) + 1);
+		for (const { repoId, transcriptId, sessions } of pending) {
+			// Only the sessions in this blob that are actually missing turns — a blob
+			// is selected when ANY of its sessions is uncovered, and re-projecting the
+			// already-covered ones would re-stamp their rows with `recordedAtMs` and
+			// re-upload them. Filtering keeps the "inserts only" invariant true.
+			const uncovered = uncoveredSessionsForSlice(db, repoId, transcriptId, sessions);
+			if (uncovered.length > 0) projectSessionTurns(db, repoId, transcriptId, uncovered, recordedAtMs);
+		}
+		const after = (db.prepare("SELECT count(*) AS c FROM session_turns").get() as { c: number }).c;
+		return after - before;
+	});
 }

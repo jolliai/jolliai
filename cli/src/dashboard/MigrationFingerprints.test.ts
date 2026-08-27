@@ -81,6 +81,17 @@ const EXPECTED: ReadonlyArray<readonly [name: string, fingerprint: string]> = [
 	// A pure-SQL `sqlMigration`, so it is fingerprinted here rather than by a companion
 	// test. See the entry's own file.
 	["2026-08-27-0804-session-activity-keyset-index", "5fa9e542b152"],
+	// Text-free per-turn projection `session_turns` — the web coaching dashboard's
+	// transcript-derived signal source (waits, attribution, compactions, friction,
+	// test-first). A pure-SQL `sqlMigration`, so it is fingerprinted here rather than
+	// by a companion test; the projector `SessionTurnsProjection.ts` has its own test.
+	["2026-08-27-0824-session-turns", "99915a11bc45"],
+	// Keyset index for `session_turns`' session-sync paging — the composite the
+	// reader's `(recorded_at_ms, session_event_id, slice_id, seq)` cursor needs and
+	// the frozen `SESSION_TURNS_DDL`'s primary key cannot drive (it does not lead
+	// with `recorded_at_ms`). The `session_turns` sibling of the `session_activity`
+	// keyset entry above; a pure-SQL `sqlMigration`, so fingerprinted here.
+	["2026-08-28-0516-session-turns-keyset-index", "b86033388ec4"],
 ];
 
 /** `YYYY-MM-DD-HHMM-<subject>`, UTC. Uniqueness and a readable chronology. */

@@ -97,6 +97,8 @@ INDEX ix_ts_session ON transcript_sessions
     CREATE INDEX ix_ts_session ON transcript_sessions(repo_id, session_id, source)
 INDEX ix_tsr_ref ON topic_source_refs
     CREATE INDEX ix_tsr_ref ON topic_source_refs(repo_id, ref_type, ref_id)
+INDEX ix_turns_keyset ON session_turns
+    CREATE INDEX ix_turns_keyset ON session_turns(recorded_at_ms, session_event_id, slice_id, seq)
 TABLE branches
     CREATE TABLE branches ( id INTEGER PRIMARY KEY, repo_id INTEGER NOT NULL REFERENCES repos(id), name TEXT NOT NULL, UNIQUE (repo_id, name) ) STRICT
 TABLE commit_aliases
@@ -141,6 +143,8 @@ TABLE session_model_usage
     CREATE TABLE session_model_usage ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, updated_at_ms INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (session_event_id, model) ) STRICT
 TABLE session_tool_use
     CREATE TABLE session_tool_use ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, tool_name TEXT NOT NULL, kind TEXT NOT NULL, server TEXT, calls INTEGER NOT NULL DEFAULT 0, last_call_at_ms INTEGER, updated_at_ms INTEGER NOT NULL DEFAULT 0, input_tokens INTEGER, output_tokens INTEGER, cached_tokens INTEGER, usage_confidence TEXT, plugin TEXT, origin_root TEXT, PRIMARY KEY (session_event_id, tool_name, kind) ) STRICT
+TABLE session_turns
+    CREATE TABLE session_turns ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, slice_id TEXT NOT NULL, seq INTEGER NOT NULL, role TEXT, ts_ms INTEGER, kind TEXT NOT NULL, recorded_at_ms INTEGER NOT NULL, PRIMARY KEY (session_event_id, slice_id, seq) ) STRICT
 TABLE session_usage_events
     CREATE TABLE session_usage_events ( session_event_id TEXT NOT NULL REFERENCES sessions(event_id) ON DELETE CASCADE, dedup_key TEXT NOT NULL, responded_at_ms INTEGER NOT NULL, model TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT 0, output_tokens INTEGER NOT NULL DEFAULT 0, cached_tokens INTEGER NOT NULL DEFAULT 0, est_cost_usd REAL, updated_at_ms INTEGER NOT NULL, PRIMARY KEY (session_event_id, dedup_key) ) STRICT, WITHOUT ROWID
 TABLE sessions

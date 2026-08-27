@@ -51,6 +51,7 @@ export const SYNC_STAMP_COLUMNS = {
 	session_usage_events: "updated_at_ms",
 	session_activity: "recorded_at_ms",
 	memory_lookups: "updated_at_ms",
+	session_turns: "recorded_at_ms",
 } as const;
 
 /** A table that carries a sync stamp. */
@@ -103,6 +104,7 @@ export const KEYSET_COLUMNS: Readonly<Record<SyncStampTable, ReadonlyArray<strin
 	session_usage_events: ["session_event_id", "dedup_key"],
 	session_activity: ["session_event_id", "bucket_ms"],
 	memory_lookups: ["receipt_id"],
+	session_turns: ["session_event_id", "slice_id", "seq"],
 };
 
 /**
@@ -159,6 +161,13 @@ export const WINDOW_SOURCES: Readonly<Record<SyncStampTable, WindowSource>> = {
 	// search` typed into a plain terminal. An `EXISTS` over it would silently drop
 	// every one of those rows from the first sync's window, for ever.
 	memory_lookups: { own: "at_ms" },
+	// Through the parent session, NOT on `ts_ms`. `ts_ms` is nullable (an instant
+	// row, or an entry whose timestamp was absent/unparsable) and is per-turn
+	// business time, not the sync cursor — the cursor is `recorded_at_ms`, stamped
+	// at projection time. This is `session_activity`'s case exactly: the projector
+	// re-stamps every row of a re-parsed slice at "just now", so windowing on the
+	// parent session's clock keeps the window aligned with the advancing cursor.
+	session_turns: { parent: "session_event_id" },
 };
 
 /** The table's own business time column, or `undefined` when it has none. */
