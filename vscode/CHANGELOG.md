@@ -1,6 +1,13 @@
 # Changelog
 
-<!-- Last synced commit: 9a5797e31 | 2026-08-25 -->
+<!-- Last synced commit: fb34e0a98 | 2026-08-28 -->
+
+## 0.99.16
+
+- **Hermes Agent is supported** — Hermes conversations show up in the sidebar and can be switched on or off under **Settings → AI Agents**, like your other agents.
+- **Opening the dashboard is tidier** — the sidebar's dashboard button now opens your browser in the background instead of stacking up terminals. Click it again and it takes over the one already running.
+- **See where each repo syncs to** — Settings now shows which Jolli Space a repository is connected to.
+- Bug fixes.
 
 ## 0.99.15
 

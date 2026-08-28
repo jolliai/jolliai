@@ -1,6 +1,14 @@
 # Changelog
 
-<!-- Last synced commit: 9a5797e31 | 2026-08-25 -->
+<!-- Last synced commit: fb34e0a98 | 2026-08-28 -->
+
+## 0.99.16
+
+- **Hermes Agent is supported** — conversations from Hermes Agent turn into memories automatically, just like your other agents. That makes twelve agents in all.
+- **See where each repo syncs to** — Settings now shows which Jolli Space a repository is connected to, and signing in works more smoothly.
+- **A snappier dashboard on big repos** — pages load faster and slow spots are easier to spot, so `jolli doctor` can point them out when something drags.
+- **Decisions on the dashboard are accurate again** — the Decisions card now shows the right entries.
+- Bug fixes.
 
 ## 0.99.15
 

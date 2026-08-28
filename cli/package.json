@@ -1,6 +1,6 @@
 {
 	"name": "@jolli.ai/cli",
-	"version": "0.99.15",
+	"version": "0.99.16",
 	"description": "Automatic development memory for AI coding agents: turns your Claude Code, Codex, Gemini, Cursor, Copilot, Cline, Devin, OpenCode, Antigravity and Kimi Code sessions into structured commit summaries your agent can recall over MCP",
 	"main": "./dist/Api.js",
 	"types": "./dist/Api.d.ts",

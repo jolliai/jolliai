@@ -167,7 +167,7 @@ Add items with the **+ Add** button (**Add Plan** from `~/.claude/plans/`, **Add
 
 ## Use your memory from your AI agent (MCP)
 
-When you enable Jolli in a repo, the bundled CLI also registers a `jollimemory` **MCP server** into every AI host it detects: Claude Code and Cursor per-repo (via `.mcp.json` and `.cursor/mcp.json`), and Gemini, Codex, OpenCode, Copilot CLI, VS Code Copilot Chat, Cline, Devin, Antigravity and Kimi Code machine-wide. Eleven hosts in total. Restart your agent afterward so it picks up the server.
+When you enable Jolli in a repo, the bundled CLI also registers a `jollimemory` **MCP server** into every AI host it detects: Claude Code and Cursor per-repo (via `.mcp.json` and `.cursor/mcp.json`), and Gemini, Codex, OpenCode, Copilot CLI, VS Code Copilot Chat, Cline, Devin, Antigravity, Kimi Code and Hermes Agent machine-wide. Twelve hosts in total. Restart your agent afterward so it picks up the server.
 
 Ten tools are exposed: `search`, `recall`, `get_decision_timeline`, `list_branches`, `get_pr_description`, `queue_status`, `status`, plus `bind_space`, `list_spaces` and `push_memory` for Jolli Space. When you are signed in, your Jolli tenant's own platform tools are surfaced alongside them; turn that off with `mcpPlatformToolsEnabled=false`. You never call these by name; you ask a question and the agent picks the tool.
 

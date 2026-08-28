@@ -14,7 +14,7 @@
 
 **Jolli Memory** automatically turns your AI coding sessions into structured development documentation attached to every commit, with no extra effort.
 
-When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitHub Copilot, Cline, Devin, Antigravity, or Kimi Code), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
+When you work with AI agents (Claude Code, Codex, Gemini, OpenCode, Cursor, GitHub Copilot, Cline, Devin, Antigravity, Kimi Code, or Hermes Agent), the reasoning behind every decision lives in the conversation: *why this approach was chosen, what alternatives were weighed, what went wrong along the way*. The moment you commit, that context is gone. Jolli Memory captures it automatically.
 
 ![Asking an AI agent "why do we retry with exponential backoff instead of a fixed delay?" and it answers from Jolli Memory, citing the commit where the decision was made](docs/media/ask-your-agent.gif)
 
@@ -62,7 +62,7 @@ Prefer an in-editor panel? The same memories show up in the [VS Code extension](
 ## What you get
 
 - **Never lose the _why_.** Every commit gets a structured memory: the trigger behind the change, the decisions and trade-offs, and what was actually built.
-- **Works with 11 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer IDE and the `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), Devin CLI, Antigravity, and Kimi Code. Sessions are detected automatically, no per-tool setup. Only Claude Code and Gemini install a hook; the other nine are discovered by scanning their own local session stores.
+- **Works with 12 AI agents.** Claude Code, Codex, Gemini, OpenCode, Cursor (Composer IDE and the `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (VS Code extension and CLI), Devin CLI, Antigravity, Kimi Code, and Hermes Agent. Sessions are detected automatically, no per-tool setup. Claude Code and Gemini install a hook, and Hermes installs its own session-end hook; the rest are discovered by scanning their own local session stores.
 - **Ask your agent about past work.** `jolli mcp` exposes your history over the Model Context Protocol (10 tools: search, recall a branch, trace a decision's timeline, list branches, draft a PR description, check installation health, and more), so your agent can answer "how did we handle X?" and draft PRs without leaving the chat. Registered automatically into the AI hosts Jolli detects when you enable, and when you are signed in your Jolli Space's own platform tools are surfaced alongside them.
 - **Catch up on history.** `jolli backfill` writes memories for commits you made before installing Jolli.
 - **Knowledge wiki and graph.** `jolli compile` folds work scattered across many commits into per-topic pages; `jolli graph` renders them as an interactive, shareable map of decisions and how they connect. Both rebuild when you ask — a command, or one click in the dashboard or the editor sidebar, which also tell you how far behind they have fallen.

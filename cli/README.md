@@ -16,7 +16,7 @@ Turns your AI coding sessions into structured development documentation attached
 
 - **Automatic capture** — after each commit, reads your AI transcripts + diff, calls the LLM, and stores a structured summary alongside the commit. The commit returns instantly; the summary is generated in a detached background process (~10–20 s).
 - **Catch up on existing history** — `jolli backfill` creates memories for commits you made before enabling Jolli.
-- **Eleven supported agents** — Claude Code, Codex, Gemini CLI, Antigravity, OpenCode, Cursor (Composer IDE + `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (CLI + VS Code), Devin CLI, and Kimi Code.
+- **Twelve supported agents** — Claude Code, Codex, Gemini CLI, Antigravity, OpenCode, Cursor (Composer IDE + `cursor-agent` CLI), GitHub Copilot CLI, VS Code Copilot Chat, Cline (CLI + VS Code), Devin CLI, Kimi Code, and Hermes Agent.
 - **Dual storage** — every memory is written to a dedicated git orphan branch (`jollimemory/summaries/v3`, the source of truth) **and** to a human-browsable Memory Bank folder on disk (canonical JSON + Markdown).
 - **Worktree-aware** — hooks and summaries work across `git worktree` checkouts.
 - **Squash / amend / rebase safe** — a unified operation queue migrates or consolidates summaries when commits are rewritten, so memories are never lost.
@@ -61,7 +61,7 @@ npm install -g @jolli.ai/cli
 jolli enable            # run from your project root
 ```
 
-`jolli enable` auto-registers a local MCP server named `jollimemory` into every AI host it detects on your machine — eleven of them: Claude Code, Cursor, Gemini, Antigravity, Codex, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat, Cline (the VS Code extension), Devin CLI, and Kimi Code. A host qualifies by being **installed on disk**, which is deliberately a weaker test than "Jolli can read its conversations" — a host whose session store this runtime can't open still gets the MCP server. MCP registration is automatic: nothing to opt into, and no separate MCP install. Restart your agent afterward so it picks up the new server.
+`jolli enable` auto-registers a local MCP server named `jollimemory` into every AI host it detects on your machine — twelve of them: Claude Code, Cursor, Gemini, Antigravity, Codex, OpenCode, GitHub Copilot CLI, VS Code Copilot Chat, Cline (the VS Code extension), Devin CLI, Kimi Code, and Hermes Agent. A host qualifies by being **installed on disk**, which is deliberately a weaker test than "Jolli can read its conversations" — a host whose session store this runtime can't open still gets the MCP server. MCP registration is automatic: nothing to opt into, and no separate MCP install. Restart your agent afterward so it picks up the new server.
 
 **CLI-hosted, not remote.** Jolli's MCP server is a local stdio process (`jolli mcp`) that each host spawns on your own machine. There is no remote URL and no `.well-known/mcp.json` to point a cloud MCP client at, and your memories never leave your machine to be queried.
 

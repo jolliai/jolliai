@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.99.16
+
+### Changes
+
+- **See where each repo syncs to** — the Settings dialog now shows which Jolli Space a repository is connected to.
+
+### Fixes & Improvements
+
+- Bug fixes.
+
+### Performance
+
+- Performance improvements.
+
 ## 0.99.15
 
 ### Fixes & Improvements
