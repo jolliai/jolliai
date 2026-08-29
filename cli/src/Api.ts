@@ -43,11 +43,15 @@ import { registerSyncCommand } from "./commands/SyncCommand.js";
 import { registerTelemetryCommand } from "./commands/TelemetryCommand.js";
 import { registerUninstallCommand } from "./commands/UninstallCommand.js";
 import { registerViewCommand } from "./commands/ViewCommand.js";
-// _parseJolliApiKey / _parseBaseUrl: re-exposed at the bottom of this file.
-// See the `parseJolliApiKey` export for the rationale (Vite tree-shaker drops
-// pure re-exports from the entry bundle when nothing inside the entry
-// consumes them).
-import { parseBaseUrl as _parseBaseUrl, parseJolliApiKey as _parseJolliApiKey } from "./core/JolliApiUtils.js";
+// _ALLOWED_JOLLI_HOSTS / _parseJolliApiKey / _parseBaseUrl: re-exposed at the
+// bottom of this file. See the `parseJolliApiKey` export for the rationale
+// (Vite tree-shaker drops pure re-exports from the entry bundle when nothing
+// inside the entry consumes them).
+import {
+	ALLOWED_JOLLI_HOSTS as _ALLOWED_JOLLI_HOSTS,
+	parseBaseUrl as _parseBaseUrl,
+	parseJolliApiKey as _parseJolliApiKey,
+} from "./core/JolliApiUtils.js";
 import { installCommandTelemetryHooks } from "./core/TelemetryCommandHook.js";
 import { CLI_PACKAGE_NAME, REFRESH_COMMAND, refreshUpdateCache } from "./core/UpdateCheck.js";
 import { autoRefreshSkillsIfStale } from "./install/SkillAutoRefresh.js";
@@ -135,6 +139,25 @@ export type PluginRegister = (ctx: PluginContext) => void | Promise<void>;
 export type { JolliApiKeyMeta, ParsedBaseUrl } from "./core/JolliApiUtils.js";
 export const parseJolliApiKey = _parseJolliApiKey;
 export const parseBaseUrl = _parseBaseUrl;
+
+/**
+ * Re-exported allowlist of host suffixes a Jolli API key / OAuth callback may
+ * target (`jolli.ai`, `jolli.dev`, …). Downstream packages import this rather
+ * than restating the list, so a host added in
+ * `core/JolliApiUtils.ts` reaches them without a second edit — the same
+ * anti-drift reason the VS Code Settings webview inlines this exact array.
+ *
+ * Consumers that need the boundary *check* rather than the raw list should
+ * still apply the suffix rule the host uses (`host === h || host.endsWith("." + h)`);
+ * a bare `includes` would accept `evil-jolli.ai`.
+ *
+ * Goes through the same `import` binding + `export const` indirection as
+ * `parseJolliApiKey` above, and for the same reason: a pure
+ * `export { … } from "…"` is elided from the entry bundle by Vite's lib-mode
+ * tree-shaker, which type-checks clean and fails only at the consumer's
+ * runtime.
+ */
+export const ALLOWED_JOLLI_HOSTS = _ALLOWED_JOLLI_HOSTS;
 
 // ── Help-grouping configuration ─────────────────────────────────────────────
 // These shape `jolli --help`: anything in HIDDEN_COMMANDS is filtered out by
