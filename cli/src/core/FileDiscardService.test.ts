@@ -171,8 +171,21 @@ describe("FileDiscardService", () => {
 	describe("before the first commit (unborn HEAD)", () => {
 		beforeEach(() => {
 			// Re-make the fixture without a commit — the outer beforeEach always lands one.
+			//
+			// Take a FRESH mkdtemp rather than re-creating the outer fixture's path.
+			// Re-creating it was observed failing on CI as
+			// `EEXIST: file already exists, mkdir '/tmp/jolli-discard-fGOhbR'`, while
+			// passing every time this file is run alone. The exact writer that put the
+			// path back was not identified, and the two candidates are far apart in
+			// likelihood — a sibling worker's mkdtemp re-drawing the same six random
+			// characters is ~1-in-62^6, so a straggler (a git subprocess or a logger
+			// flush from an earlier test) recreating the tree between the rm and the
+			// mkdir is the better bet. Rather than guess, drop the requirement: an
+			// unused name cannot be contended. `rmSync` still runs so the committed
+			// fixture is cleaned up rather than leaked; reassigning `cwd` keeps the
+			// outer afterEach correct, and `git` reads `cwd` per invocation.
 			rmSync(cwd, { recursive: true, force: true });
-			mkdirSync(cwd);
+			cwd = mkdtempSync(join(tmpdir(), "jolli-discard-"));
 			git("init", "-q");
 		});
 
