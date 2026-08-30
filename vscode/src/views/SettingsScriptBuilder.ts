@@ -360,7 +360,7 @@ export function buildSettingsScript(): string {
   // Inline port of cli/src/core/JolliApiUtils.ts validateJolliApiKey — this
   // runs in the webview's browser context so it can't just import the Node
   // module. Keep in lockstep with the CLI version (and the Kotlin port in
-  // intellij/.../JolliApiClient.kt). Runs on every keystroke for inline red
+  // intellij/.../JolliAuthUtils.kt). Runs on every keystroke for inline red
   // feedback; the server-side check in handleApplySettings is authoritative.
   function validateJolliApiKeyRule(v) {
     if (v.length === 0 || v === maskedJolliApiKey) return '';
@@ -377,7 +377,7 @@ export function buildSettingsScript(): string {
         var meta = JSON.parse(json);
         if (typeof meta.t === 'string' && typeof meta.u === 'string') {
           if (!checkJolliOriginAllowed(meta.u)) {
-            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli.cloud, *.jolli-local.me).';
+            return 'Origin ' + meta.u + ' is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jollidev.com, *.jollidev.dev, *.jolli.cloud, *.jolli-local.me).';
           }
           return '';
         }
