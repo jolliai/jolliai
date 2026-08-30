@@ -67,9 +67,11 @@ describe("resolveTelemetryEnv", () => {
 	it("maps allowlisted origins (incl. subdomains) to env", () => {
 		expect(resolveTelemetryEnv("https://acme.jolli-local.me")).toBe("local");
 		expect(resolveTelemetryEnv("https://acme.jolli.dev")).toBe("dev");
+		expect(resolveTelemetryEnv("https://acme.jollidev.dev")).toBe("dev");
 		expect(resolveTelemetryEnv("https://acme.jolli.cloud")).toBe("preview");
 		expect(resolveTelemetryEnv("https://acme.jolli.ai")).toBe("prod");
 		expect(resolveTelemetryEnv("https://jolli.ai")).toBe("prod");
+		expect(resolveTelemetryEnv("https://acme.jollidev.com")).toBe("prod");
 	});
 	it("returns 'unknown' for missing, unparseable, or off-allowlist origins", () => {
 		expect(resolveTelemetryEnv()).toBe("unknown");

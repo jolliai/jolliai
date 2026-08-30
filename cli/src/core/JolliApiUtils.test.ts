@@ -119,6 +119,14 @@ describe("JolliApiUtils", () => {
 			expect(() => assertJolliOriginAllowed("https://tenant.jolli.dev")).not.toThrow();
 		});
 
+		it("accepts https://tenant.jollidev.com", () => {
+			expect(() => assertJolliOriginAllowed("https://tenant.jollidev.com")).not.toThrow();
+		});
+
+		it("accepts https://tenant.jollidev.dev", () => {
+			expect(() => assertJolliOriginAllowed("https://tenant.jollidev.dev")).not.toThrow();
+		});
+
 		it("accepts https://admin.jolli.cloud", () => {
 			expect(() => assertJolliOriginAllowed("https://admin.jolli.cloud")).not.toThrow();
 		});

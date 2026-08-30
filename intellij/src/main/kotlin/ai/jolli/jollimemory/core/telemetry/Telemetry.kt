@@ -229,8 +229,10 @@ object Telemetry {
         return when {
             matches("jolli-local.me") -> "local"
             matches("jolli.dev") -> "dev"
+            matches("jollidev.dev") -> "dev"
             matches("jolli.cloud") -> "preview"
             matches("jolli.ai") -> "prod"
+            matches("jollidev.com") -> "prod"
             else -> "unknown"
         }
     }

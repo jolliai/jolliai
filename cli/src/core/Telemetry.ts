@@ -319,8 +319,10 @@ export function resolveTelemetryEnv(origin?: string, env: NodeJS.ProcessEnv = pr
 	const matches = (h: string): boolean => host === h || host.endsWith(`.${h}`);
 	if (matches("jolli-local.me")) return "local";
 	if (matches("jolli.dev")) return "dev";
+	if (matches("jollidev.dev")) return "dev";
 	if (matches("jolli.cloud")) return "preview";
 	if (matches("jolli.ai")) return "prod";
+	if (matches("jollidev.com")) return "prod";
 	return "unknown";
 }
 

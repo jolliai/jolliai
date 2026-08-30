@@ -42,6 +42,16 @@ class JolliAuthUtilsTest {
     }
 
     @Test
+    fun `accepts https jollidev-com`() {
+        assertDoesNotThrow { JolliAuthUtils.assertJolliOriginAllowed("https://tenant.jollidev.com") }
+    }
+
+    @Test
+    fun `accepts https jollidev-dev`() {
+        assertDoesNotThrow { JolliAuthUtils.assertJolliOriginAllowed("https://tenant.jollidev.dev") }
+    }
+
+    @Test
     fun `accepts https jolli-local-me`() {
         assertDoesNotThrow { JolliAuthUtils.assertJolliOriginAllowed("https://jolli-local.me") }
     }

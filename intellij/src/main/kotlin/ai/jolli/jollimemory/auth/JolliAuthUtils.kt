@@ -9,7 +9,8 @@ import java.net.URI
  */
 object JolliAuthUtils {
 
-	private val ALLOWED_JOLLI_HOSTS = listOf("jolli.ai", "jolli.dev", "jolli.cloud", "jolli-local.me")
+	private val ALLOWED_JOLLI_HOSTS =
+		listOf("jolli.ai", "jolli.dev", "jollidev.com", "jollidev.dev", "jolli.cloud", "jolli-local.me")
 
 	/**
 	 * Validates a Jolli API key: decodes it and checks the embedded origin
@@ -44,8 +45,8 @@ object JolliAuthUtils {
 		if (!ok) {
 			throw IllegalArgumentException(
 				"Rejected Jolli origin \"$origin\". " +
-					"Only https://*.jolli.ai, https://*.jolli.dev, https://*.jolli.cloud, " +
-					"and https://*.jolli-local.me are permitted.",
+					"Only https://*.jolli.ai, https://*.jolli.dev, https://*.jollidev.com, " +
+					"https://*.jollidev.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.",
 			)
 		}
 	}

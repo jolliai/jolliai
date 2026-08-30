@@ -61,9 +61,11 @@ class TelemetryTest {
     fun `resolveEnv maps allowlisted origins and unknowns`() {
         Telemetry.resolveEnv("https://acme.jolli-local.me") shouldBe "local"
         Telemetry.resolveEnv("https://acme.jolli.dev") shouldBe "dev"
+        Telemetry.resolveEnv("https://acme.jollidev.dev") shouldBe "dev"
         Telemetry.resolveEnv("https://acme.jolli.cloud") shouldBe "preview"
         Telemetry.resolveEnv("https://acme.jolli.ai") shouldBe "prod"
         Telemetry.resolveEnv("https://jolli.ai") shouldBe "prod"
+        Telemetry.resolveEnv("https://acme.jollidev.com") shouldBe "prod"
         Telemetry.resolveEnv(null) shouldBe "unknown"
         Telemetry.resolveEnv("not a url") shouldBe "unknown"
         Telemetry.resolveEnv("https://evil.example.com") shouldBe "unknown"

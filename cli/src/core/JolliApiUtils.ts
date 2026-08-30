@@ -262,10 +262,17 @@ export function resolveJolliUrlForKey(jolliApiKey: string | undefined): string |
  * Exported so the VS Code Settings webview can inline this exact list at
  * extension build time (`SettingsScriptBuilder.buildSettingsScript`),
  * eliminating drift between the CLI's `assertJolliOriginAllowed` and the
- * webview-side validator. The IntelliJ port (`JolliApiClient.kt`) is the
+ * webview-side validator. The IntelliJ port (`JolliAuthUtils.kt`) is the
  * remaining cross-language sibling — keep all three in lockstep.
  */
-export const ALLOWED_JOLLI_HOSTS: readonly string[] = ["jolli.ai", "jolli.dev", "jolli.cloud", "jolli-local.me"];
+export const ALLOWED_JOLLI_HOSTS: readonly string[] = [
+	"jolli.ai",
+	"jolli.dev",
+	"jollidev.com",
+	"jollidev.dev",
+	"jolli.cloud",
+	"jolli-local.me",
+];
 
 /**
  * Rejects origins that are not on the Jolli allowlist. Called from the
@@ -289,7 +296,7 @@ export function assertJolliOriginAllowed(origin: string): void {
 		return;
 	}
 	throw new Error(
-		`Rejected Jolli origin "${url.origin}". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.`,
+		`Rejected Jolli origin "${url.origin}". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jollidev.com, https://*.jollidev.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.`,
 	);
 }
 
