@@ -1,6 +1,11 @@
 # Changelog
 
-<!-- Last synced commit: fb34e0a98 | 2026-08-28 -->
+<!-- Last synced commit: e3287ce7 | 2026-08-31 -->
+
+## 0.99.17
+
+- **Ready for Jolli's new web addresses** — signing in now works with Jolli's new domains, so keys issued there are accepted.
+- Bug fixes.
 
 ## 0.99.16
 

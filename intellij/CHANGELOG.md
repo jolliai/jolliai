@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.99.17
+
+### Changes
+
+- **Ready for Jolli's new web addresses** — signing in now works with Jolli's new domains, so keys issued there are accepted.
+
+### Fixes & Improvements
+
+- Bug fixes.
+
+### Performance
+
+- Performance improvements.
+
 ## 0.99.16
 
 ### Changes
