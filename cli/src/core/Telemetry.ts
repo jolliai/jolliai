@@ -322,6 +322,9 @@ export function resolveTelemetryEnv(origin?: string, env: NodeJS.ProcessEnv = pr
 	if (matches("jollidev.dev")) return "dev";
 	if (matches("jolli.cloud")) return "preview";
 	if (matches("jolli.ai")) return "prod";
+	// Keyed on TLD, not on which string reads "dev": jollidev.com is the prod
+	// deployment and jollidev.dev is the dev one. Intentional — don't "fix" the
+	// pairing to match the names.
 	if (matches("jollidev.com")) return "prod";
 	return "unknown";
 }

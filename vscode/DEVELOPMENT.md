@@ -258,7 +258,7 @@ The extension declares `onUri` as an activation event. The OAuth flow opens the 
 - The `jollimemory.signedIn` context key drives sidebar UI (banners, the sign-in/sign-out menu items in `package.json`).
 - The URI handler logs the scheme/authority/path and a parameter count only — never `uri.toString()` or `uri.query`. Even though the URI itself no longer carries credentials, the Output channel persists for the window lifetime and frequently gets pasted into bug reports, so we keep the redaction defensive.
 - A nonce/state value is generated before launching the browser and validated when the callback arrives, so a captured callback URL can't be replayed to inject a foreign session.
-- `validateJolliApiKey` is called save-time (OAuth callback exchange result, `configure --set`, settings UI). Request paths trust the saved value; the allowlist (`jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`) lives in `cli/src/core/JolliApiUtils.ts` and is shared with the CLI.
+- `validateJolliApiKey` is called save-time (OAuth callback exchange result, `configure --set`, settings UI). Request paths trust the saved value; the allowlist (`jolli.ai`, `jolli.dev`, `jollidev.com`, `jollidev.dev`, `jolli.cloud`, `jolli-local.me`) lives in `cli/src/core/JolliApiUtils.ts` and is shared with the CLI.
 
 ---
 

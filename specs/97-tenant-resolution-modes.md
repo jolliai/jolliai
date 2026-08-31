@@ -16,7 +16,7 @@ Resolve a saved Jolli site URL to the `(origin, tenantSlug)` pair that all backe
 
 **Out of scope (boundaries):**
 
-- The HTTPS host allowlist (`jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me`); that is **Jolli Origin Allowlist Enforcement**.
+- The HTTPS host allowlist (`jolli.ai`, `jolli.dev`, `jollidev.com`, `jollidev.dev`, `jolli.cloud`, `jolli-local.me`); that is **Jolli Origin Allowlist Enforcement**.
 - The `x-org-slug` header, which is sourced from the API key payload's `o` field — not from the URL — and is therefore independent of this spec.
 - The endpoints that use the resolved pair (`/api/push/jollimemory`, `/api/jolli-memory/spaces`, `/api/jolli-memory/bindings`); see **Summary Push to Jolli Space** and **Binding Required Flow**.
 - The product API key parser; see **Jolli API Key Format and Parsing**.
@@ -87,7 +87,7 @@ This is a stateless transformation. The same input always produces the same outp
 - **The same parser produces both forms.** Callers receive a uniform `(origin, tenantSlug)` pair regardless of which form the saved URL uses. They never have to branch on URL shape — only on whether the slug is defined. (Notable.)
 - **Only the first path segment is the slug.** Multi-segment paths like `/acme/extra` resolve to `tenantSlug = "acme"`; the remaining segments are silently ignored. There is no `tenantPath` or multi-level tenant. (Notable.)
 - **Path-based vs subdomain-based is determined entirely by the path component.** A URL whose host has multiple labels (`acme.jolli.ai`) is **not** automatically treated as subdomain-based by the parser — the parser does not inspect the host. The host's role in tenant resolution is a server-side concern; the client only sends `x-tenant-slug` when the path carries one. (Surprising; intentional.)
-- **No host allowlist enforcement here.** The allowlist (`jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me` and HTTPS-only) is enforced at the save-time of the URL — not by this parser. By the time a saved URL reaches this resolver it has already been screened. The resolver therefore happily parses any well-formed URL, including ones outside the allowlist. (Notable; the security boundary is elsewhere.)
+- **No host allowlist enforcement here.** The allowlist (`jolli.ai`, `jolli.dev`, `jollidev.com`, `jollidev.dev`, `jolli.cloud`, `jolli-local.me` and HTTPS-only) is enforced at the save-time of the URL — not by this parser. By the time a saved URL reaches this resolver it has already been screened. The resolver therefore happily parses any well-formed URL, including ones outside the allowlist. (Notable; the security boundary is elsewhere.)
 - **`origin` does not include trailing slash and never carries a path.** Endpoint URLs are built by joining `origin` + the absolute endpoint path. (Notable.)
 - **Default ports are not added to `origin`.** A URL with no explicit port resolves to an `origin` without one; the URL parser is responsible for canonicalization. (Notable.)
 - **A path of `/` resolves to `tenantSlug = undefined`.** Trimming leading and trailing slashes leaves the empty string, which the empty-segment filter drops. The filter is therefore the load-bearing detail that distinguishes "no tenant on the path" from "empty-string tenant on the path". (Notable.)

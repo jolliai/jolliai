@@ -166,9 +166,9 @@ The Jolli-API-key validation runs in the webview's own script context (an inline
 The key's payload encodes a URL via base64url-decoded segments. The URL is accepted only if:
 
 - Scheme is HTTPS.
-- Hostname matches one of `jolli.ai`, `jolli.dev`, `jolli.cloud`, `jolli-local.me` exactly, or is a sub-domain of one (suffix-boundary check, not substring).
+- Hostname matches one of `jolli.ai`, `jolli.dev`, `jollidev.com`, `jollidev.dev`, `jolli.cloud`, `jolli-local.me` exactly, or is a sub-domain of one (suffix-boundary check, not substring).
 
-Any deviation rejects with the inline error: `Origin <u> is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jolli.cloud, *.jolli-local.me).`. Shape failures emit the dedicated message: `Key cannot be decoded. Paste the key exactly as issued by Jolli.`.
+Any deviation rejects with the inline error: `Origin <u> is not on the Jolli allowlist (only *.jolli.ai, *.jolli.dev, *.jollidev.com, *.jollidev.dev, *.jolli.cloud, *.jolli-local.me).`. Shape failures emit the dedicated message: `Key cannot be decoded. Paste the key exactly as issued by Jolli.`.
 
 ### Apply Changes button
 

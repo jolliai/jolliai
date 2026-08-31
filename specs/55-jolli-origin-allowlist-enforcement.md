@@ -34,6 +34,8 @@ A fixed array of host suffixes:
 | ------------------ |
 | `jolli.ai`         |
 | `jolli.dev`        |
+| `jollidev.com`     |
+| `jollidev.dev`     |
 | `jolli.cloud`      |
 | `jolli-local.me`   |
 
@@ -83,7 +85,7 @@ The two forms differ **only** in how they report the outcome — the parse, the 
 | Failure                  | Outcome                                                                                                       |
 | ------------------------ | ------------------------------------------------------------------------------------------------------------- |
 | Unparseable URL          | Throws `Rejected Jolli origin (unparseable): <input>`.                                                        |
-| Wrong protocol or host   | Throws `Rejected Jolli origin "<parsed origin>". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.` |
+| Wrong protocol or host   | Throws `Rejected Jolli origin "<parsed origin>". Only https://*.jolli.ai, https://*.jolli.dev, https://*.jollidev.com, https://*.jollidev.dev, https://*.jolli.cloud, and https://*.jolli-local.me are permitted.` |
 
 A throw at a save site refuses the save: nothing is persisted, the in-memory pending state (if any) is cleared by the caller, and the previously trusted state on disk is untouched. The trusted state never becomes tainted by an attempted save of an off-allowlist value.
 

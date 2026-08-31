@@ -232,6 +232,9 @@ object Telemetry {
             matches("jollidev.dev") -> "dev"
             matches("jolli.cloud") -> "preview"
             matches("jolli.ai") -> "prod"
+            // Keyed on TLD, not on which string reads "dev": jollidev.com is the prod
+            // deployment and jollidev.dev is the dev one. Intentional — don't "fix" the
+            // pairing to match the names.
             matches("jollidev.com") -> "prod"
             else -> "unknown"
         }
