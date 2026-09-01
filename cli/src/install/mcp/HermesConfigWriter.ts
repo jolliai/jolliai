@@ -122,6 +122,29 @@ const isCommentAtCol0 = (line: string): boolean => /^#/.test(line);
 const isIndentedOrBlank = (line: string): boolean => line.length === 0 || /^[ \t]/.test(line);
 
 /**
+ * Drop a header line's inline value when the whole of it is a YAML comment.
+ *
+ * `key: # remark` is block form: the comment is not a value, the indented lines
+ * below are. Every caller either compares this result against
+ * {@link TRIVIAL_INLINE_VALUES} or reads a non-empty one as "an inline shape
+ * this small parser will not touch" — so a comment reaching either test is the
+ * same silent failure at three different depths, and all three fail by doing
+ * nothing while reporting success: the whole block is skipped, our own entry is
+ * never refreshed, or our hook is never registered at all.
+ *
+ * Only a value that is ENTIRELY a comment is stripped. A `#` further along may
+ * be a literal inside a flow mapping (`{cmd: "a # b"}`), and telling those apart
+ * needs a real YAML scanner — so `{} # note` stays non-trivial and its caller
+ * keeps its hands off it. That conservative half is the same contract: guessing
+ * there would corrupt the file, which is worse than the stale value it avoids.
+ *
+ * Takes an already-trimmed value; every caller's header regex trims for it.
+ */
+function stripTrailingComment(inlineValue: string): string {
+	return inlineValue.startsWith("#") ? "" : inlineValue;
+}
+
+/**
  * Locate the block for `key` in `lines`. Returns:
  *   - null when the key is absent,
  *   - `{ headerIndex, endIndex, trivialInline }` when it is present.
@@ -166,9 +189,7 @@ function findBlock(lines: ReadonlyArray<string>, key: string): BlockLocation | n
 
 	// A trailing YAML comment (`mcp_servers: # remark`) is semantically null —
 	// strip it so it does not read as a non-trivial inline value.
-	if (inlineValue?.startsWith("#")) {
-		inlineValue = "";
-	}
+	if (inlineValue !== undefined) inlineValue = stripTrailingComment(inlineValue);
 
 	if (inlineValue !== undefined && inlineValue.length > 0) {
 		if (TRIVIAL_INLINE_VALUES.has(inlineValue)) {
@@ -307,11 +328,16 @@ function renderBlock(key: string, entries: ReadonlyArray<YamlBlockEntry>): strin
 /**
  * Add or refresh `entry` under `key` in the Hermes config at `p`.
  *
- * Every OTHER sub-entry under `key` is preserved verbatim (a user's other MCP
- * servers, other hook events). Every other TOP-LEVEL section is preserved
- * byte-for-byte. Idempotent: re-running with the same entry writes nothing.
- * Parent directories are created if absent. Fails open on a permission-error
- * read — the file is left untouched and a warning is logged.
+ * Preservation runs at THREE levels, and the innermost one is the easiest to
+ * lose: every other TOP-LEVEL section stays byte-for-byte, every other SUB-ENTRY
+ * under `key` stays verbatim (a user's other MCP servers, other hook events),
+ * and inside our own sub-entry every CHILD KEY we do not author stays too — see
+ * {@link mergeEntryPreservingExtras} for why that last one is a security
+ * property and not just tidiness.
+ *
+ * Idempotent: re-running with the same entry writes nothing. Parent directories
+ * are created if absent. Fails open on a permission-error read — the file is
+ * left untouched and a warning is logged.
  */
 export async function upsertYamlBlockEntry(p: string, key: YamlBlockKey, entry: YamlBlockEntry): Promise<void> {
 	let text = "";
@@ -541,7 +567,9 @@ function mergeHookCommandEntry(
 	const lines = entry.body.replace(/\n+$/, "").split("\n");
 	const header = /^([ \t]*)[^:]+:\s*(.*?)\s*$/.exec(lines[0]);
 	const headerIndent = header?.[1] ?? "  ";
-	const inlineValue = header?.[2] ?? "";
+	// `event: # remark` is block form, not an inline value — without the strip it
+	// reads as one below and this event silently never receives our command.
+	const inlineValue = stripTrailingComment(header?.[2] ?? "");
 	// `event: []` / null is the empty state. Replace it with block form before
 	// adding the first command; appending beneath an inline scalar is invalid YAML.
 	if (TRIVIAL_INLINE_VALUES.has(inlineValue)) {
@@ -666,11 +694,157 @@ export function writeHookCommandRemoval(text: string, event: string, command: st
 	return `${out.replace(/\n+$/, "")}\n`;
 }
 
+/**
+ * One child key inside a sub-entry, with every line it owns.
+ *
+ * `key` is `""` for a group this parser does not read as a `key:` header — a
+ * comment, a list item, a stray indent. Those are carried verbatim and in place,
+ * so a merge cannot drop them either.
+ */
+interface EntryChild {
+	readonly key: string;
+	readonly lines: ReadonlyArray<string>;
+}
+
+interface ParsedEntry {
+	/** The `<indent><subKey>:` line, verbatim. */
+	readonly header: string;
+	/**
+	 * Whatever followed the colon on the header line, trimmed and with a
+	 * whole-line comment stripped ({@link stripTrailingComment}). `""` for block
+	 * form — which `jollimemory: # remark` also is.
+	 */
+	readonly inlineValue: string;
+	/** The indent the child keys sit at. `""` when the entry has no children. */
+	readonly indent: string;
+	readonly children: EntryChild[];
+}
+
+/**
+ * Split one sub-entry into its header line and one group per child key.
+ *
+ * Structurally the same scan as {@link parseSubEntries}, one level deeper: a
+ * child owns its header line plus every following blank / more-deeply-indented
+ * line, and a sibling begins at the next line back at the child indent. Returns
+ * `null` when the first line is not a `key:` header at all.
+ */
+function parseEntryBody(body: string): ParsedEntry | null {
+	const lines = body.replace(/\n+$/, "").split("\n");
+	const header = /^[ \t]*[^\s:#][^:]*:\s*(.*?)\s*$/.exec(lines[0]);
+	if (header === null) return null;
+	const rest = lines.slice(1);
+	const firstChild = rest.find((line) => !isBlank(line));
+	const indent = firstChild === undefined ? "" : (/^([ \t]+)/.exec(firstChild)?.[1] ?? "");
+	const children: EntryChild[] = [];
+	if (indent.length > 0) {
+		// Same `(?!-\s)` guard as parseSubEntries: an indentless PyYAML sequence
+		// puts its `- ` marker at the key's own indent and is NOT a sibling key.
+		const childRe = new RegExp(`^${indent}(?!-\\s)([^\\s:#][^:]*):`);
+		let i = 0;
+		while (i < rest.length) {
+			if (isBlank(rest[i])) {
+				i++;
+				continue;
+			}
+			const match = childRe.exec(rest[i]);
+			if (match === null) {
+				children.push({ key: "", lines: [rest[i]] });
+				i++;
+				continue;
+			}
+			const start = i;
+			i++;
+			while (i < rest.length && (isBlank(rest[i]) || childRe.exec(rest[i]) === null)) i++;
+			let end = i;
+			while (end > start + 1 && isBlank(rest[end - 1])) end--;
+			children.push({ key: match[1].trim(), lines: rest.slice(start, end) });
+		}
+	}
+	return { header: lines[0], inlineValue: stripTrailingComment(header[1] ?? ""), indent, children };
+}
+
+/** Re-anchor `lines` from one child indent to another, preserving deeper nesting. */
+function reindent(lines: ReadonlyArray<string>, from: string, to: string): string[] {
+	if (from === to || from.length === 0) return [...lines];
+	return lines.map((line) => (line.startsWith(from) ? to + line.slice(from.length) : line));
+}
+
+/**
+ * Overlay `incoming`'s child keys onto `existing`, keeping every child key
+ * `incoming` does not declare.
+ *
+ * This is the difference between refreshing our registration and rewriting the
+ * user's entry. Hermes reads per-server keys we never author — `trust`, which
+ * gates every write-capable tool call behind an approval prompt, is the one that
+ * matters most — and a wholesale replacement deleted them. That failure is
+ * silent AND it fails toward danger: an absent `trust` key means `full` in
+ * Hermes' own normalisation, so the gate does not loosen by a notch, it turns
+ * OFF, and the only visible symptom is that the prompts the operator asked for
+ * stop appearing. Measured on a real config: one `jolli enable` removed a
+ * hand-added `trust: untrusted`.
+ *
+ * Two shapes are handed back rather than merged, and each for its own reason:
+ *
+ *   - A trivial inline value (`jollimemory: {}` / `null`) is Hermes' "empty"
+ *     idiom and carries nothing to keep, so `incoming` wins outright.
+ *   - A NON-trivial inline value (`jollimemory: {command: x, trust: untrusted}`)
+ *     is valid YAML this small parser does not understand. `existing` is
+ *     returned untouched — the same fail-open choice {@link mergeHookCommandEntry}
+ *     already makes one level down. Our command may then be stale, which is
+ *     recoverable; deleting a key the user set is not.
+ *
+ * A trailing comment (`jollimemory: # my server`) is NEITHER of those — it is
+ * block form with a remark on the header line, and {@link stripTrailingComment}
+ * is what keeps it out of the second case. Without that, the entry took the
+ * fail-open path forever and our `command` never refreshed again, which is a
+ * regression against the wholesale replacement this function replaced: that one
+ * at least always wrote the current path.
+ */
+function mergeEntryPreservingExtras(existing: YamlBlockEntry, incoming: YamlBlockEntry): YamlBlockEntry {
+	const current = parseEntryBody(existing.body);
+	const next = parseEntryBody(incoming.body);
+	// Defensive rather than live: a sub-entry only reaches here once
+	// {@link parseSubEntries} read a KEY off its first line, which is the shape
+	// {@link parseEntryBody} needs, so neither is null today. It still hands back
+	// `existing`, because the two regexes are written apart and the day they
+	// drift, THIS is the line that decides whether the drift leaves our command
+	// stale or quietly deletes the user's `trust`. Every bail-out below points the
+	// same way for the same reason; `incoming` here would be the one exception,
+	// and it would fail toward danger.
+	if (current === null || next === null) return existing;
+	if (current.inlineValue.length > 0) {
+		return TRIVIAL_INLINE_VALUES.has(current.inlineValue) ? incoming : existing;
+	}
+	if (current.children.length === 0) return incoming;
+
+	const merged: EntryChild[] = current.children.map((child) => {
+		if (child.key.length === 0) return child;
+		const replacement = next.children.find((c) => c.key === child.key);
+		if (replacement === undefined) return child;
+		// Re-anchor to the indent already in the file: sibling keys of one YAML
+		// mapping must share an indent, so emitting ours verbatim beside a
+		// hand-indented entry would produce a file Hermes cannot parse.
+		return { key: child.key, lines: reindent(replacement.lines, next.indent, current.indent) };
+	});
+	const declared = new Set(current.children.map((child) => child.key));
+	for (const child of next.children) {
+		if (child.key.length === 0 || declared.has(child.key)) continue;
+		merged.push({ key: child.key, lines: reindent(child.lines, next.indent, current.indent) });
+	}
+
+	return {
+		subKey: existing.subKey,
+		body: `${[current.header, ...merged.flatMap((child) => child.lines)].join("\n")}\n`,
+	};
+}
+
 function mergeEntries(existing: ReadonlyArray<YamlBlockEntry>, entry: YamlBlockEntry): YamlBlockEntry[] {
-	// Replace an existing sub-entry with the same key; otherwise append.
+	// Refresh an existing sub-entry KEY BY KEY; otherwise append. Replacing the
+	// whole entry would delete the user's own per-server keys — see
+	// {@link mergeEntryPreservingExtras}.
 	const index = existing.findIndex((e) => e.subKey === entry.subKey);
 	if (index === -1) return [...existing, entry];
 	const next = [...existing];
-	next[index] = entry;
+	next[index] = mergeEntryPreservingExtras(existing[index], entry);
 	return next;
 }

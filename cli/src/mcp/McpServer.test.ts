@@ -306,14 +306,63 @@ describe("startMcpServer", () => {
 	});
 
 	// `requiresRepo` decides what is advertised; it is not part of the advertisement.
-	// The platform-tool path already projected its entries down to these three keys to
+	// The platform-tool path already projected its entries down to the public keys to
 	// keep `binding` / `menu` off the wire, and the built-ins are now held to the same
 	// rule — a client has no use for it and the MCP tool schema has no field for it.
-	it("ListTools never leaks the internal requiresRepo flag onto the wire", async () => {
+	// `readOnly` is internal too: it reaches the wire only as `annotations.readOnlyHint`.
+	it("ListTools never leaks the internal requiresRepo / readOnly flags onto the wire", async () => {
 		await startMcpServer("/repo");
 		const result = (await capturedHandlers[0]({ params: { name: "" } })) as { tools: object[] };
 		for (const tool of result.tools) {
-			expect(Object.keys(tool).sort()).toEqual(["description", "inputSchema", "name"]);
+			expect(Object.keys(tool).sort()).toEqual(["annotations", "description", "inputSchema", "name"]);
+		}
+	});
+
+	/*
+	 * The read-only classification, pinned as an exact partition — same reasoning as
+	 * the repo-scoped one above, with the risk pointing the other way.
+	 *
+	 * A tool wrongly marked read-only is the dangerous direction: on a host gating an
+	 * untrusted server it buys an exemption from the approval prompt the operator
+	 * configured. Only the two tools that mutate anything are on the false side —
+	 * `bind_space` writes this repo's Space binding, `push_memory` publishes its
+	 * summaries. Everything else, including the backend-reading `list_spaces` and the
+	 * possibly-blocking `queue_status`, only reads.
+	 */
+	it("classifies every built-in tool as read-only or write-capable", () => {
+		const partition = (readOnly: boolean) =>
+			TOOL_DEFINITIONS.filter((t) => t.readOnly === readOnly)
+				.map((t) => t.name)
+				.sort();
+		expect(partition(false)).toEqual(["bind_space", "push_memory"]);
+		expect(partition(true)).toEqual([
+			"get_decision_timeline",
+			"get_pr_description",
+			"list_branches",
+			"list_spaces",
+			"queue_status",
+			"recall",
+			"search",
+			"status",
+		]);
+	});
+
+	// The hint a host actually consults. Hermes 0.21.0 treats anything without
+	// `readOnlyHint === true` as write-capable and routes it through an approval
+	// prompt, so an absent block gates all ten — including `recall`.
+	it("ListTools advertises readOnlyHint on both sides of the classification", async () => {
+		await startMcpServer("/repo");
+		const result = (await capturedHandlers[0]({ params: { name: "" } })) as {
+			tools: { name: string; annotations?: { readOnlyHint?: boolean } }[];
+		};
+		const hint = (name: string) => result.tools.find((t) => t.name === name)?.annotations?.readOnlyHint;
+		expect(hint("recall")).toBe(true);
+		expect(hint("list_branches")).toBe(true);
+		expect(hint("push_memory")).toBe(false);
+		expect(hint("bind_space")).toBe(false);
+		// Every advertised built-in carries the block — absence is what fails closed.
+		for (const tool of result.tools) {
+			expect(typeof tool.annotations?.readOnlyHint).toBe("boolean");
 		}
 	});
 

@@ -25,7 +25,7 @@ vi.mock("./SqliteHelpers.js", async (importOriginal) => {
 	return { ...actual, hasNodeSqliteSupport: vi.fn(actual.hasNodeSqliteSupport) };
 });
 
-import { createHermesDb } from "../testUtils/hermesDbFixture.js";
+import { createHermesDb, createLegacyHermesDb } from "../testUtils/hermesDbFixture.js";
 import {
 	discoverHermesSessions,
 	getHermesHomeDir,
@@ -255,6 +255,73 @@ describe("HermesSessionDiscoverer", () => {
 			]);
 			const { sessions } = await scanHermesSessionsOnDiskAt([dbPath]);
 			expect(sessions.map((s) => s.session.sessionId)).toEqual(["archived"]);
+		});
+
+		it("reads a database that predates the hidden column instead of failing it", async () => {
+			// The reported failure (`no such column: hidden`, CLI 0.99.16): a profile
+			// Hermes has not opened since the column landed, which Hermes therefore
+			// never repaired and we — reading read-only — cannot repair either. The
+			// whole database used to be lost to a `schema` error, not just the filter.
+			const dbPath = await createLegacyHermesDb(
+				tempDir,
+				[{ id: "s1", startedAt: secondsAgo(HOUR_MS), cwd: projectDir, title: "legacy" }],
+				["hidden"],
+			);
+			const { sessions, error } = await scanHermesSessionsOnDiskAt([dbPath]);
+			expect(error).toBeUndefined();
+			expect(sessions.map((s) => s.session.sessionId)).toEqual(["s1"]);
+			expect(sessions[0].session.title).toBe("legacy");
+		});
+
+		it("reads a database missing every optional column, treating each as null", async () => {
+			// A schema without `last_activity_at` still dates the row, because the
+			// COALESCE falls through to `started_at` — the same path a live-but-null
+			// column already takes.
+			const dbPath = await createLegacyHermesDb(
+				tempDir,
+				[{ id: "s1", startedAt: secondsAgo(HOUR_MS), cwd: projectDir }],
+				["hidden", "title", "cwd", "git_repo_root", "last_activity_at"],
+			);
+			const { sessions, error } = await scanHermesSessionsOnDiskAt([dbPath]);
+			expect(error).toBeUndefined();
+			expect(sessions).toHaveLength(1);
+			expect(sessions[0].session.title).toBeUndefined();
+			// Both directory columns are gone, so the row is unattributable — exactly
+			// what a live NULL pair produces, never an attach-to-every-repo.
+			expect(sessions[0].dirs).toEqual([]);
+		});
+
+		it("still reports a schema failure when a REQUIRED column is missing", async () => {
+			// The tolerance above is scoped to columns the reader can do without.
+			// `started_at` is the only guaranteed timestamp, so a database lacking it
+			// must stay a genuine failure rather than degrade into zero sessions.
+			const dbPath = await createLegacyHermesDb(
+				tempDir,
+				[{ id: "s1", startedAt: secondsAgo(HOUR_MS), cwd: projectDir }],
+				["started_at"],
+			);
+			const { sessions, error } = await scanHermesSessionsOnDiskAt([dbPath]);
+			expect(error?.kind).toBe("schema");
+			expect(sessions).toEqual([]);
+		});
+
+		it("keeps a legacy profile's sessions beside a current profile's", async () => {
+			// The mixed install the report describes: one dormant profile on an old
+			// schema, one in daily use. Neither may cost the other its rows.
+			const legacy = await createLegacyHermesDb(
+				join(tempDir, "legacy"),
+				[{ id: "old", startedAt: secondsAgo(HOUR_MS), cwd: projectDir }],
+				["hidden"],
+			);
+			const current = await createHermesDb(join(tempDir, "current"), [
+				{ id: "new", startedAt: secondsAgo(HOUR_MS), cwd: projectDir },
+				{ id: "new-hidden", startedAt: secondsAgo(HOUR_MS), cwd: projectDir, hidden: 1 },
+			]);
+			const { sessions, error } = await scanHermesSessionsOnDiskAt([legacy, current]);
+			expect(error).toBeUndefined();
+			// The current profile's `hidden` row is still filtered — tolerating an
+			// absent column must not relax the filter where the column exists.
+			expect(sessions.map((s) => s.session.sessionId)).toEqual(["old", "new"]);
 		});
 
 		it("carries no directories for a session recorded outside any project", async () => {

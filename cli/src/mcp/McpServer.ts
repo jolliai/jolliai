@@ -71,18 +71,60 @@ const log = createLogger("McpServer");
  *
  * Split from {@link ToolDefinition} so the internal fields below cannot reach the
  * wire by being added to one type. The platform-tool path already projected its
- * manifest entries down to these three keys for that reason (`binding` and `menu`
- * are backend routing / curation metadata); making the shape explicit means the
- * built-ins are held to the same rule instead of relying on their type happening to
- * carry nothing extra.
+ * manifest entries down to this shape for that reason (`binding` and `menu` are
+ * backend routing / curation metadata); making it explicit means the built-ins are
+ * held to the same rule instead of relying on their type happening to carry nothing
+ * extra. `requiresRepo` and `readOnly` stay internal — the first decides what is
+ * advertised at all, the second reaches a client only as {@link annotations}.
  */
 export interface PublicToolDefinition {
 	name: string;
 	description: string;
 	inputSchema: { type: "object"; properties: Record<string, unknown>; required?: string[] };
+	/**
+	 * The MCP `annotations` block. Optional here because a platform tool carries
+	 * whatever its manifest entry declares — today, nothing; the built-ins always
+	 * set it. See {@link ToolDefinition.readOnly}.
+	 */
+	annotations?: ToolAnnotations;
+}
+
+/**
+ * The behavioural hints this server asserts about a tool.
+ *
+ * Deliberately ONE field rather than the protocol's full set. `destructiveHint` /
+ * `idempotentHint` / `openWorldHint` are all things we could truthfully say, but
+ * nothing reads them today, and an unread hint is a claim that can silently rot
+ * as the tool changes. Add one when a host is measured acting on it.
+ */
+export interface ToolAnnotations {
+	readonly readOnlyHint: boolean;
 }
 
 export interface ToolDefinition extends PublicToolDefinition {
+	/**
+	 * Whether this tool only READS — no repository write, no backend mutation.
+	 *
+	 * Required, for the same reason {@link requiresRepo} is: with no default,
+	 * adding a tool without classifying it is a compile error. The direction of
+	 * the risk is the opposite one, though, and worth stating so the two are not
+	 * confused. A wrong `requiresRepo: false` is silent and harmful; a missing
+	 * read-only claim is merely pessimistic — a host that gates on it asks for an
+	 * approval it did not need to ask for. Wrong in the OTHER direction is the
+	 * dangerous one: claiming read-only for a tool that writes buys it an
+	 * exemption from exactly the prompt the operator configured.
+	 *
+	 * Surfaced as `annotations.readOnlyHint` in `tools/list`, which is what a host
+	 * running an untrusted server consults. Measured on Hermes 0.21.0
+	 * (`tools/mcp_tool.py::_trust_gate_check`): on a server configured
+	 * `trust: untrusted` every tool WITHOUT `readOnlyHint === true` routes through
+	 * an approval prompt before its RPC fires, and missing annotations fail closed
+	 * to write-capable. With none of ours declaring it, all ten were gated — a
+	 * `recall` in a non-interactive session was auto-denied and the skill fell
+	 * through to its CLI recipe, which is why the breakage looked like nothing at
+	 * all.
+	 */
+	readOnly: boolean;
 	/**
 	 * Whether this tool derives the repository it answers for from the server's cwd.
 	 *
@@ -105,6 +147,7 @@ export interface ToolDefinition extends PublicToolDefinition {
 export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	{
 		name: "bind_space",
+		readOnly: false,
 		requiresRepo: true,
 		description:
 			'Bind this repo to a Jolli Space so `push_memory` can push to it. Idempotent — binding an already-bound repo returns `{type:"already_bound"}` rather than erroring.',
@@ -121,6 +164,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "list_spaces",
+		readOnly: true,
 		requiresRepo: false,
 		description:
 			"List the Jolli Spaces this tenant can bind a repo to, plus the tenant's configured default space.",
@@ -128,6 +172,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "push_memory",
+		readOnly: false,
 		requiresRepo: true,
 		description:
 			'Push this branch\'s JolliMemory commit summaries to the bound Jolli Space as articles. If the repo isn\'t bound yet, returns {"type":"binding_required"} with the available spaces — call again with `space` set (or use `bind_space` first) to bind and push. If the user has turned outbound push off for this repo, returns {"type":"push_disabled"} — memory is still recorded locally; this is a deliberate setting, so do not retry, and tell the user to re-enable it instead.',
@@ -149,6 +194,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "search",
+		readOnly: true,
 		requiresRepo: true,
 		description:
 			"Full-text search over this repo's historical decisions and implementations (topics + commits). Use to check how a topic was handled before.",
@@ -165,6 +211,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "recall",
+		readOnly: true,
 		requiresRepo: true,
 		description:
 			"Recall the development context for a branch from raw commit summaries (decisions, plans, notes, commits) — the same data the recall skill surfaces, NOT the topic KB. Omit `branch` to recall the current branch.",
@@ -175,6 +222,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "get_decision_timeline",
+		readOnly: true,
 		requiresRepo: true,
 		description: "Chronological evolution of a topic — its source events ordered oldest-first.",
 		inputSchema: {
@@ -185,12 +233,14 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "list_branches",
+		readOnly: true,
 		requiresRepo: true,
 		description: "List all branches that have JolliMemory records, with their topic titles.",
 		inputSchema: { type: "object", properties: {} },
 	},
 	{
 		name: "get_pr_description",
+		readOnly: true,
 		requiresRepo: true,
 		description:
 			"Build a GitHub PR title + description from the CURRENT branch's JolliMemory commit summaries — the same memory-rich body the VS Code extension writes. Use before `gh pr create` so the PR embeds the curated memory instead of a diff-derived summary. Always describes the current branch (the commit range is base..HEAD).",
@@ -211,6 +261,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "queue_status",
+		readOnly: true,
 		requiresRepo: true,
 		description:
 			'Report whether this repo\'s memory-summary generation is still in progress. Call before building a PR (get_pr_description) so freshly-committed summaries are included. Wiki/graph rendering is excluded from the verdict. Pass {"wait": true} to block until drained (default 120s, override with timeoutMs).',
@@ -224,6 +275,7 @@ export const TOOL_DEFINITIONS: ToolDefinition[] = [
 	},
 	{
 		name: "status",
+		readOnly: true,
 		requiresRepo: true,
 		description:
 			"Report Jolli Memory's installation & configuration health for this repo: which hooks are installed, the active hook runtime, data-migration state, account / API-key configuration, detected AI integrations with their session counts, the stored-memory count, and the orphan branch. This is the environment health check — pair it with queue_status (generation progress), not list_branches (recorded memory).",
@@ -597,15 +649,40 @@ function buildRuntime(cwd: string, platform: PlatformToolSet, insideRepo: boolea
 	// check in `createMcpServer` is the backstop for a client working from a cached
 	// list, not the primary defence.
 	const availableBuiltIns = insideRepo ? TOOL_DEFINITIONS : TOOL_DEFINITIONS.filter((t) => !t.requiresRepo);
-	// Every advertised entry is projected down to the public schema
-	// (name / description / inputSchema). Both sides carry fields that must never reach
-	// a client's `tools/list`: a manifest entry has `binding` (backend routing) and
-	// `menu` (curation), a built-in has `requiresRepo`. Dispatch still uses the full
-	// entries via `platformByName`, so routing is unaffected.
-	const advertise = ({ name, description, inputSchema }: PublicToolDefinition): PublicToolDefinition => ({
+	// Every advertised entry is projected down to the public schema. Both sides carry
+	// fields that must never reach a client's `tools/list`: a manifest entry has
+	// `binding` (backend routing) and `menu` (curation), a built-in has `requiresRepo`
+	// and `readOnly`. Dispatch still uses the full entries via `platformByName`, so
+	// routing is unaffected.
+	//
+	// Two projections rather than one, because the two sides answer the annotations
+	// question differently. A built-in DERIVES its block from the required `readOnly`
+	// field, so the compile error that catches an unclassified tool is also what
+	// guarantees the hint is present. A platform tool has no such field — it carries
+	// whatever its manifest declared, which is nothing today; passing the key through
+	// rather than fabricating one keeps the backend, not this file, the author of a
+	// claim about a backend tool.
+	const advertiseBuiltIn = ({ name, description, inputSchema, readOnly }: ToolDefinition): PublicToolDefinition => ({
 		name,
 		description,
 		inputSchema,
+		// Emitted on BOTH sides of the boolean, not just when true. The protocol
+		// defaults an absent hint to false, so `false` and absent gate identically —
+		// what differs is legibility: an explicit false says this tool was classified
+		// and writes, where absence is indistinguishable from a server too old to have
+		// been asked the question.
+		annotations: { readOnlyHint: readOnly },
+	});
+	const advertise = ({
+		name,
+		description,
+		inputSchema,
+		annotations,
+	}: PublicToolDefinition): PublicToolDefinition => ({
+		name,
+		description,
+		inputSchema,
+		...(annotations !== undefined ? { annotations } : {}),
 	});
 	// Logged because the daemon is detached with stdio ignored: this line is the
 	// only way to tell the states apart — gate closed, fetch failed, the tenant
@@ -623,7 +700,7 @@ function buildRuntime(cwd: string, platform: PlatformToolSet, insideRepo: boolea
 	return {
 		cwd,
 		insideRepo,
-		toolDefinitions: [...availableBuiltIns.map(advertise), ...platformTools.map(advertise)],
+		toolDefinitions: [...availableBuiltIns.map(advertiseBuiltIn), ...platformTools.map(advertise)],
 		...(platformClient ? { platformClient } : {}),
 		platformByName: new Map(platformTools.map((t) => [t.name, t] as const)),
 		menu,

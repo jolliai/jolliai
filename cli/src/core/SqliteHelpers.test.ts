@@ -1,6 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { classifyScanError, hasNodeSqliteSupport, NODE_SQLITE_MIN_VERSION, withSqliteDb } from "./SqliteHelpers.js";
+import {
+	classifyScanError,
+	hasNodeSqliteSupport,
+	NODE_SQLITE_MIN_VERSION,
+	readTableColumns,
+	type SqliteDbHandle,
+	withSqliteDb,
+} from "./SqliteHelpers.js";
 
 describe("hasNodeSqliteSupport", () => {
 	const { major, minor } = NODE_SQLITE_MIN_VERSION;
@@ -201,5 +208,46 @@ describe("withSqliteDb", () => {
 			),
 		).rejects.toThrow(/SQLITE_BUSY/);
 		expect(attempts).toBe(3);
+	});
+});
+
+describe("readTableColumns", () => {
+	async function withSeededDb<T>(ddl: string, fn: (db: SqliteDbHandle) => T): Promise<T> {
+		const { tmpdir } = await import("node:os");
+		const { mkdtemp } = await import("node:fs/promises");
+		const { join } = await import("node:path");
+		const { DatabaseSync } = await import("node:sqlite");
+		const dir = await mkdtemp(join(tmpdir(), "sqlite-columns-"));
+		const dbPath = join(dir, "x.db");
+		const seed = new DatabaseSync(dbPath);
+		seed.prepare(ddl).run();
+		seed.close();
+		return withSqliteDb(dbPath, fn);
+	}
+
+	it("returns every column of an existing table", async () => {
+		const names = await withSeededDb(
+			"CREATE TABLE sessions (id TEXT PRIMARY KEY, cwd TEXT, hidden INTEGER)",
+			(db) => [...readTableColumns(db, "sessions")],
+		);
+		expect(names).toEqual(["id", "cwd", "hidden"]);
+	});
+
+	it("returns an empty set for a table that does not exist", async () => {
+		// PRAGMA table_info does not raise for an unknown name. Callers depend on
+		// this being empty rather than throwing — and on NOT reading it as "degrade
+		// every column", since the following query reports the absent table itself
+		// with a message classifyScanError already grades as `schema`.
+		const names = await withSeededDb("CREATE TABLE other (x INTEGER)", (db) => [
+			...readTableColumns(db, "sessions"),
+		]);
+		expect(names).toEqual([]);
+	});
+
+	it("escapes a quote in the table name rather than truncating the PRAGMA", async () => {
+		const names = await withSeededDb('CREATE TABLE "we""ird" (x INTEGER)', (db) => [
+			...readTableColumns(db, 'we"ird'),
+		]);
+		expect(names).toEqual(["x"]);
 	});
 });

@@ -53,12 +53,52 @@ import type { SessionInfo } from "../Types.js";
 import { type DiskSession, sessionsForRepo } from "./DiskSessionScan.js";
 import { hermesHomeDir } from "./HermesConfigPaths.js";
 import { sessionDirBelongsToRepo } from "./SessionDirMatch.js";
-import { classifyScanError, hasNodeSqliteSupport, type SqliteScanError, withSqliteDb } from "./SqliteHelpers.js";
+import {
+	classifyScanError,
+	hasNodeSqliteSupport,
+	readTableColumns,
+	type SqliteScanError,
+	withSqliteDb,
+} from "./SqliteHelpers.js";
 
 const log = createLogger("HermesDiscoverer");
 
 /** Sessions older than 48 hours are considered stale (matches other sources). */
 const SESSION_STALE_MS = 48 * 60 * 60 * 1000;
+
+/**
+ * Columns this reader asks for but can do without, because an older Hermes
+ * `sessions` table may not have them yet.
+ *
+ * ## Why a stale schema reaches us when Hermes repairs its own
+ *
+ * Hermes reconciles on startup — `_reconcile_columns` in `hermes_state_schema.py`
+ * diffs the live table against its declared DDL and `ALTER TABLE ... ADD COLUMN`s
+ * whatever is missing, so its own reads never see an old shape. Three facts turn
+ * that into a gap for US rather than a non-problem:
+ *
+ *   1. It repairs only the profile Hermes is CURRENTLY running. A named profile
+ *      (`~/.hermes/profiles/<name>/state.db`) the user has not switched into since
+ *      the feature landed keeps its old columns indefinitely.
+ *   2. We read EVERY profile's database — see {@link listHermesStateDbPaths} for
+ *      why reading only the default one is worse than useless.
+ *   3. We open read-only, so we can never trigger the repair either.
+ *
+ * So a dormant profile is a database only Jolli opens and only Hermes can fix,
+ * and nothing brings the two together until the user happens to switch into it.
+ * `hidden` is the column that has actually been reported (`no such column:
+ * hidden`, CLI 0.99.16); the rest are listed because the same reasoning covers
+ * them and the next addition upstream should not need another bug report.
+ *
+ * ## Why NULL is the exact answer, not a fallback
+ *
+ * Every consumer already treats these as nullable — Hermes itself declares all
+ * four without NOT NULL, and a fresh install here had `git_repo_root` NULL on
+ * every row. Reading an absent column as NULL therefore says exactly what is
+ * true ("this database records nothing for that field") in the vocabulary the
+ * row handling already speaks, instead of inventing a value.
+ */
+const OPTIONAL_COLUMNS = ["title", "cwd", "git_repo_root", "last_activity_at"] as const;
 
 /**
  * Hermes' home directory.
@@ -277,27 +317,52 @@ async function scanOneHermesDb(dbPath: string, cutoffMs: number): Promise<Hermes
 
 	try {
 		const sessions = await withSqliteDb(dbPath, (db) => {
-			// Timestamps are epoch SECONDS stored as REAL, so the cutoff is compared
-			// as a float rather than floored — the column has sub-second precision and
-			// truncating it would widen the window by up to a second for no reason.
-			//
-			// `hidden = 0` only. `archived` is deliberately NOT filtered: archiving is
-			// a user's own filing action, and the conversation still happened — the
-			// dashboard counts work, not what the user chose to tidy away.
-			//
+			// Which columns this particular database HAS, because it may predate the
+			// Hermes release that added the ones below. See OPTIONAL_COLUMNS for why a
+			// stale database reaches us at all and why substituting NULL is exact
+			// rather than a guess.
+			const columns = readTableColumns(db, "sessions");
+			const missing = OPTIONAL_COLUMNS.filter((name) => !columns.has(name));
+			if (missing.length > 0) {
+				log.info("Hermes DB %s predates column(s) %s — reading it without them", dbPath, missing.join(", "));
+			}
+			// A column the schema lacks is read as NULL, which every consumer below
+			// already handles (`sessionDirs` skips a non-string, the title guard
+			// requires a non-blank string, and the COALESCE falls through to
+			// `started_at`). `id` and `started_at` get no such treatment: they are the
+			// identity and the only guaranteed timestamp, so a database missing either
+			// — or missing `sessions` altogether — must still fail. Leaving them
+			// unguarded is what makes SQLite report that itself, with a `no such
+			// table` / `no such column` message `classifyScanError` grades as `schema`.
+			const optional = (name: (typeof OPTIONAL_COLUMNS)[number]): string =>
+				columns.has(name) ? `"${name}"` : "NULL";
 			// COALESCE because `last_activity_at` is nullable while `started_at` is
 			// NOT NULL: a session that has produced no turn yet would otherwise be
 			// dropped by the window comparison against NULL, which is neither true
 			// nor false.
+			const activityAt = `COALESCE(${optional("last_activity_at")}, started_at)`;
+			// `hidden = 0` only. `archived` is deliberately NOT filtered: archiving is
+			// a user's own filing action, and the conversation still happened — the
+			// dashboard counts work, not what the user chose to tidy away.
+			//
+			// A schema without the column predates the hide feature entirely, so no
+			// row in it can be hidden and dropping the clause is what the filter would
+			// have decided anyway — not a relaxation of it.
+			const hiddenClause = columns.has("hidden") ? "hidden = 0 AND " : "";
+			// Timestamps are epoch SECONDS stored as REAL, so the cutoff is compared
+			// as a float rather than floored — the column has sub-second precision and
+			// truncating it would widen the window by up to a second for no reason.
 			const rows = db
 				.prepare(
 					// No ORDER BY: every row passing the window and the JS directory match
 					// is kept regardless of order, so sorting would buy nothing.
-					`SELECT id, title, cwd, git_repo_root,
-					        COALESCE(last_activity_at, started_at) AS activity_at
+					`SELECT id,
+					        ${optional("title")} AS title,
+					        ${optional("cwd")} AS cwd,
+					        ${optional("git_repo_root")} AS git_repo_root,
+					        ${activityAt} AS activity_at
 					 FROM sessions
-					 WHERE hidden = 0
-					   AND COALESCE(last_activity_at, started_at) > :cutoff`,
+					 WHERE ${hiddenClause}${activityAt} > :cutoff`,
 				)
 				.all({ cutoff: cutoffMs / 1000 }) as ReadonlyArray<{
 				id: string;

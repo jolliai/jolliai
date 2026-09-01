@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.99.18
+
+### Fixes & Improvements
+
+- Bug fixes.
+
 ## 0.99.17
 
 ### Changes

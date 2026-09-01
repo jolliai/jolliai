@@ -2,6 +2,13 @@
 
 <!-- Last synced commit: e3287ce7 | 2026-08-31 -->
 
+## 0.99.18
+
+- **Conversations from an older Hermes profile show up again** — a profile you haven't switched into for a while can still be on an older database layout, and reading it failed outright, so nothing from it reached the sidebar or your memories. Those profiles are read again.
+- **Enabling a repository keeps the Hermes settings you added yourself** — re-registering rewrote the whole `jollimemory` entry in Hermes' `config.yaml` and deleted anything else you had put there, including `trust`. Only the command and its arguments are refreshed now.
+- **Read-only memory tools no longer ask for approval** — the MCP tools now say which of them only read and which write, so an agent that prompts before running a tool that can change something will stop prompting for `recall`, `search` and the other six that only read.
+- **Memories move to a local database on their own** — a repository switches its storage to the local SQLite database without you running `jolli cutover`. This has been the case since 0.99.16 and was missing from that release's notes.
+
 ## 0.99.17
 
 - **Ready for Jolli's new web addresses** — signing in now works with Jolli's new domains, so keys issued there are accepted.

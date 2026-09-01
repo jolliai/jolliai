@@ -82,6 +82,102 @@ export interface HermesSessionInput {
 	readonly messages?: ReadonlyArray<HermesMessageInput>;
 }
 
+/**
+ * The `sessions` table, one `[column, ddl]` pair per column.
+ *
+ * A list rather than a SQL string so {@link createLegacyHermesDb} can build the
+ * same table MINUS a column without restating the schema — the drift this file's
+ * header warns about is just as real between two builders here as it is between
+ * two test files.
+ */
+const SESSION_COLUMNS: ReadonlyArray<readonly [string, string]> = [
+	["id", "TEXT PRIMARY KEY"],
+	["source", "TEXT NOT NULL"],
+	["display_name", "TEXT"],
+	["model", "TEXT"],
+	["parent_session_id", "TEXT"],
+	["started_at", "REAL NOT NULL"],
+	["ended_at", "REAL"],
+	["end_reason", "TEXT"],
+	["message_count", "INTEGER DEFAULT 0"],
+	["tool_call_count", "INTEGER DEFAULT 0"],
+	["input_tokens", "INTEGER DEFAULT 0"],
+	["output_tokens", "INTEGER DEFAULT 0"],
+	["cache_read_tokens", "INTEGER DEFAULT 0"],
+	["cache_write_tokens", "INTEGER DEFAULT 0"],
+	["reasoning_tokens", "INTEGER DEFAULT 0"],
+	["cwd", "TEXT"],
+	["git_branch", "TEXT"],
+	["git_repo_root", "TEXT"],
+	["git_metadata_generation", "INTEGER NOT NULL DEFAULT 0"],
+	["estimated_cost_usd", "REAL"],
+	["actual_cost_usd", "REAL"],
+	["title", "TEXT"],
+	["title_source", "TEXT"],
+	["last_activity_at", "REAL"],
+	["api_call_count", "INTEGER DEFAULT 0"],
+	["archived", "INTEGER NOT NULL DEFAULT 0"],
+	["pinned", "INTEGER NOT NULL DEFAULT 0"],
+	["hidden", "INTEGER NOT NULL DEFAULT 0"],
+];
+
+/** Every column {@link createHermesDb} actually populates, and the value it writes. */
+function sessionValues(s: HermesSessionInput): Record<string, string | number | null> {
+	return {
+		id: s.id,
+		source: s.source ?? "cli",
+		model: s.model ?? null,
+		started_at: s.startedAt,
+		ended_at: s.endedAt ?? null,
+		message_count: s.messageCount ?? s.messages?.length ?? 0,
+		tool_call_count: s.toolCallCount ?? 0,
+		cwd: s.cwd ?? null,
+		git_branch: s.gitBranch ?? null,
+		git_repo_root: s.gitRepoRoot ?? null,
+		title: s.title ?? null,
+		title_source: s.titleSource ?? (s.title ? "llm" : null),
+		last_activity_at: s.lastActivityAt === undefined ? s.startedAt : s.lastActivityAt,
+		archived: s.archived ?? 0,
+		hidden: s.hidden ?? 0,
+	};
+}
+
+/**
+ * A `sessions` table as an OLDER Hermes wrote it: {@link SESSION_COLUMNS} minus
+ * `omit`, with no `messages` table.
+ *
+ * This is the shape a dormant profile keeps. Hermes repairs a schema on startup
+ * (`_reconcile_columns`), but only for the profile it is running, and Jolli reads
+ * every profile read-only — so a profile the user has not switched into since a
+ * column landed is a database only we open and only Hermes can fix. See
+ * `OPTIONAL_COLUMNS` in HermesSessionDiscoverer.
+ *
+ * Rows are inserted for the surviving columns only, so omitting one is
+ * indistinguishable from a release that never had it.
+ */
+export async function createLegacyHermesDb(
+	dbDir: string,
+	sessions: ReadonlyArray<HermesSessionInput>,
+	omit: ReadonlyArray<string>,
+): Promise<string> {
+	await mkdir(dbDir, { recursive: true });
+	const dbPath = join(dbDir, "state.db");
+	const db = new DatabaseSync(dbPath);
+	const kept = SESSION_COLUMNS.filter(([name]) => !omit.includes(name));
+	db.prepare(`CREATE TABLE sessions (${kept.map(([name, ddl]) => `${name} ${ddl}`).join(", ")})`).run();
+
+	for (const s of sessions) {
+		const values = sessionValues(s);
+		const names = Object.keys(values).filter((name) => !omit.includes(name));
+		db.prepare(`INSERT INTO sessions (${names.join(", ")}) VALUES (${names.map((n) => `:${n}`).join(", ")})`).run(
+			Object.fromEntries(names.map((n) => [n, values[n]])),
+		);
+	}
+
+	db.close();
+	return dbPath;
+}
+
 /** Builds one `tool_calls` entry in Hermes' exact on-disk shape. */
 export function hermesToolCall(input: HermesToolCallInput): Record<string, unknown> {
 	return {
@@ -103,38 +199,7 @@ export async function createHermesDb(dbDir: string, sessions: ReadonlyArray<Herm
 	const dbPath = join(dbDir, "state.db");
 	const db = new DatabaseSync(dbPath);
 
-	db.prepare(
-		`CREATE TABLE sessions (
-			id TEXT PRIMARY KEY,
-			source TEXT NOT NULL,
-			display_name TEXT,
-			model TEXT,
-			parent_session_id TEXT,
-			started_at REAL NOT NULL,
-			ended_at REAL,
-			end_reason TEXT,
-			message_count INTEGER DEFAULT 0,
-			tool_call_count INTEGER DEFAULT 0,
-			input_tokens INTEGER DEFAULT 0,
-			output_tokens INTEGER DEFAULT 0,
-			cache_read_tokens INTEGER DEFAULT 0,
-			cache_write_tokens INTEGER DEFAULT 0,
-			reasoning_tokens INTEGER DEFAULT 0,
-			cwd TEXT,
-			git_branch TEXT,
-			git_repo_root TEXT,
-			git_metadata_generation INTEGER NOT NULL DEFAULT 0,
-			estimated_cost_usd REAL,
-			actual_cost_usd REAL,
-			title TEXT,
-			title_source TEXT,
-			last_activity_at REAL,
-			api_call_count INTEGER DEFAULT 0,
-			archived INTEGER NOT NULL DEFAULT 0,
-			pinned INTEGER NOT NULL DEFAULT 0,
-			hidden INTEGER NOT NULL DEFAULT 0
-		)`,
-	).run();
+	db.prepare(`CREATE TABLE sessions (${SESSION_COLUMNS.map(([name, ddl]) => `${name} ${ddl}`).join(", ")})`).run();
 
 	db.prepare(
 		`CREATE TABLE messages (
@@ -158,15 +223,6 @@ export async function createHermesDb(dbDir: string, sessions: ReadonlyArray<Herm
 		)`,
 	).run();
 
-	const insertSession = db.prepare(
-		`INSERT INTO sessions (
-			id, source, model, started_at, ended_at, message_count, tool_call_count,
-			cwd, git_branch, git_repo_root, title, title_source, last_activity_at, archived, hidden
-		) VALUES (
-			:id, :source, :model, :startedAt, :endedAt, :messageCount, :toolCallCount,
-			:cwd, :gitBranch, :gitRepoRoot, :title, :titleSource, :lastActivityAt, :archived, :hidden
-		)`,
-	);
 	const insertMessage = db.prepare(
 		`INSERT INTO messages (
 			session_id, role, content, tool_call_id, tool_calls, tool_name, timestamp,
@@ -178,23 +234,11 @@ export async function createHermesDb(dbDir: string, sessions: ReadonlyArray<Herm
 	);
 
 	for (const s of sessions) {
-		insertSession.run({
-			id: s.id,
-			source: s.source ?? "cli",
-			model: s.model ?? null,
-			startedAt: s.startedAt,
-			endedAt: s.endedAt ?? null,
-			messageCount: s.messageCount ?? s.messages?.length ?? 0,
-			toolCallCount: s.toolCallCount ?? 0,
-			cwd: s.cwd ?? null,
-			gitBranch: s.gitBranch ?? null,
-			gitRepoRoot: s.gitRepoRoot ?? null,
-			title: s.title ?? null,
-			titleSource: s.titleSource ?? (s.title ? "llm" : null),
-			lastActivityAt: s.lastActivityAt === undefined ? s.startedAt : s.lastActivityAt,
-			archived: s.archived ?? 0,
-			hidden: s.hidden ?? 0,
-		});
+		const values = sessionValues(s);
+		const names = Object.keys(values);
+		db.prepare(`INSERT INTO sessions (${names.join(", ")}) VALUES (${names.map((n) => `:${n}`).join(", ")})`).run(
+			values,
+		);
 		for (const m of s.messages ?? []) {
 			insertMessage.run({
 				sessionId: s.id,

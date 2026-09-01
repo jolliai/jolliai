@@ -56,6 +56,71 @@ describe("HermesConfigWriter.writeUpsert (mcp_servers)", () => {
 		expect(writeUpsert(once, "mcp_servers", JOLLI)).toBe(once);
 	});
 
+	it("keeps a user's `trust` key on our own entry while refreshing the command", () => {
+		// Measured on a real config: one `jolli enable` deleted a hand-added
+		// `trust: untrusted`. Hermes normalizes an ABSENT trust key to `full`, so
+		// that deletion did not loosen the approval gate by a notch — it switched
+		// the gate off, silently, leaving no symptom but the prompts stopping.
+		const before = `mcp_servers:\n  jollimemory:\n    command: /old/path/run-cli\n    args: ["mcp"]\n    trust: untrusted\n`;
+		const after = writeUpsert(before, "mcp_servers", JOLLI);
+		expect(after).toContain("trust: untrusted");
+		expect(after).toContain("command: /Users/zf/.jolli/jollimemory/run-cli");
+		expect(after).not.toContain("/old/path/run-cli");
+	});
+
+	it("keeps unknown child keys in place and in order, including nested ones", () => {
+		// Position matters as much as survival: re-appending a preserved key would
+		// reorder a file the user reads, and a nested block must not be flattened
+		// into the parent mapping.
+		const before = `mcp_servers:\n  jollimemory:\n    trust: untrusted\n    command: /old\n    env:\n      FOO: bar\n    args: ["stale"]\n`;
+		const after = writeUpsert(before, "mcp_servers", JOLLI);
+		expect(after).toBe(
+			`mcp_servers:\n  jollimemory:\n    trust: untrusted\n` +
+				`    command: /Users/zf/.jolli/jollimemory/run-cli\n    env:\n      FOO: bar\n    args: ["mcp"]\n`,
+		);
+	});
+
+	it("re-anchors our keys to the indent already in the file", () => {
+		// Sibling keys of one YAML mapping must share an indent, so emitting ours
+		// verbatim beside a hand-indented entry would produce a file Hermes cannot
+		// parse — worse than the stale value it was refreshing.
+		const before = `mcp_servers:\n    jollimemory:\n        command: /old\n        trust: untrusted\n`;
+		const after = writeUpsert(before, "mcp_servers", JOLLI);
+		expect(after).toBe(
+			`mcp_servers:\n    jollimemory:\n        command: /Users/zf/.jolli/jollimemory/run-cli\n` +
+				`        trust: untrusted\n        args: ["mcp"]\n`,
+		);
+	});
+
+	it("stays idempotent once a preserved key is present", () => {
+		const before = `mcp_servers:\n  jollimemory:\n    command: /old\n    args: ["mcp"]\n    trust: untrusted\n`;
+		const once = writeUpsert(before, "mcp_servers", JOLLI);
+		expect(writeUpsert(once, "mcp_servers", JOLLI)).toBe(once);
+	});
+
+	it("leaves a non-trivial inline SUB-entry untouched rather than flattening it", () => {
+		// `hasNonTrivialInlineBlock` guards the BLOCK header; this is one level
+		// down. Rewriting it in block form would be a correct-looking write that
+		// silently drops whatever else the flow mapping carried, so the entry is
+		// handed back whole — the same fail-open choice the hook merge makes.
+		const before = `mcp_servers:\n  jollimemory: {command: "/old", trust: untrusted}\n`;
+		expect(writeUpsert(before, "mcp_servers", JOLLI)).toBe(before);
+	});
+
+	it("refreshes an entry whose header carries a trailing comment", () => {
+		// `jollimemory: # my server` is block form with a remark, not an inline
+		// value — the mapping below it is the value. Reading the comment as an
+		// inline value sent this entry down the fail-open path forever, so the
+		// command never refreshed again after a Node path change, silently and
+		// while reporting success. The comment itself is on the header line we
+		// carry verbatim, so it survives too.
+		const before = `mcp_servers:\n  jollimemory: # my server\n    command: /old/path\n    trust: untrusted\n`;
+		expect(writeUpsert(before, "mcp_servers", JOLLI)).toBe(
+			`mcp_servers:\n  jollimemory: # my server\n` +
+				`    command: /Users/zf/.jolli/jollimemory/run-cli\n    trust: untrusted\n    args: ["mcp"]\n`,
+		);
+	});
+
 	it("keeps a real-world config's surrounding sections byte-stable", () => {
 		// The exact shape of a fresh Hermes config, taken from `hermes setup`.
 		const before =
@@ -256,6 +321,19 @@ describe("HermesConfigWriter hook command transforms", () => {
 	it("leaves a non-empty inline event untouched rather than emitting invalid YAML", () => {
 		const before = `hooks:\n  on_session_end: [{command: /user/end, timeout: 10}]\n`;
 		expect(writeHookCommandUpsert(before, "on_session_end", JOLLI_HOOK, 30)).toBe(before);
+	});
+
+	it("registers into an event whose header carries a trailing comment", () => {
+		// The same header-comment trap as the mcp_servers entry merge, one level
+		// down and with a worse outcome: there our command went stale, here the
+		// hook was never registered at all, so no session ever reached the queue.
+		const before = `hooks:\n  on_session_end: # my hook\n  - command: "/user/end"\n    timeout: 5\n`;
+		const after = writeHookCommandUpsert(before, "on_session_end", JOLLI_HOOK, 30);
+		expect(after).toBe(
+			`hooks:\n  on_session_end: # my hook\n  - command: "/user/end"\n    timeout: 5\n` +
+				`  - command: ${JSON.stringify(JOLLI_HOOK)}\n    timeout: 30\n`,
+		);
+		expect(writeHookCommandUpsert(after, "on_session_end", JOLLI_HOOK, 30)).toBe(after);
 	});
 
 	it("leaves a non-trivial inline hooks block untouched instead of dropping user data", () => {

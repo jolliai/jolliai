@@ -71,6 +71,37 @@ export async function withSqliteDb<T>(
 }
 
 /**
+ * The column names a table actually has, for a reader that must tolerate an
+ * older-than-current schema.
+ *
+ * Every store these discoverers read belongs to ANOTHER application, which is
+ * free to add columns whenever it likes and owns the only code that may migrate
+ * them. We open read-only (see {@link withSqliteDb}), so we can never trigger
+ * that migration ourselves — a store the owning app has not opened since its own
+ * schema moved on stays behind our query forever, and a hard-coded reference to
+ * a column it lacks turns the WHOLE database into a `schema` scan failure rather
+ * than the rows it can still answer for. Probing first is what lets a reader
+ * treat "this column does not exist" the same way it already treats "this column
+ * is NULL".
+ *
+ * Returns an EMPTY set for a table that does not exist — `PRAGMA table_info`
+ * does not raise for an unknown name. Callers must NOT read that as "no columns
+ * are available" and silently degrade: a genuinely absent table is a real
+ * failure, and leaving it to the following query means SQLite reports it with an
+ * accurate `no such table` that {@link classifyScanError} already grades.
+ */
+export function readTableColumns(db: SqliteDbHandle, table: string): ReadonlySet<string> {
+	const rows = db.prepare(`PRAGMA table_info("${table.replace(/"/g, '""')}")`).all() as ReadonlyArray<{
+		name?: unknown;
+	}>;
+	const names = new Set<string>();
+	for (const row of rows) {
+		if (typeof row.name === "string") names.add(row.name);
+	}
+	return names;
+}
+
+/**
  * Minimum Node version that loads `node:sqlite` **without a flag**. SQLite-based
  * agent support requires this built-in module; older runtimes cannot load it
  * even if the DB file is present.
