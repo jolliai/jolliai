@@ -201,7 +201,7 @@ intellijPlatform {
                 <li><b>Account</b> &mdash; sign in or out of Jolli with browser OAuth</li>
                 <li><b>Anthropic API Key</b> &mdash; for AI summarization (falls back to <code>${'$'}ANTHROPIC_API_KEY</code> env var)</li>
                 <li><b>Model</b> &mdash; aliases (<code>haiku</code>, <code>sonnet</code>, <code>opus</code>) or full model ID</li>
-                <li><b>Jolli API Key</b> &mdash; for Push to Jolli Space (sign up at <a href="https://jolli.ai">jolli.ai</a>)</li>
+                <li><b>Jolli API Key</b> &mdash; for Push to Jolli Space (sign up at <a href="https://jollidev.com">jollidev.com</a>)</li>
                 <li><b>Slack Workspace URL</b> &mdash; used to build deep links for captured Slack references</li>
             </ul>
             <p>
@@ -234,8 +234,8 @@ intellijPlatform {
             <h3>Links</h3>
             <ul>
                 <li><a href="https://github.com/jolliai/jolliai">Source code</a> (Apache-2.0)</li>
-                <li><a href="https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory">Documentation</a></li>
-                <li><a href="https://jolli.ai/privacy">Privacy policy</a></li>
+                <li><a href="https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory">Documentation</a></li>
+                <li><a href="https://www.jollidev.com/privacy">Privacy policy</a></li>
                 <li><a href="https://github.com/jolliai/jolliai/issues">Report an issue</a></li>
             </ul>
         """.trimIndent()
@@ -251,7 +251,7 @@ intellijPlatform {
         }
         vendor {
             name = "Jolli"
-            url = "https://jolli.ai"
+            url = "https://jollidev.com"
             email = "support@jolli.ai"
         }
         ideaVersion {

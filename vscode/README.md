@@ -420,7 +420,7 @@ Separately from your memory content, Jolli Memory collects **anonymous, content-
 - Click **Turn off** on the first-run notice.
 - Run `jolli telemetry off` in a terminal, or set `DO_NOT_TRACK=1`.
 
-See <https://jolli.ai/telemetry> for the full event list.
+See <https://jollidev.com/telemetry> for the full event list.
 
 ## Support
 

@@ -45,7 +45,7 @@ function clearAllErrors() {
 
 function renderSpaces() {
   if (!spaces || spaces.length === 0) {
-    spacesListEl.innerHTML = '<div class="spaces-empty">No Memory spaces available. Create one on jolli.ai, then try Push again.</div>';
+    spacesListEl.innerHTML = '<div class="spaces-empty">No Memory spaces available. Create one on jollidev.com, then try Push again.</div>';
     return;
   }
   spacesListEl.innerHTML = spaces.map(function(s) {

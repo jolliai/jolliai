@@ -14,7 +14,7 @@ describe("buildBindingChooserScript", () => {
 	it("disables binding when no existing spaces are available", () => {
 		const script = buildBindingChooserScript();
 
-		expect(script).toContain("Create one on jolli.ai");
+		expect(script).toContain("Create one on jollidev.com");
 		expect(script).toContain("confirmBtn.disabled = b || spaces.length === 0");
 	});
 

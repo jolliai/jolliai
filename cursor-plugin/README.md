@@ -246,12 +246,12 @@ by setting `DO_NOT_TRACK` to any non-empty value other than `0`, or by running
 you also have the CLI installed globally). The `telemetry off` form is written to
 the machine-global config, so it applies to every Jolli integration on this
 machine. Exactly what is collected is listed at
-[jolli.ai/telemetry](https://www.jolli.ai/telemetry) and in
+[jollidev.com/telemetry](https://www.jollidev.com/telemetry) and in
 [TELEMETRY.md](https://github.com/jolliai/jolliai/blob/main/TELEMETRY.md).
 
 ## Support and source
 
-- Product: [jolli.ai](https://jolli.ai)
+- Product: [jollidev.com](https://jollidev.com)
 - Source, issues, and security policy:
   [github.com/jolliai/jolliai](https://github.com/jolliai/jolliai)
 

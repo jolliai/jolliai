@@ -39,7 +39,7 @@ jolli view      # recent commit summaries
 jolli recall    # full branch context, ready to feed back to your agent
 ```
 
-Full walkthrough: [Getting started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory).
+Full walkthrough: [Getting started with Jolli Memory](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory).
 
 **Just want the MCP server, without installing anything?** Point any MCP-aware agent at `npx -y @jolli.ai/cli mcp`, or use a one-click link:
 
@@ -111,14 +111,14 @@ Every surface writes to the same place, so mixing them is fine. The CLI is the o
 
 After each commit, a background process reads your AI session transcript and the code diff, calls the LLM, and writes a structured summary. Your commit returns instantly; the summary lands about 10 to 20 seconds later. Memories are stored on a dedicated git orphan branch (`jollimemory/summaries/v3`), completely separate from your code history, and mirrored to a readable Memory Bank folder on disk.
 
-More detail: [How capture works](https://docs.jolli.ai/jolli-memory/supported-ai-assistants-and-capture) · [Recall vs. search](https://docs.jolli.ai/jolli-memory/recall-vs-search) · [Use your memory from any AI assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp).
+More detail: [How capture works](https://docs.jollidev.com/jolli-memory/supported-ai-assistants-and-capture) · [Recall vs. search](https://docs.jollidev.com/jolli-memory/recall-vs-search) · [Use your memory from any AI assistant (MCP)](https://docs.jollidev.com/jolli-memory/use-your-memory-from-any-ai-assistant-mcp).
 
 ---
 
 ## Documentation
 
-- **Guides:** [docs.jolli.ai](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory), covering getting started, supported assistants, MCP, Memory Bank and sync, CI, and a full reference.
-- **Troubleshooting and FAQ:** [docs.jolli.ai/jolli-memory/troubleshooting-and-faq](https://docs.jolli.ai/jolli-memory/troubleshooting-and-faq).
+- **Guides:** [docs.jollidev.com](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory), covering getting started, supported assistants, MCP, Memory Bank and sync, CI, and a full reference.
+- **Troubleshooting and FAQ:** [docs.jollidev.com/jolli-memory/troubleshooting-and-faq](https://docs.jollidev.com/jolli-memory/troubleshooting-and-faq).
 - **Per-surface reference:**
 
 | Surface | README | CHANGELOG |

@@ -8,7 +8,7 @@
 <idea-plugin require-restart="true">
     <id>ai.jolli.jollimemory</id>
     <name>Jolli Memory</name>
-    <vendor url="https://jolli.ai" email="support@jolli.ai">Jolli</vendor>
+    <vendor url="https://jollidev.com" email="support@jolli.ai">Jolli</vendor>
 
     <!-- NOTE: this <description> is a dev-facing placeholder only. `patchPluginXml`
          OVERWRITES it at build time with the `pluginConfiguration.description` block in
@@ -21,7 +21,7 @@
         summaries for each commit — so you always remember <em>why</em>.
         <br/><br/>
         <a href="https://github.com/jolliai/jolliai">Source Code</a> |
-        <a href="https://jolli.ai/privacy">Privacy Policy</a>
+        <a href="https://www.jollidev.com/privacy">Privacy Policy</a>
     ]]></description>
 
     <depends>com.intellij.modules.platform</depends>

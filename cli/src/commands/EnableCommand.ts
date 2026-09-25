@@ -543,7 +543,7 @@ async function reportEnableResult(
 		// (the once-only first-run banner also covers non-enable first commands).
 		console.log("\n  Telemetry: anonymous, content-free usage data is on by default to improve");
 		console.log("  Jolli Memory (never your code, paths, or memory content). Turn it off with");
-		console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://www.jolli.ai/telemetry");
+		console.log("  'jolli telemetry off' (or DO_NOT_TRACK=1) · https://www.jollidev.com/telemetry");
 
 		// Step 2: Interactive provider configuration
 		if (isInteractive() && !options.yes) {

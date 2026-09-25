@@ -71,8 +71,8 @@ jolli enable            # run from your project root
 
 **Full onboarding docs:**
 
-- [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) - install, enable, and your first memory.
-- [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp) - the full per-host MCP setup.
+- [Getting Started with Jolli Memory](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory) - install, enable, and your first memory.
+- [Connect Memory to Your AI Assistant (MCP)](https://docs.jollidev.com/jolli-memory/use-your-memory-from-any-ai-assistant-mcp) - the full per-host MCP setup.
 
 ## Jolli Memory
 
@@ -752,7 +752,7 @@ jolli telemetry off
 export DO_NOT_TRACK=1
 ```
 
-Jolli also honors your OS / IDE data-sharing setting. Check the current state with `jolli telemetry status`, print the exact buffered events with `jolli telemetry inspect`, and see <https://jolli.ai/telemetry> for the full event list.
+Jolli also honors your OS / IDE data-sharing setting. Check the current state with `jolli telemetry status`, print the exact buffered events with `jolli telemetry inspect`, and see <https://jollidev.com/telemetry> for the full event list.
 
 ---
 
@@ -845,7 +845,7 @@ What it does: detects sidebar config, reorganizes directory structure, downgrade
 
 ## Support
 
-- **Documentation:** [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) and [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp), plus the full guides and reference on [docs.jolli.ai](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory).
+- **Documentation:** [Getting Started with Jolli Memory](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory) and [Connect Memory to Your AI Assistant (MCP)](https://docs.jollidev.com/jolli-memory/use-your-memory-from-any-ai-assistant-mcp), plus the full guides and reference on [docs.jollidev.com](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory).
 - **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 - **Jolli Space onboarding / enterprise** — support@jolli.ai
 - **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jolliai/tree/main/vscode)
