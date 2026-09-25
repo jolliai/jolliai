@@ -323,6 +323,32 @@ export function isJolliOriginAllowed(origin: string): boolean {
 }
 
 /**
+ * Hosts production has left. `jolli.ai` now serves a different product, so a
+ * credential whose tenant sits under it can never authenticate again — the
+ * config loader treats it as signed out (`loadConfigFromDir` in
+ * `SessionTracker.ts`) so every surface prompts a fresh sign-in, which lands
+ * on the new auth host. Deliberately separate from `ALLOWED_JOLLI_HOSTS`:
+ * narrowing that list is its own security-reviewed change, and would also
+ * reject `JOLLI_URL` overrides this rule has no reason to touch.
+ */
+const RETIRED_JOLLI_HOSTS: readonly string[] = ["jolli.ai"];
+
+/**
+ * True when `url`'s host is a retired production host or any subdomain of one
+ * (same suffix-boundary rule as the allowlist). An unparseable URL is NOT
+ * retired — this only ever retires a credential it can positively identify.
+ */
+export function isRetiredJolliOrigin(url: string): boolean {
+	let host: string;
+	try {
+		host = new URL(url).hostname.toLowerCase();
+	} catch {
+		return false;
+	}
+	return RETIRED_JOLLI_HOSTS.some((h) => host === h || host.endsWith(`.${h}`));
+}
+
+/**
  * The allowlist rule itself, in one place so the throwing and predicate forms
  * above can never disagree about what "allowed" means. Takes a parsed `URL`
  * because the two differ only in how they report an unparseable input.

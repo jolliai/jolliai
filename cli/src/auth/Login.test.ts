@@ -171,7 +171,7 @@ describe("Login", () => {
 
 	it("persists the minted key's tenant as jolliUrl, not the sign-in origin", async () => {
 		// Regression guard for the default-login break: signing in at the auth
-		// hub (`auth.jolli.ai`) mints a key whose `meta.u` is the user's real
+		// hub (`DEFAULT_JOLLI_URL`) mints a key whose `meta.u` is the user's real
 		// tenant. Persisting the hub as `jolliUrl` would make
 		// `saveAuthCredentials`'s same-tenant symmetry check reject the key.
 		const HUB_URL = "https://auth.jolli.ai";

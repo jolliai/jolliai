@@ -38,6 +38,7 @@ import {
 	type TranscriptSource,
 } from "../Types.js";
 import { atomicWriteFile as atomicWrite } from "./AtomicWrite.js";
+import { isRetiredJolliOrigin, parseJolliApiKey } from "./JolliApiUtils.js";
 import { withConfigLock, withPlansLock, withSessionsLock } from "./Locks.js";
 import { writeReferenceMarkdown } from "./references/ReferenceStore.js";
 import { archivedTotalsOf, isLegacyArchived, uncommittedDelta } from "./skills/SkillDelta.js";
@@ -534,7 +535,7 @@ export async function loadConfigFromDir(dir: string): Promise<JolliMemoryConfig>
 	try {
 		const content = await readFile(filePath, "utf-8");
 		const raw = JSON.parse(content) as JolliMemoryConfig;
-		return coalesceLegacyKeys(raw);
+		return dropRetiredCredentials(coalesceLegacyKeys(raw));
 	} catch {
 		log.debug("No config file found in %s, using defaults", dir);
 		return {};
@@ -559,6 +560,37 @@ function coalesceLegacyKeys(raw: JolliMemoryConfig): JolliMemoryConfig {
 	if (raw.syncEnabled === undefined) return raw;
 	const { syncEnabled, ...rest } = raw;
 	return rest.autoSyncEnabled === undefined ? { ...rest, autoSyncEnabled: syncEnabled } : rest;
+}
+
+/**
+ * Treats a credential minted for a retired production host as signed out.
+ *
+ * The routing tenant lives inside the key (`meta.u`) and a key is immutable, so
+ * a `jolli.ai`-era key keeps aiming at a host that no longer serves this
+ * product — no client update can re-point it; only a fresh sign-in can.
+ * Dropping it here, at the single read chokepoint, reaches every surface at
+ * once: the CLI and the VS Code extension (which bundles this module) read
+ * through it, and so does IntelliJ (via `ide-bridge session-state config-load`).
+ * Each then sees "no key" and offers sign-in, which goes to the new auth host.
+ *
+ * Removes exactly what `clearAuthCredentials` removes — `authToken`,
+ * `jolliApiKey`, and `aiProvider` when it is `"jolli"` (a proxy provider with
+ * no key would fail every summary silently) — and keeps `jolliUrl` for the
+ * same reason that function does. Nothing is written here; like
+ * {@link coalesceLegacyKeys}, the next `saveConfigScoped` re-reads through
+ * this function, so the retired fields leave the file on the next write.
+ *
+ * Keyed on the key's own tenant only. A key with no decodable `meta.u` is left
+ * alone — it cannot be positively identified as retired.
+ */
+function dropRetiredCredentials(config: JolliMemoryConfig): JolliMemoryConfig {
+	const tenant = config.jolliApiKey ? parseJolliApiKey(config.jolliApiKey)?.u : undefined;
+	if (!tenant || !isRetiredJolliOrigin(tenant)) return config;
+	log.info("Ignoring stored credential for retired host %s — sign in again", tenant);
+	const { authToken: _token, jolliApiKey: _key, ...rest } = config;
+	if (rest.aiProvider !== "jolli") return rest;
+	const { aiProvider: _provider, ...withoutProvider } = rest;
+	return withoutProvider;
 }
 
 /**
