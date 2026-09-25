@@ -586,7 +586,9 @@ function coalesceLegacyKeys(raw: JolliMemoryConfig): JolliMemoryConfig {
 function dropRetiredCredentials(config: JolliMemoryConfig): JolliMemoryConfig {
 	const tenant = config.jolliApiKey ? parseJolliApiKey(config.jolliApiKey)?.u : undefined;
 	if (!tenant || !isRetiredJolliOrigin(tenant)) return config;
-	log.info("Ignoring stored credential for retired host %s — sign in again", tenant);
+	// The tenant is decoded from the key, so it never reaches the log (CodeQL
+	// js/clear-text-logging traces it back to jolliApiKey).
+	log.info("Ignoring stored credential for a retired Jolli host — sign in again");
 	const { authToken: _token, jolliApiKey: _key, ...rest } = config;
 	if (rest.aiProvider !== "jolli") return rest;
 	const { aiProvider: _provider, ...withoutProvider } = rest;
