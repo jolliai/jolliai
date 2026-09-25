@@ -24,7 +24,7 @@ export function buildBindingChooserHtml(nonce: string): string {
 <body>
   <div class="chooser-page">
     <h1>Choose a Memory space</h1>
-    <p class="subtitle">Bind this repo to an existing space. Create or manage spaces on jolli.ai.</p>
+    <p class="subtitle">Bind this repo to an existing space. Create or manage spaces on jollidev.com.</p>
 
     <div class="repo-meta">
       <span class="repo-label">Repo</span>

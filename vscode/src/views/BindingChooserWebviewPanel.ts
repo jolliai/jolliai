@@ -9,7 +9,7 @@
  *
  * The plugin deliberately does NOT create spaces or offer move / delete /
  * rename / "view all bindings" affordances; everything beyond first-bind
- * happens on jolli.ai's web frontend.
+ * happens on jollidev.com's web frontend.
  */
 
 import { randomBytes } from "node:crypto";

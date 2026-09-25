@@ -9914,7 +9914,7 @@ describe("Extension", () => {
 			await opts.showNotice("Telemetry notice", "Learn more");
 			expect(showInformationMessage).toHaveBeenCalledWith("Telemetry notice", "Learn more");
 
-			opts.openExternal("https://jolli.ai/telemetry");
+			opts.openExternal("https://www.jollidev.com/telemetry");
 			expect(openExternal).toHaveBeenCalled();
 
 			// The IDE telemetry-toggle listener re-evaluates on change.

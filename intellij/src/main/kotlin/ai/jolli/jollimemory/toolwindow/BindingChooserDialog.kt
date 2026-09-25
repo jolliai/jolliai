@@ -75,7 +75,7 @@ class BindingAlreadyExistsException(
  * success it closes and the caller reads the result via [getOutcome].
  *
  * The dialog does NOT create spaces — only lists existing ones. Space
- * management happens on the jolli.ai web frontend.
+ * management happens on the jollidev.com web frontend.
  */
 class BindingChooserDialog private constructor(
 	project: Project,
@@ -138,7 +138,7 @@ class BindingChooserDialog private constructor(
 				alignmentX = Component.LEFT_ALIGNMENT
 			})
 			add(Box.createVerticalStrut(4))
-			add(JBLabel("<html><span style='color:gray'>Bind this repo to an existing space. Create or manage spaces on jolli.ai.</span></html>").apply {
+			add(JBLabel("<html><span style='color:gray'>Bind this repo to an existing space. Create or manage spaces on jollidev.com.</span></html>").apply {
 				alignmentX = Component.LEFT_ALIGNMENT
 			})
 			add(Box.createVerticalStrut(8))
@@ -167,7 +167,7 @@ class BindingChooserDialog private constructor(
 			}
 		}
 
-		val emptyLbl = JBLabel("<html><span style='color:gray'>No Memory spaces available. Create one on jolli.ai, then try Push again.</span></html>").apply {
+		val emptyLbl = JBLabel("<html><span style='color:gray'>No Memory spaces available. Create one on jollidev.com, then try Push again.</span></html>").apply {
 			border = JBUI.Borders.empty(20)
 			isVisible = false
 			alignmentX = Component.LEFT_ALIGNMENT
