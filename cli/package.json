@@ -101,7 +101,7 @@
 		"tsx": "^4.22.4",
 		"typescript": "^5.7.2",
 		"vite": "^8.0.16",
-		"vitest": "^4.1.1"
+		"vitest": "^4.1.11"
 	},
 	"publishConfig": {
 		"access": "public"
