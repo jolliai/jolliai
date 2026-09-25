@@ -6,6 +6,7 @@ import {
 	deriveJolliEnvKey,
 	deriveJolliEnvKeyFromApiKey,
 	isJolliOriginAllowed,
+	isRetiredJolliOrigin,
 	parseBaseUrl,
 	parseJolliApiKey,
 	resolveArticleUrl,
@@ -103,6 +104,30 @@ describe("JolliApiUtils", () => {
 			const payload = Buffer.from(JSON.stringify({ sub: "someone", iat: 1 })).toString("base64url");
 			const sig = "signatureBytesHere";
 			expect(parseJolliApiKey(`sk-jol-${header}.${payload}.${sig}`)).toBeNull();
+		});
+	});
+
+	describe("isRetiredJolliOrigin", () => {
+		it("retires the jolli.ai apex and every subdomain, case-insensitively", () => {
+			expect(isRetiredJolliOrigin("https://jolli.ai")).toBe(true);
+			expect(isRetiredJolliOrigin("https://auth.jolli.ai")).toBe(true);
+			expect(isRetiredJolliOrigin("https://Acme.JOLLI.ai/tenant")).toBe(true);
+		});
+
+		it("keeps the new production domain and every other environment", () => {
+			expect(isRetiredJolliOrigin("https://auth.jollidev.com")).toBe(false);
+			expect(isRetiredJolliOrigin("https://acme.jollidev.com")).toBe(false);
+			expect(isRetiredJolliOrigin("https://staging.jolli.dev")).toBe(false);
+			expect(isRetiredJolliOrigin("https://jolli-local.me/dev")).toBe(false);
+		});
+
+		it("respects the suffix boundary", () => {
+			expect(isRetiredJolliOrigin("https://notjolli.ai")).toBe(false);
+			expect(isRetiredJolliOrigin("https://jolli.ai.example.com")).toBe(false);
+		});
+
+		it("does not retire an unparseable URL", () => {
+			expect(isRetiredJolliOrigin("not a url")).toBe(false);
 		});
 	});
 

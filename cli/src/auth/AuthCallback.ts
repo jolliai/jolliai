@@ -238,7 +238,7 @@ export async function resolveAuthCallback(options: AuthCallbackOptions): Promise
  *
  * The persisted `jolliUrl` is the tenant the minted key actually targets, not
  * the sign-in origin: with no `JOLLI_URL` set the latter is the auth hub
- * (`auth.jolli.ai`) while the key's `meta.u` is the user's real tenant.
+ * (`DEFAULT_JOLLI_URL`) while the key's `meta.u` is the user's real tenant.
  * Persisting the hub would (a) make `saveAuthCredentials`'s same-tenant
  * symmetry check reject every normal key and (b) leave the routing fallback
  * pointing at the hub. See `resolveSignInJolliUrl`.

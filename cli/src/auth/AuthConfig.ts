@@ -14,7 +14,15 @@ import {
 } from "../core/JolliApiUtils.js";
 import { loadConfig, saveConfig } from "../core/SessionTracker.js";
 
-const DEFAULT_JOLLI_URL = "https://auth.jolli.ai";
+/**
+ * The compiled sign-in origin, used when `JOLLI_URL` is unset. It is the whole
+ * user experience: `auth login` takes no options and `jolliUrl` is not a
+ * settable config key, so a client that ships the wrong host here cannot be
+ * re-pointed without an env var. Must stay on the origin allowlist (asserted
+ * below). The IntelliJ plugin carries its own copy in `JolliUrlConfig.kt`,
+ * held in lockstep by `AuthConfig.test.ts`.
+ */
+export const DEFAULT_JOLLI_URL = "https://auth.jollidev.com";
 
 /**
  * Returns the Jolli server URL. Checks JOLLI_URL env var, then falls back to default.
@@ -214,7 +222,7 @@ export function shouldRequestFreshApiKey(existingKey: string | undefined, jolliU
  * The minted Jolli API key's embedded `meta.u` is the authoritative tenant the
  * account routes to (LLM proxy + sync both extract it via `parseJolliApiKey`).
  * The sign-in *origin* is not: with no `JOLLI_URL` set it is the auth hub
- * (`auth.jolli.ai`), which is not where the user's data lives. Persisting the
+ * (`DEFAULT_JOLLI_URL`), which is not where the user's data lives. Persisting the
  * hub would leave the missing-/stale-key routing fallback pointing at the hub
  * instead of the tenant. So we prefer the key's embedded tenant, and fall back
  * to `signInOrigin` only when no key was issued or the key is legacy/hand-typed
