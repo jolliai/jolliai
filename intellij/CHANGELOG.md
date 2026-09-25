@@ -2,6 +2,10 @@
 
 ## 0.99.18
 
+### Changes
+
+- **Signing in goes to Jolli's new address** — sign-in now opens `auth.jollidev.com` instead of the old `jolli.ai` address, which no longer leads to Jolli. A key saved from `jolli.ai` can no longer sign you in, so it is set aside and the plugin asks you to sign in again instead of every sync and summary failing. If Jolli was your AI provider, it is cleared along with the key until you sign back in.
+
 ### Fixes & Improvements
 
 - Bug fixes.

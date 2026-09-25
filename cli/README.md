@@ -71,8 +71,8 @@ jolli enable            # run from your project root
 
 **Full onboarding docs:**
 
-- [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) - install, enable, and your first memory.
-- [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp) - the full per-host MCP setup.
+- [Getting Started with Jolli Memory](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory) - install, enable, and your first memory.
+- [Connect Memory to Your AI Assistant (MCP)](https://docs.jollidev.com/jolli-memory/use-your-memory-from-any-ai-assistant-mcp) - the full per-host MCP setup.
 
 ## Jolli Memory
 
@@ -203,6 +203,8 @@ jolli auth logout
 The login flow opens your default browser for OAuth authentication. After completing sign-in, the browser tab closes automatically and the CLI receives your credentials.
 
 **How it works**: The CLI starts a temporary local server on a random available port, opens the browser to the Jolli auth page, and waits for the OAuth callback. On success, the auth token and a `jolliApiKey` (`sk-jol-...`) are automatically generated and stored in `~/.jolli/jollimemory/config.json`. The `jolliApiKey` is used for LLM proxy calls and cloud sync — no manual API key configuration needed.
+
+**Where sign-in goes**: `https://auth.jollidev.com` by default. Set `JOLLI_URL` to sign in somewhere else (a staging or self-hosted Jolli); it must be an HTTPS address on a Jolli domain. A key saved from the old `jolli.ai` address can no longer sign in, so the CLI treats it as signed out — run `jolli auth login` again. If Jolli was your AI provider, that setting is cleared with the key until you sign back in.
 
 ### `jolli status`
 
@@ -750,7 +752,7 @@ jolli telemetry off
 export DO_NOT_TRACK=1
 ```
 
-Jolli also honors your OS / IDE data-sharing setting. Check the current state with `jolli telemetry status`, print the exact buffered events with `jolli telemetry inspect`, and see <https://jolli.ai/telemetry> for the full event list.
+Jolli also honors your OS / IDE data-sharing setting. Check the current state with `jolli telemetry status`, print the exact buffered events with `jolli telemetry inspect`, and see <https://jollidev.com/telemetry> for the full event list.
 
 ---
 
@@ -843,7 +845,7 @@ What it does: detects sidebar config, reorganizes directory structure, downgrade
 
 ## Support
 
-- **Documentation:** [Getting Started with Jolli Memory](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory) and [Connect Memory to Your AI Assistant (MCP)](https://docs.jolli.ai/jolli-memory/use-your-memory-from-any-ai-assistant-mcp), plus the full guides and reference on [docs.jolli.ai](https://docs.jolli.ai/jolli-memory/getting-started-with-jolli-memory).
+- **Documentation:** [Getting Started with Jolli Memory](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory) and [Connect Memory to Your AI Assistant (MCP)](https://docs.jollidev.com/jolli-memory/use-your-memory-from-any-ai-assistant-mcp), plus the full guides and reference on [docs.jollidev.com](https://docs.jollidev.com/jolli-memory/getting-started-with-jolli-memory).
 - **Issues & feature requests** — [GitHub Issues](https://github.com/jolliai/jolliai/issues)
 - **Jolli Space onboarding / enterprise** — support@jolli.ai
 - **VS Code extension reference** — see the [VS Code README](https://github.com/jolliai/jolliai/tree/main/vscode)

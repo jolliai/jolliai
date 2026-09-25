@@ -752,6 +752,64 @@ describe("SessionTracker", () => {
 		});
 	});
 
+	describe("retired-host credentials", () => {
+		const keyFor = (u: string): string =>
+			`sk-jol-${Buffer.from(JSON.stringify({ t: "tenant", u })).toString("base64url")}.secret`;
+
+		async function writeConfig(config: Record<string, unknown>): Promise<string> {
+			const dir = await ensureJolliMemoryDir(tempDir);
+			await writeFile(join(dir, "config.json"), JSON.stringify(config), "utf-8");
+			return dir;
+		}
+
+		it("treats a key whose tenant is under jolli.ai as signed out", async () => {
+			const dir = await writeConfig({
+				authToken: "tok",
+				jolliApiKey: keyFor("https://acme.jolli.ai"),
+				jolliUrl: "https://acme.jolli.ai",
+				aiProvider: "jolli",
+				model: "claude-haiku",
+			});
+			const config = await loadConfigFromDir(dir);
+			expect(config.authToken).toBeUndefined();
+			expect(config.jolliApiKey).toBeUndefined();
+			// A proxy provider with no key would fail every summary silently.
+			expect(config.aiProvider).toBeUndefined();
+			// Same as clearAuthCredentials: the bare URL is kept, and unrelated
+			// settings are untouched.
+			expect(config.jolliUrl).toBe("https://acme.jolli.ai");
+			expect(config.model).toBe("claude-haiku");
+		});
+
+		it("keeps a non-jolli aiProvider when dropping a retired key", async () => {
+			const dir = await writeConfig({ jolliApiKey: keyFor("https://jolli.ai"), aiProvider: "anthropic" });
+			const config = await loadConfigFromDir(dir);
+			expect(config.jolliApiKey).toBeUndefined();
+			expect(config.aiProvider).toBe("anthropic");
+		});
+
+		it("keeps a credential for the new production domain", async () => {
+			const key = keyFor("https://acme.jollidev.com");
+			const dir = await writeConfig({ authToken: "tok", jolliApiKey: key, aiProvider: "jolli" });
+			const config = await loadConfigFromDir(dir);
+			expect(config).toMatchObject({ authToken: "tok", jolliApiKey: key, aiProvider: "jolli" });
+		});
+
+		it("keeps a legacy key that carries no tenant", async () => {
+			const dir = await writeConfig({ authToken: "tok", jolliApiKey: "sk-jol-0123456789abcdef" });
+			const config = await loadConfigFromDir(dir);
+			expect(config.jolliApiKey).toBe("sk-jol-0123456789abcdef");
+			expect(config.authToken).toBe("tok");
+		});
+
+		it("removes the retired credential from disk on the next save", async () => {
+			const dir = await writeConfig({ authToken: "tok", jolliApiKey: keyFor("https://jolli.ai") });
+			await saveConfigScoped({ model: "claude-haiku" }, dir);
+			const onDisk = JSON.parse(await readFile(join(dir, "config.json"), "utf-8"));
+			expect(onDisk).toEqual({ model: "claude-haiku" });
+		});
+	});
+
 	describe("squash-pending helpers", () => {
 		const SQUASH_PARENT_HASH = "aabbcc1122334455aabbcc1122334455aabbcc11";
 

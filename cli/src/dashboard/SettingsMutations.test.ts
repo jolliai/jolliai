@@ -61,9 +61,9 @@ function baseInput(over: Partial<SettingsApplyInput> = {}): SettingsApplyInput {
 	};
 }
 
-/** A decodable, allowlisted Jolli key (tenant acme.jolli.ai). */
+/** A decodable, allowlisted Jolli key (tenant acme.jollidev.com). */
 function validJolliKey(): string {
-	const payload = Buffer.from(JSON.stringify({ t: "acme", u: "https://acme.jolli.ai" })).toString("base64url");
+	const payload = Buffer.from(JSON.stringify({ t: "acme", u: "https://acme.jollidev.com" })).toString("base64url");
 	// JWT-shaped: parseJolliApiKey rejects a dot-less key, so carry a dummy header segment.
 	return `sk-jol-${payload}.sig`;
 }
@@ -357,12 +357,12 @@ describe("applySettings", () => {
 		await applySettings(baseInput({ jolliApiKey: validJolliKey() }), d);
 		const config = readConfig(d);
 		expect(config.jolliApiKey).toBe(validJolliKey());
-		expect(config.jolliUrl).toBe("https://acme.jolli.ai");
+		expect(config.jolliUrl).toBe("https://acme.jollidev.com");
 	});
 
 	it("keeps a stored jolli key when the submission equals its mask", async () => {
 		const stored = validJolliKey();
-		const d = configDirWith({ jolliApiKey: stored, jolliUrl: "https://acme.jolli.ai" });
+		const d = configDirWith({ jolliApiKey: stored, jolliUrl: "https://acme.jollidev.com" });
 		await applySettings(baseInput({ jolliApiKey: maskApiKey(stored) }), d);
 		// The masked submission round-trips to "keep the stored full key".
 		expect(readConfig(d).jolliApiKey).toBe(stored);

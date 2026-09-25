@@ -233,6 +233,8 @@ From the **Status overlay**, click **Sign In to Jolli** to authenticate with a J
 
 The `jolliApiKey` serves two purposes: it lets the LLM proxy handle summary generation (so you don't need to manage an Anthropic key directly), and it authorises pushing summaries to your Jolli Space. You can still set a manual Anthropic `apiKey` in Settings if you prefer your own account.
 
+Sign-in goes to `https://auth.jollidev.com`. A key saved from the old `jolli.ai` address can no longer sign you in, so the extension shows you as signed out — click **Sign In to Jolli** again. If Jolli was your AI provider, that setting is cleared with the key until you sign back in.
+
 Click **Sign Out of Jolli** from the same toolbar to clear the stored credentials.
 
 ### Settings Panel
@@ -418,7 +420,7 @@ Separately from your memory content, Jolli Memory collects **anonymous, content-
 - Click **Turn off** on the first-run notice.
 - Run `jolli telemetry off` in a terminal, or set `DO_NOT_TRACK=1`.
 
-See <https://jolli.ai/telemetry> for the full event list.
+See <https://jollidev.com/telemetry> for the full event list.
 
 ## Support
 

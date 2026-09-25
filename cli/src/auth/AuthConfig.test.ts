@@ -1,3 +1,6 @@
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const mockLoadConfig = vi.fn();
@@ -10,6 +13,7 @@ vi.mock("../core/SessionTracker.js", () => ({
 
 import {
 	clearAuthCredentials,
+	DEFAULT_JOLLI_URL,
 	getJolliUrl,
 	loadAuthToken,
 	resolveSignInJolliUrl,
@@ -27,7 +31,27 @@ describe("AuthConfig", () => {
 
 	describe("getJolliUrl", () => {
 		it("should return default URL when no env var is set", () => {
-			expect(getJolliUrl()).toBe("https://auth.jolli.ai");
+			expect(getJolliUrl()).toBe(DEFAULT_JOLLI_URL);
+		});
+
+		it("defaults to the production auth host, which passes the origin allowlist", () => {
+			// Pinned literally: asserting against the imported constant alone
+			// would pass whatever it was changed to.
+			expect(DEFAULT_JOLLI_URL).toBe("https://auth.jollidev.com");
+			expect(() => getJolliUrl()).not.toThrow();
+		});
+
+		it("matches the IntelliJ plugin's independent default (JolliUrlConfig.kt)", () => {
+			// The two constants are separate declarations and no build fails
+			// when only one moves, so a JetBrains user would silently sign in
+			// somewhere else. Read the Kotlin source and hold them together.
+			const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "..");
+			const kotlin = readFileSync(
+				join(repoRoot, "intellij/src/main/kotlin/ai/jolli/jollimemory/auth/JolliUrlConfig.kt"),
+				"utf8",
+			);
+			const match = kotlin.match(/const val DEFAULT_URL = "([^"]+)"/);
+			expect(match?.[1]).toBe(DEFAULT_JOLLI_URL);
 		});
 
 		it("should return JOLLI_URL env var when set", () => {
@@ -42,7 +66,7 @@ describe("AuthConfig", () => {
 
 		it("should return default when JOLLI_URL is empty", () => {
 			process.env.JOLLI_URL = "   ";
-			expect(getJolliUrl()).toBe("https://auth.jolli.ai");
+			expect(getJolliUrl()).toBe(DEFAULT_JOLLI_URL);
 		});
 
 		it("should accept a staging jolli.dev host with trailing slash stripped", () => {
