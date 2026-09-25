@@ -157,6 +157,8 @@ Open **Settings > Tools > Jolli Memory** (or click the Sign In button in the too
 
 The `jolliApiKey` covers two flows: it lets the Jolli LLM proxy handle summary generation (so you don't need to manage an Anthropic key), and it authorises pushing summaries to your Jolli Space. A manual Anthropic API key takes precedence when no provider is pinned; explicitly choosing **Jolli** or **Local Agent** in Settings > AI Summary routes summaries there regardless.
 
+Sign-in goes to `https://auth.jollidev.com` unless the `JOLLI_URL` environment variable (or the `jolli.url` JVM system property) points elsewhere. A key saved from the old `jolli.ai` address can no longer sign you in, so the plugin shows you as signed out — click **Sign In** again. If Jolli was your AI provider, that setting is cleared with the key until you sign back in.
+
 ### Plans & Notes
 
 Jolli Memory auto-detects Claude Code plan files from your session transcripts and shows them in **WORKING MEMORY**. You can also add your own notes, either short text snippets or imported Markdown files, to capture context that doesn't live in the AI conversation. When you commit, active plans and notes are archived as snapshots in the orphan branch and associated with the commit.

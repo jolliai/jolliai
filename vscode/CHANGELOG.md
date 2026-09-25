@@ -1,9 +1,10 @@
 # Changelog
 
-<!-- Last synced commit: e3287ce7 | 2026-08-31 -->
+<!-- Last synced commit: 7093764a | 2026-09-25 -->
 
 ## 0.99.18
 
+- **Signing in goes to Jolli's new address** — sign-in now opens `auth.jollidev.com`, and a key saved from the old `jolli.ai` address, which can no longer sign you in, is set aside so the extension asks you to sign in again instead of every sync and summary failing. If Jolli was your AI provider, it is cleared along with the key until you sign back in.
 - **Conversations from an older Hermes profile show up again** — a profile you haven't switched into for a while can still be on an older database layout, and reading it failed outright, so nothing from it reached the sidebar or your memories. Those profiles are read again.
 - **Enabling a repository keeps the Hermes settings you added yourself** — re-registering rewrote the whole `jollimemory` entry in Hermes' `config.yaml` and deleted anything else you had put there, including `trust`. Only the command and its arguments are refreshed now.
 - **Read-only memory tools no longer ask for approval** — the MCP tools now say which of them only read and which write, so an agent that prompts before running a tool that can change something will stop prompting for `recall`, `search` and the other six that only read.

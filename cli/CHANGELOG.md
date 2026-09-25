@@ -1,9 +1,10 @@
 # Changelog
 
-<!-- Last synced commit: e3287ce7 | 2026-08-31 -->
+<!-- Last synced commit: 7093764a | 2026-09-25 -->
 
 ## 0.99.18
 
+- **Signing in goes to Jolli's new address** — `jolli auth login` now opens `auth.jollidev.com` by default, and a key saved from the old `jolli.ai` address, which can no longer sign you in, is set aside so you are asked to sign in again instead of every sync and summary failing. If you had Jolli set as your AI provider, it is cleared along with the key until you sign back in. `JOLLI_URL` still overrides the default.
 - **Conversations from an older Hermes profile are found again** — a profile you haven't switched into for a while can still be on an older database layout, and reading it failed outright, so every conversation in it went missing from your memories. Those profiles are read again. A database that genuinely cannot be read is still reported as a failure rather than counted as empty.
 - **`jolli enable` keeps the Hermes settings you added yourself** — re-registering rewrote the whole `jollimemory` entry in `config.yaml` and deleted anything else you had put there, including `trust`. Only the command and its arguments are refreshed now; the rest of the entry is left alone.
 - **A comment in your Hermes config no longer blocks setup** — a line written as `on_session_end: # my hook` was read as if the comment were its value, so `jolli enable` quietly left that line alone and the session hook was never registered. The same applied to a comment on the `jollimemory:` line, where the command stopped being refreshed. Both are handled now.

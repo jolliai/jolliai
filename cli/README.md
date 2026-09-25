@@ -204,6 +204,8 @@ The login flow opens your default browser for OAuth authentication. After comple
 
 **How it works**: The CLI starts a temporary local server on a random available port, opens the browser to the Jolli auth page, and waits for the OAuth callback. On success, the auth token and a `jolliApiKey` (`sk-jol-...`) are automatically generated and stored in `~/.jolli/jollimemory/config.json`. The `jolliApiKey` is used for LLM proxy calls and cloud sync — no manual API key configuration needed.
 
+**Where sign-in goes**: `https://auth.jollidev.com` by default. Set `JOLLI_URL` to sign in somewhere else (a staging or self-hosted Jolli); it must be an HTTPS address on a Jolli domain. A key saved from the old `jolli.ai` address can no longer sign in, so the CLI treats it as signed out — run `jolli auth login` again. If Jolli was your AI provider, that setting is cleared with the key until you sign back in.
+
 ### `jolli status`
 
 Shows the current installation status, including CLI version, hook state, authentication state, active sessions, supported integrations (Claude, Codex, Gemini, Antigravity, OpenCode, Cursor, Copilot CLI, Copilot Chat, Cline, Devin CLI), Memory Bank state, whether this repo pushes to a Jolli Space, and summary count.
