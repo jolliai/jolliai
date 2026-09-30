@@ -210,7 +210,8 @@ publish_assert_safe_dest() {
 #   docs/          internal ops guides (e.g. MARKETPLACE_SUBMISSION.md, which names
 #                  the private marketplace repo) — governance detail, not for the
 #                  public marketplace product
-#   .DS_Store      macOS cruft
+#   .DS_Store      macOS cruft — keeps OUR copies from being sent, but it cannot keep
+#                  the destination's own out of the release (publish_unstage_os_cruft)
 #
 # LICENSE is deliberately NOT excluded (it was, until this tree grew its own copy).
 # The old arrangement let the PROD repo's hand-created root LICENSE survive
@@ -235,6 +236,24 @@ publish_sync() {
 		--exclude 'docs/' \
 		--exclude '.DS_Store' \
 		"$SRC"/ "$dest"/
+}
+
+# publish_unstage_os_cruft — keep macOS Finder metadata out of the release index.
+# Run inside the destination checkout, straight after its `git add -A`.
+#
+# An rsync exclude also PROTECTS the matching file on the receiving side from
+# `--delete`, so a `.DS_Store` that Finder writes into the destination checkout
+# survives publish_sync. `add -A` then stages it, because it runs with
+# core.excludesFile=/dev/null and that switches off the global ignore which normally
+# hides it. Any destination without its own `.gitignore` commits it: the Codex prod
+# release did exactly that (jolli-chatgpt-plugin 529bbc7, removed by hand in c518012).
+# Filtering the INDEX instead of the disk is deliberate. It does not depend on the
+# destination's `.gitignore` or on rsync filter modifiers (macOS ships openrsync). It
+# cannot race Finder rewriting the file. It also stages the removal of a copy that an
+# earlier release already committed. `--ignore-unmatch` keeps the usual no-match case
+# at exit 0, which `set -e` needs.
+publish_unstage_os_cruft() {
+	git rm -q --cached --ignore-unmatch -- ':(glob)**/.DS_Store'
 }
 
 # publish_readme_source <dest-dir> <marketplace-source> — resolve the README's
@@ -380,6 +399,7 @@ publish_git_repo() {
 	# ignore files the plugin legitimately ships (e.g. SKILL.md) and would silently
 	# drop them from the release. The marketplace repo's OWN .gitignore is still honored.
 	git -c core.excludesFile=/dev/null add -A
+	publish_unstage_os_cruft
 	if git -c core.excludesFile=/dev/null diff --cached --quiet; then
 		echo "==> Nothing changed — target already up to date."
 		# "Nothing to COMMIT" is not proof the release is complete. A destination

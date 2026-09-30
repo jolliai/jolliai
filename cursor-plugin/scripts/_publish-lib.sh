@@ -226,7 +226,9 @@ publish_assert_safe_dest() {
 }
 
 # publish_sync <dest-dir> — mirror the CONTENTS of cursor-plugin/ into <dest-dir>/.
-# Excludes the monorepo-only scaffolding a consumer must not receive.
+# Excludes the monorepo-only scaffolding a consumer must not receive. The `.DS_Store`
+# exclude keeps OUR copies from being sent, but it cannot keep the destination's own
+# out of the release — that is publish_unstage_os_cruft's job.
 publish_sync() {
 	local dest="$1"
 	command -v rsync >/dev/null 2>&1 || { echo "error: 'rsync' not found on PATH" >&2; return 1; }
@@ -241,6 +243,25 @@ publish_sync() {
 		--exclude 'docs/' \
 		--exclude '.DS_Store' \
 		"$SRC"/ "$dest"/
+}
+
+# publish_unstage_os_cruft — keep macOS Finder metadata out of the release index.
+# Run inside the destination checkout, straight after its `git add -A`.
+#
+# An rsync exclude also PROTECTS the matching file on the receiving side from
+# `--delete`, so a `.DS_Store` that Finder writes into the destination checkout
+# survives publish_sync. `add -A` then stages it, because it runs with
+# core.excludesFile=/dev/null and that switches off the global ignore which normally
+# hides it. Any destination without its own `.gitignore` commits it: the Codex prod
+# release did exactly that (jolli-chatgpt-plugin 529bbc7, removed by hand in c518012),
+# and this plugin's prod checkout was carrying one too. Filtering the INDEX instead of
+# the disk is deliberate. It does not depend on the destination's `.gitignore` or on
+# rsync filter modifiers (macOS ships openrsync). It cannot race Finder rewriting the
+# file. It also stages the removal of a copy that an earlier release already
+# committed. `--ignore-unmatch` keeps the usual no-match case at exit 0, which
+# `set -e` needs.
+publish_unstage_os_cruft() {
+	git rm -q --cached --ignore-unmatch -- ':(glob)**/.DS_Store'
 }
 
 # publish_readme_source <dest-dir> <marketplace-source> — resolve the README's install
@@ -479,6 +500,7 @@ publish_git_repo() {
 	(
 		cd "$dest"
 		git -c core.excludesFile=/dev/null add -A
+		publish_unstage_os_cruft
 		if git -c core.excludesFile=/dev/null diff --cached --quiet; then
 			echo "==> Nothing changed — target already up to date."
 			# Unconditionally, BEFORE the unpushed branch below: a destination
